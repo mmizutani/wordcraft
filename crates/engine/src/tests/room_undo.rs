@@ -223,21 +223,25 @@ fn steps_merged_after_others_changes_keep_them() {
 #[test]
 fn a_long_run_of_others_changes_is_kept_as_one_change() {
     let (mut s, _) = session("Mine\nTheirs");
-    cmd(&mut s, "caret.docStart", json!({}));
-    cmd(&mut s, "text.insert", json!({"text": "> "}));
-    // Ben types 1,200 characters one by one at the end of the second paragraph.
+    cmd(&mut s, "caret.set", json!({"pos": Pos::body(0, 4)}));
+    cmd(&mut s, "text.insert", json!({"text": " <"}));
+    // Ben types 1,200 characters one by one at the start of the same paragraph, each moving
+    // the session's step along, and 1,200 more at the end of the second.
     let mut ben = Session::new(s.doc.clone());
-    cmd(&mut ben, "caret.docEnd", json!({}));
-    for _ in 0..1200 {
-        let was = ben.doc.clone();
-        cmd(&mut ben, "text.insert", json!({"text": "x"}));
-        s.apply_theirs(&ChangeSet::between(&was, &ben.doc), "Ben").unwrap();
+    for at in ["caret.docStart", "caret.docEnd"] {
+        cmd(&mut ben, at, json!({}));
+        for _ in 0..1200 {
+            let was = ben.doc.clone();
+            cmd(&mut ben, "text.insert", json!({"text": "x"}));
+            s.apply_theirs(&ChangeSet::between(&was, &ben.doc), "Ben").unwrap();
+        }
     }
-    assert_eq!(body(&s), format!("> Mine\nTheirs{}", "x".repeat(1200)));
+    let xs = "x".repeat(1200);
+    assert_eq!(body(&s), format!("{xs}Mine <\nTheirs{xs}"));
     cmd(&mut s, "edit.undo", json!({}));
-    assert_eq!(body(&s), format!("Mine\nTheirs{}", "x".repeat(1200)));
+    assert_eq!(body(&s), format!("{xs}Mine\nTheirs{xs}"));
     cmd(&mut s, "edit.redo", json!({}));
-    assert_eq!(body(&s), format!("> Mine\nTheirs{}", "x".repeat(1200)));
+    assert_eq!(body(&s), format!("{xs}Mine <\nTheirs{xs}"));
 }
 
 #[test]
@@ -345,5 +349,39 @@ fn an_undo_made_again_after_a_clash_takes_the_same_step_or_none() {
     run(a, "edit.redo", json!({}));
     assert_eq!(text(a), "one\nTWO\nYthree");
     settle(&mut c).unwrap();
+    same_everywhere(&c).unwrap();
+}
+
+#[test]
+fn others_changes_while_an_edit_waits_for_the_hub_stay_in_its_steps() {
+    let room = Room::new(Document::from_text("one two three\nfour"));
+    let mut c = [join(&room, "Ana"), join(&room, "Ben")];
+    // Ana types "X" in the second paragraph; the hub has it.
+    run(&mut c[0], "caret.set", json!({"pos": Pos::body(1, 0)}));
+    run(&mut c[0], "text.insert", json!({"text": "X"}));
+    settle(&mut c).unwrap();
+    // Ana bolds "two" and hasn't sent it when Ben's bold of her "X" comes in: her bold moves
+    // past it. Then Ben types "2" over "two", and the hub takes it before Ana's bold, which is
+    // made again on "2".
+    run(&mut c[0], "select.text", json!({"text": "two"}));
+    run(&mut c[0], "format.bold", json!({}));
+    run(&mut c[1], "select.text", json!({"text": "X"}));
+    run(&mut c[1], "format.bold", json!({}));
+    c[1].send();
+    c[0].receive();
+    assert!(c[0].has_unconfirmed());
+    run(&mut c[1], "select.text", json!({"text": "two"}));
+    run(&mut c[1], "text.insert", json!({"text": "2"}));
+    c[1].sync();
+    c[0].send();
+    let a = &mut c[0];
+    assert_eq!((a.stats().clashes, a.stats().made_again, a.stats().lost), (1, 1, 0));
+    // Undo takes the bold made again back; the "X" Ben bolded meanwhile stays, naming him.
+    run(a, "edit.undo", json!({}));
+    let why = refused(a, "edit.undo");
+    assert!(why.contains("Typing can't be undone: Ben has changed it since"), "{why}");
+    assert_eq!(text(a), "one 2 three\nXfour");
+    settle(&mut c).unwrap();
+    smooth(&c);
     same_everywhere(&c).unwrap();
 }
