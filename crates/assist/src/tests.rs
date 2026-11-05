@@ -433,6 +433,28 @@ fn hostile_permission_requests_and_events_are_held_to_the_pane_s_limits() {
 }
 
 #[test]
+fn labels_and_answers_can_t_be_made_to_read_as_something_else() {
+    use crate::backend::{label, shown};
+    // An option a backend names "Allow" with a right-to-left override shows as what it is.
+    assert_eq!(label("\u{202E}wollA\u{202C}"), "wollA");
+    assert_eq!(label("Al\u{200B}low\u{FEFF}\u{2066}\u{2069}\u{200E}"), "Allow");
+    assert_eq!(label("Reject\u{E0041}\u{E0042}"), "Reject", "tag characters hide text from the person");
+    // What scripts and emoji need stays.
+    assert_eq!(label("👩\u{200D}💻 می\u{200C}خواهم"), "👩\u{200D}💻 می\u{200C}خواهم");
+    let r = PermissionRequest::bounded(
+        "\u{202E}etirw",
+        [PermissionOption { id: "allow".into(), name: "\u{202E}tcejeR".into(), kind: PermissionKind::AllowOnce }],
+    );
+    assert_eq!((r.title.as_str(), r.options[0].name.as_str()), ("etirw", "tcejeR"));
+    // Answers keep their lines and right-to-left text, without overrides or hidden tags.
+    assert_eq!(shown("שלום\nمرحبا \u{200F}x".into()), "שלום\nمرحبا \u{200F}x");
+    let Event::Text { text } = (Event::Text { text: "I changed \u{202E}gnihton\u{202C}.\u{E0069}".into() }).bounded() else { panic!() };
+    assert_eq!(text, "I changed gnihton.");
+    let Event::Error { message } = (Event::Error { message: "\u{2067}x".into() }).bounded() else { panic!() };
+    assert_eq!(message, "x");
+}
+
+#[test]
 fn the_tools_are_the_mcp_server_s_for_one_document() {
     let names: Vec<&str> = specs().iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, TOOLS);

@@ -283,20 +283,20 @@ impl Event {
     }
 
     /// The event held to the pane's limits: text cut at [`MAX_EVENT_TEXT`] bytes, labels at
-    /// [`MAX_LABEL`] characters, plans at [`MAX_PLAN`] entries.
+    /// [`MAX_LABEL`] characters, plans at [`MAX_PLAN`] entries, and no character that reorders
+    /// or hides the text around it ([`shown`], [`label`]).
     pub fn bounded(self) -> Event {
+        let text = |t: String| cut(shown(t), MAX_EVENT_TEXT);
         match self {
-            Event::Text { text } => Event::Text { text: cut(text, MAX_EVENT_TEXT) },
-            Event::Thought { text } => Event::Thought { text: cut(text, MAX_EVENT_TEXT) },
-            Event::Tool(t) => {
-                Event::Tool(ToolCall { id: label(&t.id), title: label(&t.title), kind: label(&t.kind), detail: cut(t.detail, MAX_EVENT_TEXT), ..t })
-            }
+            Event::Text { text: t } => Event::Text { text: text(t) },
+            Event::Thought { text: t } => Event::Thought { text: text(t) },
+            Event::Tool(t) => Event::Tool(ToolCall { id: label(&t.id), title: label(&t.title), kind: label(&t.kind), detail: text(t.detail), ..t }),
             Event::Plan { entries } => {
                 Event::Plan { entries: entries.into_iter().take(MAX_PLAN).map(|e| PlanEntry { content: label(&e.content), ..e }).collect() }
             }
             Event::Permission(r) => Event::Permission(PermissionRequest { id: r.id, ..PermissionRequest::bounded(&r.title, r.options) }),
             Event::Model { name } => Event::Model { name: label(&name) },
-            Event::Error { message } => Event::Error { message: cut(message, MAX_EVENT_TEXT) },
+            Event::Error { message } => Event::Error { message: text(message) },
             e @ (Event::Answered { .. } | Event::Done { .. }) => e,
         }
     }
@@ -314,9 +314,34 @@ pub fn cut(mut text: String, max: usize) -> String {
     text
 }
 
-/// `text` as a label: at most [`MAX_LABEL`] characters, without control characters.
+/// `text` as a label (a title, a name, a permission option): at most [`MAX_LABEL`] characters,
+/// without control characters or invisible ones ([`invisible_in_label`]), so a backend can't
+/// make a label read as something it isn't: "\u{202E}wollA" shows as "wollA", not "Allow".
 pub fn label(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).take(MAX_LABEL).collect()
+    text.chars().filter(|c| !c.is_control() && !invisible_in_label(*c)).take(MAX_LABEL).collect()
+}
+
+/// `text` as the pane shows it in an answer, a thought or an error: without the characters that
+/// reorder or hide the text around them ([`reorders_or_hides`]). Line breaks and the marks
+/// right-to-left text uses stay.
+pub fn shown(text: String) -> String {
+    if text.chars().any(reorders_or_hides) { text.chars().filter(|c| !reorders_or_hides(*c)).collect() } else { text }
+}
+
+/// The bidi embeddings, overrides and isolates (U+202A–U+202E, U+2066–U+2069), which show text in
+/// an order other than its own, and the tag characters (U+E0000–U+E007F), which a model reads but
+/// the person doesn't see.
+fn reorders_or_hides(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{E0000}'..='\u{E007F}')
+}
+
+/// What a label leaves out besides control characters: [`reorders_or_hides`], the bidi marks
+/// (U+061C, U+200E, U+200F), the zero-width space (U+200B), the word joiner and invisible
+/// operators (U+2060–U+2064), the byte order mark (U+FEFF) and the interlinear annotation signs
+/// (U+FFF9–U+FFFB). The zero-width joiner and non-joiner stay: scripts and emoji need them.
+fn invisible_in_label(c: char) -> bool {
+    reorders_or_hides(c)
+        || matches!(c, '\u{061C}' | '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
 }
 
 /// A function tool a backend offers its model: the MCP server's tools, for one shared document
