@@ -33,11 +33,12 @@ vars == << dirExists, lockPath, nextInode, holder, copies, pending, proc, ops, c
 \* fd:     the file Store::lock opened and is trying to lock
 \* guard:  the lock scan holds while it reads the record
 \* lock:   Store.locks[id]. A process with an entry never locks again (Store::acquire)
+\* kept:   Store::reclaim found the lock already in Store.locks, so it leaves it there
 \* slot:   an open document keeps its copy in this record (Slot.id)
 \* listed: Store.entries has the record
 \* alive:  the process is running
 Idle(slot, alive) == [pc |-> IF alive THEN "idle" ELSE "dead", op |-> "", why |-> "", fd |-> NoInode,
-                      guard |-> NoInode, lock |-> NoInode, slot |-> slot, listed |-> FALSE,
+                      guard |-> NoInode, lock |-> NoInode, kept |-> FALSE, slot |-> slot, listed |-> FALSE,
                       alive |-> alive]
 
 Init ==
@@ -59,6 +60,10 @@ Quiet == UNCHANGED << ops, crashes >>
 ----
 \* Store::lock. private_file(owner.lock, create) does not create the folder.
 
+\* What a discard does under the lock: a job deletes, and cleaning up after a scan or a failed save
+\* looks at the record again first (Store::reclaim).
+DiscardLocked(p) == IF proc[p].why = "job" THEN "discardDelete" ELSE "discardCheck"
+
 \* What the Store call does once it has the lock. scan keeps it in a guard; everything else
 \* goes through Store::acquire and keeps it in Store.locks.
 Locked(p, i) ==
@@ -67,7 +72,7 @@ Locked(p, i) ==
     ELSE proc' = [proc EXCEPT ![p].fd = NoInode, ![p].lock = i,
                               ![p].pc = CASE proc[p].op = "save" -> "saveFiles"
                                           [] proc[p].op = "load" -> "loadRead"
-                                          [] proc[p].op = "discard" -> "discardDelete"]
+                                          [] proc[p].op = "discard" -> DiscardLocked(p)]
 
 \* A lock that failed, in each caller's words. A record scan could not lock is skipped, so the
 \* `self.entries = entries` at its end drops it from the list.
@@ -236,13 +241,27 @@ Discarded(p) ==
                          ![p].slot = IF proc[p].why = "job" THEN FALSE ELSE @]
 
 \* `if !dir.exists() { self.entries.remove(id); return Ok(()) }`, then self.acquire. Store.locks
-\* keeps any entry it had.
+\* keeps any entry it had. Store::reclaim's acquire fails on a missing folder instead, which ends
+\* the same way for a reclaim: nothing else happens.
 DiscardStart(p) ==
     /\ proc[p].pc = "discardStart"
     /\ IF dirExists
-       THEN Go(p, Acquire(p, "discardDelete"))
+       THEN proc' = [proc EXCEPT ![p].pc = Acquire(p, DiscardLocked(p)),
+                                 ![p].kept = proc[p].why # "job" /\ proc[p].lock # NoInode]
        ELSE /\ Discarded(p)
     /\ FsUnchanged /\ Quiet
+
+\* Store::reclaim, under the lock: `Self::files` again, because the look its caller made may be
+\* stale. A record that is not empty stays, and a lock taken only for this look is released.
+DiscardCheck(p) ==
+    /\ proc[p].pc = "discardCheck"
+    /\ IF dirExists /\ ~copies
+       THEN /\ proc' = [proc EXCEPT ![p].pc = "discardDelete", ![p].kept = FALSE]
+            /\ UNCHANGED holder
+       ELSE /\ holder' = IF proc[p].kept THEN holder ELSE Release(p, proc[p].lock)
+            /\ proc' = [proc EXCEPT ![p].lock = IF proc[p].kept THEN @ ELSE NoInode, ![p].kept = FALSE,
+                                    ![p].pc = "idle", ![p].op = "", ![p].why = ""]
+    /\ UNCHANGED << dirExists, lockPath, nextInode, copies, pending >> /\ Quiet
 
 \* The entry check, deleting the generations and the temporary files, sync_dir, self.entries.remove.
 \* read_dir on a folder someone removed fails, and the lock acquire took stays in Store.locks.
@@ -317,7 +336,7 @@ Next ==
           \/ SaveStart(p) \/ SaveFiles(p) \/ SaveTemp(p) \/ SaveRename(p) \/ SaveFailed(p)
           \/ ScanStart(p) \/ ScanRead(p) \/ ScanRelease(p) \/ ScanEmpty(p)
           \/ LoadStart(p) \/ LoadRead(p)
-          \/ DiscardJob(p) \/ DiscardStart(p) \/ DiscardDelete(p) \/ DiscardUnlink(p)
+          \/ DiscardJob(p) \/ DiscardStart(p) \/ DiscardCheck(p) \/ DiscardDelete(p) \/ DiscardUnlink(p)
           \/ DiscardRmdir(p) \/ DiscardRelease(p) \/ DiscardRmdirAgain(p)
           \/ Crash(p)
     \/ Stop
@@ -333,9 +352,12 @@ DiscardTail == {"discardUnlink", "discardRmdir", "discardRelease", "discardRelea
 LiveOwner(p) == proc[p].alive /\ proc[p].slot /\ proc[p].lock # NoInode /\ proc[p].pc \notin DiscardTail
 
 \* About to read the record's files (and list it), hand it to a document, or delete it.
-Touching(q) == proc[q].pc \in {"scanRead", "loadRead", "discardDelete"}
+Touching(q) == proc[q].pc \in {"scanRead", "loadRead", "discardCheck", "discardDelete"}
 
 \* A record with a live owner is never scanned, listed, restored or discarded by another process.
 LiveOwnerIsAlone == \A p, q \in Procs : (p # q /\ LiveOwner(p)) => ~Touching(q)
+
+\* Cleaning up an empty record, after a scan or a failed save, never deletes a committed copy.
+ReclaimOnlyEmpty == \A p \in Procs : ~(proc[p].pc = "discardDelete" /\ proc[p].why # "job" /\ copies)
 
 ====

@@ -2,7 +2,7 @@
 const procs = (v) => Object.values(v.proc);
 const owner = (v) =>
   procs(v).find((p) => p.alive && p.slot && p.lock !== 0 && !p.pc.startsWith("discardU") && !p.pc.startsWith("discardR"));
-const reading = (p) => ["scanRead", "loadRead", "discardDelete"].includes(p.pc);
+const reading = (p) => ["scanRead", "loadRead", "discardCheck", "discardDelete"].includes(p.pc);
 export const title = "Two running processes and one recovery record";
 export const state = (v) => {
   const o = owner(v);
@@ -28,6 +28,7 @@ const words = {
   LoadRead: "the restore reads the copy",
   DiscardJob: "a discard starts",
   DiscardStart: "the discard looks for the folder",
+  DiscardCheck: "the cleanup looks again whether the record is empty",
   DiscardDelete: "the discard deletes the files",
   DiscardUnlink: "the discard unlinks owner.lock",
   DiscardRmdir: "the discard removes the folder",

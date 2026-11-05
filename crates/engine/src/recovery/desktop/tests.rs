@@ -680,3 +680,32 @@ fn discard_holds_the_lock_until_the_record_is_gone() {
         assert!(!spinner.join().unwrap(), "the lock was free while the record was still there");
     }
 }
+
+#[test]
+fn cleaning_up_an_empty_record_keeps_a_copy_written_since_the_look() {
+    let t = Temp::new();
+    let id = new_id().unwrap();
+    let dir = t.0.join(&id);
+    private_dir(&dir).unwrap();
+    // B's scan or failed save found the record empty, with no lock held. A then writes its first
+    // copy and dies, so the lock is free when B comes to clean up.
+    assert!(Store::files(&dir).unwrap().is_empty());
+    let mut a = Store::new(t.0.clone()).unwrap();
+    a.save(snapshot(&id, "Only copy")).unwrap();
+    drop(a);
+    let mut b = Store::new(t.0.clone()).unwrap();
+    b.reclaim(&id).unwrap();
+    assert_eq!(Store::files(&dir).unwrap().len(), 1, "the only copy of A's work stays");
+
+    // A lock B took only to look is not kept, so the copy can be recovered elsewhere.
+    let mut c = Store::new(t.0.clone()).unwrap();
+    c.scan().unwrap();
+    assert_eq!(c.inventory().len(), 1);
+
+    // An owner keeps the lock it already held.
+    c.acquire(&id).unwrap();
+    c.reclaim(&id).unwrap();
+    let mut d = Store::new(t.0.clone()).unwrap();
+    d.scan().unwrap();
+    assert!(d.inventory().is_empty(), "the record is still locked by its owner");
+}

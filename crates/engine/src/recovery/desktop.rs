@@ -230,7 +230,7 @@ impl Store {
             // A crash before the first commit leaves no document to recover. Reclaim
             // that slot only under a fresh lock and the discard path's entry checks.
             if Self::files(&dir)?.is_empty()
-                && let Err(e) = self.discard(id)
+                && let Err(e) = self.reclaim(id)
             {
                 log::warn!("recovery: cannot remove empty record: {e}");
             }
@@ -259,7 +259,7 @@ impl Store {
         // A record containing any committed generation is never removed here.
         if result.is_err()
             && Self::files(&self.root.join(&id)).is_ok_and(|files| files.is_empty())
-            && let Err(e) = self.discard(&id)
+            && let Err(e) = self.reclaim(&id)
         {
             log::warn!("recovery: cannot remove failed empty record: {e}");
         }
@@ -320,6 +320,19 @@ impl Store {
         }
         self.acquire(id)?;
         read_snapshot(&self.entries.get(id).ok_or("no such recovery copy")?.path)
+    }
+    /// Deletes a record that holds no generation. The caller may have looked with no lock held, so
+    /// look again under it: a copy written since then may be the only one of its document.
+    fn reclaim(&mut self, id: &str) -> Result<(), String> {
+        let held = self.locks.contains_key(id);
+        self.acquire(id)?;
+        if Self::files(&self.root.join(id)).is_ok_and(|files| files.is_empty()) {
+            return self.discard(id);
+        }
+        if !held {
+            self.locks.remove(id);
+        }
+        Ok(())
     }
     fn discard(&mut self, id: &str) -> Result<(), String> {
         if !id_ok(id) {

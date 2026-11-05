@@ -18,6 +18,7 @@ description: Model-check WordCraft's crash recovery (recovery copies, Slot, Stor
 | `NoPlaintextOfProtected` | A password-protected document's text is never in a recovery copy. | The document's text sits unencrypted in the profile folder. |
 | `RestoreOnlyReplacesBlank` | A restored copy replaces only a document that holds no text. | Restoring overwrites work. |
 | `LiveOwnerIsAlone` (`RecoveryLock.tla`) | A record with a live owner is never scanned, listed, restored or discarded by another process. | Another window lists a running document's copy. Discarding it there, or a scan deleting its temporary file, takes away what a crash would have recovered; restoring it there gives two processes one record. |
+| `ReclaimOnlyEmpty` (`RecoveryLock.tla`) | Cleaning up an empty record, after a scan or a failed save, never deletes a committed copy. | A process that wrote its first copy and then crashed loses it to another process's cleanup. |
 
 ## When to run it
 
@@ -77,13 +78,14 @@ In `RecoveryLock.tla`, one action is one system call, or a run of them nothing e
 | `LockRecheck` | `lock`: `names_file(&path, &file)`, and opening the path again if it does not name the locked file |
 | `SaveStart` | `write_snapshot`: `dir.exists()`, `private_dir`, then `acquire`, which locks only if `locks` has no entry |
 | `SaveFiles`, `SaveTemp`, `SaveRename` | `write_snapshot`: `Self::files`, `private_file(&tmp, true)`, `fs::rename` with the sync and prune after it |
-| `SaveFailed` | `save`: discard the record if a failed write left it without a generation |
+| `SaveFailed` | `save`: reclaim the record if a failed write left it without a generation |
 | `ScanStart` | `scan`: `directories()`, then `lock` unless `locks` has an entry (`guard` is `None`) |
 | `ScanRead` | `scan`: the loops that delete `pending-*.tmp` and read the generations |
 | `ScanRelease`, `ScanEmpty` | `scan`: `drop(guard)`, then `Self::files(&dir)?.is_empty()` with no lock held |
 | `LoadStart`, `LoadRead` | `load`: `acquire`, `read_snapshot`, and `Slot::adopt` on success |
 | `DiscardJob` | `Job::Discard`; `Applied::Discarded` clears the slot |
 | `DiscardStart`, `DiscardDelete` | `discard`: `dir.exists()`, `acquire`, the entry check, deleting generations and temporary files, `sync_dir`, `entries.remove` |
+| `DiscardCheck` | `reclaim`: `Self::files` under the lock, then `discard` if empty, or release a lock taken only for this look |
 | `DiscardUnlink`, `DiscardRmdir`, `DiscardRelease`, `DiscardRmdirAgain` | `discard`: `fs::remove_file(owner.lock)`, `fs::remove_dir(&dir)`, `locks.remove(id)`, then `fs::remove_dir(&dir)` again if the first one failed |
 | `Crash` | A process dies: its descriptors close, its files stay |
 
@@ -91,7 +93,7 @@ In `RecoveryLock.tla`, one action is one system call, or a run of them nothing e
 
 ## Scope
 
-`RecoveryStore.tla` is checked with `MaxEdits = 2`, `MaxFaults = 1`, `MaxCrashes = 1`, three record ids: about 28 million states generated, 9 million distinct. `RecoveryLock.tla` is checked with three processes, `MaxOps = 8`, `MaxCrashes = 2`: about 7 million states generated, 1.3 million distinct. A pass covers these models at these bounds, not the whole app.
+`RecoveryStore.tla` is checked with `MaxEdits = 2`, `MaxFaults = 1`, `MaxCrashes = 1`, three record ids: about 28 million states generated, 9 million distinct. `RecoveryLock.tla` is checked with three processes, `MaxOps = 8`, `MaxCrashes = 2`: about 7 million states generated, 1.4 million distinct. A pass covers these models at these bounds, not the whole app.
 
 Left out of `RecoveryLock.tla`:
 
@@ -100,7 +102,6 @@ Left out of `RecoveryLock.tla`:
 - Time: nothing says how likely an order is.
 - I/O failures, and discards interrupted partway other than by `Crash`: `DiscardDelete` is one step.
 - Filesystems where flock does not behave as it does on a local APFS or ext4 disk (NFS, some network home folders), and Windows, where `try_lock` is `LockFileEx`. Nobody has run the lock test there. A Windows volume without POSIX delete keeps an open unlinked file in its folder until it closes, which is what `discard`'s second `remove_dir` is for; the model's unlink always takes the file out at once.
-- A promise the current code breaks and no rule states: a scan reclaims only an empty record. `scan` looks whether a record is empty after dropping its guard, and `discard` deletes every generation without looking again. If A commits its first copy and dies in the 100 ms B's `lock` retries for, B deletes the only copy of A's work. TLC finds that path with `ReclaimOnlyEmpty == \A p \in Procs : ~(proc[p].pc = "discardDelete" /\ proc[p].why = "reclaim" /\ copies)`, and `Store::discard` deletes such a copy when called in that order. A real scan has not been seen doing it: a scan must first land in the tens of microseconds before A's first lock.
 
 Left out of `RecoveryStore.tla`:
 
@@ -126,6 +127,7 @@ Each rule has been seen failing on a broken variant, made in a scratch copy of t
 | `try_lock` ignores another process's lock | `LockTry` does not test `holder` | `LiveOwnerIsAlone` |
 | `lock` trusts the file it locked | `LockRecheck` tests `TRUE` | `LiveOwnerIsAlone` |
 | `discard` releases the lock before it unlinks | `DiscardDelete` releases `holder` | `LiveOwnerIsAlone` |
+| `scan` and `save` call `discard` instead of `reclaim` | `DiscardLocked` is always `"discardDelete"` | `ReclaimOnlyEmpty` |
 
 **Why `lock` and `discard` each have their half.** A flock belongs to the inode, so a process that opened `owner.lock` and is retrying can lock a file a discard has since unlinked. It then believes it owns the record while the next scan makes a new `owner.lock` and takes the record, live copy included. This happened in the code until the fix; `a_process_waiting_on_a_discard_never_keeps_the_deleted_lock` guards the recheck. Neither half is enough alone:
 
@@ -133,6 +135,8 @@ Each rule has been seen failing on a broken variant, made in a scratch copy of t
 - Without `discard` holding the lock until the folder is gone, a process can pass the recheck just before the unlink. That window is microseconds wide (0 of 9,139 waits measured), but the model finds it, and `discard_holds_the_lock_until_the_record_is_gone` catches it by spinning on `try_lock`.
 
 With both, 0 of 9,001 waits across 20,000 first copies, and a process that loses this way gets an ordinary failed save, retried at the next interval.
+
+**Why `reclaim` is not `discard`.** `scan` and `save` look whether a record is empty with no lock held, and `discard` deletes every generation, as a discard the user asked for should. Without the second look, a process that commits its first copy and dies while the other's `lock` is retrying loses that copy. `cleaning_up_an_empty_record_keeps_a_copy_written_since_the_look` tests `reclaim` itself. No test can pause `scan` or `save` at that gap, so only `ReclaimOnlyEmpty` covers those two calling it.
 
 Moving `sync_dir` after the prune while still sparing `previous` is not a break: the last confirmed copy stays on disk whichever way a crash lands. Reason a change through the model before calling it safe or unsafe.
 
