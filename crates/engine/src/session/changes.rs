@@ -186,6 +186,14 @@ impl Session {
         self.changes = ChangeLog::new(&self.doc);
     }
 
+    /// [`Session::record_changes`], unless a command on the active document is running (it
+    /// records the whole edit when it ends).
+    pub(crate) fn record_outside_changes(&mut self) {
+        if self.outside_commands() {
+            self.record_changes();
+        }
+    }
+
     /// Whether no command on the active document is running: what changes it now records
     /// its own change.
     pub(crate) fn outside_commands(&self) -> bool {

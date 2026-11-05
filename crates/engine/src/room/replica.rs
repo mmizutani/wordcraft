@@ -384,10 +384,15 @@ impl Made {
     }
 }
 
+/// How a copy runs a command in its session: [`Session::run`], or [`Session::run_ime`] for an
+/// input method's.
+type Runner = fn(&mut Session, &str, &Value) -> Result<Value, CmdError>;
+
 /// A participant's copy of a room's document (see [`super`]). Its commands run at once
 /// ([`Replica::run`]); [`Replica::send`] sends the edits they made to the hub,
 /// [`Replica::receive`] makes the changes the hub accepted in the copy. A copy on a thread of
-/// its own calls them when it likes: the copy is never wrong, only behind.
+/// its own calls them when it likes: the copy is never wrong, only behind. A copy leaves the
+/// room when it's dropped.
 pub struct Replica {
     room: Arc<Room>,
     who: Participant,
@@ -409,6 +414,10 @@ pub struct Replica {
     /// The next unit's serial.
     serials: u64,
     stats: Stats,
+    /// Whether its session is one the room's own process keeps, lent to it for each step
+    /// ([`Replica::lend`]): the app's window's, which has other documents open beside the
+    /// room's. The copy never closes them.
+    lent: bool,
 }
 
 impl Replica {
@@ -427,7 +436,49 @@ impl Replica {
             seen,
             serials: 0,
             stats: Stats::default(),
+            lent: false,
         }
+    }
+
+    /// The copy of participant `who` for `lender`, a session the room's own process keeps, whose
+    /// active document is the room's at version 0, `confirmed` ([`super::Room::host`]). It
+    /// holds `stand_in` while `lender` isn't lent to it.
+    pub(super) fn lent_by(room: Arc<Room>, who: Participant, lender: &Session, stand_in: Session, confirmed: Document) -> Replica {
+        let mut copy = Replica::new(room, who, stand_in, 0, confirmed);
+        copy.document = lender.document_id();
+        copy.seen = lender.changes().version();
+        copy.lent = true;
+        copy
+    }
+
+    /// Work on `session`, the session the copy was made for ([`super::Room::host`]): run `f`
+    /// with the copy holding it in place of its own, and give it back after (also when `f`
+    /// panics). What changed in the room's document since the copy last held it is the
+    /// participant's own edit, made outside a command. `None`, running nothing, when the copy
+    /// isn't one made for a session, or the room's document isn't `session`'s active one: the
+    /// copy catches up once it is again.
+    pub fn lend<R>(&mut self, session: &mut Session, f: impl FnOnce(&mut Replica) -> R) -> Option<R> {
+        if !self.lent || session.document_id() != self.document {
+            return None;
+        }
+        /// Gives the session back when dropped.
+        struct Lent<'a> {
+            copy: &'a mut Replica,
+            session: &'a mut Session,
+        }
+        impl Drop for Lent<'_> {
+            fn drop(&mut self) {
+                std::mem::swap(&mut self.copy.session, self.session);
+            }
+        }
+        std::mem::swap(&mut self.session, session);
+        let lent = Lent { copy: self, session };
+        Some(f(&mut *lent.copy))
+    }
+
+    /// The session's id for the room's document.
+    pub fn document(&self) -> u64 {
+        self.document
     }
 
     /// Which participant this is.
@@ -472,6 +523,16 @@ impl Replica {
     /// participant's role doesn't allow ([`super::Role::allows`]), and the session undoes one
     /// that changed more than the role lets them ([`Session::role`]).
     pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
+        self.run_as(id, params, Session::run)
+    }
+
+    /// [`Replica::run`] for an input method: the command runs as its own
+    /// ([`Session::run_ime`]). Made again after a clash, it runs as any command.
+    pub fn run_ime(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
+        self.run_as(id, params, Session::run_ime)
+    }
+
+    fn run_as(&mut self, id: &str, params: &Value, how: Runner) -> Result<Value, CmdError> {
         let Some(scope) = Scope::of(id) else { return Err(CmdError::Unknown(id.to_string())) };
         if !self.who.role.allows(scope) {
             let why = match scope {
@@ -481,12 +542,15 @@ impl Replica {
             return Err(CmdError::Disabled(format!("{id}: {why}")));
         }
         self.capture();
-        self.run_made(id, params, 0)
+        if !self.on_document() {
+            return Err(CmdError::Failed(format!("{id}: the shared document isn't open")));
+        }
+        self.run_made(id, params, 0, how)
     }
 
-    /// Run command `id`, run again `tries` times after reading the document again so far, and
-    /// keep what it changed as an edit of the copy's own.
-    fn run_made(&mut self, id: &str, params: &Value, tries: u32) -> Result<Value, CmdError> {
+    /// Run command `id` with `how`, run again `tries` times after reading the document again
+    /// so far, and keep what it changed as an edit of the copy's own.
+    fn run_made(&mut self, id: &str, params: &Value, tries: u32, how: Runner) -> Result<Value, CmdError> {
         let before = selection_anchors(&self.session);
         let around = Around::of(&self.session);
         let doc = &self.session.doc;
@@ -503,7 +567,7 @@ impl Replica {
         };
         self.session.view.draw.lasso = lasso;
         let pending = self.session.pending.clone();
-        let result = self.session.run(id, params);
+        let result = how(&mut self.session, id, params);
         self.stay_in_document();
         let after = selection_anchors(&self.session);
         let made =
@@ -518,7 +582,7 @@ impl Replica {
     /// latest version.
     pub fn send(&mut self) {
         self.capture();
-        if self.sent.is_some() || self.pending.is_empty() {
+        if self.sent.is_some() || self.pending.is_empty() || !self.on_document() {
             return;
         }
         let n = self.pending.len().min(MAX_BATCH);
@@ -558,6 +622,9 @@ impl Replica {
     /// (which move past them). Edits of its own that clash with one are made again after it.
     pub fn receive(&mut self) {
         self.capture();
+        if !self.on_document() {
+            return;
+        }
         let got = self.room.hub().since(self.received);
         match got {
             Ok(changes) => {
@@ -749,7 +816,7 @@ impl Replica {
                 }
                 self.session.pending = pending;
                 went_on = Some(after);
-                match self.run_made(&id, &params, tries) {
+                match self.run_made(&id, &params, tries, Session::run) {
                     Ok(_) => self.stats.made_again = self.stats.made_again.saturating_add(1),
                     Err(e) => {
                         self.stats.lost = self.stats.lost.saturating_add(1);
@@ -887,6 +954,12 @@ impl Replica {
         Some(Selection { anchor: self.find(a, through)?, focus: self.find(f, through)? })
     }
 
+    /// Whether the session's active document is the room's: always, but in a lent session whose
+    /// room document was closed.
+    fn on_document(&self) -> bool {
+        self.session.document_id() == self.document
+    }
+
     /// Take what the session changed outside [`Replica::run`] since the copy last looked as edits
     /// of its own, which can't be made again.
     fn capture(&mut self) {
@@ -897,6 +970,10 @@ impl Replica {
     /// Take the changes the session recorded since the copy last looked as edits of the copy's
     /// own: the last of them made by `made`, any before it outside a command.
     fn collect(&mut self, made: Made) {
+        // Another document's changes are none of the room's.
+        if !self.on_document() {
+            return;
+        }
         let changes: Vec<Arc<ChangeSet>> = match self.session.changes().since(self.seen) {
             Ok(changes) => changes.into_iter().map(|(_, cs)| cs).collect(),
             // More than the session keeps: what changed since what the copy expected.
@@ -923,7 +1000,16 @@ impl Replica {
     /// Bring the room's document back as the session's active one, if a command made another
     /// one active (scopes keep commands that can from copies; this is a net under them).
     fn stay_in_document(&mut self) {
-        if self.session.document_id() == self.document || self.session.return_to(self.document) {
+        if self.session.document_id() == self.document {
+            return;
+        }
+        // A lent session keeps its other documents open; the room's one is active again, or,
+        // when it was closed, the copy has nothing to follow until the process stops sharing.
+        if self.lent {
+            self.session.come_back_to(self.document);
+            return;
+        }
+        if self.session.return_to(self.document) {
             return;
         }
         // The room's document was closed: the copy starts again from the hub's.
@@ -966,6 +1052,12 @@ impl Replica {
             return Err(format!("the copy's version {version} isn't the hub's"));
         }
         Ok(())
+    }
+}
+
+impl Drop for Replica {
+    fn drop(&mut self) {
+        self.room.leave(self.who.id);
     }
 }
 

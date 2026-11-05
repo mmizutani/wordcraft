@@ -79,6 +79,8 @@ struct Invite {
     key: String,
     name: String,
     role: Role,
+    /// Which invite this is: the participants who join with it keep its number.
+    number: u64,
 }
 
 impl std::fmt::Debug for Invite {
@@ -86,6 +88,18 @@ impl std::fmt::Debug for Invite {
         // The key stays out of logs.
         f.debug_struct("Invite").field("name", &self.name).field("role", &self.role).finish_non_exhaustive()
     }
+}
+
+/// A participant, with how they joined and whether they're still in the room.
+#[derive(Clone, Debug)]
+struct Member {
+    who: Participant,
+    /// The invite they joined with, by its number; `None` when the room's own process let
+    /// them in ([`Hub::admit`]).
+    via: Option<u64>,
+    /// Whether they're in the room: not once they left ([`Hub::leave`]), or the invite they
+    /// joined with was taken back ([`Hub::revoke`]).
+    here: bool,
 }
 
 /// The hub of a shared document: the document as of its latest version, the changes that made
@@ -101,9 +115,13 @@ pub struct Hub {
     /// Most changes kept: [`MAX_KEPT`], fewer in tests.
     most: usize,
     /// Who joined, in the order they did: participant `n` is the `n`th.
-    participants: Vec<Participant>,
+    participants: Vec<Member>,
     /// The keys handed out.
     invites: Vec<Invite>,
+    /// How many invites were handed out: the next one's number.
+    invited: u64,
+    /// Whether the room was closed ([`Hub::close`]).
+    closed: bool,
 }
 
 impl Hub {
@@ -112,25 +130,38 @@ impl Hub {
     pub fn new(mut doc: Document) -> Hub {
         doc.ensure_nonempty();
         doc.ensure_block_ids(None);
-        Hub { doc, version: 0, kept: VecDeque::new(), bytes: 0, most: MAX_KEPT, participants: Vec::new(), invites: Vec::new() }
+        Hub {
+            doc,
+            version: 0,
+            kept: VecDeque::new(),
+            bytes: 0,
+            most: MAX_KEPT,
+            participants: Vec::new(),
+            invites: Vec::new(),
+            invited: 0,
+            closed: false,
+        }
     }
 
     /// Admit a participant called `name` with `role`. Refused when the name is empty, too long
-    /// or holds control characters, or an invite has it ([`Hub::invite`]).
+    /// or holds control characters, an invite has it ([`Hub::invite`]), or the room is closed.
     pub fn admit(&mut self, name: &str, role: Role) -> Result<Participant, RoomError> {
+        self.open()?;
         let name = valid_name(name)?;
         if self.invites.iter().any(|i| same_name(&i.name, name)) {
             return Err(RoomError::Name(format!("{name} is invited: they join with their key")));
         }
-        self.add(name, role)
+        self.add(name, role, None)
     }
 
     /// A key for a participant called `name` with `role` ([`Hub::admit_with`]): 32 hex digits
     /// from the system's random source. Refused like [`Hub::admit`], or when another invite
-    /// or a participant has the name.
+    /// or a participant has the name (one who left too: their comments and tracked changes
+    /// keep it).
     pub fn invite(&mut self, name: &str, role: Role) -> Result<String, RoomError> {
+        self.open()?;
         let name = valid_name(name)?;
-        if self.invites.iter().any(|i| same_name(&i.name, name)) || self.participants.iter().any(|p| same_name(&p.name, name)) {
+        if self.invites.iter().any(|i| same_name(&i.name, name)) || self.participants.iter().any(|m| same_name(&m.who.name, name)) {
             return Err(RoomError::Name(format!("{name} is someone's name in this room already")));
         }
         if self.invites.len() >= MAX_INVITES {
@@ -139,44 +170,79 @@ impl Hub {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).map_err(|e| RoomError::Full(format!("no key could be made: {e}")))?;
         let key: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        self.invites.push(Invite { key: key.clone(), name: name.to_string(), role });
+        let number = self.invited;
+        self.invited = self.invited.saturating_add(1);
+        self.invites.push(Invite { key: key.clone(), name: name.to_string(), role, number });
         Ok(key)
     }
 
-    /// Take back the invite with `key`. Whether there was one.
+    /// Take back the invite with `key`: no one joins with it any more, and those who joined
+    /// with it are out of the room (the hub accepts no change of theirs). Whether there was one.
     pub fn revoke(&mut self, key: &str) -> bool {
-        let before = self.invites.len();
+        let gone: Vec<u64> = self.invites.iter().filter(|i| same_key(&i.key, key)).map(|i| i.number).collect();
         self.invites.retain(|i| !same_key(&i.key, key));
-        self.invites.len() != before
+        for m in &mut self.participants {
+            if m.via.is_some_and(|n| gone.contains(&n)) {
+                m.here = false;
+            }
+        }
+        !gone.is_empty()
     }
 
     /// Admit the participant the invite with `key` names, with its role. The same key admits
-    /// them again (another copy of theirs) until it is revoked.
+    /// them again (another copy of theirs) until it is revoked. Refused when the room is closed.
     pub fn admit_with(&mut self, key: &str) -> Result<Participant, RoomError> {
+        self.open()?;
         // Every invite is compared, so how long it takes says nothing about the key.
         let found = self.invites.iter().fold(None, |found, i| if same_key(&i.key, key) { Some(i) } else { found });
-        let Invite { name, role, .. } = found.cloned().ok_or(RoomError::UnknownKey)?;
-        self.add(&name, role)
+        let Invite { name, role, number, .. } = found.cloned().ok_or(RoomError::UnknownKey)?;
+        self.add(&name, role, Some(number))
     }
 
-    fn add(&mut self, name: &str, role: Role) -> Result<Participant, RoomError> {
+    fn add(&mut self, name: &str, role: Role, via: Option<u64>) -> Result<Participant, RoomError> {
         if self.participants.len() >= MAX_PARTICIPANTS {
             return Err(RoomError::Full(format!("the room holds {MAX_PARTICIPANTS} participants at most")));
         }
         let n = u32::try_from(self.participants.len()).map_err(|_| RoomError::Full("too many participants".into()))?;
         let who = Participant { id: ParticipantId(n.saturating_add(1)), name: name.to_string(), role };
-        self.participants.push(who.clone());
+        self.participants.push(Member { who: who.clone(), via, here: true });
         Ok(who)
     }
 
-    /// Participant `id`, if they joined.
+    /// Participant `id`, while they're in the room.
     pub fn participant(&self, id: ParticipantId) -> Option<&Participant> {
+        self.member(id).filter(|m| m.here).map(|m| &m.who)
+    }
+
+    fn member(&self, id: ParticipantId) -> Option<&Member> {
         id.0.checked_sub(1).and_then(|n| self.participants.get(usize::try_from(n).ok()?))
     }
 
-    /// The participants who joined, in the order they did.
+    /// The participants in the room, in the order they joined.
     pub fn participants(&self) -> impl Iterator<Item = &Participant> {
-        self.participants.iter()
+        self.participants.iter().filter(|m| m.here).map(|m| &m.who)
+    }
+
+    /// Participant `id` leaves the room: the hub accepts no change of theirs any more (their
+    /// name stays theirs). Whether they were in it.
+    pub fn leave(&mut self, id: ParticipantId) -> bool {
+        let Some(m) = id.0.checked_sub(1).and_then(|n| self.participants.get_mut(usize::try_from(n).ok()?)) else { return false };
+        std::mem::replace(&mut m.here, false)
+    }
+
+    /// Close the room: no one joins any more, and the hub accepts no change. What it has stays
+    /// readable.
+    pub fn close(&mut self) {
+        self.closed = true;
+    }
+
+    /// Whether the room was closed ([`Hub::close`]).
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    fn open(&self) -> Result<(), RoomError> {
+        if self.closed { Err(RoomError::Closed) } else { Ok(()) }
     }
 
     /// The same hub, keeping at most `most` changes (at least one).
@@ -221,15 +287,19 @@ impl Hub {
     /// the rest, which were made after it; the copy that made them finds the same clash, drops
     /// them and makes them again. All are sent back, leaving the hub as it was, when the first
     /// clashes, when `base` is not a version the hub can move them from, when one doesn't
-    /// apply, when one puts in a block under an id the document already has, or when one is
+    /// apply, when one puts in a block under an id the document already has, when one is
     /// more than `by`'s role lets them change (a viewer changes nothing; a commenter only
-    /// comments of their own; a suggester also tracked changes in their name).
+    /// comments of their own; a suggester also tracked changes in their name), when `by` isn't
+    /// in the room, or when the room is closed.
     pub fn submit_all(&mut self, base: u64, changes: &[ChangeSet], by: ParticipantId) -> Result<Took, Bounce> {
         if changes.len() > MAX_BATCH {
             return Err(Bounce::Refused(format!("{} changes at once are more than the {MAX_BATCH} the hub takes", changes.len())));
         }
         if changes.is_empty() || changes.iter().any(ChangeSet::is_empty) {
             return Err(Bounce::Refused("a change that changes nothing".into()));
+        }
+        if self.closed {
+            return Err(Bounce::Refused("the room is closed".into()));
         }
         let who = self.participant(by).cloned().ok_or_else(|| Bounce::Refused(format!("{by} isn't in the room")))?;
         if who.role == Role::Viewer {

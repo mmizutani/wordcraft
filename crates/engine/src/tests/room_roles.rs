@@ -71,12 +71,16 @@ fn an_invite_lets_whoever_holds_its_key_in_under_its_name_and_role() {
     for wrong in ["", "nonsense", &key[..31], &key.to_uppercase(), &"0".repeat(32)] {
         assert!(matches!(room.join_with(wrong), Err(RoomError::UnknownKey)), "{wrong:?}");
     }
+    let names = |room: &Room| room.participants().into_iter().map(|p| (p.id.0, p.name, p.role)).collect::<Vec<_>>();
+    assert_eq!(names(&room), [(1, "Ana".to_string(), Role::Suggester), (2, "Ana".into(), Role::Suggester)]);
+    // Taken back, the key lets no one in, and the copies that joined with it are out.
     assert!(room.revoke(&key));
     assert!(!room.revoke(&key));
     assert!(matches!(room.join_with(&key), Err(RoomError::UnknownKey)));
-    assert!(room.join_with(&other).is_ok());
-    let names: Vec<(u32, String, Role)> = room.participants().into_iter().map(|p| (p.id.0, p.name, p.role)).collect();
-    assert_eq!(names, [(1, "Ana".to_string(), Role::Suggester), (2, "Ana".into(), Role::Suggester), (3, "Ben".into(), Role::Viewer)]);
+    assert!(!room.is_in(ana.id()) && !room.is_in(again.id()));
+    let ben = room.join_with(&other).unwrap();
+    assert_eq!(names(&room), [(3, "Ben".to_string(), Role::Viewer)]);
+    assert!(room.is_in(ben.id()));
     // Keys stay out of the hub's debug output.
     let mut hub = Hub::new(Document::from_text("Hello"));
     let key = hub.invite("Eve", Role::Editor).unwrap();

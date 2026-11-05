@@ -73,6 +73,13 @@ impl Session {
         true
     }
 
+    /// Make document `id` the active one again after a command made another one active,
+    /// leaving the others open: a session the room's own process lends a copy keeps them
+    /// ([`crate::room::Replica::lend`]). False, changing nothing, when `id` is not open.
+    pub(crate) fn come_back_to(&mut self, id: u64) -> bool {
+        self.switch_to(id).is_ok()
+    }
+
     /// After `self.doc` became what change `cs` (or, with none, another version) made of
     /// `before`: move what the session holds, and record the change.
     fn follow_shared(&mut self, before: &Document, cs: Option<&ChangeSet>) {

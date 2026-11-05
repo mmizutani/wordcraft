@@ -25,9 +25,14 @@
 //! tracked changes in their name, which others accept or reject. Their copies hold each
 //! command to that ([`Session::run`] undoes one that does more), and the hub each change.
 //!
-//! Next in milestone A1: agents' copies on threads of their own; undo per participant (until
-//! then a copy drops its undo steps when another participant's change arrives,
-//! [`Session::apply_change`]); presence.
+//! The app's window shares the document it shows ([`Room::host`]): its owner's copy works on the
+//! window's own session, lent to it for each step ([`Replica::lend`]), so what the person types
+//! goes through the copy like anyone's. Agents with a key reach the room through the process's
+//! [`Lobby`] (the app's control channel): each gets a copy of their own, on their connection's
+//! thread, which answers their requests ([`hosted::call`]).
+//!
+//! Next in milestone A1: undo per participant (until then a copy drops its undo steps when
+//! another participant's change arrives, [`Session::apply_change`]); presence.
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -38,6 +43,7 @@ use wordcraft_doc::{ChangeSet, Document};
 use crate::scope::Scope;
 use crate::{Registry, Session};
 
+pub mod hosted;
 mod hub;
 mod replica;
 pub(crate) mod rules;
@@ -133,13 +139,22 @@ pub enum RoomError {
     /// The room has as many participants or invites as it holds, or no key could be made.
     #[error("{0}")]
     Full(String),
+    /// The room was closed: its document isn't shared any more.
+    #[error("the document isn't shared any more")]
+    Closed,
 }
+
+/// What a room calls when its hub accepted changes or it closed: the app's window asks to be
+/// drawn again, to show them.
+type OnChange = Box<dyn Fn() + Send + Sync>;
 
 /// One shared document: its hub, and what its participants' copies share.
 pub struct Room {
     hub: Mutex<Hub>,
-    /// Signalled when the hub accepts a change.
+    /// Signalled when the hub accepts a change, and when the room closes.
     changed: Condvar,
+    /// Called after that ([`Room::on_change`]).
+    on_change: Mutex<Option<OnChange>>,
     /// The commands, shared by the copies' sessions.
     registry: Arc<Registry>,
 }
@@ -152,7 +167,71 @@ impl Room {
 
     /// A room whose hub is `hub`.
     pub fn with_hub(hub: Hub) -> Arc<Room> {
-        Arc::new(Room { hub: Mutex::new(hub), changed: Condvar::new(), registry: Arc::new(crate::cmd::registry()) })
+        Room::with_registry(hub, Arc::new(crate::cmd::registry()))
+    }
+
+    fn with_registry(hub: Hub, registry: Arc<Registry>) -> Arc<Room> {
+        Arc::new(Room { hub: Mutex::new(hub), changed: Condvar::new(), on_change: Mutex::new(None), registry })
+    }
+
+    /// Share the active document of `session`, a session the room's own process keeps for
+    /// itself (the app's window, with its other documents): a room holding it at version 0,
+    /// which `name` joins as its owner with a copy that works on `session` itself, lent to it
+    /// for each step ([`Replica::lend`]). Blocks without an id get one first, in `session`
+    /// too. Refused when the name can't be a participant's.
+    pub fn host(session: &mut Session, name: &str) -> Result<(Arc<Room>, Replica), RoomError> {
+        // What changed outside a command is the session's own, before the room has it.
+        session.record_outside_changes();
+        let mut hub = Hub::new(session.doc.clone());
+        let who = hub.admit(name, Role::Owner)?;
+        if *hub.document() != session.doc || hub.document().block_ids() != session.doc.block_ids() {
+            session.reset_shared(hub.document().clone());
+        }
+        let doc = hub.document().clone();
+        let room = Room::with_registry(hub, session.registry.clone());
+        // The copy's own session stands in while the window's isn't lent to it.
+        let stand_in = Session::with_registry(Document::new(), room.registry.clone());
+        let copy = Replica::lent_by(room.clone(), who, session, stand_in, doc);
+        Ok((room, copy))
+    }
+
+    /// Call `f` whenever the hub accepted changes, and when the room closes, on the thread that
+    /// made that happen (in place of what was called before).
+    pub fn on_change(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_change.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(f));
+    }
+
+    /// Wake whoever waits for a change ([`Room::wait_past`], [`Room::on_change`]).
+    fn changed(&self) {
+        self.changed.notify_all();
+        if let Some(f) = self.on_change.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            f();
+        }
+    }
+
+    /// Close the room: no one joins any more, the hub accepts no change, and the copies
+    /// hosted for those with a key stop answering ([`hosted::call`]). What it has stays
+    /// readable.
+    pub fn close(&self) {
+        self.hub().close();
+        self.changed();
+    }
+
+    /// Whether the room was closed ([`Room::close`]).
+    pub fn is_closed(&self) -> bool {
+        self.hub().is_closed()
+    }
+
+    /// Participant `id` leaves the room ([`Hub::leave`]); a copy does when it's dropped.
+    pub fn leave(&self, id: ParticipantId) {
+        self.hub().leave(id);
+    }
+
+    /// Whether participant `id` is in the room: they joined, didn't leave, the invite they
+    /// joined with wasn't taken back, and the room isn't closed.
+    pub fn is_in(&self, id: ParticipantId) -> bool {
+        let hub = self.hub();
+        !hub.is_closed() && hub.participant(id).is_some()
     }
 
     /// The hub, whatever a thread that panicked while holding it left (the hub changes its
@@ -191,8 +270,9 @@ impl Room {
         self.hub().invite(name, role)
     }
 
-    /// Take back the invite with `key`: no one joins with it any more (copies that joined with
-    /// it stay). Whether there was one.
+    /// Take back the invite with `key`: no one joins with it any more, and the copies that
+    /// joined with it are out of the room (the hub accepts no change of theirs, and a hosted
+    /// copy stops answering). Whether there was one.
     pub fn revoke(&self, key: &str) -> bool {
         self.hub().revoke(key)
     }
@@ -207,7 +287,7 @@ impl Room {
         Ok(self.copy_for(who, version, doc))
     }
 
-    /// The participants who joined, in the order they did.
+    /// The participants in the room, in the order they joined.
     pub fn participants(&self) -> Vec<Participant> {
         self.hub().participants().cloned().collect()
     }
@@ -220,14 +300,14 @@ impl Room {
         Replica::new(self.clone(), who, session, version, doc)
     }
 
-    /// Wait until the document is past `version`, or `timeout` has passed; the latest version.
-    /// The web build has no threads to wait for: there it doesn't wait.
+    /// Wait until the document is past `version`, the room closes, or `timeout` has passed;
+    /// the latest version. The web build has no threads to wait for: there it doesn't wait.
     pub fn wait_past(&self, version: u64, timeout: Duration) -> u64 {
         let hub = self.hub();
-        if cfg!(target_arch = "wasm32") || hub.version() > version {
+        if cfg!(target_arch = "wasm32") || hub.version() > version || hub.is_closed() {
             return hub.version();
         }
-        let waited = self.changed.wait_timeout_while(hub, timeout, |h| h.version() <= version);
+        let waited = self.changed.wait_timeout_while(hub, timeout, |h| h.version() <= version && !h.is_closed());
         let (hub, _) = waited.unwrap_or_else(PoisonError::into_inner);
         hub.version()
     }
@@ -237,8 +317,53 @@ impl Room {
     fn submit(&self, base: u64, changes: &[ChangeSet], by: ParticipantId) -> Result<Took, Bounce> {
         let took = self.hub().submit_all(base, changes, by);
         if took.is_ok() {
-            self.changed.notify_all();
+            self.changed();
         }
         took
+    }
+}
+
+/// Where those with a key find the room the process shares, if it shares one: the app's
+/// window opens it when it shares its document, and its control channel lets participants in
+/// through it ([`Lobby::join_with`]). Clones are the same lobby.
+#[derive(Clone, Default)]
+pub struct Lobby(Arc<Mutex<Option<Arc<Room>>>>);
+
+impl Lobby {
+    fn slot(&self) -> MutexGuard<'_, Option<Arc<Room>>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Let participants with a key into `room` (in place of the room before, which closes).
+    pub fn open(&self, room: Arc<Room>) {
+        let before = self.slot().replace(room.clone());
+        if let Some(before) = before.filter(|b| !Arc::ptr_eq(b, &room)) {
+            before.close();
+        }
+    }
+
+    /// Close the room the lobby lets participants into, if it has one ([`Room::close`]).
+    pub fn close(&self) {
+        let before = self.slot().take();
+        if let Some(room) = before {
+            room.close();
+        }
+    }
+
+    /// The room participants with a key join, while it's open.
+    pub fn room(&self) -> Option<Arc<Room>> {
+        self.slot().clone().filter(|r| !r.is_closed())
+    }
+
+    /// Join the room with a key it handed out ([`Room::join_with`]). [`RoomError::Closed`]
+    /// when no document is shared.
+    pub fn join_with(&self, key: &str) -> Result<Replica, RoomError> {
+        self.room().ok_or(RoomError::Closed)?.join_with(key)
+    }
+}
+
+impl std::fmt::Debug for Lobby {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lobby").field("open", &self.room().is_some()).finish()
     }
 }
