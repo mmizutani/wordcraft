@@ -9,7 +9,9 @@
 #   - cargo-nextest at the CI version (xtask uses it when installed),
 #   - craft-i18n at craft-i18n.rev and craft-fonts at ci.yml's pin, next to the repository,
 #     with CRAFT_I18N_DIR / CRAFT_FONTS_DIR exported for every shell,
-#   - the crates.io and git dependencies (`cargo fetch --locked`).
+#   - the crates.io and git dependencies (`cargo fetch --locked`),
+#   - Java and TLC for the recovery-store skill's model check, with TLA2TOOLS exported,
+#   - the pstack model sheet CLAUDE.md includes, unless one is already there.
 #
 # Idempotent: every step checks what is already there, so rerunning it is quick.
 # Runs from the repository root or from the directory above it (where the cloud environment
@@ -27,6 +29,8 @@ SKIP_FONTS="${WORDCRAFT_SKIP_FONTS:-0}"
 NEXTEST_VERSION="0.9.150"
 # Fallback pins when the repository files cannot be read.
 DEFAULT_FONTS_REF="b076417b5880bd4154bd22f00695b1d28c6bea83"
+DEFAULT_TLA_VERSION="1.7.4"
+DEFAULT_TLA_SHA="936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 
 log() { printf '\n==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -58,6 +62,8 @@ fi
 # Myanmar without reordering it, so font fallback picks it and the layout crate's Myanmar shaping
 # tests fail; Padauk (SIL OFL) gives fallback a real Myanmar face, as on the CI runners.
 APT_PACKAGES="$APT_PACKAGES build-essential curl ca-certificates git fonts-sil-padauk"
+# TLC (see below) needs Java 11 or later; an image that has a Java keeps it.
+java -version >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES default-jre-headless"
 
 if command -v apt-get >/dev/null 2>&1; then
   missing=()
@@ -157,6 +163,77 @@ if [ "$SKIP_FONTS" != 1 ]; then
   else
     warn "craft-fonts checkout failed; building without it"
   fi
+fi
+
+# --- TLC -------------------------------------------------------------------------------------
+# The model checker .claude/skills/recovery-store/check.sh and the /statechart skill run. The pin
+# is read from check.sh so the two never drift, and the jar goes where check.sh looks for it.
+# TLA2TOOLS is what lets /statechart skip its mise install, which an image without mise can't do.
+tla_version="$DEFAULT_TLA_VERSION"
+tla_sha="$DEFAULT_TLA_SHA"
+tla_check="$REPO/.claude/skills/recovery-store/check.sh"
+if [ -n "$REPO" ] && [ -f "$tla_check" ]; then
+  v="$(sed -n 's/^version=//p' "$tla_check")"
+  s="$(sed -n 's/^sha=//p' "$tla_check")"
+  if [ -n "$v" ] && [ -n "$s" ]; then
+    tla_version="$v"
+    tla_sha="$s"
+  fi
+fi
+tla_jar="${XDG_CACHE_HOME:-$HOME/.cache}/wordcraft-tla/tla2tools-$tla_version.jar"
+tla_verified() { [ -f "$tla_jar" ] && [ "$(sha256sum "$tla_jar" | cut -d' ' -f1)" = "$tla_sha" ]; }
+if tla_verified; then
+  log "TLC $tla_version already downloaded"
+else
+  log "Downloading TLC $tla_version"
+  mkdir -p "$(dirname "$tla_jar")"
+  curl -fsSL --retry 3 -o "$tla_jar.part" "https://github.com/tlaplus/tlaplus/releases/download/v$tla_version/tla2tools.jar" \
+    && mv -f "$tla_jar.part" "$tla_jar" || true
+fi
+if tla_verified; then
+  ENV_LINES+=("export TLA2TOOLS=\"$tla_jar\"")
+else
+  rm -f "$tla_jar" "$tla_jar.part"
+  warn "could not get TLC $tla_version; the recovery-store check will try again when it runs"
+fi
+
+# --- pstack model sheet ----------------------------------------------------------------------
+# CLAUDE.md includes this file, which lives outside the repository. /setup-pstack rewrites it, so
+# one that is already there is left alone. A session without the pstack plugin ignores it.
+PSTACK_SHEET="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/pstack-models.md"
+if [ -f "$PSTACK_SHEET" ]; then
+  log "pstack model sheet already at $PSTACK_SHEET"
+else
+  log "Writing the pstack model sheet to $PSTACK_SHEET"
+  mkdir -p "$(dirname "$PSTACK_SHEET")"
+  cat >"$PSTACK_SHEET" <<'EOF'
+# pstack model configuration
+
+Per-role model overrides for pstack skills, from tools/claude-cloud-setup.sh; /setup-pstack rewrites this file. Each pstack SKILL.md names its defaults in a Models section; the values here override those defaults. Delete a line to fall back to the skill default.
+
+feature, refactoring: sonnet
+bug-fix: opus
+perf-issue: opus
+hillclimb: opus
+judgment and prose: opus
+strongest judgment: fable
+how explorer: opus
+how explainer: opus
+why investigators: opus
+why synthesizer: opus
+reflect tooling: opus
+reflect judgment, divergent, synthesizer: opus
+arena runners: opus, fable, sonnet, haiku
+arena cross-judge pool: opus, fable, sonnet, haiku
+swarm workers: opus
+architect runners: opus, fable, sonnet, haiku
+interrogate reviewers: opus, fable, sonnet, haiku
+thermos reviewers: opus
+no-comments reviewer: opus
+
+default effort: session
+session hook: on
+EOF
 fi
 
 # --- Shell environment -----------------------------------------------------------------------
