@@ -1067,6 +1067,35 @@ fn a_repeated_reply_made_again_replies_to_the_comment_it_was_made_on() {
 }
 
 #[test]
+fn repeat_after_a_reply_made_again_replies_to_the_comment_it_was_made_on() {
+    let room = Room::new(Document::from_text("one two three"));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    // Ana comments on "two" and replies to her comment; Ben comments on "one" first, under the
+    // same new id. Once her edits are made again, Repeat replies to her comment again, not to
+    // Ben's.
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "review.newComment", json!({"text": "A"}));
+    let id = a.session().doc.comments.keys().next().copied().unwrap();
+    run(&mut a, "review.reply", json!({"id": id, "text": "R"}));
+    run(&mut b, "select.text", json!({"text": "one"}));
+    run(&mut b, "review.newComment", json!({"text": "B"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    run(&mut a, "edit.repeat", json!({}));
+    let d = &a.session().doc;
+    let by_text = |t: &str| d.comments.iter().find(|(_, c)| d.plain_text(StoryRef::Part(c.part)) == t).map(|(id, _)| *id);
+    let ana = by_text("A").unwrap();
+    let parents: Vec<Option<u32>> = d.comments.values().filter(|c| d.plain_text(StoryRef::Part(c.part)) == "R").map(|c| c.parent).collect();
+    assert_eq!(parents, [Some(ana), Some(ana)]);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
 fn edits_in_a_new_text_box_made_again_are_made_in_that_box() {
     let room = Room::new(Document::from_text("one two"));
     let mut a = join(&room, "Ana");

@@ -399,6 +399,20 @@ struct Unit {
     serial: u64,
 }
 
+/// Name the comment command `id` names in `params` ([`NAMES_COMMENTS`]) by the id `renamed`
+/// gives it, when an edit made again made it under another id. False when it is gone.
+fn rename_comment(id: &str, params: &mut Value, renamed: &BTreeMap<u32, Option<u32>>) -> bool {
+    let was = params.get("id").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
+    let Some(&now) = was.filter(|_| NAMES_COMMENTS.contains(&id)).and_then(|was| renamed.get(&was)) else { return true };
+    match (now, params.as_object_mut()) {
+        (Some(now), Some(o)) => {
+            o.insert("id".into(), Value::from(now));
+            true
+        }
+        _ => false,
+    }
+}
+
 /// The selection of session `s`, as anchors (`None` when an end isn't in a paragraph).
 fn selection_anchors(s: &Session) -> SelAnchors {
     Some((s.doc.anchor_at(&s.sel.anchor)?, s.doc.anchor_at(&s.sel.focus)?))
@@ -835,25 +849,15 @@ impl Replica {
                     continue;
                 };
                 // A comment an edit before it made, named by the id it had then.
-                if NAMES_COMMENTS.contains(&id.as_str())
-                    && let Some(was) = params.get("id").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok())
-                    && let Some(&now) = renamed.get(&was)
-                {
-                    match (now, params.as_object_mut()) {
-                        (Some(now), Some(o)) => {
-                            o.insert("id".into(), Value::from(now));
-                        }
-                        _ => {
-                            self.stats.lost = self.stats.lost.saturating_add(1);
-                            self.session.status = format!(
-                                "An edit made at the same time as another participant's couldn't be made again ({id}): the comment it was made on is gone"
-                            );
-                            gone(&mut renamed, &comments);
-                            self.lost_blocks(&blocks);
-                            went_on = None;
-                            continue;
-                        }
-                    }
+                if !rename_comment(&id, &mut params, &renamed) {
+                    self.stats.lost = self.stats.lost.saturating_add(1);
+                    self.session.status = format!(
+                        "An edit made at the same time as another participant's couldn't be made again ({id}): the comment it was made on is gone"
+                    );
+                    gone(&mut renamed, &comments);
+                    self.lost_blocks(&blocks);
+                    went_on = None;
+                    continue;
                 }
                 let reselect = went_on != Some(before) || !around.is_empty();
                 // From the document the command was made on to the one it is made again on: the
@@ -929,6 +933,13 @@ impl Replica {
         }
         let cut_now = self.session.pending_move.take();
         kept.put(&mut self.session);
+        // Repeat repeats the participant's last command: one naming a comment made again names
+        // it by its new id, and there's nothing to repeat when that comment is gone.
+        if let Some((id, params)) = self.session.last_command.as_mut()
+            && !rename_comment(id, params, &renamed)
+        {
+            self.session.last_command = None;
+        }
         // A tracked cut made again is the one the participant's next paste can move: under the
         // revision it has now, or none when it was given up or something after it took it.
         if cut {
