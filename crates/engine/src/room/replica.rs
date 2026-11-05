@@ -239,8 +239,8 @@ fn new_blocks(cs: &ChangeSet) -> Vec<BlockId> {
 /// (typing replaces the selection, Overtype, AutoCorrect, AutoFormat…), the view (Outline view,
 /// field codes, the pens and the rest of the Draw tab, design mode…; without the lasso, kept
 /// with the selection in [`Around`]), the highlighter colour, the editing language, the
-/// bibliography style, column selection mode, and the name and initials new comments and
-/// tracked changes are made under.
+/// bibliography style, column selection mode, the name and initials new comments and
+/// tracked changes are made under, and mail merge's recipients and preview.
 #[derive(Clone, Debug, PartialEq)]
 struct Context {
     prefs: Prefs,
@@ -251,6 +251,8 @@ struct Context {
     column_mode: bool,
     author: String,
     initials: String,
+    /// Mail merge's recipients, the record previewed and whether results are previewed.
+    merge: crate::cmd::mailings::MergeState,
 }
 
 impl Context {
@@ -265,6 +267,7 @@ impl Context {
             column_mode: s.column_mode,
             author: s.author.clone(),
             initials: s.initials.clone(),
+            merge: s.merge.clone(),
         }
     }
 
@@ -278,6 +281,7 @@ impl Context {
             && self.column_mode == s.column_mode
             && self.author == s.author
             && self.initials == s.initials
+            && self.merge == s.merge
     }
 
     /// Put it in session `s`, which keeps its lasso.
@@ -292,6 +296,7 @@ impl Context {
         s.column_mode = self.column_mode;
         s.author = self.author;
         s.initials = self.initials;
+        s.merge = self.merge;
     }
 }
 
