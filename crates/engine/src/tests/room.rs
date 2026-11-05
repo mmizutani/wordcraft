@@ -1117,6 +1117,40 @@ fn repeat_after_a_reply_made_again_replies_to_the_comment_it_was_made_on() {
 }
 
 #[test]
+fn repeat_after_another_s_change_repeats_at_the_place_it_was_made() {
+    let room = Room::new(Document::from_text("a\nb"));
+    let mut a = room.join("Ana");
+    let b = room.join("Ben");
+    let para = |r: &Replica, i: usize| r.session().doc.body.get(i).and_then(|b| b.as_para()).map(|p| p.text.clone()).unwrap_or_default();
+    // A check box at the end of each paragraph.
+    for i in 0..2 {
+        run(&mut a, "caret.set", json!({"pos": Pos::body(i, 1)}));
+        run(&mut a, "developer.checkBox", json!({}));
+    }
+    // Ana ticks the second box by its place; Ben puts a paragraph in at the start. Repeat
+    // then toggles that box again, now in the third paragraph, not the first box, which is
+    // where the second was.
+    run(&mut a, "developer.toggleCheckBox", json!({"at": Pos::body(1, 1)}));
+    let (first, ticked) = (para(&a, 0), para(&a, 1));
+    assert_ne!(first, ticked);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    let [mut a, mut b] = copies;
+    run(&mut b, "caret.docStart", json!({}));
+    run(&mut b, "text.newParagraph", json!({}));
+    b.send();
+    a.receive();
+    assert_eq!((para(&a, 1), para(&a, 2)), (first.clone(), ticked));
+    run(&mut a, "edit.repeat", json!({}));
+    assert_eq!(para(&a, 1), first);
+    assert_eq!(para(&a, 2), first.replace('a', "b"));
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
 fn edits_in_a_new_text_box_made_again_are_made_in_that_box() {
     let room = Room::new(Document::from_text("one two"));
     let mut a = room.join("Ana");
