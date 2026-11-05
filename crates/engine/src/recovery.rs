@@ -28,10 +28,15 @@ impl Session {
     }
     /// Copies left by an earlier run (or another window's documents that have closed), newest
     /// first. The copies this session's open documents keep are not listed: they are not lost.
+    /// Nor is a loaded copy waiting to open: the document it opens as keeps its copy there.
     pub fn recovery_documents(&self) -> Vec<RecoveryInfo> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(r) = &self.recovery {
-            let held = |id: &str| self.recovery_slots().any(|(_, _, s)| s.id.as_deref() == Some(id)) || r.closing().any(|c| c == id);
+            let held = |id: &str| {
+                self.recovery_slots().any(|(_, _, s)| s.id.as_deref() == Some(id))
+                    || r.closing().any(|c| c == id)
+                    || r.held.as_ref().is_some_and(|(s, _)| s.info.id == id)
+            };
             return r.documents.iter().filter(|d| !held(&d.id)).cloned().collect();
         }
         Vec::new()

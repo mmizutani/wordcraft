@@ -10,8 +10,7 @@
 #   - craft-i18n at craft-i18n.rev and craft-fonts at ci.yml's pin, next to the repository,
 #     with CRAFT_I18N_DIR / CRAFT_FONTS_DIR exported for every shell,
 #   - the crates.io and git dependencies (`cargo fetch --locked`),
-#   - Java and TLC for the recovery-store skill's model check, with TLA2TOOLS exported,
-#   - the pstack model sheet CLAUDE.md includes, unless one is already there.
+#   - Java and TLC for the recovery-store skill's model check, with TLA2TOOLS exported.
 #
 # Idempotent: every step checks what is already there, so rerunning it is quick.
 # Runs from the repository root or from the directory above it (where the cloud environment
@@ -195,45 +194,6 @@ if tla_verified; then
 else
   rm -f "$tla_jar" "$tla_jar.part"
   warn "could not get TLC $tla_version; the recovery-store check will try again when it runs"
-fi
-
-# --- pstack model sheet ----------------------------------------------------------------------
-# CLAUDE.md includes this file, which lives outside the repository. /setup-pstack rewrites it, so
-# one that is already there is left alone. A session without the pstack plugin ignores it.
-PSTACK_SHEET="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/pstack-models.md"
-if [ -f "$PSTACK_SHEET" ]; then
-  log "pstack model sheet already at $PSTACK_SHEET"
-else
-  log "Writing the pstack model sheet to $PSTACK_SHEET"
-  mkdir -p "$(dirname "$PSTACK_SHEET")"
-  cat >"$PSTACK_SHEET" <<'EOF'
-# pstack model configuration
-
-Per-role model overrides for pstack skills, from tools/claude-cloud-setup.sh; /setup-pstack rewrites this file. Each pstack SKILL.md names its defaults in a Models section; the values here override those defaults. Delete a line to fall back to the skill default.
-
-feature, refactoring: sonnet
-bug-fix: opus
-perf-issue: opus
-hillclimb: opus
-judgment and prose: opus
-strongest judgment: fable
-how explorer: opus
-how explainer: opus
-why investigators: opus
-why synthesizer: opus
-reflect tooling: opus
-reflect judgment, divergent, synthesizer: opus
-arena runners: opus, fable, sonnet, haiku
-arena cross-judge pool: opus, fable, sonnet, haiku
-swarm workers: opus
-architect runners: opus, fable, sonnet, haiku
-interrogate reviewers: opus, fable, sonnet, haiku
-thermos reviewers: opus
-no-comments reviewer: opus
-
-default effort: session
-session hook: on
-EOF
 fi
 
 # --- Shell environment -----------------------------------------------------------------------
