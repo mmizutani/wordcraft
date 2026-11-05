@@ -363,6 +363,7 @@ pub(crate) fn assemble(paras: Vec<ParaOut>) -> Blocks {
                 grid: grid.to_vec(),
                 rows: std::mem::take(rows),
                 controls: Default::default(),
+                id: Default::default(),
             })));
         }
         rows.clear();

@@ -1,4 +1,4 @@
-use super::{Arc, Deserialize, Paragraph, Serialize, Table};
+use super::{Arc, BlockId, Deserialize, Paragraph, Serialize, Table};
 
 /// A block in a story. (Blocks are always behind an `Arc`, so the size difference is fine.)
 #[allow(clippy::large_enum_variant)]
@@ -20,6 +20,19 @@ impl Block {
         match self {
             Block::Table(t) => Some(t),
             Block::Para(_) => None,
+        }
+    }
+    /// Which block this is ([`BlockId`]).
+    pub fn id(&self) -> BlockId {
+        match self {
+            Block::Para(p) => p.id,
+            Block::Table(t) => t.id,
+        }
+    }
+    pub(crate) fn id_mut(&mut self) -> &mut BlockId {
+        match self {
+            Block::Para(p) => &mut p.id,
+            Block::Table(t) => &mut t.id,
         }
     }
 }

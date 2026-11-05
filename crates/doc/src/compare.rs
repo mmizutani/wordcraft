@@ -23,10 +23,10 @@ fn same_block(a: &Block, b: &Block) -> bool {
 }
 
 /// The same table. Every field is listed, so a new one does not build until someone decides
-/// whether a change to it counts.
+/// whether a change to it counts. Which table it is (its id) doesn't count: content does.
 fn same_table(a: &Table, b: &Table) -> bool {
-    let Table { props, grid, rows, controls } = a;
-    let Table { props: other_props, grid: other_grid, rows: other_rows, controls: other_controls } = b;
+    let Table { props, grid, rows, controls, id: _ } = a;
+    let Table { props: other_props, grid: other_grid, rows: other_rows, controls: other_controls, id: _ } = b;
     props == other_props
         && grid == other_grid
         && controls == other_controls

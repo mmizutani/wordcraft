@@ -35,6 +35,9 @@ fn control_print_discovery_reports_metadata_without_host_side_effects() {
     assert!(commands.iter().any(|command| command["id"] == "file.print"), "engine print commands remain visible");
     let settings = commands.iter().find(|command| command["id"] == "ui.printSettings").unwrap();
     assert_eq!(settings["enabled"], true, "settings/status inspection is available");
+    // Each command's scope, as MCP lists them: printing stays with people.
+    assert_eq!(commands.iter().find(|command| command["id"] == "file.print").unwrap()["scope"], "file");
+    assert_eq!(settings["scope"], "ui");
     for field in ["printer", "copies", "duplex", "grayscale", "refresh", "status", "detail"] {
         assert!(settings["params"].as_str().unwrap().contains(field), "documented setting: {field}");
     }

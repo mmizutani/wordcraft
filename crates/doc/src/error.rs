@@ -10,6 +10,9 @@ pub enum DocError {
     BadStory(StoryRef),
     #[error("{0}")]
     Invalid(String),
+    /// A change ([`crate::ChangeSet`]) made on other content than this copy holds.
+    #[error("the change was made on other content: {0}")]
+    Stale(String),
 }
 
 pub type Result<T> = std::result::Result<T, DocError>;

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use crate::BlockId;
 use crate::props::{CharProps, ParaProps};
 use crate::section::SectionProps;
 use crate::{DocError, Result};
@@ -41,16 +42,16 @@ pub struct Paragraph {
     /// Change counter for caches (not part of equality).
     #[serde(skip, default = "next_rev")]
     pub rev: u64,
+    /// Which paragraph this is ([`BlockId`]): not part of equality, never saved.
+    #[serde(skip)]
+    pub id: BlockId,
 }
 
+/// Paragraphs are equal when they hold the same: their identity and cache counter don't count.
 impl PartialEq for Paragraph {
     fn eq(&self, o: &Self) -> bool {
-        self.text == o.text
-            && self.runs == o.runs
-            && self.props == o.props
-            && self.mark == o.mark
-            && self.objects == o.objects
-            && self.section == o.section
+        let Paragraph { text, runs, props, mark, objects, section, rev: _, id: _ } = self;
+        *text == o.text && *runs == o.runs && *props == o.props && *mark == o.mark && *objects == o.objects && *section == o.section
     }
 }
 
@@ -70,6 +71,7 @@ impl Paragraph {
             objects: Vec::new(),
             section: None,
             rev: next_rev(),
+            id: BlockId::UNSET,
         }
     }
     /// A paragraph of plain text in one run.
@@ -469,6 +471,8 @@ impl Paragraph {
             objects: tail_objs,
             section: self.section.take(),
             rev: next_rev(),
+            // A new paragraph: `Document::split_paragraph` says which half keeps the identity.
+            id: BlockId::UNSET,
         };
         if tail.text.is_empty() {
             tail.mark = self.props_at(off).unlinked();

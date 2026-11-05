@@ -11,8 +11,10 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod bidi;
+mod block_id;
 mod byte_store;
 pub mod cfb_guard;
+pub mod change;
 pub mod chart;
 mod cjk_numbers;
 pub mod cluster;
@@ -80,6 +82,8 @@ mod settings;
 mod text_walk;
 
 pub use block::{Block, Blocks, BoxBudget, MAX_TEXT_BOX_DEPTH};
+pub use block_id::BlockId;
+pub use change::ChangeSet;
 pub use compare::para_block;
 use document::MediaIndex;
 pub use error::{DocError, Result};

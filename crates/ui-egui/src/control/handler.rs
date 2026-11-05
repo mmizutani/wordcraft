@@ -198,8 +198,17 @@ pub fn handle(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) -> O
         }
         "engine.commands" => {
             let reg = app.session.registry.clone();
-            let mut commands: Vec<Value> = reg.all().iter()
-                .map(|c| json!({"id": c.id, "label": c.label, "location": c.location, "shortcut": c.shortcut, "params": c.params, "enabled": app.session.why_disabled(c.id).is_none()}))
+            let mut commands: Vec<Value> = reg
+                .all()
+                .iter()
+                .map(|c| {
+                    // As MCP lists them (scope, positions), and whether each can run now.
+                    let mut command = c.describe();
+                    if let Value::Object(m) = &mut command {
+                        m.insert("enabled".into(), json!(app.session.why_disabled(c.id).is_none()));
+                    }
+                    command
+                })
                 .collect();
             commands.extend(crate::printing::commands(app));
             let search = s("search").unwrap_or("").to_ascii_lowercase();
