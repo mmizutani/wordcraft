@@ -217,6 +217,9 @@ covers every target starting with it (`wordcraft*=debug`). The logger is
 
 `cargo xtask ci` runs formatting, clippy, ~800 tests, the asset-attribution check, the layering
 check and the wasm build. Contributor and agent instructions: [AGENTS.md](AGENTS.md).
+On Ubuntu (and in Claude Code cloud environments, as the setup script)
+[`tools/claude-cloud-setup.sh`](tools/claude-cloud-setup.sh) installs everything it needs, with
+craft-i18n and craft-fonts at the CI pins.
 
 ## Roadmap
 
