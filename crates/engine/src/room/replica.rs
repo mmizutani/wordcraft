@@ -931,7 +931,8 @@ impl Replica {
         }
         // A tracked cut made again is the one the participant's next paste can move: under the
         // revision it has now, or none when it was given up or something after it took it.
-        if cut {
+        // When the participant has let it go since (Bold turned on at the caret), it stays gone.
+        if cut && self.session.pending_move.is_some() {
             self.session.pending_move = cut_now;
         }
         // The participant's own selection, when they moved it after their last edit, and the
