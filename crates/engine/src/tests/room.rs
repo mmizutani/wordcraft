@@ -1038,6 +1038,35 @@ fn an_edit_of_a_new_comment_made_again_edits_that_comment() {
 }
 
 #[test]
+fn a_repeated_reply_made_again_replies_to_the_comment_it_was_made_on() {
+    let room = Room::new(Document::from_text("one two three"));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    // Ana comments on "two", replies to her comment and repeats the reply; Ben comments on
+    // "one" first, under the same new id. Ana's comment is made again under another id, and
+    // both replies, the repeated one too, are replies to it.
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "review.newComment", json!({"text": "A"}));
+    let id = a.session().doc.comments.keys().next().copied().unwrap();
+    run(&mut a, "review.reply", json!({"id": id, "text": "R"}));
+    run(&mut a, "edit.repeat", json!({}));
+    run(&mut b, "select.text", json!({"text": "one"}));
+    run(&mut b, "review.newComment", json!({"text": "B"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    let d = &a.session().doc;
+    let by_text = |t: &str| d.comments.iter().find(|(_, c)| d.plain_text(StoryRef::Part(c.part)) == t).map(|(id, _)| *id);
+    let ana = by_text("A").unwrap();
+    let parents: Vec<Option<u32>> = d.comments.values().filter(|c| d.plain_text(StoryRef::Part(c.part)) == "R").map(|c| c.parent).collect();
+    assert_eq!(parents, [Some(ana), Some(ana)]);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
 fn edits_in_a_new_text_box_made_again_are_made_in_that_box() {
     let room = Room::new(Document::from_text("one two"));
     let mut a = join(&room, "Ana");
@@ -1140,6 +1169,36 @@ fn a_comment_made_again_keeps_the_name_it_was_made_under() {
     by.sort();
     assert_eq!(by, [("A".to_string(), "Ana".to_string()), ("B".to_string(), "Ben".to_string())]);
     assert_eq!(a.session().author, "Zoe");
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
+fn a_tracked_cut_made_again_is_the_one_its_paste_moves() {
+    let room = Room::new(Document::from_text("First one.\nSecond one.\nThird one.\nFourth one."));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    run(&mut a, "review.trackChanges", json!({"value": true}));
+    a.send();
+    a.receive();
+    b.receive();
+    // Ana and Ben each cut a paragraph under Track Changes, Ben first, both under the first new
+    // revision. Ana's cut is made again under another revision; when she then pastes, her
+    // paste moves what she cut, not what Ben did.
+    run(&mut a, "select.range", json!({"anchor": Pos::body(1, 0), "focus": Pos::body(2, 0)}));
+    run(&mut a, "edit.cut", json!({}));
+    run(&mut b, "select.range", json!({"anchor": Pos::body(3, 0), "focus": Pos::body(3, "Fourth one.".len())}));
+    run(&mut b, "edit.cut", json!({}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    run(&mut a, "caret.set", json!({"pos": Pos::body(0, 0)}));
+    run(&mut a, "edit.paste", json!({}));
+    let d = &a.session().doc;
+    let moved: Vec<&str> = d.revisions.iter().filter(|r| r.move_name.is_some()).map(|r| r.author.as_str()).collect();
+    assert_eq!(moved, ["Ana", "Ana"]);
     let mut copies = [a, b];
     settle(&mut copies).unwrap();
     smooth(&copies);

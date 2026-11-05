@@ -74,7 +74,7 @@ pub fn take_paste(s: &mut Session, frag: &Fragment) -> Option<u32> {
     if !s.doc.settings.track_moves || m.author != s.author || frag.plain_text() != m.text || !in_use(s, m.rev) {
         return None;
     }
-    let src = s.doc.revisions.get(m.rev as usize).filter(|r| r.kind == RevisionKind::Delete && r.move_name.is_none())?;
+    let src = s.doc.revisions.get(m.rev as usize).filter(|r| r.kind == RevisionKind::Delete && r.move_name.is_none() && r.author == m.author)?;
     let date = src.date.clone();
     let taken: BTreeSet<&str> = s.doc.revisions.iter().filter_map(|r| r.move_name.as_deref()).collect();
     let name = (1..).map(|n: u64| format!("move{n}")).find(|n| !taken.contains(n.as_str()))?;

@@ -365,6 +365,8 @@ struct Made {
     context: Option<Arc<Context>>,
     /// How many times it was run again after the copy read the document again.
     tries: u32,
+    /// Whether it left a tracked cut for the next paste to make a move of (`edit.cut`).
+    moves: bool,
 }
 
 impl Made {
@@ -382,6 +384,7 @@ impl Made {
             blocks: Vec::new(),
             context: None,
             tries: 0,
+            moves: false,
         }
     }
 }
@@ -531,6 +534,15 @@ impl Replica {
         if let Some(why) = self.who.role.refuses(scope) {
             return Err(CmdError::Disabled(format!("{id}: {why}")));
         }
+        // Repeat runs the command it repeats as the copy's own, so that it keeps its places and
+        // the comments it names like any other (made again as Repeat, it would repeat the
+        // command as saved, with the ids it had then).
+        if id == "edit.repeat" {
+            let Some((again, p)) = self.session.last_command.clone().filter(|(again, _)| again != id) else {
+                return Err(CmdError::Failed("nothing to repeat".into()));
+            };
+            return self.run(&again, &p);
+        }
         // A macro's steps run one by one as the copy's commands, so that each keeps its places
         // and the rest of what it takes to make it again (made again whole, a macro would make
         // its steps at the offsets they had). A step that fails stops the macro; the steps
@@ -575,7 +587,9 @@ impl Replica {
         self.session.view.draw.lasso = lasso;
         let pending = self.session.pending.clone();
         let comments_before: Vec<u32> = self.session.doc.comments.keys().copied().collect();
+        let move_before = self.session.pending_move.as_ref().map(|m| m.rev);
         let result = self.session.run(id, params);
+        let moves = self.session.pending_move.as_ref().is_some_and(|m| Some(m.rev) != move_before);
         let comments = new_comments(&comments_before, &self.session.doc);
         self.stay_in_document();
         let after = selection_anchors(&self.session);
@@ -591,6 +605,7 @@ impl Replica {
             blocks: Vec::new(),
             context: Some(context),
             tries,
+            moves,
         };
         self.collect(made);
         result
@@ -803,9 +818,14 @@ impl Replica {
             }
         };
         self.reborn.clear();
+        let mut cut = false;
         for (k, u) in dropped.into_iter().enumerate() {
             for (j, m) in u.made.into_iter().enumerate() {
-                let Made { command, before, after, around, places, inputs, pending, comments, blocks, context, tries } = m;
+                let Made { command, before, after, around, places, inputs, pending, comments, blocks, context, tries, moves } = m;
+                // After a tracked cut made again (or given up), the cut a paste can move is that
+                // one as made again, not the revision it had.
+                let after_cut = cut;
+                cut |= moves;
                 let tries = if read_again { tries.saturating_add(1) } else { tries };
                 let Some((id, mut params)) = command.filter(|_| tries <= MAX_TRIES) else {
                     self.stats.lost = self.stats.lost.saturating_add(1);
@@ -859,7 +879,10 @@ impl Replica {
                     went_on = None;
                     continue;
                 }
-                if let Some(inputs) = inputs {
+                if let Some(mut inputs) = inputs {
+                    if after_cut {
+                        inputs.pending_move = None;
+                    }
                     inputs.put(&mut self.session);
                 }
                 if let Some(context) = context {
@@ -904,7 +927,13 @@ impl Replica {
             }
             origin = origin.and_then(|mut d| d.apply(&u.change).ok().map(|_| d));
         }
+        let cut_now = self.session.pending_move.take();
         kept.put(&mut self.session);
+        // A tracked cut made again is the one the participant's next paste can move: under the
+        // revision it has now, or none when it was given up or something after it took it.
+        if cut {
+            self.session.pending_move = cut_now;
+        }
         // The participant's own selection, when they moved it after their last edit, and the
         // equation they are editing move from the document they had to the one with their edits
         // made again.
