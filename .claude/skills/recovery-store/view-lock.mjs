@@ -29,9 +29,10 @@ const words = {
   DiscardJob: "a discard starts",
   DiscardStart: "the discard looks for the folder",
   DiscardDelete: "the discard deletes the files",
-  DiscardRelease: "the discard drops the lock",
   DiscardUnlink: "the discard unlinks owner.lock",
   DiscardRmdir: "the discard removes the folder",
+  DiscardRelease: "the discard drops the lock",
+  DiscardRmdirAgain: "the discard tries again to remove the folder",
   Crash: "a process dies",
   Stop: "nothing left to do",
 };

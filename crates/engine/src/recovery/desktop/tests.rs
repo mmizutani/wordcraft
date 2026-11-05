@@ -620,24 +620,21 @@ fn finish_recovery_covers_every_open_document() {
     assert_eq!(records(&t.0), [dirty]);
 }
 
-// Two running processes on one record: .claude/skills/recovery-store/RecoveryLock.tla, config
-// finding-lock-orphan.cfg. File locks on separate descriptors conflict within one process, so
-// separate `Store` values stand in for separate processes. Unix: this is how flock and unlink meet.
+// Two running processes on one record: .claude/skills/recovery-store/RecoveryLock.tla. File locks on
+// separate descriptors conflict within one process, so separate `Store` values stand in for them.
 
-/// A in `Store::acquire`, retrying on B's lock, while B's `Store::discard` deletes the record: A's
-/// open descriptor still names the unlinked file, and its next retry locks that. Both are the real
-/// functions; only the moment B starts is tried again, in case A's thread starts late. `None` means
-/// A never ended up holding a deleted file.
-#[cfg(unix)]
-fn a_store_holding_a_deleted_lock(root: &Path) -> Option<(Store, String)> {
-    use std::os::unix::fs::MetadataExt;
-    for _ in 0..20 {
-        let id = new_id().unwrap();
-        private_dir(&root.join(&id)).unwrap();
-        let mut b = Store::new(root.to_path_buf()).unwrap();
+#[test]
+fn a_process_waiting_on_a_discard_never_keeps_the_deleted_lock() {
+    let t = Temp::new();
+    let id = new_id().unwrap();
+    // A in Store::acquire, retrying on B's lock, while B's Store::discard deletes the record. A's
+    // open descriptor still names the deleted file. Tried again because A's thread can start late.
+    for _ in 0..5 {
+        private_dir(&t.0.join(&id)).unwrap();
+        let mut b = Store::new(t.0.clone()).unwrap();
         b.acquire(&id).unwrap();
         let a = {
-            let (root, id) = (root.to_path_buf(), id.clone());
+            let (root, id) = (t.0.clone(), id.clone());
             std::thread::spawn(move || {
                 let mut a = Store::new(root).unwrap();
                 a.acquire(&id).map(|()| a)
@@ -645,123 +642,41 @@ fn a_store_holding_a_deleted_lock(root: &Path) -> Option<(Store, String)> {
         };
         std::thread::sleep(Duration::from_millis(30));
         b.discard(&id).unwrap();
-        if let Ok(a) = a.join().unwrap()
-            && a.locks.get(&id).unwrap().metadata().unwrap().nlink() == 0
-        {
-            return Some((a, id));
+        if let Ok(a) = a.join().unwrap() {
+            assert!(names_file(&t.0.join(&id).join("owner.lock"), a.locks.get(&id).unwrap()), "A holds the lock on a deleted file");
         }
     }
-    None
-}
-
-/// PASSES while the finding is there. Whoever fixes it turns this around: the helper returns `None`.
-#[cfg(unix)]
-#[test]
-fn finding_a_lock_won_on_a_discarded_file_opens_a_live_record_to_other_processes() {
-    let t = Temp::new();
-    let (mut a, id) = a_store_holding_a_deleted_lock(&t.0).expect("A holds the lock on a deleted file");
-    let dir = t.0.join(&id);
-    let lock_path = dir.join("owner.lock");
-
-    // A's next save makes the folder again, and Store::acquire skips locking because Store.locks
-    // has the entry: A's copy sits in a record with no owner.lock.
+    // A's next save locks the record properly, so another process stays out.
+    let mut a = Store::new(t.0.clone()).unwrap();
     a.save(snapshot(&id, "Live draft")).unwrap();
-    assert!(!lock_path.exists());
-    let in_flight = dir.join(format!("pending-{}.tmp", new_id().unwrap()));
-    fs::write(&in_flight, "A's next copy, being written").unwrap();
-
-    // C's scan makes a new owner.lock and locks it, with A running.
     let mut c = Store::new(t.0.clone()).unwrap();
     c.scan().unwrap();
-    assert_eq!(c.inventory().len(), 1, "A's live copy is listed in another process");
-    assert!(!in_flight.exists(), "and the scan deleted the copy A is writing");
-    assert_eq!(c.load(&id).unwrap().document.plain_text(StoryRef::Body), "Live draft", "it can be restored there");
-    c.discard(&id).unwrap();
-    assert!(!dir.exists(), "or discarded there");
-
-    assert!(a.locks.contains_key(&id) && a.entries.contains_key(&id), "A still believes it owns the record");
-    drop((a, c));
-    let mut after_a_crash = Store::new(t.0.clone()).unwrap();
-    after_a_crash.scan().unwrap();
-    assert!(after_a_crash.inventory().is_empty(), "so a crash of A now has nothing to recover");
+    assert!(c.inventory().is_empty(), "A's live copy is not listed in another process");
+    assert!(c.discard(&id).is_err(), "and cannot be discarded there");
 }
 
-/// How often the unmodified `Store::scan` and `Store::acquire`, racing on real threads, leave A
-/// holding the lock on a deleted file, and what a later scan does then. B scans non-stop, far more
-/// often than the app does (once at start, and on the Recover page's refresh), so read the result
-/// as "given that a scan lands in A's first lock", not as how often it happens to a user.
-/// By hand: `cargo test -p wordcraft-engine --lib finding_measure -- --ignored --nocapture`, with
-/// WORDCRAFT_RACE_ROUNDS for the number of first copies, 20000 by default.
-#[cfg(unix)]
 #[test]
-#[ignore = "a measurement, not a check: it depends on timing"]
-fn finding_measure_lock_race_on_unmodified_code() {
-    use std::os::unix::fs::MetadataExt;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    let rounds: u64 = std::env::var("WORDCRAFT_RACE_ROUNDS").ok().and_then(|r| r.parse().ok()).unwrap_or(20_000);
+fn discard_holds_the_lock_until_the_record_is_gone() {
     let t = Temp::new();
-    let stop = Arc::new(AtomicBool::new(false));
-    let pause = Arc::new(AtomicBool::new(false));
-    let paused = Arc::new(AtomicBool::new(false));
-    let scan_errors = Arc::new(AtomicU64::new(0));
-    let scanner = {
-        let (stop, pause, paused, scan_errors, root) = (stop.clone(), pause.clone(), paused.clone(), scan_errors.clone(), t.0.clone());
-        std::thread::spawn(move || {
-            let mut b = Store::new(root).unwrap();
-            let mut scans = 0u64;
-            while !stop.load(Ordering::Relaxed) {
-                paused.store(pause.load(Ordering::Relaxed), Ordering::Relaxed);
-                if paused.load(Ordering::Relaxed) {
-                    std::thread::yield_now();
-                    continue;
-                }
-                scans += 1;
-                if b.scan().is_err() {
-                    scan_errors.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            scans
-        })
-    };
-    let mut a = Store::new(t.0.clone()).unwrap();
-    let (mut waited, mut refused, mut deleted, mut listed_live) = (0u64, 0u64, 0u64, 0u64);
-    let started = Instant::now();
-    for _ in 0..rounds {
+    // A process that wins the lock while the file is still in place passes the check in Store::lock.
+    // Spinning, because the gap between a release and an unlink is microseconds.
+    for _ in 0..20 {
         let id = new_id().unwrap();
-        // The start of Store::write_snapshot.
-        private_dir(&t.0.join(&id)).unwrap();
-        let asked = Instant::now();
-        let acquired = a.acquire(&id);
-        if asked.elapsed() >= Duration::from_millis(10) {
-            waited += 1;
-        }
-        if acquired.is_err() {
-            refused += 1;
-        } else if a.locks.get(&id).unwrap().metadata().unwrap().nlink() == 0 {
-            deleted += 1;
-            // A scan racing A's write deletes its temporary file, and the failed save then
-            // discards the record, which ends this by luck. So B waits while A writes, and one
-            // later scan looks: the case of scans that are seconds apart.
-            pause.store(true, Ordering::Relaxed);
-            while !paused.load(Ordering::Relaxed) {
-                std::thread::yield_now();
-            }
-            let saved = a.save(snapshot(&id, "Live draft")).is_ok();
-            let mut c = Store::new(t.0.clone()).unwrap();
-            if saved && c.scan().is_ok() && c.inventory().iter().any(|d| d.id == id) {
-                listed_live += 1;
-            }
-            drop(c);
-            pause.store(false, Ordering::Relaxed);
-        }
-        let _ = a.discard(&id);
-        a.locks.remove(&id);
+        let dir = t.0.join(&id);
+        private_dir(&dir).unwrap();
+        let mut b = Store::new(t.0.clone()).unwrap();
+        b.acquire(&id).unwrap();
+        let waiting = private_file(&dir.join("owner.lock"), false).unwrap();
+        let spinner = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                while matches!(waiting.try_lock(), Err(std::fs::TryLockError::WouldBlock)) {
+                    std::hint::spin_loop();
+                }
+                dir.exists()
+            })
+        };
+        b.discard(&id).unwrap();
+        assert!(!spinner.join().unwrap(), "the lock was free while the record was still there");
     }
-    let per_round = started.elapsed() / u32::try_from(rounds).unwrap();
-    stop.store(true, Ordering::Relaxed);
-    let scans = scanner.join().unwrap();
-    println!(
-        "first copies {rounds} ({per_round:?} each), B's scans {scans} (failed {}), A had to wait {waited}, A refused {refused}, A holds a deleted lock {deleted}, another process then listed A's live copy {listed_live}",
-        scan_errors.load(Ordering::Relaxed)
-    );
 }

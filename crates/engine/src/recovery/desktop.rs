@@ -82,6 +82,11 @@ fn private_file(path: &Path, exclusive: bool) -> io::Result<File> {
     }
     o.open(path)
 }
+/// Whether `path` still names `file`: not if it was unlinked, or replaced by a new file.
+fn names_file(path: &Path, file: &File) -> bool {
+    let open = file.try_clone().and_then(same_file::Handle::from_file);
+    matches!((open, same_file::Handle::from_path(path)), (Ok(open), Ok(named)) if open == named)
+}
 fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -151,23 +156,26 @@ impl Store {
         paths.sort_by_key(|p| std::cmp::Reverse(generation(p)));
         Ok(paths)
     }
-    /// Locks a record's `owner.lock`, retrying [`LOCK_RETRIES`] times 10 ms apart.
+    /// Locks a record's `owner.lock`, retrying [`LOCK_RETRIES`] times 10 ms apart. The file locked
+    /// is the one the path names: a lock on a file a discard has unlinked keeps no one out.
     fn lock(&self, id: &str) -> Result<File, String> {
         if !id_ok(id) {
             return Err("invalid recovery id".into());
         }
-        let file = private_file(&self.root.join(id).join("owner.lock"), false).map_err(|e| e.to_string())?;
+        let path = self.root.join(id).join("owner.lock");
+        let mut file = private_file(&path, false).map_err(|e| e.to_string())?;
         // A process another part of the app (or a test) is starting holds the lock for a moment
         // (a forked child shares it until it execs): wait that out, but not a live owner.
-        for _ in 0..LOCK_RETRIES {
+        for retries_left in (0..=LOCK_RETRIES).rev() {
             match file.try_lock() {
-                Ok(()) => return Ok(file),
-                Err(std::fs::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+                Ok(()) if names_file(&path, &file) => return Ok(file),
+                // Discarded while we waited. Opening again fails if the folder went with it.
+                Ok(()) => file = private_file(&path, false).map_err(|e| e.to_string())?,
+                Err(std::fs::TryLockError::WouldBlock) if retries_left > 0 => std::thread::sleep(Duration::from_millis(10)),
                 Err(e) => return Err(format!("recovery copy is in use or cannot be locked: {e}")),
             }
         }
-        file.try_lock().map_err(|e| format!("recovery copy is in use or cannot be locked: {e}"))?;
-        Ok(file)
+        Err("recovery copy is in use or cannot be locked: it keeps being discarded".into())
     }
     fn acquire(&mut self, id: &str) -> Result<(), String> {
         if !self.locks.contains_key(id) {
@@ -345,9 +353,17 @@ impl Store {
         }
         sync_dir(&dir).map_err(|e| e.to_string())?;
         self.entries.remove(id);
+        // Only once the lock is unlinked and its folder gone does a process waiting on it get it:
+        // it then finds the path no longer names that file (see `lock`).
+        let unlinked = fs::remove_file(dir.join("owner.lock"));
+        let removed = unlinked.is_ok() && fs::remove_dir(&dir).is_ok();
         self.locks.remove(id);
-        fs::remove_file(dir.join("owner.lock")).map_err(|e| e.to_string())?;
-        fs::remove_dir(&dir).map_err(|e| e.to_string())?;
+        unlinked.map_err(|e| e.to_string())?;
+        if !removed {
+            // A Windows volume without POSIX delete keeps an open unlinked file in its folder until
+            // it closes. Removing an empty folder is safe unlocked: an owner keeps owner.lock in it.
+            fs::remove_dir(&dir).map_err(|e| e.to_string())?;
+        }
         sync_dir(&self.root).map_err(|e| e.to_string())?;
         Ok(())
     }

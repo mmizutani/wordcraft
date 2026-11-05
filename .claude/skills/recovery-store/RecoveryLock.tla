@@ -7,12 +7,10 @@
 EXTENDS Integers, FiniteSets
 
 CONSTANTS
-    Procs,               \* the running processes
-    Creator,             \* the process that made up this record's id (Recovery::tick, new_id)
-    MaxOps,              \* saves, scans, restores and discards started, across all processes
-    MaxCrashes,          \* processes that die; the OS releases their locks
-    ReleaseBeforeUnlink, \* Store::discard drops the lock before it unlinks owner.lock
-    NoRecheckAfterLock   \* Store::lock trusts the file it locked without looking at the path again
+    Procs,      \* the running processes
+    Creator,    \* the process that made up this record's id (Recovery::tick, new_id)
+    MaxOps,     \* saves, scans, restores and discards started, across all processes
+    MaxCrashes  \* processes that die; the OS releases their locks
 
 NoInode == 0
 Inodes == 1..(MaxOps + 2)
@@ -97,7 +95,7 @@ LockOpen(p) ==
 LockTry(p) ==
     /\ proc[p].pc = "lockTry" /\ holder[proc[p].fd] = "nobody"
     /\ holder' = [holder EXCEPT ![proc[p].fd] = p]
-    /\ IF NoRecheckAfterLock THEN Locked(p, proc[p].fd) ELSE Go(p, "lockRecheck")
+    /\ Go(p, "lockRecheck")
     /\ UNCHANGED << dirExists, lockPath, nextInode, copies, pending >> /\ Quiet
 
 LockGiveUp(p) ==
@@ -105,7 +103,8 @@ LockGiveUp(p) ==
     /\ LockFailed(p)
     /\ FsUnchanged /\ Quiet
 
-\* Not in the code: the path must still name the file we locked, or that file is on its way out.
+\* names_file: the path must still name the file we locked, or that file is on its way out. The
+\* descriptor closes, and the file is opened again. A folder that went with it makes that fail.
 LockRecheck(p) ==
     /\ proc[p].pc = "lockRecheck"
     /\ IF lockPath = proc[p].fd
@@ -251,40 +250,52 @@ DiscardDelete(p) ==
     /\ proc[p].pc = "discardDelete"
     /\ IF dirExists
        THEN /\ copies' = FALSE /\ pending' = {}
-            /\ proc' = [proc EXCEPT ![p].listed = FALSE,
-                        ![p].pc = IF ReleaseBeforeUnlink THEN "discardRelease" ELSE "discardUnlink"]
+            /\ proc' = [proc EXCEPT ![p].listed = FALSE, ![p].pc = "discardUnlink"]
        ELSE /\ Finish(p)
             /\ UNCHANGED << copies, pending >>
     /\ UNCHANGED << dirExists, lockPath, nextInode, holder >> /\ Quiet
 
-\* self.locks.remove(id). With the fixed order it comes last, after the unlink and remove_dir
-\* succeeded ("discardRelease") or failed ("discardReleaseFailed").
+\* fs::remove_file(owner.lock). It unlinks whatever the path names, and fails if nothing does: that
+\* failure is returned once the lock is released.
+DiscardUnlink(p) ==
+    /\ proc[p].pc = "discardUnlink"
+    /\ lockPath' = NoInode
+    /\ Go(p, IF lockPath # NoInode THEN "discardRmdir" ELSE "discardReleaseFailed")
+    /\ UNCHANGED << dirExists, nextInode, holder, copies, pending >> /\ Quiet
+
+FolderEmpty == ~copies /\ pending = {} /\ lockPath = NoInode
+
+\* fs::remove_dir(&dir). It fails while anything is in the folder.
+DiscardRmdir(p) ==
+    /\ proc[p].pc = "discardRmdir"
+    /\ IF dirExists /\ FolderEmpty
+       THEN /\ dirExists' = FALSE
+            /\ Go(p, "discardRelease")
+       ELSE /\ Go(p, "discardReleaseRetry")
+            /\ UNCHANGED dirExists
+    /\ UNCHANGED << lockPath, nextInode, holder, copies, pending >> /\ Quiet
+
+\* self.locks.remove(id), last: after the folder went ("discardRelease"), after remove_dir failed
+\* ("discardReleaseRetry"), or after the unlink failed ("discardReleaseFailed").
 DiscardRelease(p) ==
-    /\ proc[p].pc \in {"discardRelease", "discardReleaseFailed"}
+    /\ proc[p].pc \in {"discardRelease", "discardReleaseRetry", "discardReleaseFailed"}
     /\ holder' = Release(p, proc[p].lock)
-    /\ IF ReleaseBeforeUnlink
-       THEN proc' = [proc EXCEPT ![p].lock = NoInode, ![p].pc = "discardUnlink"]
+    /\ IF proc[p].pc = "discardReleaseRetry"
+       THEN proc' = [proc EXCEPT ![p].lock = NoInode, ![p].pc = "discardRmdirAgain"]
        ELSE proc' = [proc EXCEPT ![p].lock = NoInode, ![p].pc = "idle", ![p].op = "", ![p].why = "",
                                  ![p].slot = IF proc[p].pc = "discardRelease" /\ proc[p].why = "job"
                                              THEN FALSE ELSE @]
     /\ UNCHANGED << dirExists, lockPath, nextInode, copies, pending >> /\ Quiet
 
-\* fs::remove_file(owner.lock)?. It unlinks whatever the path names, and fails if nothing does.
-DiscardUnlink(p) ==
-    /\ proc[p].pc = "discardUnlink"
-    /\ lockPath' = NoInode
-    /\ IF lockPath # NoInode
-       THEN Go(p, "discardRmdir")
-       ELSE IF ReleaseBeforeUnlink THEN Finish(p) ELSE Go(p, "discardReleaseFailed")
-    /\ UNCHANGED << dirExists, nextInode, holder, copies, pending >> /\ Quiet
-
-\* fs::remove_dir(&dir)?. It fails while anything is in the folder.
-DiscardRmdir(p) ==
-    /\ proc[p].pc = "discardRmdir"
-    /\ IF dirExists /\ ~copies /\ pending = {} /\ lockPath = NoInode
+\* The second fs::remove_dir(&dir), with no lock held. This model's unlink always takes the file out
+\* of the folder, so here only something another process put there, or the folder's being gone, can
+\* make either remove_dir fail.
+DiscardRmdirAgain(p) ==
+    /\ proc[p].pc = "discardRmdirAgain"
+    /\ IF dirExists /\ FolderEmpty
        THEN /\ dirExists' = FALSE
-            /\ IF ReleaseBeforeUnlink THEN Discarded(p) ELSE Go(p, "discardRelease")
-       ELSE /\ IF ReleaseBeforeUnlink THEN Finish(p) ELSE Go(p, "discardReleaseFailed")
+            /\ Discarded(p)
+       ELSE /\ Finish(p)
             /\ UNCHANGED dirExists
     /\ UNCHANGED << lockPath, nextInode, holder, copies, pending >> /\ Quiet
 
@@ -306,8 +317,8 @@ Next ==
           \/ SaveStart(p) \/ SaveFiles(p) \/ SaveTemp(p) \/ SaveRename(p) \/ SaveFailed(p)
           \/ ScanStart(p) \/ ScanRead(p) \/ ScanRelease(p) \/ ScanEmpty(p)
           \/ LoadStart(p) \/ LoadRead(p)
-          \/ DiscardJob(p) \/ DiscardStart(p) \/ DiscardDelete(p) \/ DiscardRelease(p)
-          \/ DiscardUnlink(p) \/ DiscardRmdir(p)
+          \/ DiscardJob(p) \/ DiscardStart(p) \/ DiscardDelete(p) \/ DiscardUnlink(p)
+          \/ DiscardRmdir(p) \/ DiscardRelease(p) \/ DiscardRmdirAgain(p)
           \/ Crash(p)
     \/ Stop
 
@@ -317,7 +328,8 @@ Next ==
 \* A process with an open document whose copy is in this record, holding what it believes is the
 \* lock. It stops being one once its own discard has deleted the record's files: all that is left
 \* is removing the empty folder, and the new owner.lock another process makes only fails that step.
-DiscardTail == {"discardRelease", "discardReleaseFailed", "discardUnlink", "discardRmdir"}
+DiscardTail == {"discardUnlink", "discardRmdir", "discardRelease", "discardReleaseRetry",
+                "discardReleaseFailed", "discardRmdirAgain"}
 LiveOwner(p) == proc[p].alive /\ proc[p].slot /\ proc[p].lock # NoInode /\ proc[p].pc \notin DiscardTail
 
 \* About to read the record's files (and list it), hand it to a document, or delete it.

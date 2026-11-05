@@ -62,18 +62,14 @@ for module in RecoveryStore RecoveryLock; do
   fi
 done
 
-for known in "finding-held-discard RecoveryStore UnsavedWorkHasCopy" \
-             "finding-late-discard RecoveryStore UnsavedWorkHasCopy" \
-             "finding-lock-orphan RecoveryLock LiveOwnerIsAlone"; do
-  # shellcheck disable=SC2086 # three words, split on purpose
-  set -- $known
-  echo "== known finding ($1.cfg)"
-  tlc "$1" "$2"
-  if grep -q "Invariant $3 is violated" "$tmp/$1.out"; then
-    echo "still breaks $3, as recorded"
+for finding in finding-held-discard finding-late-discard; do
+  echo "== known finding ($finding.cfg)"
+  tlc "$finding" RecoveryStore
+  if grep -q 'Invariant UnsavedWorkHasCopy is violated' "$tmp/$finding.out"; then
+    echo "still breaks UnsavedWorkHasCopy, as recorded"
   else
-    grep -E '^Error|No error' "$tmp/$1.out" | head -5
-    echo "It no longer breaks $3. Full output: $tmp/$1.out"
+    grep -E '^Error|No error' "$tmp/$finding.out" | head -5
+    echo "It no longer breaks UnsavedWorkHasCopy. Full output: $tmp/$finding.out"
     [ "$code" -ne 0 ] || code=2
   fi
 done
