@@ -41,6 +41,9 @@ cat ~/.config/wordcraft/control-key.local-7981   # Linux, outside Flatpak, port 
   one limit: blank lines and bad JSON do not extend it. After an authorised request the
   connection may stay idle.
 
+The key of an invite to the document the window shares gets its holder a copy of that document
+of their own instead of the window: see [Shared documents](#shared-documents).
+
 `wordcraft-cli mcp --connect` takes the key from `WORDCRAFT_CONTROL_KEY`, or else from the key
 file for the port it connects to, and reads it again on every new connection (the app may have
 restarted). It sends the key only to the app's own address, `127.0.0.1` (`localhost` connects
@@ -70,6 +73,7 @@ and set `WORDCRAFT_CONTROL_KEY` to that app's key.
 | `ui.parity` | — | feature-catalog parity |
 | `ui.resize` | `width`, `height` | asks for that window content size in points; sizes that aren't positive and finite are refused, the rest are clamped to the app's minimum (760 × 480) and to the largest surface the GPU can draw (at most 16384; that limit wins over the minimum), and the reply's `width` and `height` are the size asked for |
 | `ui.focus` / `app.quit` | | window control |
+| `room.share`, `room.invite`, `room.revoke`, `room.participants`, `room.stop` | see [Shared documents](#shared-documents) | sharing the document the window shows with agents and people who join with a key |
 
 Any other method name is treated as a command id: `{"method": "format.bold"}` works.
 
@@ -195,3 +199,80 @@ short edge for folded booklets; this does not configure a printer's duplex capab
 The preview shows physical sheet sides, before copies, using the same sheet plan.
 Explicit `paper` chooses the physical sheet; otherwise the first selected page supplies
 its size. Independent Page Setup multiple-page modes (#2414) are not required.
+
+## Shared documents
+
+The window can share the document it shows with agents (and people's other programs) at once.
+Each participant joins with a key of their own and gets a copy of the document of their own in
+the app, which answers their connection on its own thread: an agent's command never waits for
+the window's frame, and the person's typing never waits for an agent. Every copy, the window's
+included, sends what each command changed to the document's room (`engine::room`), which puts
+the changes in one order; an edit that clashes with a change the room took meanwhile comes back
+to its copy, which makes it again after that change, from the same place. Nobody's edit is lost
+unless another participant's change took its text away, and then its sender is told. The window
+brings in what the others changed every frame.
+
+With the window's key:
+
+| Method | Params | Result |
+|---|---|---|
+| `room.share` | `name?` | shares the active document; the window joins its room as its owner, under `name`, else the author name (File › Options › User name), else `Owner`. `{"shared": true, "document", "version", "you", "participants"}`: the document's id, the number of changes the room took, the window's participant and everyone in the room, each `{"id", "name", "role"}`. Sharing the same document again answers the same; another one is an error while one is shared |
+| `room.invite` | `name`, `role?` | a key (32 hex digits, random) for a participant called `name`, with `role` ([roles](#roles), `suggester` unless given): `{"key", "name", "role"}`. A name is someone's in the room for good, even after they left, since their comments and tracked changes keep it: up to 128 characters, no control characters, compared without case |
+| `room.revoke` | `key` | takes the invite back: nobody joins with the key any more, and the copies that joined with it are out of the room (the room refuses their changes, and their connections end). `{"revoked": bool}` |
+| `room.participants` | — | `{"shared": false}`, or what `room.share` answers |
+| `room.stop` | — | stops sharing: the room closes and every participant's connection ends; the window keeps the document as it is, with every change the room took, whether it shows that document or another. `{"stopped": bool}` |
+
+Closing the shared document's window stops sharing too. A close sees every change the room took
+until then: an agent's edit since the window's last frame is unsaved work, so `file.close`
+without `force` is refused for it, and the person's Close asks to save. One document is shared
+at a time.
+Undo and Redo (`edit.undo`, `edit.redo`, `edit.undoTo`) take back the steps of whoever runs
+them, the window's or a participant's own, and leave others' changes in. When another
+participant changed what the step changed since (the same characters, blocks, part or document
+field), the step stays and the command fails naming them (`edit.undoTo` stops there and says
+why under `stopped`).
+
+### Joining with an invite's key
+
+Connect to the window's port and send the invite's key where the window's would go: top-level
+`key`, or `auth` first. The connection's first request decides who answers it: from then on
+the participant's own copy does, and the window never sees its requests. Later requests carry
+the same key or none. The copy answers:
+
+| Method | Params | Result |
+|---|---|---|
+| `engine.execute` | `command`, `params` | runs the command in the copy, held to the participant's role, and sends what it changed to the room until the room took it. The command's result; an error when the room sent the edit back and it couldn't be made again because another participant's change took its text away (the error names the command) |
+| `document.inspect` | `text?` | the document as the copy has it, with what others changed |
+| `engine.commands` | `search?` | every command, as for the window; `enabled` says whether this participant may run it now |
+| `ui.render` | `page?`, `scale?` | a page of the document as base64 `png`, as for the window; a copy writes no files, so `path` is refused |
+| `ui.parity` | — | as for the window |
+| `room.participants` | — | `{"you", "participants", "version"}`: the caller, everyone in the room, and the version of the document the copy has |
+
+Any other method name is a command id, as for the window. Each request first brings in what
+others changed since. `doc` may name the shared document only. Commands that work on files,
+other documents or windows (`file.*`, `view.switchWindows`, `ui.*`), the window's methods
+(`ui.click`, `ui.screenshot`…, `app.quit`) and the room's other methods (which are the owner's)
+are refused. Their commands reach none of the computer's files, whatever their role: a document
+command that reads or writes a file it names (mail merge's recipients `path`, a picture's) is
+refused. `document.changes` follows what changed, by the window and others alike, in the
+copy's own versions.
+
+When the invite is taken back or sharing stops, the connection's next request gets an error
+that says so, and the app closes the connection. An invite's key is a wrong key while no
+document is shared.
+
+`wordcraft-cli mcp --connect 127.0.0.1:7981` with `WORDCRAFT_CONTROL_KEY` set to the invite's
+key gives an agent its copy through MCP's tools (see [MCP](mcp.md#shared-documents)).
+
+### Roles
+
+| Role | May |
+|---|---|
+| `viewer` | read the document and move their own caret, selection and view; changes nothing |
+| `commenter` | also add comments and replies, and edit and delete their own |
+| `suggester` | also edit, always as tracked changes in their name, which others accept or reject; they withdraw their own |
+| `editor` | also edit directly, and accept and reject tracked changes |
+| `owner` | also change the application's settings in their copy |
+
+A participant's copy undoes and refuses a command that changes more than their role lets them,
+and the room refuses such a change from any copy.

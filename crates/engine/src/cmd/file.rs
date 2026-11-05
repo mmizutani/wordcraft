@@ -648,17 +648,29 @@ fn changes(s: &mut Session, v: &Value) -> CmdResult {
     Ok(r)
 }
 
-/// Change `cs` in short: for each list of blocks it edited, where the list is (`in`: a story,
-/// or a cell of a table), the blocks around the edit, the ids of the blocks it took away and of
-/// those it put in, and the text splice on their text (U+2029 between paragraphs, U+FFFC for a
-/// table; byte offsets): `deleted` bytes from `at`, `text` put there. Then the tables whose
-/// properties changed, the parts (notes, comments, text boxes, headers…) added, removed or
+/// Change `cs` in short. First, for each paragraph edited in place, where it is (`in`: a story,
+/// or a cell of a table), its id (`paragraph`) and the characters replaced (byte offsets in its
+/// text): `deleted` bytes from `at`, `text` put there (U+FFFC for an object); `properties` when
+/// its own properties changed. Then, for each list of blocks it edited, where the list is, the
+/// blocks around the edit, the ids of the blocks it took away and of those it put in, and the
+/// text splice on their text (U+2029 between paragraphs, U+FFFC for a table). Then the tables
+/// whose properties changed, the parts (notes, comments, text boxes, headers…) added, removed or
 /// changed, and the names of the other things that changed.
 fn change_summary(cs: &ChangeSet) -> Value {
-    let edits: Vec<Value> = cs
-        .splices
-        .iter()
-        .map(|sp| {
+    let in_place = cs.edits.iter().map(|e| {
+        let mut o = json!({"in": e.container, "paragraph": e.id});
+        if let Some(c) = &e.chars {
+            o["at"] = json!(c.at);
+            o["deleted"] = json!(c.removed);
+            o["text"] = json!(c.inserted.text);
+        }
+        if e.shell.is_some() {
+            o["properties"] = json!(true);
+        }
+        o
+    });
+    let edits: Vec<Value> = in_place
+        .chain(cs.splices.iter().map(|sp| {
             let mut o = json!({
                 "in": sp.container,
                 "removed": sp.removed.iter().map(|b| b.id).collect::<Vec<_>>(),
@@ -674,7 +686,7 @@ fn change_summary(cs: &ChangeSet) -> Value {
                 o["before"] = json!(b);
             }
             o
-        })
+        }))
         .collect();
     let mut o = json!({"edits": edits});
     if !cs.tables.is_empty() {

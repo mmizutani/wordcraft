@@ -73,6 +73,8 @@ impl Session {
             view: _,
             pending: _,
             last_highlight: _,
+            // Set once for a room's copy; no command changes it.
+            confined: _,
             path: _,
             file_name: _,
             // The custom dictionary file, like the file path: host wiring, not an edit.
@@ -89,6 +91,8 @@ impl Session {
             page_hint: _,
             registry: _,
             author: _,
+            // Like the author: who edits, not an edit.
+            role: _,
             initials: _,
             painter: _,
             status: _,

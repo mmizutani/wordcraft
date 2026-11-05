@@ -18,11 +18,18 @@ fn undo_to(s: &mut Session, v: &Value) -> CmdResult {
     if s.step_lifts_protection(false) {
         return Err(CmdError::Disabled("edit.undoTo: use Stop Protection to lift the document's protection".into()));
     }
-    let undone = s.undo_steps(n);
+    let (undone, stopped) = s.undo_steps_or_why(n);
+    // In a shared document, a step another participant's change since keeps stops it.
+    if let (0, Some(why)) = (undone, &stopped) {
+        return Err(CmdError::Failed(format!("edit.undoTo: {why}")));
+    }
     let mut r = sel_result(s)?;
     if let Some(m) = r.as_object_mut() {
         m.insert("undone".into(), json!(undone));
         m.insert("depth".into(), json!(s.undo_depth()));
+        if let Some(why) = stopped {
+            m.insert("stopped".into(), json!(why));
+        }
     }
     Ok(r)
 }
@@ -43,7 +50,8 @@ pub fn specs() -> Vec<CommandSpec> {
             if s.step_lifts_protection(false) {
                 return Err(CmdError::Disabled("edit.undo: use Stop Protection to lift the document's protection".into()));
             }
-            s.undo();
+            // In a shared document, a change another participant made since can keep the step.
+            s.undo_step().map_err(|why| CmdError::Failed(format!("edit.undo: {why}")))?;
             sel_result(s)
         })
         .key("Mod+Z")
@@ -60,7 +68,7 @@ pub fn specs() -> Vec<CommandSpec> {
             if s.step_lifts_protection(true) {
                 return Err(CmdError::Disabled("edit.redo: use Stop Protection to lift the document's protection".into()));
             }
-            s.redo();
+            s.redo_step().map_err(|why| CmdError::Failed(format!("edit.redo: {why}")))?;
             sel_result(s)
         })
         .key("Mod+Y / Mod+Shift+Z")

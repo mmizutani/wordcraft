@@ -18,6 +18,8 @@ struct SuccessContext<'a> {
     ime_caret_before: ImeCaretState,
     rev_before: u64,
     sel_before: &'a Selection,
+    /// Whether its formatting changes are formatting revisions already.
+    recorded: bool,
 }
 
 struct ElsewhereContext {
@@ -82,10 +84,13 @@ impl Session {
         let ime_text_join = self.ime_text_join.take();
         let reg = self.registry.clone();
         let Some(spec) = reg.get(id) else { return Err(CmdError::Unknown(id.to_string())) };
+        if let Some(why) = self.confined_refuses(id) {
+            return Err(CmdError::Disabled(format!("{id}: {why}")));
+        }
         let join = join
             || (equation_join && matches!(id, "equation.type" | "equation.backspace"))
             || (id == "text.insert" && ime_text_join.as_ref().is_some_and(|sel| sel == &self.sel));
-        if let Some(why) = (spec.enabled)(self) {
+        if let Some(why) = (spec.enabled)(self).or_else(|| self.refused_by_role(spec.mutates)) {
             return Err(CmdError::Disabled(format!("{id}: {why}")));
         }
         // Restrict Editing: refused outright, or allowed as long as it only edits the exceptions.
@@ -114,13 +119,15 @@ impl Session {
         }
         // Typing, caret movement and selection outside the equation commands leave the equation.
         self.leave_math_for_command(id);
+        // Snapshotted like an edit, to be undone like one when it did more than the role allows.
+        let held = self.held_to_role(spec.mutates);
         // The undo stacks are snapshotted whole, not as a length: commands run nested commands,
         // whose checkpoints, undos and redos (and evictions at the limit) must be put back too.
-        let ime_epoch_before = spec.mutates.then_some(self.ime_body_epoch);
+        let ime_epoch_before = held.then_some(self.ime_body_epoch);
         // Commands may leave an equation (a whole-body replacement) even after they fail; put
         // the editing session back with the document.
-        let math_before = spec.mutates.then(|| self.math.clone());
-        let before_doc: Option<RunSnapshot> = if spec.mutates {
+        let math_before = held.then(|| self.math.clone());
+        let before_doc: Option<RunSnapshot> = if held {
             Some((
                 self.doc.clone(),
                 self.sel.clone(),
@@ -143,8 +150,8 @@ impl Session {
         // Whether the document has unsaved changes, and the revision its layout is keyed on: a
         // command that changes nothing leaves both as they were, and a failed one leaves no
         // trace.
-        let dirty_before = spec.mutates.then_some(self.dirty);
-        let rev_restore = spec.mutates.then_some(self.rev);
+        let dirty_before = held.then_some(self.dirty);
+        let rev_restore = held.then_some(self.rev);
         // These mutating commands can replace the open document and discard its saved versions.
         // Keep the versions until the command and the protected-region post-check have both
         // succeeded; rejected commands must leave the old document and its snapshots together.
@@ -196,6 +203,7 @@ impl Session {
         let mutates = spec.mutates;
         let ime_caret_before = self.current_ime_caret_state();
         let rev_before = self.rev;
+        let forced = self.force_tracking(mutates);
         // While it runs, a command on this document records no change of its own: this one
         // records the whole edit when it ends.
         self.command_docs.push(home);
@@ -208,6 +216,8 @@ impl Session {
                 Err(CmdError::Failed(format!("{id} panicked: {msg}")))
             }
         };
+        // In a shared document, nothing more than the participant's role lets them change.
+        let recorded = self.hold_to_role(id, home, mutates, forced, before_doc.as_ref().map(|(d, ..)| d), &mut result);
         if self.document_id != home || (result.is_err() && self.order.iter().any(|d| *d >= mark)) {
             return self.finish_elsewhere(
                 ElsewhereContext { home, mark, before_doc, blocks_before, default_language_before, pending_application_change_before },
@@ -237,6 +247,7 @@ impl Session {
                 ime_caret_before,
                 rev_before,
                 sel_before: &sel_before,
+                recorded,
             }),
             Err(e) => {
                 self.ime_edit_outcome = ImeEditOutcome::default();
@@ -305,11 +316,12 @@ impl Session {
             ime_caret_before,
             rev_before,
             sel_before,
+            recorded,
         } = context;
         let mut no_op = false;
         if spec.mutates {
             // Formatting changed while tracking becomes a formatting revision.
-            if let Some((before, ..)) = before_doc {
+            if !recorded && let Some((before, ..)) = before_doc {
                 crate::cmd::fmt_revisions::record(self, id, before);
             }
             self.doc.ensure_nonempty();

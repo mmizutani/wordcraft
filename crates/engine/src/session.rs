@@ -12,6 +12,7 @@ use crate::{CmdError, ImeEditOutcome, Registry};
 
 mod documents;
 mod views;
+pub(crate) use changes::weight as change_weight;
 pub use changes::{ChangeLog, MAX_CHANGES};
 pub use documents::{DocInfo, DocState};
 use documents::{document_id_mark, next_document_id, untitled_name};
@@ -22,7 +23,9 @@ mod ime;
 mod layout;
 mod lifecycle;
 mod query;
+mod roles;
 mod run;
+mod shared;
 mod snapshot;
 
 use crate::doc_state;
@@ -39,6 +42,7 @@ pub use locale::set_system_locale;
 pub(crate) use locale::system_locale;
 pub use prefs::Prefs;
 pub use query::blank_document;
+pub(crate) use shared::Steps;
 pub use snapshot_types::EditSnapshot;
 use snapshot_types::{LayoutSlots, RunSnapshot};
 pub use view::{StylesPaneDock, ViewState};
@@ -83,6 +87,11 @@ pub struct Session {
     pub registry: Arc<Registry>,
     /// Author name for comments and tracked changes.
     pub author: String,
+    /// In a shared document ([`crate::room`]): the participant's role, which [`Session::run`]
+    /// holds each command to. A suggester's commands make tracked changes whatever the
+    /// document's Track Changes setting, and a command that changes more than the role lets
+    /// them is undone and refused. `None` outside a room.
+    pub role: Option<crate::room::Role>,
     /// Initials for comments (File › Options › General); empty = the name's initials.
     pub initials: String,
     /// Format painter: copied formatting waiting to be applied (and whether it stays on).
@@ -218,6 +227,9 @@ pub struct Session {
     /// More pictures and shapes selected along with the one the selection holds (Shift+click),
     /// for Group. Cleared by any edit or selection change other than adding to it.
     pub also_selected: Vec<Pos>,
+    /// A room's copy of a shared document: commands on files, other documents and windows are
+    /// refused, also when another command runs them (a macro's steps, Repeat).
+    pub(crate) confined: bool,
     /// Column (block) selection, if one was made (see [`Session::column_segments`]).
     pub column: Option<ColumnBlock>,
     /// Column selection mode (Ctrl+Shift+F8): caret movement extends the block.

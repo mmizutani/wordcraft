@@ -13,14 +13,14 @@ mod changes;
 mod comments;
 mod proofing;
 
+pub(crate) use changes::reject_all;
 pub use changes::{
     DELETION_TEXT_CHARS, DeletionBalloon, deletion_balloons, format_changes, has_deletions, has_format_changes, move_changes, tracking_json,
 };
 use changes::{list_changes, nav_change, resolve_all_then, resolve_sel_then, tracking_options};
-use comments::{
-    comment_at_caret, comments_change, delete_comment, edit_comment, list_comments, nav_comment, new_comment, reply, validate_comment_id,
-};
+pub(crate) use comments::comment_at_caret;
 pub use comments::{comment_list, comment_range_at_caret};
+use comments::{comments_change, delete_comment, edit_comment, list_comments, nav_comment, new_comment, reply, validate_comment_id};
 use proofing::{all_issues, issue_at, next_issue, suggestions, thesaurus, word_count};
 
 pub fn specs() -> Vec<CommandSpec> {

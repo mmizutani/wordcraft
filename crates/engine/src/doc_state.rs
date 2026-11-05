@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use wordcraft_doc::props::CharProps;
-use wordcraft_doc::{Document, Path, Pos, StoryRef, Table};
+use wordcraft_doc::{ChangeSet, Document, Path, Pos, StoryRef, Table};
 
 /// A selection: anchor (where it started) and focus (where the caret is).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -129,7 +131,23 @@ pub(super) struct Undo {
     /// The column block or whole cells the selection was (undoing brings the selection back as
     /// it was).
     pub(super) column: Option<ColumnBlock>,
+    /// In a shared document, the changes other participants made after the step, before the
+    /// next one: the snapshot doesn't hold them, and taking the step back moves them past it.
+    pub(super) theirs: Option<Arc<Theirs>>,
 }
+
+/// Changes other participants made in a shared document after an undo or redo step
+/// ([`Undo::theirs`]).
+#[derive(Clone)]
+pub(super) struct Theirs {
+    /// The document as the step left it, which the first of them was made on.
+    pub(super) base: Document,
+    /// The changes, oldest first, each made on the document the one before it left.
+    pub(super) changes: Vec<Their>,
+}
+
+/// A change another participant made, and their name.
+pub(super) type Their = (Arc<ChangeSet>, Arc<str>);
 
 /// The number of edit locations Go Back cycles through (Word: four).
 pub(super) const EDIT_MARKS: usize = 4;
@@ -177,6 +195,10 @@ pub const MAX_UI_REQUESTS: usize = 64;
 
 /// Maximum undo depth.
 pub(super) const MAX_UNDO: usize = 500;
+
+/// Most changes of other participants an undo step keeps one by one ([`Theirs`]): more are
+/// kept as one, the difference they made.
+pub(super) const MAX_THEIRS: usize = 1024;
 
 /// How many steps the Undo button's list shows (#701); `edit.undoTo` reaches no further.
 pub const UNDO_LIST_MAX: usize = 100;

@@ -3,7 +3,10 @@
 //! changes, sent as JSON, holds what the document holds under the same block ids.
 
 use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::TestRunner;
 use serde_json::{Value, json};
+use wordcraft_doc::change::Side;
 use wordcraft_doc::{ChangeSet, Document};
 
 use super::block_ids::{Step, step};
@@ -50,7 +53,7 @@ impl Copy {
 }
 
 /// Where two documents differ, in short: the first field whose JSON differs.
-fn difference(a: &Document, b: &Document) -> String {
+pub(super) fn difference(a: &Document, b: &Document) -> String {
     let (Ok(Value::Object(x)), Ok(Value::Object(y))) = (serde_json::to_value(a), serde_json::to_value(b)) else {
         return "(no JSON)".into();
     };
@@ -222,7 +225,9 @@ fn a_command_inside_another_records_one_change() {
     run_and_follow(&mut s, &mut copy, "test.typeTwice", &json!({})).unwrap().unwrap();
     assert_eq!(s.changes().version(), version + 1);
     let changes = s.changes().since(version).unwrap();
-    let inserted: String = changes[0].1.splices.iter().map(|sp| sp.text.inserted.as_str()).collect();
+    let cs = &changes[0].1;
+    let typed = cs.edits.iter().filter_map(|e| e.chars.as_ref()).map(|c| c.inserted.text.as_str());
+    let inserted: String = typed.chain(cs.splices.iter().map(|sp| sp.text.inserted.as_str())).collect();
     assert!(inserted.contains("one ") && inserted.contains("two"), "{inserted:?}");
 }
 
@@ -315,4 +320,131 @@ fn a_new_document_starts_its_changes_at_version_zero() {
     s.set_document(sample_document());
     assert_ne!(s.document_id(), id);
     assert_eq!(s.changes().version(), 0);
+}
+
+/// Run one random step, whatever it gives.
+pub(super) fn run_step(s: &mut Session, st: &Step) {
+    match st {
+        Step::Type(t) => _ = s.run("text.insert", &json!({"text": t})),
+        Step::Command(id, v) => _ = s.run(id, v),
+        Step::UndoRedo => {
+            _ = s.run("edit.undo", &json!({}));
+            _ = s.run("edit.redo", &json!({}));
+        }
+    }
+}
+
+/// What two changes made at once did.
+enum AtOnce {
+    /// They clash: one is made again.
+    Clash,
+    /// Both edited the same paragraph in place, and both went through.
+    SameParagraph,
+    /// Both went through, elsewhere.
+    Apart,
+    /// The session changed the document before any step (nothing to compare).
+    Skipped,
+}
+
+/// Two sessions open the same version of a document (after `warm`), go to the same place and
+/// make their edits (`a`, `b`); their edits, each one change, are moved past each other. They
+/// clash or not whichever is moved; when they don't, either order gives the same document
+/// under the same ids, each change sent as JSON.
+fn at_once(warm: &[Step], place: usize, a: &[Step], b: &[Step]) -> Result<AtOnce, String> {
+    let places = [("caret.docStart", json!({})), ("select.text", json!({"text": "Studio"})), ("caret.docEnd", json!({}))];
+    let mut s = Session::new(sample_document());
+    for st in warm {
+        run_step(&mut s, st);
+    }
+    let base = s.doc.clone();
+    let mut changes = Vec::new();
+    for steps in [a, b] {
+        let mut s = Session::new(base.clone());
+        if s.doc != base || s.doc.block_ids() != base.block_ids() {
+            return Ok(AtOnce::Skipped);
+        }
+        let (place, at) = places.get(place).ok_or("no such place")?;
+        _ = s.run(place, at);
+        for st in steps {
+            run_step(&mut s, st);
+        }
+        changes.push(ChangeSet::between(&base, &s.doc));
+    }
+    let [ca, cb] = &changes[..] else { return Err("two changes expected".into()) };
+    let wire = |cs: &ChangeSet| -> Result<ChangeSet, String> {
+        serde_json::from_str(&serde_json::to_string(cs).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    };
+    // The hub took `b` first: `a` goes after it. A copy that made `a` puts `b` before its own.
+    match (ca.rebase(cb, Side::After), cb.rebase(ca, Side::Before)) {
+        (Err(_), Err(_)) => Ok(AtOnce::Clash),
+        (Ok(_), Err(e)) | (Err(e), Ok(_)) => Err(format!("a clash one way only: {e}")),
+        (Ok(a2), Ok(b2)) => {
+            let mut x = base.clone();
+            x.apply(&wire(cb)?).map_err(|e| format!("b: {e}"))?;
+            x.apply(&wire(&a2)?).map_err(|e| format!("a after b: {e}"))?;
+            let mut y = base.clone();
+            y.apply(&wire(ca)?).map_err(|e| format!("a: {e}"))?;
+            y.apply(&wire(&b2)?).map_err(|e| format!("b after a: {e}"))?;
+            if x != y {
+                return Err(format!("the orders give other content: {}", difference(&x, &y)));
+            }
+            if x.block_ids() != y.block_ids() {
+                return Err("the orders give the same content under other block ids".into());
+            }
+            let same = ca.edits.iter().any(|e| cb.edits.iter().any(|f| f.id == e.id));
+            Ok(if same { AtOnce::SameParagraph } else { AtOnce::Apart })
+        }
+    }
+}
+
+/// A step of someone editing beside others: mostly typing, selecting, deleting and formatting
+/// characters and paragraphs where they are, and now and then any step of the edits above.
+pub(super) fn edit_step() -> impl Strategy<Value = Step> {
+    let commands = [
+        ("caret.left", json!({})),
+        ("caret.right", json!({})),
+        ("caret.left", json!({"extend": true})),
+        ("caret.right", json!({"extend": true})),
+        ("text.backspace", json!({})),
+        ("text.delete", json!({})),
+        ("format.bold", json!({})),
+        ("format.italic", json!({})),
+        ("format.color", json!({"color": "C00000"})),
+        ("para.alignCenter", json!({})),
+        ("para.style", json!({"style": "Heading 2"})),
+    ];
+    prop_oneof![
+        4 => "[a-z ]{1,4}".prop_map(Step::Type),
+        4 => proptest::sample::select(commands.to_vec()).prop_map(|(id, v)| Step::Command(id, v)),
+        2 => step(),
+    ]
+}
+
+/// Edits made at once from the same place in two copies of a document (typing, selecting,
+/// deleting and formatting, with paragraph breaks, cut and paste, tables, notes, comments, text
+/// boxes, undo and redo among them; 600 cases, the same each run): they clash or not whichever
+/// is moved past the other, and when they don't, either order gives the same document under
+/// the same ids. In many of them both edit the same paragraph and both go through.
+#[test]
+fn edits_made_at_once_clash_or_give_the_same_document_in_either_order() {
+    const CASES: usize = 600;
+    let mut runner = TestRunner::deterministic();
+    let edits = || proptest::collection::vec(edit_step(), 1..6);
+    let cases = (proptest::collection::vec(step(), 0..8), 0usize..3, edits(), edits());
+    let (mut clash, mut same, mut apart, mut skipped) = (0, 0, 0, 0);
+    let mut failures = Vec::new();
+    for case in 0..CASES {
+        let Ok(tree) = cases.new_tree(&mut runner) else { continue };
+        let (warm, place, a, b) = tree.current();
+        match at_once(&warm, place, &a, &b) {
+            Ok(AtOnce::Clash) => clash += 1,
+            Ok(AtOnce::SameParagraph) => same += 1,
+            Ok(AtOnce::Apart) => apart += 1,
+            Ok(AtOnce::Skipped) => skipped += 1,
+            Err(e) => failures.push(format!("case {case}: {e}\n  warm {warm:?}\n  place {place}\n  a {a:?}\n  b {b:?}")),
+        }
+    }
+    assert!(failures.is_empty(), "{} of {CASES} cases failed:\n{}", failures.len(), failures.join("\n"));
+    assert!(skipped == 0, "{skipped} cases skipped");
+    assert!(same >= CASES / 5, "too few cases edit the same paragraph and both go through: {same} (clash {clash}, apart {apart})");
 }

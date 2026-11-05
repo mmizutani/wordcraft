@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::{CharProps, DocError, Paragraph, Path, Pos, Rgb, para_block};
+use crate::para::OBJ;
+use crate::{Align, CharProps, DocError, InlineObject, Paragraph, Path, Pos, Rgb, para_block};
 
 /// A document of three paragraphs, a 2×2 table and a last paragraph, with ids.
 fn sample() -> Document {
@@ -46,18 +47,17 @@ fn type_at(block: usize, off: usize, text: &str) -> impl FnOnce(&mut Document) {
 }
 
 #[test]
-fn typing_makes_one_splice_of_one_paragraph_keeping_its_id() {
+fn typing_sends_only_the_characters_typed() {
     let d = sample();
     let (after, cs) = edit(&d, type_at(1, 3, "!"));
-    assert_eq!(cs.splices.len(), 1, "{cs:?}");
-    let s = &cs.splices[0];
-    assert_eq!(s.container, Container::Story(StoryRef::Body));
-    assert_eq!((s.after, s.before), (Some(d.body[0].id()), Some(d.body[2].id())));
-    assert_eq!(s.removed.iter().map(|b| b.id).collect::<Vec<_>>(), vec![d.body[1].id()]);
-    assert_eq!(s.inserted.len(), 1);
-    assert_eq!(s.inserted[0].0.id(), d.body[1].id());
-    assert_eq!(s.text, TextSplice { at: 3, removed: 0, inserted: "!".into() });
-    assert!(cs.tables.is_empty() && cs.parts.is_empty() && cs.fields.is_empty());
+    assert!(cs.splices.is_empty() && cs.tables.is_empty() && cs.parts.is_empty() && cs.fields.is_empty(), "{cs:?}");
+    assert_eq!(cs.edits.len(), 1, "{cs:?}");
+    let e = &cs.edits[0];
+    assert_eq!((e.container, e.id), (Container::Story(StoryRef::Body), d.body[1].id()));
+    assert_eq!(e.was, Some(fingerprint(&d.body[1])));
+    let c = e.chars.as_ref().unwrap();
+    assert_eq!((c.at, c.removed, c.inserted.text.as_str(), c.inserted.runs.len()), (3, 0, "!", 1));
+    assert!(e.shell.is_none());
     let mut other = copy(&d);
     other.apply(&sent(&cs)).unwrap();
     assert_same(&other, &after);
@@ -114,15 +114,15 @@ fn deleting_across_paragraphs_joins_them_and_maps_into_the_join() {
 }
 
 #[test]
-fn typing_in_a_table_cell_splices_only_that_cell() {
+fn typing_in_a_table_cell_edits_only_that_cell() {
     let d = sample();
     let table = d.body[3].id();
     let (after, cs) = edit(&d, |d| {
         d.insert_text(&Pos::new(StoryRef::Body, Path(vec![3, 1, 0, 0]), 0), "cell", &CharProps::default()).unwrap();
     });
-    assert_eq!(cs.splices.len(), 1, "{cs:?}");
-    assert_eq!(cs.splices[0].container, Container::Cell { table, row: 1, col: 0 });
-    assert!(cs.tables.is_empty());
+    assert!(cs.splices.is_empty() && cs.tables.is_empty(), "{cs:?}");
+    assert_eq!(cs.edits.len(), 1, "{cs:?}");
+    assert_eq!(cs.edits[0].container, Container::Cell { table, row: 1, col: 0 });
     let mut other = copy(&d);
     other.apply(&sent(&cs)).unwrap();
     assert_same(&other, &after);
@@ -299,12 +299,19 @@ fn block_ids_travel_beside_the_json() {
 #[test]
 fn ids_and_fingerprints_are_written_as_hex() {
     let d = sample();
-    let (_, cs) = edit(&d, type_at(0, 0, "x"));
+    let (_, cs) = edit(&d, |d| {
+        d.body.remove(0);
+    });
     let v = serde_json::to_value(&cs).unwrap();
     let id = v["splices"][0]["removed"][0]["id"].as_str().unwrap().to_string();
     assert_eq!(id, d.body[0].id().to_string());
     assert_eq!(id.len(), 16);
     assert_eq!(v["splices"][0]["removed"][0]["hash"].as_str().map(str::len), Some(16));
+    let (_, cs) = edit(&d, type_at(0, 0, "x"));
+    let v = serde_json::to_value(&cs).unwrap();
+    assert_eq!(v["edits"][0]["id"].as_str(), Some(d.body[0].id().to_string().as_str()));
+    assert_eq!(v["edits"][0]["was"].as_str().map(str::len), Some(16));
+    assert_eq!(v["edits"][0]["chars"]["hash"].as_str().map(str::len), Some(16));
 }
 
 #[test]
@@ -313,4 +320,395 @@ fn text_splices_cut_at_character_boundaries() {
     assert_eq!(text_splice("aéc", "aèc"), TextSplice { at: 1, removed: 2, inserted: "è".into() });
     assert_eq!(text_splice("aaa", "aa"), TextSplice { at: 2, removed: 1, inserted: String::new() });
     assert_eq!(text_splice("", "日本"), TextSplice { at: 0, removed: 0, inserted: "日本".into() });
+}
+
+/// The text of block `i` of the body (none for a table).
+fn text(d: &Document, i: usize) -> &str {
+    d.body.get(i).and_then(|b| b.as_para()).map_or("", |p| p.text.as_str())
+}
+
+/// Changes `a` and `b`, both made on `d`, in both orders, each sent as JSON: `b` then `a` moved
+/// past it (a hub that took `b` first puts `a` after it), and `a` then `b` moved past it. Both
+/// give the same document under the same ids, which is returned.
+fn both_orders(d: &Document, a: &ChangeSet, b: &ChangeSet) -> Document {
+    let a_after_b = sent(&a.rebase(b, Side::After).unwrap());
+    let b_before_a = sent(&b.rebase(a, Side::Before).unwrap());
+    let mut x = copy(d);
+    x.apply(&sent(b)).unwrap();
+    x.apply(&a_after_b).unwrap();
+    let mut y = copy(d);
+    y.apply(&sent(a)).unwrap();
+    y.apply(&b_before_a).unwrap();
+    assert_same(&x, &y);
+    x
+}
+
+/// Whether changes `a` and `b`, made at once, clash: the same whichever is moved past the other.
+fn clashes(a: &ChangeSet, b: &ChangeSet) -> bool {
+    let (x, y) = (a.rebase(b, Side::After), b.rebase(a, Side::Before));
+    assert_eq!(x.is_err(), y.is_err(), "a clash is a clash whichever change moves: {x:?} / {y:?}");
+    for r in [&x, &y] {
+        assert!(matches!(r, Ok(_) | Err(DocError::Stale(_))), "{r:?}");
+    }
+    x.is_err()
+}
+
+fn bold(d: &mut Document, block: usize, a: usize, b: usize) {
+    d.format_range(&Pos::body(block, a), &Pos::body(block, b), &|c: &mut CharProps| c.bold = Some(true)).unwrap();
+}
+
+fn align(block: usize, to: Align) -> impl FnOnce(&mut Document) {
+    move |d| {
+        if let Some(Block::Para(p)) = d.body.get_mut(block).map(Arc::make_mut) {
+            p.props.align = Some(to);
+        }
+    }
+}
+
+#[test]
+fn formatting_a_word_sends_that_word_with_its_new_formatting() {
+    let d = sample();
+    let (after, cs) = edit(&d, |d| bold(d, 1, 1, 3));
+    assert_eq!(cs.edits.len(), 1, "{cs:?}");
+    let c = cs.edits[0].chars.as_ref().unwrap();
+    assert_eq!((c.at, c.removed, c.inserted.text.as_str()), (1, 2, "wo"));
+    assert_eq!(c.inserted.runs.iter().map(|r| (r.len, r.props.bold)).collect::<Vec<_>>(), vec![(2, Some(true))]);
+    let mut other = copy(&d);
+    other.apply(&sent(&cs)).unwrap();
+    assert_same(&other, &after);
+}
+
+#[test]
+fn a_paragraph_s_own_properties_travel_with_a_fingerprint_of_the_old_ones() {
+    let d = sample();
+    let (after, cs) = edit(&d, align(1, Align::Center));
+    assert_eq!(cs.edits.len(), 1, "{cs:?}");
+    assert!(cs.edits[0].chars.is_none());
+    assert_eq!(cs.edits[0].shell.as_ref().map(|s| s.props.align), Some(Some(Align::Center)));
+    let mut other = copy(&d);
+    other.apply(&sent(&cs)).unwrap();
+    assert_same(&other, &after);
+    // Someone typing in it meanwhile is no clash; someone aligning it otherwise is.
+    let (_, typed) = edit(&d, type_at(1, 0, "x"));
+    assert_eq!(text(&both_orders(&d, &cs, &typed), 1), "xtwo");
+    let (_, right) = edit(&d, align(1, Align::Right));
+    assert!(clashes(&cs, &right));
+}
+
+#[test]
+fn objects_travel_with_the_characters_around_them() {
+    let d = sample();
+    let mark = |name: &str| InlineObject::BookmarkStart { name: name.into() };
+    let put = |at: usize, name: &'static str| {
+        move |d: &mut Document| {
+            if let Some(Block::Para(p)) = d.body.get_mut(0).map(Arc::make_mut) {
+                p.insert_object(at, mark(name), &CharProps::default()).unwrap();
+            }
+        }
+    };
+    let (after, cs) = edit(&d, put(1, "here"));
+    let c = cs.edits[0].chars.as_ref().unwrap();
+    assert_eq!((c.at, c.inserted.text.as_str(), c.inserted.objects.len()), (1, "\u{FFFC}", 1));
+    let mut other = copy(&d);
+    other.apply(&sent(&cs)).unwrap();
+    assert_same(&other, &after);
+    // Another one before it, and the copy holds them in their order.
+    let (again, cs) = edit(&after, put(0, "there"));
+    other.apply(&sent(&cs)).unwrap();
+    assert_same(&other, &again);
+    assert!(
+        matches!(&again.body[0].as_para().unwrap().objects[..], [InlineObject::BookmarkStart { name: a }, InlineObject::BookmarkStart { name: b }] if a == "there" && b == "here")
+    );
+}
+
+#[test]
+fn anchors_move_with_the_characters_put_in_before_them() {
+    let d = sample();
+    let (_, cs) = edit(&d, type_at(2, 1, "xy"));
+    let id = d.body[2].id();
+    let at = |off| Anchor { block: id, off };
+    assert_eq!(cs.map(at(0)), Mapped::At(at(0)));
+    assert_eq!(cs.map(at(1)), Mapped::At(at(1)), "an anchor where text was put in stays before it");
+    assert_eq!(cs.map(at(4)), Mapped::At(at(6)));
+}
+
+#[test]
+fn anchors_stay_with_characters_whose_formatting_alone_changed() {
+    let d = sample();
+    let at = |block: usize, off| Anchor { block: d.body[block].id(), off };
+    // Bolding "wo" of "two" sends "wo" again, and moves no character.
+    let (_, cs) = edit(&d, |d| bold(d, 1, 1, 3));
+    let c = cs.edits[0].chars.as_ref().unwrap();
+    assert_eq!((c.at, c.removed, c.kept), (1, 2, KeptChars { start: 2, end: 0 }));
+    for off in 0..=3 {
+        assert_eq!(cs.map(at(1, off)), Mapped::At(at(1, off)), "{off}");
+    }
+    // Bolding "three" and typing an X after "th": the places around the X keep their
+    // characters, as in a change of the text alone.
+    let (after, cs) = edit(&d, |d| {
+        bold(d, 2, 0, 5);
+        d.insert_text(&Pos::body(2, 2), "X", &CharProps { bold: Some(true), ..CharProps::default() }).unwrap();
+    });
+    assert_eq!(text(&after, 2), "thXree");
+    let c = cs.edits[0].chars.as_ref().unwrap();
+    assert_eq!((c.at, c.removed, c.inserted.text.as_str(), c.kept), (0, 5, "thXree", KeptChars { start: 2, end: 3 }));
+    for (off, now) in [(0, 0), (1, 1), (2, 2), (3, 4), (5, 6)] {
+        assert_eq!(cs.map(at(2, off)), Mapped::At(at(2, now)), "{off}");
+    }
+    // The kept characters travel with the change.
+    assert_eq!(sent(&cs), cs);
+    // Kept counts larger than the characters, from elsewhere, are cut to fit them.
+    let mut wild = cs.clone();
+    if let Some(c) = wild.edits[0].chars.as_mut() {
+        c.kept = KeptChars { start: usize::MAX, end: usize::MAX };
+    }
+    for off in [0, 3, 5, usize::MAX] {
+        assert!(matches!(wild.map(at(2, off)), Mapped::At(a) if a.block == d.body[2].id()), "{off}");
+    }
+}
+
+#[test]
+fn two_people_typing_in_one_paragraph_both_get_their_words_in() {
+    let d = sample();
+    let (_, a) = edit(&d, type_at(2, 0, "and "));
+    let (_, b) = edit(&d, type_at(2, 5, "!"));
+    assert!(!clashes(&a, &b));
+    assert_eq!(text(&both_orders(&d, &a, &b), 2), "and three!");
+    // At the same place: the change the hub took first goes first.
+    let (_, b) = edit(&d, type_at(2, 0, "but "));
+    assert_eq!(text(&both_orders(&d, &a, &b), 2), "but and three");
+}
+
+#[test]
+fn edits_of_the_same_characters_clash_whichever_comes_first() {
+    let d = sample();
+    let delete = |a, b| move |d: &mut Document| _ = d.delete_range(&Pos::body(2, a), &Pos::body(2, b)).unwrap();
+    // "three" without "hre".
+    let (_, del) = edit(&d, delete(1, 4));
+    let (_, inside) = edit(&d, type_at(2, 2, "x"));
+    assert!(clashes(&del, &inside));
+    let (_, overlapping) = edit(&d, delete(3, 5));
+    assert!(clashes(&del, &overlapping));
+    // Typing where the deleted characters were, before or after them, or deleting the next
+    // ones, is no clash.
+    let (_, start) = edit(&d, type_at(2, 1, "x"));
+    assert_eq!(text(&both_orders(&d, &del, &start), 2), "txe");
+    let (_, end) = edit(&d, type_at(2, 4, "y"));
+    assert_eq!(text(&both_orders(&d, &del, &end), 2), "tye");
+    let (_, next) = edit(&d, delete(4, 5));
+    assert_eq!(text(&both_orders(&d, &del, &next), 2), "t");
+}
+
+#[test]
+fn formatting_and_typing_in_one_paragraph_both_go_through() {
+    let d = sample();
+    let (_, bolded) = edit(&d, |d| bold(d, 1, 0, 3));
+    let (_, typed) = edit(&d, type_at(1, 3, "!"));
+    let after = both_orders(&d, &bolded, &typed);
+    let p = after.body[1].as_para().unwrap();
+    assert_eq!(p.text, "two!");
+    assert_eq!(p.runs.iter().map(|r| (r.len, r.props.bold)).collect::<Vec<_>>(), vec![(3, Some(true)), (1, None)]);
+}
+
+#[test]
+fn an_edit_of_a_paragraph_another_change_takes_away_clashes() {
+    let d = sample();
+    let (_, typed) = edit(&d, type_at(1, 0, "x"));
+    let (_, removed) = edit(&d, |d| _ = d.body.remove(1));
+    assert!(clashes(&typed, &removed));
+    let (_, joined) = edit(&d, |d| _ = d.delete_range(&Pos::body(0, 3), &Pos::body(1, 0)).unwrap());
+    assert!(clashes(&typed, &joined));
+    // Enter still replaces the paragraph it splits: typing in it meanwhile is made again.
+    let (_, split) = edit(&d, |d| _ = d.split_paragraph(&Pos::body(1, 1)).unwrap());
+    assert!(clashes(&typed, &split));
+    // Typing in a cell of a table taken away.
+    let (_, in_cell) = edit(&d, |d| _ = d.insert_text(&Pos::new(StoryRef::Body, Path(vec![3, 0, 1, 0]), 0), "x", &CharProps::default()).unwrap());
+    let (_, no_table) = edit(&d, |d| _ = d.body.remove(3));
+    assert!(clashes(&in_cell, &no_table));
+    // Typing in the next paragraph is no clash.
+    let (_, next) = edit(&d, type_at(2, 0, "y"));
+    let after = both_orders(&d, &removed, &next);
+    assert_eq!((text(&after, 0), text(&after, 1)), ("one", "ythree"));
+}
+
+#[test]
+fn paragraphs_put_in_at_the_same_place_both_go_in() {
+    let d = sample();
+    let put = |t: &'static str| move |d: &mut Document| d.body.insert(1, para_block(Paragraph::with_text(t, CharProps::default())));
+    let (_, a) = edit(&d, put("A"));
+    let (_, b) = edit(&d, put("B"));
+    let after = both_orders(&d, &a, &b);
+    assert_eq!((text(&after, 1), text(&after, 2)), ("B", "A"));
+    // A change moved past another names the blocks it now sits beside.
+    assert_eq!(a.rebase(&b, Side::After).unwrap().splices[0].after, Some(after.body[1].id()));
+    assert_eq!(b.rebase(&a, Side::Before).unwrap().splices[0].before, Some(after.body[2].id()));
+}
+
+#[test]
+fn blocks_put_in_after_blocks_taken_away_go_where_those_were() {
+    let d = sample();
+    let (_, removed) = edit(&d, |d| _ = d.body.remove(1));
+    let (_, put) = edit(&d, |d| d.body.insert(2, para_block(Paragraph::with_text("new", CharProps::default()))));
+    let after = both_orders(&d, &put, &removed);
+    assert_eq!((text(&after, 0), text(&after, 1), text(&after, 2)), ("one", "new", "three"));
+    assert_eq!(put.rebase(&removed, Side::After).unwrap().splices[0].after, Some(d.body[0].id()));
+    // Between two blocks taken away, they would have no place: a clash.
+    let (_, two) = edit(&d, |d| _ = d.body.drain(1..3).count());
+    assert!(clashes(&put, &two));
+}
+
+#[test]
+fn a_change_moved_past_another_still_checks_what_it_replaces() {
+    let d = sample();
+    // "three" without "ree", and an "x" typed before it meanwhile.
+    let (_, del) = edit(&d, |d| _ = d.delete_range(&Pos::body(2, 2), &Pos::body(2, 5)).unwrap());
+    let (with_x, x) = edit(&d, type_at(2, 0, "x"));
+    let moved = del.rebase(&x, Side::After).unwrap();
+    assert_eq!(moved.edits[0].was, None);
+    assert_eq!(moved.edits[0].chars.as_ref().map(|c| c.at), Some(3));
+    let mut there = copy(&with_x);
+    there.apply(&sent(&moved)).unwrap();
+    assert_eq!(text(&there, 2), "xth");
+    // Where the characters it replaces aren't, it is refused.
+    let mut here = copy(&d);
+    assert!(matches!(here.apply(&sent(&moved)), Err(DocError::Stale(_))));
+    assert_same(&here, &d);
+}
+
+#[test]
+fn junk_paragraph_edits_are_errors_not_panics() {
+    let d = sample();
+    let (_, cs) = edit(&d, type_at(1, 1, "é"));
+    let table = d.body[3].id();
+    let junk: Vec<Box<dyn Fn(&mut ParaEdit)>> = vec![
+        Box::new(|e| e.chars.as_mut().unwrap().at = 99),
+        Box::new(|e| e.chars.as_mut().unwrap().at = usize::MAX),
+        Box::new(|e| {
+            let c = e.chars.as_mut().unwrap();
+            (c.at, c.removed) = (usize::MAX, 2);
+        }),
+        // Other characters than it was made on.
+        Box::new(|e| e.chars.as_mut().unwrap().removed = 1),
+        Box::new(|e| e.chars.as_mut().unwrap().inserted.runs.clear()),
+        Box::new(|e| e.chars.as_mut().unwrap().inserted.runs[0].len = 1),
+        Box::new(|e| {
+            let c = e.chars.as_mut().unwrap();
+            c.inserted.text.push(OBJ);
+            c.inserted.runs[0].len += OBJ.len_utf8();
+        }),
+        Box::new(move |e| e.id = table),
+        Box::new(|e| e.id = BlockId::UNSET),
+        Box::new(|e| e.container = Container::Cell { table: BlockId::UNSET, row: 0, col: 0 }),
+        Box::new(|e| e.container = Container::Story(StoryRef::Part(99))),
+        Box::new(|e| e.shell = Some(ParaShell { was: Fingerprint(1), props: Default::default(), mark: Default::default(), section: None })),
+        Box::new(|e| e.was = Some(Fingerprint(1))),
+    ];
+    for (i, f) in junk.iter().enumerate() {
+        let mut bad = cs.clone();
+        f(&mut bad.edits[0]);
+        let mut other = copy(&d);
+        assert!(other.apply(&bad).is_err(), "junk {i}: {bad:?}");
+        assert_same(&other, &d);
+        // Moving junk past a change, or a change past junk, doesn't panic either.
+        let _ = bad.rebase(&cs, Side::After);
+        let _ = cs.rebase(&bad, Side::Before);
+    }
+}
+
+#[test]
+fn an_anchor_is_found_again_by_its_paragraph_wherever_that_went() {
+    let d = sample();
+    // In the second paragraph, and in the last cell of the table.
+    let two = Pos::body(1, 2);
+    let cell = Pos::new(StoryRef::Body, Path(vec![3, 1, 1, 0]), 0);
+    let a = d.anchor_at(&two).unwrap();
+    let c = d.anchor_at(&cell).unwrap();
+    assert_eq!(a, Anchor { block: d.body[1].id(), off: 2 });
+    assert_eq!(d.anchor_at(&Pos::body(99, 0)), None);
+    // Two paragraphs put in before them: same paragraphs, other paths.
+    let (after, _) = edit(&d, |d| {
+        d.body.insert(0, para_block(Paragraph::new()));
+        d.body.insert(0, para_block(Paragraph::new()));
+    });
+    assert_eq!(after.pos_of(a, Some(&two)), Some(Pos::body(3, 2)));
+    assert_eq!(after.pos_of(c, None), Some(Pos::new(StoryRef::Body, Path(vec![5, 1, 1, 0]), 0)));
+    // An offset past the text, or inside a character, moves back into it.
+    assert_eq!(after.pos_of(Anchor { off: 99, ..a }, None), Some(Pos::body(3, 3)));
+    let mut e = d.clone();
+    e.insert_text(&Pos::body(1, 0), "é", &CharProps::default()).unwrap();
+    assert_eq!(e.pos_of(Anchor { off: 1, ..a }, None), Some(Pos::body(1, 0)));
+    // A paragraph no longer there.
+    let (gone, _) = edit(&d, |d| {
+        d.body.remove(1);
+    });
+    assert_eq!(gone.pos_of(a, Some(&two)), None);
+    assert_eq!(gone.place(Mapped::Gone, None), None);
+}
+
+#[test]
+fn an_anchor_in_a_table_put_back_whole_stays_only_where_its_text_is_the_same() {
+    let mut d = sample();
+    let first = Pos::new(StoryRef::Body, Path(vec![3, 0, 0, 0]), 0);
+    let last = Pos::new(StoryRef::Body, Path(vec![3, 1, 1, 0]), 0);
+    d.insert_text(&first, "one two", &CharProps::default()).unwrap();
+    d.insert_text(&last, "one two three", &CharProps::default()).unwrap();
+    let kept = d.anchor_at(&Pos { off: 4, ..first.clone() }).unwrap();
+    let typed_in = d.anchor_at(&Pos { off: 8, ..last.clone() }).unwrap();
+    // A row put in above, and "Z " typed at the start of the last cell: the table goes whole.
+    let (after, cs) = edit(&d, |d| {
+        let t = d.table_mut(StoryRef::Body, &Path(vec![3])).unwrap();
+        let mut row = t.rows[0].clone();
+        row.cells.iter_mut().for_each(|c| c.blocks = vec![para_block(Paragraph::new())]);
+        t.rows.insert(0, row);
+        d.insert_text(&Pos::new(StoryRef::Body, Path(vec![3, 2, 1, 0]), 0), "Z ", &CharProps::default()).unwrap();
+    });
+    assert_eq!(cs.splices.len(), 1, "{cs:?}");
+    // The first cell's text is as it was: the anchor stays at "two".
+    assert_eq!(cs.map(kept), Mapped::At(kept));
+    assert_eq!(after.place(cs.map(kept), None), Some(Pos { off: 4, path: Path(vec![3, 1, 0, 0]), ..first }));
+    // The last cell's isn't: byte 8 would now be inside "two", so it isn't placed at all.
+    assert_eq!(cs.map(typed_in), Mapped::Gone);
+    // A change from before cells' text was kept with them doesn't place it either.
+    let mut old = cs.clone();
+    old.splices[0].removed.iter_mut().for_each(|b| b.inside_text.clear());
+    assert_eq!(old.map(kept), Mapped::Gone);
+}
+
+#[test]
+fn a_place_beside_a_block_is_at_its_start_or_end() {
+    let d = sample();
+    let table = d.body[3].id();
+    let first_cell = Pos::new(StoryRef::Body, Path(vec![3, 0, 0, 0]), 0);
+    let last_cell = Pos::new(StoryRef::Body, Path(vec![3, 1, 1, 0]), 0);
+    assert_eq!(d.place(Mapped::Before(table), None), Some(first_cell.clone()));
+    assert_eq!(d.place(Mapped::After(table), None), Some(last_cell.clone()));
+    assert_eq!(d.place(Mapped::Before(d.body[2].id()), None), Some(Pos::body(2, 0)));
+    assert_eq!(d.place(Mapped::After(d.body[2].id()), None), Some(Pos::body(2, 5)));
+    // An anchor at a table is at the start of its first paragraph, or the end of its last.
+    assert_eq!(d.pos_of(Anchor { block: table, off: 0 }, None), Some(first_cell));
+    assert_eq!(d.pos_of(Anchor { block: table, off: usize::MAX }, None), Some(last_cell));
+    assert_eq!(d.place(Mapped::Before(BlockId::UNSET), None), None);
+}
+
+#[test]
+fn the_ids_a_change_puts_in_are_listed_and_a_repeated_one_found() {
+    let d = sample();
+    // A table and a paragraph put in: the table's id, its cells' paragraphs' and the paragraph's.
+    let (after, cs) = edit(&d, |d| {
+        d.body.insert(0, Arc::new(Block::Table(Table::new(1, 2, 400.0))));
+        d.body.insert(0, para_block(Paragraph::new()));
+    });
+    let ids = cs.ids_put_in();
+    assert_eq!(ids.len(), 4, "{ids:?}");
+    assert!(ids.contains(&after.body[0].id()) && ids.contains(&after.body[1].id()));
+    assert_eq!(after.repeated_id(&ids), None);
+    assert_eq!(after.repeated_id(&[]), None);
+    // The same change applied twice puts the paragraph in under an id the document has.
+    let mut twice = after.clone();
+    let again = cs.rebase(&cs, Side::After).unwrap();
+    twice.apply(&again).unwrap();
+    assert!(twice.repeated_id(&again.ids_put_in()).is_some());
+    // Typing puts no block in.
+    let (_, typed) = edit(&d, type_at(0, 1, "x"));
+    assert!(typed.ids_put_in().is_empty());
 }

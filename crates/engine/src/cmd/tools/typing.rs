@@ -51,7 +51,11 @@ pub fn autocorrect_word(s: &mut Session, on_enter: bool) -> Result<(), CmdError>
     let lang = lang.or_else(|| s.editing_lang.clone());
     let turkic = is_turkic(lang.as_deref());
     // TWo INitial CApitals and cAPS LOCK come first, so "TEh" is still a replacement's typo.
-    if let Some((at, reps)) = case_fix(&ac, &word, turkic) {
+    let fixable = |(at, reps): &(usize, Vec<String>)| {
+        let n: usize = word.get(*at..).unwrap_or("").chars().take(reps.len()).map(char::len_utf8).sum();
+        may_change(s, &f, start + at, start + at + n)
+    };
+    if let Some((at, reps)) = case_fix(&ac, &word, turkic).filter(fixable) {
         let para = s.doc.para_mut(f.story, &f.path)?;
         let letters = word.get(at..).unwrap_or("").chars().take(reps.len()).collect::<String>();
         let mut end = start + at + letters.len();
@@ -95,6 +99,7 @@ pub fn autocorrect_word(s: &mut Session, on_enter: bool) -> Result<(), CmdError>
         },
         None => (start, None),
     };
+    let rep = rep.filter(|_| may_change(s, &f, from, start + word.len()));
     let replaced = rep.is_some();
     let mut caret = f.off;
     if let Some(rep) = rep {
@@ -111,14 +116,18 @@ pub fn autocorrect_word(s: &mut Session, on_enter: bool) -> Result<(), CmdError>
     let Some(word) = s.doc.para_at(&f).and_then(|p| p.text.get(start..end)).map(str::to_string) else { return Ok(()) };
     let at = |off: usize| Pos { off, ..f.clone() };
     // 1st, 22nd, 103rd → superscript suffix.
-    if let Some(n) = ordinal_suffix(&word).filter(|_| ac.ordinals) {
+    if let Some(n) = ordinal_suffix(&word).filter(|n| ac.ordinals && may_change(s, &f, end.saturating_sub(*n), end)) {
         s.doc.format_range(&at(end - n), &at(end), &|c| c.vert_align = Some(wordcraft_doc::props::VertAlign::Superscript))?;
         return Ok(());
     }
     // Web addresses become links (trailing punctuation stays outside).
     let lower = word.to_ascii_lowercase();
-    if ac.links && (lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.")) && word.len() > 8 {
-        let url = word.trim_end_matches(|c: char| ".,;:!?)]\"'”’".contains(c));
+    let url = word.trim_end_matches(|c: char| ".,;:!?)]\"'”’".contains(c));
+    if ac.links
+        && (lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www."))
+        && word.len() > 8
+        && may_change(s, &f, start, start + url.len())
+    {
         let href = if lower.starts_with("www.") { format!("http://{url}") } else { url.to_string() };
         let url_end = start + url.len();
         s.doc.format_range(&at(start), &at(url_end), &|c| {
@@ -160,7 +169,8 @@ pub fn autocorrect_word(s: &mut Session, on_enter: bool) -> Result<(), CmdError>
         sentence = false;
     }
     let day = ac.cap_days && DAYS.contains(&first);
-    if sentence || day {
+    let first_letter = word.chars().next().map_or(0, char::len_utf8);
+    if (sentence || day) && may_change(s, &f, start, start + first_letter) {
         let para = s.doc.para_mut(f.story, &f.path)?;
         if let Some(c) = word.chars().next() {
             let up = upper_char(c, turkic);
@@ -180,6 +190,20 @@ pub fn autocorrect_word(s: &mut Session, on_enter: bool) -> Result<(), CmdError>
         }
     }
     Ok(())
+}
+
+/// Whether AutoCorrect (or AutoFormat's dashes and double-space full stop) may change the text
+/// of the paragraph at `f` from `from` to `to`: with Track Changes on, only text the author is
+/// inserting (their own tracked insertion, not deleted), since changing anyone else's text here
+/// wouldn't be tracked. WordCraft's own rule, as for `*bold*` and `_italic_` marks.
+pub(crate) fn may_change(s: &Session, f: &Pos, from: usize, to: usize) -> bool {
+    if !s.doc.settings.track_changes {
+        return true;
+    }
+    let Some(p) = s.doc.para_at(f) else { return false };
+    p.run_ranges()
+        .filter(|(r, _)| r.start < to && r.end > from)
+        .all(|(_, c)| c.del.is_none() && c.ins.and_then(|i| s.doc.revisions.get(i as usize)).is_some_and(|rv| rv.author == s.author))
 }
 
 /// The lowercase token before a word that starts a sentence ("there." in "there. world"), as

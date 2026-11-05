@@ -30,7 +30,7 @@ use recipients::recipients;
 pub use recipients::{RECIPIENT_EXTENSIONS, is_spreadsheet_name, parse_csv};
 
 /// The mail-merge data source and preview state (lives in the session, not the document).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MergeState {
     pub kind: String,
     pub headers: Vec<String>,

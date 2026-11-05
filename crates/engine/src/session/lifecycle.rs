@@ -35,7 +35,7 @@ impl Session {
     }
 
     /// Initialise session defaults while sharing the immutable command registry with previews.
-    pub(super) fn with_registry(doc: Document, registry: Arc<Registry>) -> Self {
+    pub(crate) fn with_registry(doc: Document, registry: Arc<Registry>) -> Self {
         let DocState {
             doc,
             sel,
@@ -91,6 +91,7 @@ impl Session {
             view,
             pending,
             last_highlight: wordcraft_doc::props::Highlight::Yellow,
+            confined: false,
             path,
             file_name,
             user_dict_path: None,
@@ -105,6 +106,7 @@ impl Session {
             page_hint,
             registry,
             author: "WordCraft User".into(),
+            role: None,
             initials: String::new(),
             painter: None,
             status: String::new(),

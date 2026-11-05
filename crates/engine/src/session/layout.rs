@@ -155,6 +155,25 @@ impl Session {
         layout.map(|l| (copy.doc, copy.sel, l))
     }
 
+    /// Page `page` (counted from 1; 0 is the first too) as it is output, as PNG at `scale`
+    /// pixels a point (held to 0.1–8), for a reply: `{"png"` (base64), `"width"`, `"height"`,
+    /// `"pages"` (how many the document has)`}`. What the control channel's `ui.render` answers
+    /// without a `path`. An error when the document has no such page.
+    pub fn page_png(&self, page: u64, scale: f32) -> Result<Value, String> {
+        let page = usize::try_from(page.max(1)).unwrap_or(usize::MAX).saturating_sub(1);
+        let scale = if scale.is_nan() { 1.0 } else { scale.clamp(0.1, 8.0) };
+        let l = self.export_layout();
+        let pg = l.pages.get(page).ok_or_else(|| format!("no page {}", page.saturating_add(1)))?;
+        let img = wordcraft_render::render_page(&self.doc, pg, scale, &Default::default());
+        let png = img.to_png();
+        Ok(serde_json::json!({
+            "png": crate::cmd::insert::base64_encode(&png),
+            "width": img.width,
+            "height": img.height,
+            "pages": l.pages.len(),
+        }))
+    }
+
     /// A layout for output (PDF, images, print): no proofing marks, print view.
     pub fn export_layout(&self) -> Arc<DocLayout> {
         self.export_layout_with(false)

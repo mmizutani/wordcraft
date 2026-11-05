@@ -254,6 +254,8 @@ impl Session {
             clip_history: _,
             registry: _,
             author: _,
+            // The participant's role in a shared document, like their name.
+            role: _,
             initials: _,
             painter: _,
             status: _,
@@ -271,6 +273,7 @@ impl Session {
             math_latex: _,
             math_normal_text: _,
             last_highlight: _,
+            confined: _,
             // Keyed by document id and revision, so one cache serves every document.
             protect_facts: _,
             // The input method talks to the window, whichever document it shows; the IME

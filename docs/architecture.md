@@ -1,6 +1,6 @@
 # WordCraft architecture
 
-> **Last reviewed:** 2026-10-28 · **Last updated:** 2026-11-05 · **Change:** trivial (data flow: every command has a scope, `engine::scope`, and names the params that are places); previously trivial (data flow: what a command changed becomes one change another copy applies, `doc::ChangeSet`, and agents follow, `document.changes`); previously trivial (data flow: every paragraph and table has an id, `doc::BlockId`); previously trivial (craft-proof's row says what a build without the Language data keeps: English spelling from an installed Hunspell English or the built-in list, rule hyphenation for Bulgarian, Turkish and Russian; previously minor: proofing moved out: `wordcraft-proof` is craft-libs' `craft-proof`, its Language data craft-i18n's `language-data/` embedded from `CRAFT_I18N_DIR`; previously major: crate and layer inventory, source counts, proofing languages and module boundaries re-measured from this checkout; previously minor: `proof` is per language: English and Polish; previously major: first committed version; `plan/architecture.md` is local-only) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+> **Last reviewed:** 2026-10-28 · **Last updated:** 2026-11-05 · **Change:** trivial (data flow: Undo in a shared document takes the participant's own step back past others' changes, or names who changed the same thing); previously trivial (data flow: the window shares its document through a room, and agents with an invite's key get copies of their own on their connections' threads, `room::hosted`); previously trivial (data flow: a participant's Repeat, macros, Undo and Redo are held to their role as a whole; names in a room are its participants' own; a comment's text is its own; others' tracked changes stay where they were); previously trivial (data flow: participants in a room have roles, `room::Role`, which their copy and the hub hold each change to); previously trivial (data flow: shared documents are rooms, `engine::room`: participants edit copies of their own, and the room's hub puts their changes in one order); previously trivial (data flow: a paragraph edited in place sends only the characters the edit replaced, and a change made at the same time as another is moved past it, `ChangeSet::rebase`); previously trivial (data flow: every command has a scope, `engine::scope`, and names the params that are places); previously trivial (data flow: what a command changed becomes one change another copy applies, `doc::ChangeSet`, and agents follow, `document.changes`); previously trivial (data flow: every paragraph and table has an id, `doc::BlockId`); previously trivial (craft-proof's row says what a build without the Language data keeps: English spelling from an installed Hunspell English or the built-in list, rule hyphenation for Bulgarian, Turkish and Russian; previously minor: proofing moved out: `wordcraft-proof` is craft-libs' `craft-proof`, its Language data craft-i18n's `language-data/` embedded from `CRAFT_I18N_DIR`; previously major: crate and layer inventory, source counts, proofing languages and module boundaries re-measured from this checkout; previously minor: `proof` is per language: English and Polish; previously major: first committed version; `plan/architecture.md` is local-only) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
 
 How WordCraft is built today. The longer design notes in
 `plan/architecture.md` are gitignored and local to the original author's machine; this file is the
@@ -29,7 +29,7 @@ crate name links to its source tree.
 | L2 | [`layout`](../crates/layout/src) | 35,990 | Paragraph line layout (`para`), page/section flow and table layout, then display-list generation (`display`); hit testing maps points to document positions. `para` owns shaping, breaks, tabs and line geometry; page flow composes paragraphs, tables, headers/footers, notes and floats. |
 | L3 | [`pdf`](../crates/pdf/src) | 4,513 | krilla PDF export: font subsets, selectable text, links, outline and tagging |
 | L3 | [`render`](../crates/render/src) | 4,499 | vello_cpu rasterizer: pages and thumbnails from the display list; PNG/JPEG |
-| L4 | [`engine`](../crates/engine/src) | 72,851 | `Session` and editing state; command registry in `cmd/`; file dispatch in `io`; catalog, keymap, recovery, ribbon model, speech and view state |
+| L4 | [`engine`](../crates/engine/src) | 72,851 | `Session` and editing state; command registry in `cmd/`; file dispatch in `io`; shared documents in `room`; catalog, keymap, recovery, ribbon model, speech and view state |
 | L5 | [`mcp`](../crates/mcp/src) | 1,822 | MCP server exposing commands as tools; headless or bridged to the running app |
 | L5 | [`zotero`](../crates/zotero/src) | 2,372 | Zotero word-processor integration protocol answered against a `Session` |
 | L6 | [`ui-egui`](../crates/ui-egui/src) | 81,759 | Front end: ribbon, keytips, mini-toolbar, Backstage, canvas, rulers, panes, dialogs, i18n, themes, control channel and headless `ui_shot` example |
@@ -53,12 +53,55 @@ crate name links to its source tree.
    When the command ends, what it changed becomes one change (`doc::ChangeSet`) in the
    document's change log (`engine::ChangeLog`, the last 1,024): the blocks taken away and put
    in, by id, with a text splice for mapping positions, table properties, parts and document
-   fields. Another copy of the document makes the same edit with `Document::apply`, which
-   checks by id and content fingerprint that it holds what the change was made on, and is
-   left as it was otherwise. Agents follow the log (`document.changes`, MCP `get_changes`).
+   fields; a paragraph edited in place sends only the characters the edit replaced, with their
+   formatting and objects. Another copy of the document makes the same edit with
+   `Document::apply`, which checks by id and content fingerprint that it holds what the change
+   was made on, and is left as it was otherwise. A change made at the same time as another is
+   moved past it with `ChangeSet::rebase` (past the characters the other put in or took away in
+   the same paragraph), unless the two change the same characters or blocks. Agents follow the
+   log (`document.changes`, MCP `get_changes`).
    Every command has a scope (`engine::scope`: document, selection, view, file, app or UI),
    what it touches and so who may run it in a shared document, and names the params that are
    places in the document, which a change moves (`ChangeSet::map`).
+   A document people and agents edit at once is a room (`engine::room`): each participant
+   edits a copy of their own (`room::Replica`, a `Session`), whose commands change it at once,
+   and sends each command's change to the room's hub (`room::Hub`) with the version it was
+   made on. The hub accepts a change made on its latest version as it is, moves one made on an
+   earlier version past the changes it accepted since, and sends back one that clashes with
+   them; every copy makes the accepted changes in that order. A copy moves the changes the hub
+   hasn't accepted yet past the others' as those arrive (`Session::apply_change`, which moves
+   the caret and selection with their text), and makes its edits that clash again after the
+   other's change: it runs the same commands from the same places, moved through that change.
+   Each participant has a role (`room::Role`: viewer, commenter, suggester, editor or owner).
+   The room's own process joins people and agents under a name and a role, a name no one in
+   the room has (ignoring case); anyone else joins with a key the room handed out for one
+   (`Room::invite`, `Room::join_with`). A suggester's commands make tracked changes in their
+   name whatever the document's Track Changes setting. Their copy undoes a command that
+   changes more than the role lets them (`Session::role`), Repeat, a macro, Undo and Redo as a
+   whole, and the hub sends such a change back (`room::rules`): a commenter's must leave the
+   document as it was but for their own comments (each with a comment part of its own), a
+   suggester's the same once every tracked change is rejected, with others' tracked changes
+   covering what they covered, where they were, once the suggester's own are taken back (a
+   paragraph they split joins its other half again, as Reject does it). Both compare only the
+   blocks and parts the change touched.
+   The app's window shares the document it shows (`Room::host`, control method `room.share`):
+   its own session is the owner's copy, lent to that copy for each command and each frame
+   (`Replica::lend`), so the person's typing goes through the hub like anyone's and comes back
+   made again, not lost, when it clashes with an agent's. The hub wakes the window when it
+   takes a change (`Room::on_change`), and every frame the window brings in what others
+   changed. An agent connects to the control port with an invite's key (`room.invite`); the
+   control server finds the room in the lobby it shares with the window (`room::Lobby`) and
+   gives the connection a copy of its own, which answers it on the connection's thread
+   (`room::hosted`): the agent's commands never wait for the window's frame, nor the window's
+   for an agent. MCP's `--connect` bridge with that key gives the agent its copy through MCP.
+   Revoking the invite or closing the room takes their copies out, and their connections end.
+   Undo stays each participant's own. Undo steps are snapshots of the whole document, so the
+   newest undo and redo steps of a copy keep the changes others made since
+   (`Session::apply_theirs`): Undo makes the step's change undone in the document as it is,
+   moved past theirs as the hub moves an edit (`ChangeSet::rebase`), and leaves theirs in, or
+   refuses and names who changed what the step changed. What the participant types after
+   another's change is a step of its own. A copy that makes its edits again after a clash puts
+   back the steps it had before them, so Undo among them takes the same step.
 3. **Layout:** `layout` turns the document into pages of positioned glyphs, boxes and images
    (display list), incrementally: an edit relayouts only what changed (1.4 ms on a 188-page
    document, measured 2026-10-06).
@@ -82,6 +125,12 @@ crate name links to its source tree.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-05 | trivial | Data flow: Undo per participant: a copy's newest undo and redo steps keep others' changes since (`Session::apply_theirs`), Undo moves the step's change past them or refuses naming who changed the same thing, and edits made again after a clash keep their steps |
+| 2026-11-05 | trivial | Data flow: the window shares its document through a room (`Room::host`, `Replica::lend`), and agents with an invite's key get copies of their own on their connections' threads (`room::Lobby`, `room::hosted`) |
+| 2026-11-05 | trivial | Data flow: a participant's Repeat, macros, Undo and Redo are held to their role as a whole; a name in a room is one participant's (ignoring case); a comment's text is a comment part of its own; others' tracked changes stay where they were, not only as they were |
+| 2026-11-05 | trivial | Data flow: participants in a room have roles (`room::Role`); a suggester's commands make tracked changes in their name, and their copy and the hub refuse a change beyond the role (`room::rules`), comparing only what it touched |
+| 2026-11-05 | trivial | Data flow: a document edited at once is a room (`engine::room`): each participant edits a copy of their own, the room's hub accepts, moves or sends back their changes, and copies make their clashing edits again after the other's |
+| 2026-11-05 | trivial | Data flow: a paragraph edited in place sends only the characters the edit replaced (`doc::change::ParaEdit`), and a change made at the same time as another is moved past it unless both change the same characters or blocks (`ChangeSet::rebase`) |
 | 2026-11-05 | trivial | Data flow: every command has a scope (`engine::scope`: what it touches, so who may run it in a shared document) and names the params that are places in the document |
 | 2026-11-05 | trivial | Data flow: what a command changed becomes one change (`doc::ChangeSet`) that another copy applies (`Document::apply`) and agents follow (`document.changes`, `get_changes`) |
 | 2026-11-05 | trivial | Data flow: every paragraph and table has an id of its own (`doc::BlockId`), kept through edits and given after every command to the blocks it made or copied |

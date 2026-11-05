@@ -189,6 +189,21 @@ pub fn tool_definitions() -> Value {
             obj(json!({}), &[]),
             true
         ),
+        tool(
+            "room",
+            "Shared document",
+            "Share the document the app shows with other agents and people, each editing a copy of their own at once (desktop app only). With the app's own key, as its owner: `share` shares the active document; `invite` {name, role} gives a key for a participant (role: viewer, commenter, suggester (the default; their edits are tracked changes in their name), editor or owner), who joins by connecting with it (WORDCRAFT_CONTROL_KEY=<key> wordcraft-cli mcp --connect 127.0.0.1:<port>) and then works on the shared document only, with their role; `revoke` {key} takes a key back, ending the copies that joined with it; `stop` stops sharing. `participants`, for anyone: who is in the shared document, and who you are.",
+            obj(
+                json!({
+                    "action": {"type": "string", "enum": ["share", "invite", "revoke", "participants", "stop"]},
+                    "name": s("invite: the participant's name, which their comments and tracked changes carry; share: yours (the author name when left out)"),
+                    "role": s("invite: viewer, commenter, suggester (default), editor or owner"),
+                    "key": s("revoke: the key invite gave")
+                }),
+                &["action"]
+            ),
+            false
+        ),
     ])
 }
 
@@ -343,6 +358,15 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
         "click" => wrap(b.call("ui.click", a.clone())),
         "key" => wrap(b.call("ui.key", a.clone())),
         "ui_inspect" => wrap(b.call("ui.inspect", json!({}))),
+        "room" => match st("action") {
+            Some(action @ ("share" | "invite" | "revoke" | "participants" | "stop")) => {
+                let params: serde_json::Map<String, Value> =
+                    ["name", "role", "key"].iter().filter_map(|k| a.get(*k).filter(|v| !v.is_null()).map(|v| (k.to_string(), v.clone()))).collect();
+                wrap(b.call(&format!("room.{action}"), Value::Object(params)))
+            }
+            Some(other) => ToolResult::error(format!("unknown action {other:?}: share, invite, revoke, participants or stop")),
+            None => ToolResult::error("missing `action`"),
+        },
         other => ToolResult::error(format!("unknown tool `{other}`")),
     }
 }

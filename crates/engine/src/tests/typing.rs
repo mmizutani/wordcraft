@@ -517,6 +517,66 @@ fn enter_finishes_a_word_for_autocorrect() {
     assert_eq!(s.doc.plain_text(StoryRef::Body), "Hello\nThe end\n");
 }
 
+/// With Track Changes on, finishing a word corrects only text the author is inserting: a space,
+/// a full stop or Enter after someone else's word leaves it as it is (the change wouldn't be
+/// tracked), so Reject All gives back the document as it was. What they type is corrected.
+#[test]
+fn tracked_autocorrect_leaves_text_the_author_did_not_insert() {
+    let original = "teh 1st\nwww.example.org\nline";
+    let mut s = Session::new(wordcraft_doc::Document::from_text(original));
+    s.author = "Sam".into();
+    run(&mut s, "review.trackChanges", json!({"value": true}));
+    // After "teh" (a replacement and a sentence capital), "1st" (an ordinal), a web address,
+    // and "line" (a sentence capital, finished by Enter).
+    for (word, keys) in [("teh", " "), ("1st", "."), ("example.org", " "), ("line", "\n")] {
+        run(&mut s, "select.text", json!({"text": word}));
+        run(&mut s, "caret.right", json!({}));
+        typ(&mut s, keys);
+    }
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "teh  1st.\nwww.example.org \nline\n");
+    let p = s.doc.para_at(&Pos::body(0, 0)).unwrap();
+    assert_eq!(p.props_of_char(5).vert_align, None);
+    let p = s.doc.para_at(&Pos::body(1, 0)).unwrap();
+    assert_eq!(p.props_of_char(0).link, None);
+    // What they type is corrected as usual.
+    typ(&mut s, "teh end ");
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "teh  1st.\nwww.example.org \nline\nThe end ");
+    run(&mut s, "review.rejectAll", json!({}));
+    assert_eq!(s.doc.plain_text(StoryRef::Body), original);
+}
+
+/// With Track Changes on, a space after someone else's hyphens or space leaves them as they are:
+/// AutoFormat's dashes and the double-space full stop change only text the author is typing
+/// (the change wouldn't be tracked), so Reject All gives back the document as it was, and a
+/// suggester's space there isn't refused for an untracked change. What they type is formatted.
+#[test]
+fn tracked_dashes_and_full_stops_leave_text_the_author_did_not_insert() {
+    let original = "e--f\na -- b\nc - d\nend ";
+    let mut s = Session::new(wordcraft_doc::Document::from_text(original));
+    s.author = "Sam".into();
+    run(&mut s, "tools.autocorrect", json!({"doubleSpacePeriod": true}));
+    run(&mut s, "review.trackChanges", json!({"value": true}));
+    for word in ["f", "b", "d", "end "] {
+        run(&mut s, "select.text", json!({"text": word}));
+        run(&mut s, "caret.right", json!({}));
+        typ(&mut s, " ");
+    }
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "e--f \na -- b \nc - d \nend  ");
+    // What they type is formatted as usual.
+    typ(&mut s, "x--y and p -- q and r  ");
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "e--f \na -- b \nc - d \nend  x\u{2014}y and p \u{2013} q and r. ");
+    run(&mut s, "review.rejectAll", json!({}));
+    assert_eq!(s.doc.plain_text(StoryRef::Body), original);
+    // A suggester's space after someone else's hyphens goes through, as a tracked space.
+    let mut s = Session::new(wordcraft_doc::Document::from_text("word--word"));
+    s.author = "Sam".into();
+    s.role = Some(crate::room::Role::Suggester);
+    run(&mut s, "caret.docEnd", json!({}));
+    run(&mut s, "text.insert", json!({"text": " "}));
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "word--word ");
+    assert!(!s.doc.settings.track_changes && !s.doc.revisions.is_empty() && s.doc.revisions.iter().all(|r| r.author == "Sam"));
+}
+
 /// A word after a no-break space or an ideographic space is corrected as after a plain space:
 /// replacements, sentence capitals, ordinals and links.
 #[test]

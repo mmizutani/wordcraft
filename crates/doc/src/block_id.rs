@@ -123,12 +123,17 @@ pub(crate) const MAX_ID_DEPTH: usize = 64;
 /// unset ones included: what a copy needs, beside `b` itself, to hold it with the same ids.
 pub(crate) fn inside_ids(b: &Block) -> Vec<BlockId> {
     let mut out = Vec::new();
+    each_inside(b, &mut |inner| out.push(inner.id()));
+    out
+}
+
+/// Each block inside `b` (in its table cells), in the order [`inside_ids`] lists them.
+pub(crate) fn each_inside<'a>(b: &'a Block, f: &mut dyn FnMut(&'a Arc<Block>)) {
     if let Block::Table(t) = b {
         for cell in t.rows.iter().flat_map(|r| &r.cells) {
-            walk(&cell.blocks, StoryRef::Body, &mut Vec::new(), 1, &mut |_, _, inner| out.push(inner.id()));
+            walk(&cell.blocks, StoryRef::Body, &mut Vec::new(), 1, &mut |_, _, inner| f(inner));
         }
     }
-    out
 }
 
 /// Give the blocks inside `b` the ids [`inside_ids`] listed, in the same order. False (and `b`
@@ -254,6 +259,25 @@ impl Document {
         }
         *self = d;
         Ok(())
+    }
+
+    /// The first of `ids` that more than one block of the stories has, if any: after a change
+    /// was applied, one of the blocks it put in ([`crate::ChangeSet::ids_put_in`]) whose id the
+    /// document already held.
+    pub fn repeated_id(&self, ids: &[BlockId]) -> Option<BlockId> {
+        if ids.is_empty() {
+            return None;
+        }
+        let wanted: IdSet = ids.iter().map(|id| id.0).collect();
+        let mut seen = IdSet::default();
+        let mut repeated = None;
+        self.each_block(&mut |_, _, b| {
+            let id = b.id().0;
+            if repeated.is_none() && wanted.contains(&id) && !seen.insert(id) {
+                repeated = Some(BlockId(id));
+            }
+        });
+        repeated
     }
 
     /// The blocks [`Document::ensure_block_ids`] gives ids with no `before`: those without one,

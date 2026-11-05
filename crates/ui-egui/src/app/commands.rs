@@ -44,6 +44,10 @@ impl WordApp {
             self.dialog = dialogs::Dialog::open(name, self);
             return Ok(json!({"pending": name}));
         }
+        // What agents changed in a shared document since the last frame counts as unsaved.
+        if discards_document(id, &params) {
+            self.catch_up_share();
+        }
         if (self.session.dirty || self.save_unconfirmed() || refused.is_some())
             && discards_document(id, &params)
             && !self.closes_only_its_window(id, &params)
@@ -199,10 +203,11 @@ impl WordApp {
         let math_session = self.session.math.as_ref().map(|m| m.session);
         let composing_before = !self.canvas.ime_preedit.is_empty();
         let old_path = self.session.path.clone();
-        let r = if self.ime_origin {
-            self.session.run_ime(id, &params).map_err(|e| e.to_string())
-        } else {
-            self.session.run(id, &params).map_err(|e| e.to_string())
+        // In the document the window shares, through its copy.
+        let r = match self.run_shared(id, &params, self.ime_origin) {
+            Some(r) => r.map_err(|e| e.to_string()),
+            None if self.ime_origin => self.session.run_ime(id, &params).map_err(|e| e.to_string()),
+            None => self.session.run(id, &params).map_err(|e| e.to_string()),
         };
         if self.session.ime_body_epoch() != body_epoch {
             self.canvas.ime_interrupted_preedit |= composing_before;

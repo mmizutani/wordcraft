@@ -1,4 +1,3 @@
-use super::screenshots::render_png;
 use super::{ControlRequest, Value, WordApp, json};
 
 pub enum Outcome {
@@ -138,7 +137,7 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
             let path = p.get("path").and_then(Value::as_str);
             let r = app.session.with_document(doc, |s| match path {
                 Some(path) => s.run("file.exportPng", &json!({"path": path, "page": page, "scale": scale})).map_err(|e| e.to_string()),
-                None => render_png(s, page, scale),
+                None => s.page_png(page, scale),
             });
             reply(r)
         }
@@ -181,6 +180,12 @@ pub fn handle(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) -> O
             Ok(None) => {}
             Err(e) => return err(e),
         }
+    }
+    if let Some(r) = crate::share::room_method(app, &req.method, p) {
+        return match r {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        };
     }
     let s = |k: &str| p.get(k).and_then(Value::as_str);
     let f = |k: &str| p.get(k).and_then(Value::as_f64).map(|v| v as f32);
@@ -329,7 +334,7 @@ pub fn handle(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) -> O
                 },
                 // No path: the PNG travels in the reply. Never a fixed name in the shared
                 // temporary folder, where another user could have planted a link to a file.
-                None => match render_png(&app.session, page, scale) {
+                None => match app.session.page_png(page, scale) {
                     Ok(v) => ok(v),
                     Err(e) => err(e),
                 },
