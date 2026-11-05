@@ -19,7 +19,7 @@ use std::sync::{Arc, OnceLock};
 use wordcraft_doc::para::OBJ;
 use wordcraft_doc::props::{CellProps, ParaProps, RowProps, TableProps};
 use wordcraft_doc::section::SectionProps;
-use wordcraft_doc::{Block, Blocks, CharProps, Comment, Document, InlineObject, StoryRef, StyleSheet};
+use wordcraft_doc::{Block, Blocks, CharProps, Comment, Document, InlineObject, PartKind, StoryRef, StyleSheet};
 
 use super::Role;
 use crate::{Registry, Session};
@@ -81,8 +81,9 @@ fn suggestions_only(before: &Document, after: &Document, name: &str) -> Result<(
         return Err(format!("a suggester's tracked changes are in their own name, not {}'s", r.author));
     }
     let (before, after) = (comparable(before, name)?, comparable(after, name)?);
-    // Others' tracked changes cover what they covered, as it was: none was accepted or
-    // rejected, and what they cover wasn't changed but by tracked changes of the suggester's.
+    // Others' tracked changes cover what they covered, as it was and where it was: none was
+    // accepted, rejected or moved, and what they cover wasn't changed but by tracked changes
+    // of the suggester's.
     let (was, now) = (covered(&before, name), covered(&after, name));
     for (i, r) in before.revisions.iter().enumerate() {
         let k = u32::try_from(i).unwrap_or(u32::MAX);
@@ -99,7 +100,10 @@ fn suggestions_only(before: &Document, after: &Document, name: &str) -> Result<(
 }
 
 /// Comments of others are as they were, but for being resolved or not; those added or
-/// changed are `name`'s, and so are those taken away.
+/// changed are `name`'s, and so are those taken away. A comment's text is its own: a new one's
+/// is in a new comment part, which no other comment has, and a comment keeps its part. (A
+/// change doesn't make a comment of theirs point at someone else's comment text, or a header,
+/// which their own comments' texts are left out of the comparison as.)
 fn own_comments(before: &Document, after: &Document, name: &str) -> Result<(), String> {
     for (id, c) in &after.comments {
         match before.comments.get(id) {
@@ -107,7 +111,14 @@ fn own_comments(before: &Document, after: &Document, name: &str) -> Result<(), S
             Some(old) if *old != Comment { resolved: old.resolved, ..c.clone() } && (old.author != name || c.author != name) => {
                 return Err(format!("comment {id} is {}'s: only they change it", old.author));
             }
+            None if before.parts.contains_key(&c.part) || !after.parts.get(&c.part).is_some_and(|p| p.kind == PartKind::Comment) => {
+                return Err(format!("comment {id}'s text is a comment part of its own"));
+            }
+            Some(old) if old.part != c.part => return Err(format!("comment {id}'s text stays where it is")),
             _ => {}
+        }
+        if before.comments.get(id) != Some(c) && after.comments.iter().any(|(other, o)| other != id && o.part == c.part) {
+            return Err(format!("comment {id}'s text is a comment part of its own"));
         }
     }
     if let Some((id, c)) = before.comments.iter().find(|(id, c)| !after.comments.contains_key(id) && c.author != name) {
@@ -195,8 +206,13 @@ fn comparable(doc: &Document, name: &str) -> Result<Document, String> {
             }
         }
     }
+    // Their comments' texts go with them: those in comment parts no one else's comment has.
+    let others: BTreeSet<u32> = doc.comments.values().filter(|c| c.author != name).map(|c| c.part).collect();
     for id in &ids {
-        if let Some(c) = d.comments.remove(id) {
+        if let Some(c) = d.comments.remove(id)
+            && !others.contains(&c.part)
+            && d.parts.get(&c.part).is_some_and(|p| p.kind == PartKind::Comment)
+        {
             d.parts.remove(&c.part);
         }
     }
@@ -217,27 +233,61 @@ fn rejected(doc: Document) -> Result<Document, String> {
     }
 }
 
-/// What each tracked change covers, in document order: the characters (with the objects among
-/// them) and paragraph marks it is on, with their formatting, and the properties of the
-/// paragraphs, sections, tables, rows and cells it changed. The tracked changes of `name` on
-/// them are taken back first (a deletion of theirs, their formatting change, or a paragraph
-/// they split), so what others' cover looks as it did before they suggested anything.
-fn covered(doc: &Document, name: &str) -> BTreeMap<u32, Vec<Covered>> {
+/// What each tracked change covers, in document order, and where: the characters (with the
+/// objects among them) and paragraph marks it is on, with their formatting, and the properties
+/// of the paragraphs, sections, tables, rows and cells it changed. The tracked changes of
+/// `name` on them are taken back first (a deletion of theirs, their formatting change, or a
+/// paragraph they split), so what others' cover looks as it did before they suggested
+/// anything, and is where it was ([`Place`]).
+fn covered(doc: &Document, name: &str) -> BTreeMap<u32, Vec<(Place, Covered)>> {
     let own: BTreeSet<u32> = doc.revisions.iter().enumerate().filter(|(_, r)| r.author == name).filter_map(|(i, _)| u32::try_from(i).ok()).collect();
-    let mut c = Coverage { own, by: BTreeMap::new(), styles: &doc.styles };
+    let mut c = Coverage { own, by: BTreeMap::new(), styles: &doc.styles, at: Place::start(Story::Body) };
     c.blocks(&doc.body, 0);
-    for part in doc.parts.values() {
+    for (id, part) in &doc.parts {
+        c.at = Place::start(Story::Part(*id));
         c.blocks(&part.blocks, 0);
     }
-    for sep in [&doc.footnote_separators, &doc.endnote_separators] {
-        for blocks in [&sep.separator, &sep.continuation_separator, &sep.continuation_notice].into_iter().flatten() {
+    let separators = [&doc.footnote_separators, &doc.endnote_separators]
+        .into_iter()
+        .flat_map(|sep| [&sep.separator, &sep.continuation_separator, &sep.continuation_notice]);
+    for (i, blocks) in separators.enumerate() {
+        if let Some(blocks) = blocks {
+            c.at = Place::start(Story::Separator(i));
             c.blocks(blocks, 0);
         }
     }
     if let Some(ch) = &doc.last_section.fmt_change {
+        c.at = Place::start(Story::LastSection);
         c.push(ch.rev, Covered::Section(Box::new(doc.last_section.clone())));
     }
     c.by
+}
+
+/// Where something a tracked change covers is ([`covered`]): in which story, in which of its
+/// paragraphs (counted in order, through tables, as one once the participant's own split
+/// marks are taken back) and at which byte of its text (without the participant's own
+/// insertions). Taking back what the participant suggested moves nothing to another place.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Place {
+    story: Story,
+    para: u64,
+    off: usize,
+}
+
+impl Place {
+    fn start(story: Story) -> Place {
+        Place { story, para: 0, off: 0 }
+    }
+}
+
+/// A story [`covered`] walks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Story {
+    Body,
+    Part(u32),
+    /// A note separator or continuation notice, by its order.
+    Separator(usize),
+    LastSection,
 }
 
 /// One thing a tracked change covers ([`covered`]).
@@ -270,9 +320,11 @@ struct Fate {
 struct Coverage<'a> {
     /// The revisions of the participant checked.
     own: BTreeSet<u32>,
-    by: BTreeMap<u32, Vec<Covered>>,
+    by: BTreeMap<u32, Vec<(Place, Covered)>>,
     /// The document's styles (the style Enter gives the paragraph after a heading).
     styles: &'a StyleSheet,
+    /// Where the walk is.
+    at: Place,
 }
 
 impl Coverage<'_> {
@@ -280,17 +332,21 @@ impl Coverage<'_> {
         if self.own.contains(&rev) {
             return;
         }
+        let at = self.at;
         let list = self.by.entry(rev).or_default();
         // Characters split by the participant's own insertions, deletions or formatting are
-        // one stretch, as they were.
-        if let (Some(Covered::Chars(text, props, objects)), Covered::Chars(t, p, o)) = (list.last_mut(), &what)
+        // one stretch, as they were: the next follows on where the last ends.
+        if let (Some((was, Covered::Chars(text, props, objects))), Covered::Chars(t, p, o)) = (list.last_mut(), &what)
             && props == p
+            && was.story == at.story
+            && was.para == at.para
+            && was.off.saturating_add(text.len()) == at.off
         {
             text.push_str(t);
             objects.extend(o.iter().cloned());
             return;
         }
-        list.push(what);
+        list.push((at, what));
     }
 
     /// `c` with the participant's own deletion and formatting change on it taken back.
@@ -387,6 +443,11 @@ impl Coverage<'_> {
                         let text = p.text.get(range.clone()).unwrap_or_default().to_string();
                         let here: Vec<InlineObject> = objects.iter().filter(|o| range.contains(o)).filter_map(|o| p.object_at(*o).cloned()).collect();
                         self.chars(props, |c| Covered::Chars(text.clone(), Box::new(c), here.clone()));
+                        // The participant's own insertions aren't there once taken back: what
+                        // comes after them is where it was.
+                        if !props.ins.is_some_and(|r| self.own.contains(&r)) {
+                            self.at.off = self.at.off.saturating_add(range.len());
+                        }
                     }
                     let fate = fates.get(&i).copied().unwrap_or_default();
                     // The paragraph joined from `first` on ends here: its mark and properties
@@ -413,6 +474,12 @@ impl Coverage<'_> {
                         && let Some(ch) = &section.fmt_change
                     {
                         self.push(ch.rev, Covered::Section(Box::new(section.clone())));
+                    }
+                    // The next paragraph starts after a mark that stays, and goes on from where
+                    // this one ends when its mark goes (joined to this one).
+                    if !fate.mark_goes {
+                        self.at.para = self.at.para.saturating_add(1);
+                        self.at.off = 0;
                     }
                 }
                 Block::Table(t) => {

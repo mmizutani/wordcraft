@@ -18,6 +18,27 @@ impl Session {
         (mutates && self.role == Some(Role::Viewer)).then_some("a viewer changes nothing")
     }
 
+    /// Why a participant's copy (`confined`) doesn't run command `id`, inside other
+    /// commands too (a macro's steps, Repeat): its role's scopes don't allow it. No files, other
+    /// documents or windows, and the application's settings only for an owner.
+    pub(super) fn confined_refuses(&self, id: &str) -> Option<String> {
+        if !self.confined {
+            return None;
+        }
+        match crate::scope::Scope::of(id) {
+            Some(scope) => self.role.unwrap_or(Role::Owner).refuses(scope),
+            None => Some("it has no scope".to_string()),
+        }
+    }
+
+    /// Whether a command is held to the participant's role as a whole: an edit (`mutates`), and
+    /// a pure command run by a participant below editor outside other commands, since Repeat
+    /// and a macro change the document through the commands they run, which aren't held to it
+    /// on their own, and Undo and Redo through the steps they put back.
+    pub(super) fn held_to_role(&self, mutates: bool) -> bool {
+        mutates || (self.role.is_some_and(|r| r < Role::Editor) && self.outside_commands())
+    }
+
     /// A suggester's edits are tracked changes in their name, whatever the document's setting:
     /// Track Changes, formatting included, is on for their commands alone.
     pub(super) fn force_tracking(&mut self, mutates: bool) -> Forced {
@@ -31,22 +52,26 @@ impl Session {
         Some(was)
     }
 
-    /// After command `id` ran on document `home` (`before` it, when it edits): in a shared
-    /// document the whole command (not each command it ran) is held to the participant's role.
-    /// The formatting it changed becomes formatting revisions now, while their tracking is on,
-    /// for the check to see them; tracking forced on for it goes back. A command that did more
-    /// than the role lets them gets an error in `result`, and is undone like any failed one.
-    /// Whether its formatting revisions are recorded.
+    /// After command `id` ran on document `home` (`before` it, when it `mutates`, or is a pure
+    /// one a role below editor is held to): in a shared document the whole command (not each
+    /// command it ran) is held to the participant's role, a pure one's too, since Repeat, a
+    /// macro, Undo and Redo change the document through the commands they run or the steps
+    /// they put back. The formatting an edit changed becomes formatting revisions now, while
+    /// their tracking is on, for the check to see them (a pure command's were, by the commands
+    /// it ran); tracking forced on for it goes back. A command that did more than the role lets
+    /// them gets an error in `result`, and is undone like any failed one. Whether its
+    /// formatting revisions are recorded.
     pub(super) fn hold_to_role(
         &mut self,
         id: &str,
         home: u64,
+        mutates: bool,
         forced: Forced,
         before: Option<&Document>,
         result: &mut Result<Value, CmdError>,
     ) -> bool {
         let checked = self.role.is_some() && self.outside_commands() && self.document_id == home;
-        let recorded = checked && result.is_ok() && before.is_some();
+        let recorded = checked && mutates && result.is_ok() && before.is_some();
         if recorded && let Some(before) = before {
             crate::cmd::fmt_revisions::record(self, id, before);
         }

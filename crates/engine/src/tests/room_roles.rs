@@ -97,6 +97,10 @@ fn no_one_takes_another_s_name() {
     let cy = join(&room, "Cy");
     assert!(matches!(room.invite("Cy", Role::Owner), Err(RoomError::Name(_))));
     assert_eq!(cy.participant().role, Role::Editor);
+    // Nor does the room's own process join a second participant under a name that is taken:
+    // they would edit and take back Cy's comments and tracked changes as their own.
+    assert!(matches!(room.join("cy", Role::Suggester), Err(RoomError::Name(_))));
+    assert!(matches!(room.join("Cy", Role::Editor), Err(RoomError::Name(_))));
     // Names: not empty, not too long, no control characters; spaces around them go.
     for bad in ["", "   ", "a\nb", "tab\there", &"x".repeat(129)] {
         assert!(matches!(room.invite(bad, Role::Viewer), Err(RoomError::Name(_))), "{bad:?}");
@@ -390,6 +394,133 @@ fn the_hub_holds_each_change_to_its_participant_s_role() {
     assert_eq!(resolved(doc, true), "O Hello world!");
 }
 
+#[test]
+fn others_tracked_changes_stay_where_they_are() {
+    let mut hub = Hub::new(Document::from_text("Hello world\nGoodbye"));
+    let sam = hub.admit("Sam", Role::Suggester).unwrap().id;
+    let ed = hub.admit("Ed", Role::Editor).unwrap().id;
+    let base = hub.document().clone();
+    // Ed's suggestions: "!" after "world", and the second paragraph centred.
+    let by_ed = change_by(&base, "Ed", true, |s| {
+        s.run("select.text", &json!({"text": "world"})).unwrap();
+        s.run("caret.right", &json!({})).unwrap();
+        s.run("text.insert", &json!({"text": "!"})).unwrap();
+        s.run("select.text", &json!({"text": "Goodbye"})).unwrap();
+        s.run("para.alignCenter", &json!({})).unwrap();
+    });
+    assert_eq!(hub.submit(0, &by_ed, ed).map(|t| t.version), Ok(1));
+    let base = hub.document().clone();
+    let paths = base.para_paths(StoryRef::Body);
+    let crafted = |f: &dyn Fn(&mut Document)| {
+        let mut d = base.clone();
+        f(&mut d);
+        ChangeSet::between(&base, &d)
+    };
+    // Moving them doesn't change what rejecting them leaves, nor what they are: it changes
+    // where they would go in, which is Ed's to say.
+    let bang = |d: &mut Document, to: usize, off: usize| {
+        let first = d.para_mut(StoryRef::Body, &paths[0]).unwrap();
+        let props = first.props_of_char(11).clone();
+        assert!(props.ins.is_some());
+        first.delete(11, 12).unwrap();
+        first.touch();
+        let p = d.para_mut(StoryRef::Body, &paths[to]).unwrap();
+        p.insert_text(off, "!", &props).unwrap();
+        p.touch();
+    };
+    let to_start = crafted(&|d| bang(d, 0, 0));
+    let to_goodbye = crafted(&|d| bang(d, 1, 7));
+    let centred_first = crafted(&|d| {
+        let second = d.para(StoryRef::Body, &paths[1]).unwrap().props.clone();
+        let first = d.para(StoryRef::Body, &paths[0]).unwrap().props.clone();
+        d.para_mut(StoryRef::Body, &paths[0]).unwrap().props = second;
+        d.para_mut(StoryRef::Body, &paths[1]).unwrap().props = first;
+        for path in &paths {
+            d.para_mut(StoryRef::Body, path).unwrap().touch();
+        }
+    });
+    for crafted in [&to_start, &to_goodbye, &centred_first] {
+        let took = hub.submit(1, crafted, sam);
+        assert!(matches!(&took, Err(Bounce::Refused(why)) if why.contains("leaves Ed's tracked changes")), "{took:?}");
+    }
+    // Sam's own suggestions around them move nothing of Ed's: a paragraph before them, text
+    // between, a split before, a deletion and text typed into the centred paragraph.
+    let around = change_by(&base, "Sam", true, |s| {
+        s.run("caret.docStart", &json!({})).unwrap();
+        s.run("text.insert", &json!({"text": "Intro"})).unwrap();
+        s.run("text.newParagraph", &json!({})).unwrap();
+        s.run("select.text", &json!({"text": "world"})).unwrap();
+        s.run("caret.right", &json!({})).unwrap();
+        s.run("text.insert", &json!({"text": " again"})).unwrap();
+        s.run("select.text", &json!({"text": "Hello"})).unwrap();
+        s.run("caret.right", &json!({})).unwrap();
+        s.run("text.newParagraph", &json!({})).unwrap();
+        s.run("select.text", &json!({"text": "Good"})).unwrap();
+        s.run("text.delete", &json!({})).unwrap();
+        s.run("caret.docEnd", &json!({})).unwrap();
+        s.run("text.insert", &json!({"text": " now"})).unwrap();
+    });
+    assert_eq!(hub.submit(1, &around, sam).map(|t| t.version), Ok(2));
+    let doc = hub.document();
+    assert_eq!(resolved(doc, false), "Hello world\nGoodbye");
+    assert_eq!(resolved(doc, true), "Intro\nHello\n world again!\nbye now");
+}
+
+#[test]
+fn a_comment_s_text_is_its_own() {
+    let mut hub = Hub::new(Document::from_text("Hello world"));
+    let cy = hub.admit("Cy", Role::Commenter).unwrap().id;
+    let ed = hub.admit("Ed", Role::Editor).unwrap().id;
+    let note = |base: &Document, author: &str, text: &str| {
+        change_by(base, author, false, |s| {
+            s.run("select.text", &json!({"text": "world"})).unwrap();
+            s.run("review.newComment", &json!({"text": text})).unwrap();
+        })
+    };
+    let base = hub.document().clone();
+    assert_eq!(hub.submit(0, &note(&base, "Ed", "Ed's note"), ed).map(|t| t.version), Ok(1));
+    let base = hub.document().clone();
+    let (&eds, ed_note) = base.comments.iter().next().unwrap();
+    let ed_part = ed_note.part;
+    // A comment of Cy's whose text is Ed's comment's, or a part that isn't there, is refused:
+    // Cy's comments' texts are left out of the comparison, so Cy could rewrite it next.
+    for part in [ed_part, 999] {
+        let mut d = base.clone();
+        d.comments.insert(eds + 1, wordcraft_doc::Comment { author: "Cy".into(), part, ..ed_note.clone() });
+        let took = hub.submit(1, &ChangeSet::between(&base, &d), cy);
+        assert!(matches!(&took, Err(Bounce::Refused(why)) if why.contains("comment part of its own")), "{part}: {took:?}");
+    }
+    // Their own comment, in a part of its own, goes through, and they edit its text.
+    assert_eq!(hub.submit(1, &note(&base, "Cy", "Cy's note"), cy).map(|t| t.version), Ok(2));
+    let base = hub.document().clone();
+    let (&cys, _) = base.comments.iter().find(|(_, c)| c.author == "Cy").unwrap();
+    let edit = |id: u32| change_by(&base, "Cy", false, |s| drop(s.run("review.editComment", &json!({"id": id, "text": "changed"}))));
+    assert_eq!(hub.submit(2, &edit(cys), cy).map(|t| t.version), Ok(3));
+    // Moving their comment's text to Ed's comment's part is refused too.
+    let base = hub.document().clone();
+    let mut d = base.clone();
+    if let Some(c) = d.comments.get_mut(&cys) {
+        c.part = ed_part;
+    }
+    assert!(matches!(hub.submit(3, &ChangeSet::between(&base, &d), cy), Err(Bounce::Refused(_))));
+    // A document that has such a comment already (a crafted file): the text it shares with
+    // Ed's comment stays Ed's, while Cy still comments.
+    let mut doc = base.clone();
+    let alias = cys + 1;
+    doc.comments.insert(alias, wordcraft_doc::Comment { author: "Cy".into(), part: ed_part, ..ed_note.clone() });
+    let mut hub = Hub::new(doc);
+    let cy = hub.admit("Cy", Role::Commenter).unwrap().id;
+    let base = hub.document().clone();
+    let rewrite = change_by(&base, "Cy", false, |s| {
+        s.run("review.editComment", &json!({"id": alias, "text": "Cy's now"})).unwrap();
+        // The text alone: the comments stay as they were.
+        s.doc.comments = base.comments.clone();
+    });
+    assert!(!rewrite.is_empty());
+    assert!(matches!(hub.submit(0, &rewrite, cy), Err(Bounce::Refused(_))));
+    assert_eq!(hub.submit(0, &note(&base, "Cy", "Another"), cy).map(|t| t.version), Ok(1));
+}
+
 /// Enter copies a paragraph's properties, with someone else's tracked change on them, to the
 /// paragraph it makes. A suggester splits paragraphs an editor restyled with Track Changes on
 /// (after a heading, inside a paragraph, at its start, and AutoCorrect leaves the editor's text
@@ -515,6 +646,46 @@ fn a_session_with_a_role_holds_its_commands_to_it() {
     s.role = Some(Role::Editor);
     s.run("review.acceptAll", &json!({})).unwrap();
     assert!(s.doc.revisions.is_empty());
+}
+
+#[test]
+fn commands_that_run_others_or_put_steps_back_are_held_to_the_role() {
+    // A commenter's refused command is refused again when Repeat or a macro runs it.
+    let mut s = Session::new(Document::from_text("Hello world"));
+    s.author = "Cy".into();
+    s.role = Some(Role::Commenter);
+    assert!(matches!(s.run("design.pageColor", &json!({"color": "FF0000"})), Err(CmdError::Disabled(_))));
+    let before = s.doc.clone();
+    assert!(matches!(s.run("edit.repeat", &json!({})), Err(CmdError::Disabled(_))));
+    assert_eq!(s.doc, before);
+    let steps = json!([{"command": "select.text", "params": {"text": "world"}}, {"command": "format.bold", "params": {}}]);
+    s.run("tools.macros", &json!({"define": {"name": "bold", "steps": steps}})).unwrap();
+    assert!(matches!(s.run("tools.macros", &json!({"run": "bold"})), Err(CmdError::Disabled(_))));
+    assert_eq!(s.doc, before);
+    // What the role allows goes through them: a comment, and the same again.
+    s.run("select.text", &json!({"text": "world"})).unwrap();
+    s.run("review.newComment", &json!({"text": "Which world?"})).unwrap();
+    s.run("edit.repeat", &json!({})).unwrap();
+    assert_eq!(s.doc.comments.len(), 2);
+    // Undo and Redo put back only what the role allows: here, a step from before the session
+    // had a role, which a suggester can't take back untracked. It stays to undo.
+    let mut s = Session::new(Document::from_text("Hello"));
+    s.author = "Sam".into();
+    s.run("caret.docEnd", &json!({})).unwrap();
+    s.run("text.insert", &json!({"text": " world"})).unwrap();
+    s.role = Some(Role::Suggester);
+    let before = s.doc.clone();
+    assert!(matches!(s.run("edit.undo", &json!({})), Err(CmdError::Disabled(_))));
+    assert_eq!(s.doc, before);
+    assert!(s.can_undo());
+    // In a room, the hub never sees such a change: the copy sends nothing.
+    let room = Room::new(Document::from_text("Hello world"));
+    let mut cy = join_as(&room, "Cy", Role::Commenter);
+    run(&mut cy, "select.text", json!({"text": "world"}));
+    refused(&mut cy, "format.bold", json!({}));
+    refused(&mut cy, "edit.repeat", json!({}));
+    cy.send();
+    assert_eq!(room.version(), 0);
 }
 
 /// An edit for the comparison below: by Sam, the participant checked, or by Ed; with Track

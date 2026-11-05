@@ -217,12 +217,25 @@ fn new_comments(before: &[u32], doc: &Document) -> Vec<u32> {
     doc.comments.keys().copied().filter(|id| before.binary_search(id).is_err()).collect()
 }
 
+/// The ids of the blocks change `cs` put in that weren't in the document before it (in the
+/// order it put them in): not those it took away and put back.
+fn new_blocks(cs: &ChangeSet) -> Vec<BlockId> {
+    let parts = cs.parts.iter().flat_map(|p| match p {
+        wordcraft_doc::change::PartChange::Removed { blocks, .. } => blocks.as_slice(),
+        _ => &[],
+    });
+    let old: std::collections::BTreeSet<BlockId> =
+        cs.splices.iter().flat_map(|s| &s.removed).chain(parts).flat_map(|b| std::iter::once(b.id).chain(b.inside.iter().copied())).collect();
+    cs.ids_put_in().into_iter().filter(|id| !old.contains(id)).collect()
+}
+
 /// What a command reads from its session besides the document, the selection, its params and
 /// [`Inputs`], and the participant can change without changing the document: the options
 /// (typing replaces the selection, Overtype, AutoCorrect, AutoFormat…), the view (Outline view,
 /// field codes, the pens and the rest of the Draw tab, design mode…; without the lasso, kept
 /// with the selection in [`Around`]), the highlighter colour, the editing language, the
-/// bibliography style and column selection mode.
+/// bibliography style, column selection mode, and the name and initials new comments and
+/// tracked changes are made under.
 #[derive(Clone, Debug, PartialEq)]
 struct Context {
     prefs: Prefs,
@@ -231,6 +244,8 @@ struct Context {
     editing_lang: Option<String>,
     bib_style: String,
     column_mode: bool,
+    author: String,
+    initials: String,
 }
 
 impl Context {
@@ -243,6 +258,8 @@ impl Context {
             editing_lang: s.editing_lang.clone(),
             bib_style: s.bib_style.clone(),
             column_mode: s.column_mode,
+            author: s.author.clone(),
+            initials: s.initials.clone(),
         }
     }
 
@@ -254,6 +271,8 @@ impl Context {
             && self.editing_lang == s.editing_lang
             && self.bib_style == s.bib_style
             && self.column_mode == s.column_mode
+            && self.author == s.author
+            && self.initials == s.initials
     }
 
     /// Put it in session `s`, which keeps its lasso.
@@ -266,6 +285,8 @@ impl Context {
         s.editing_lang = self.editing_lang;
         s.bib_style = self.bib_style;
         s.column_mode = self.column_mode;
+        s.author = self.author;
+        s.initials = self.initials;
     }
 }
 
@@ -328,6 +349,8 @@ struct Made {
     pending: Option<CharProps>,
     /// The ids of the comments it made (sorted).
     comments: Vec<u32>,
+    /// The ids of the blocks it made ([`new_blocks`]).
+    blocks: Vec<BlockId>,
     /// The options, view and the rest of what it read from the session that the participant can
     /// change without an edit, shared with the commands before it while they don't change.
     context: Option<Arc<Context>>,
@@ -347,6 +370,7 @@ impl Made {
             inputs: None,
             pending: None,
             comments: Vec::new(),
+            blocks: Vec::new(),
             context: None,
             tries: 0,
         }
@@ -431,10 +455,18 @@ pub struct Replica {
     /// ([`Replica::lend`]): the app's window's, which has other documents open beside the
     /// room's. The copy never closes them.
     lent: bool,
+    /// While edits are made again: the blocks they made, by the id each had when it was made,
+    /// with the id it has now, or none when it wasn't made again. Places in them are found by
+    /// these ids, not moved by comparing documents, which would take a block another
+    /// participant put in at the same place for one of them.
+    reborn: BTreeMap<BlockId, Option<BlockId>>,
 }
 
 impl Replica {
-    pub(super) fn new(room: Arc<Room>, who: Participant, session: Session, version: u64, confirmed: Document) -> Replica {
+    pub(super) fn new(room: Arc<Room>, who: Participant, mut session: Session, version: u64, confirmed: Document) -> Replica {
+        // Commands run inside others (a macro's steps, Repeat) are held to the role's scopes
+        // too: they can't reach files either.
+        session.confined = true;
         let document = session.document_id();
         let seen = session.changes().version();
         Replica {
@@ -450,6 +482,7 @@ impl Replica {
             serials: 0,
             stats: Stats::default(),
             lent: false,
+            reborn: BTreeMap::new(),
         }
     }
 
@@ -547,12 +580,28 @@ impl Replica {
 
     fn run_as(&mut self, id: &str, params: &Value, how: Runner) -> Result<Value, CmdError> {
         let Some(scope) = Scope::of(id) else { return Err(CmdError::Unknown(id.to_string())) };
-        if !self.who.role.allows(scope) {
-            let why = match scope {
-                Scope::File | Scope::Ui => "files, other documents and windows aren't part of a shared document".to_string(),
-                _ => format!("a {} doesn't change the application's settings", self.who.role),
-            };
+        if let Some(why) = self.who.role.refuses(scope) {
             return Err(CmdError::Disabled(format!("{id}: {why}")));
+        }
+        // A macro's steps run one by one as the copy's commands, so that each keeps its places
+        // and the rest of what it takes to make it again (made again whole, a macro would make
+        // its steps at the offsets they had). A step that fails stops the macro; the steps
+        // before it stay made.
+        if id == "tools.macros"
+            && let Some(name) = params.get("run").and_then(Value::as_str)
+        {
+            let mut rest = params.clone();
+            if let Some(o) = rest.as_object_mut() {
+                o.remove("run");
+            }
+            if rest.as_object().is_some_and(|o| !o.is_empty()) {
+                self.run(id, &rest)?;
+            }
+            let steps = self.session.macros.get(name).cloned().ok_or_else(|| CmdError::Params(format!("no macro `{name}`")))?;
+            for (step, p) in steps.iter().take(10_000).filter(|(step, _)| step != "tools.macros") {
+                self.run(step, p)?;
+            }
+            return Ok(serde_json::json!({"ran": name, "steps": steps.len()}));
         }
         self.capture();
         if !self.on_document() {
@@ -594,6 +643,7 @@ impl Replica {
             inputs,
             pending,
             comments,
+            blocks: Vec::new(),
             context: Some(context),
             tries,
         };
@@ -810,13 +860,15 @@ impl Replica {
                 renamed.insert(*c, None);
             }
         };
+        self.reborn.clear();
         for (k, u) in dropped.into_iter().enumerate() {
             for (j, m) in u.made.into_iter().enumerate() {
-                let Made { command, before, after, around, places, inputs, pending, comments, context, tries } = m;
+                let Made { command, before, after, around, places, inputs, pending, comments, blocks, context, tries } = m;
                 let tries = if read_again { tries.saturating_add(1) } else { tries };
                 let Some((id, mut params)) = command.filter(|_| tries <= MAX_TRIES) else {
                     self.stats.lost = self.stats.lost.saturating_add(1);
                     gone(&mut renamed, &comments);
+                    self.lost_blocks(&blocks);
                     went_on = None;
                     continue;
                 };
@@ -835,6 +887,7 @@ impl Replica {
                                 "An edit made at the same time as another participant's couldn't be made again ({id}): the comment it was made on is gone"
                             );
                             gone(&mut renamed, &comments);
+                            self.lost_blocks(&blocks);
                             went_on = None;
                             continue;
                         }
@@ -857,6 +910,7 @@ impl Replica {
                 if !self.made_at(reselect, before, &around, &places, &mut params, through) {
                     self.stats.lost = self.stats.lost.saturating_add(1);
                     gone(&mut renamed, &comments);
+                    self.lost_blocks(&blocks);
                     self.session.status = format!(
                         "An edit made at the same time as another participant's couldn't be made again ({id}): the text it was made in is gone"
                     );
@@ -872,6 +926,7 @@ impl Replica {
                 self.session.pending = pending;
                 went_on = Some(after);
                 let comments_before: Vec<u32> = self.session.doc.comments.keys().copied().collect();
+                let units = self.pending.len();
                 match self.run_made(&id, &params, tries, Session::run) {
                     Ok(_) => {
                         self.stats.made_again = self.stats.made_again.saturating_add(1);
@@ -882,10 +937,24 @@ impl Replica {
                         } else {
                             gone(&mut renamed, &comments);
                         }
+                        // Its new blocks, paired in the order they were put in.
+                        let made = self
+                            .pending
+                            .get(units..)
+                            .and_then(|u| u.last())
+                            .and_then(|u| u.made.last())
+                            .map(|m| m.blocks.clone())
+                            .unwrap_or_default();
+                        if made.len() == blocks.len() {
+                            self.reborn.extend(blocks.iter().copied().zip(made.into_iter().map(Some)));
+                        } else {
+                            self.lost_blocks(&blocks);
+                        }
                     }
                     Err(e) => {
                         self.stats.lost = self.stats.lost.saturating_add(1);
                         gone(&mut renamed, &comments);
+                        self.lost_blocks(&blocks);
                         self.session.status = format!("An edit made at the same time as another participant's couldn't be made again ({id}): {e}");
                         went_on = None;
                     }
@@ -906,6 +975,12 @@ impl Replica {
         }
         self.session.math = math_now.and_then(|(a, m)| Some(crate::MathEdit { at: self.find(a, through)?, ..m }));
         self.session.also_selected.clear();
+        self.reborn.clear();
+    }
+
+    /// Blocks dropped edits made that weren't made again: places in them are gone.
+    fn lost_blocks(&mut self, blocks: &[BlockId]) {
+        self.reborn.extend(blocks.iter().map(|b| (*b, None)));
     }
 
     /// Put the selection a command was made with back (when `reselect`), with its column or
@@ -972,9 +1047,14 @@ impl Replica {
         let segments = c.segments.iter().map(|(a, b)| Some((self.find(*a, through)?, self.find(*b, through)?))).collect::<Option<Vec<_>>>()?;
         let cells = match &c.cells {
             Some((id, r, was)) => {
+                // A table an edit made again made is found by the id it has now.
+                let table = match self.reborn.get(id) {
+                    Some(now) => (*now)?,
+                    None => *id,
+                };
                 let mut at = None;
                 self.session.doc.each_block(&mut |story, path, b| {
-                    if at.is_none() && b.id() == *id {
+                    if at.is_none() && b.id() == table {
                         at = Some((story, Path(path.to_vec()), b.as_table().map_or(0, |t| t.rows.len())));
                     }
                 });
@@ -1003,6 +1083,10 @@ impl Replica {
     /// Where anchor `a` is now: moved through `through`, which the copy's document had made
     /// since, or found by its paragraph.
     fn find(&self, a: Anchor, through: Option<&ChangeSet>) -> Option<Pos> {
+        // In a block an edit made again made: in that block as it was made again.
+        if let Some(now) = self.reborn.get(&a.block) {
+            return self.session.doc.pos_of(Anchor { block: (*now)?, ..a }, None);
+        }
         let m = through.map_or(Mapped::At(a), |cs| cs.map(a));
         // A change that replaced the blocks around it whole (a table with a row put in) leaves
         // it beside them; when its paragraph is still there, it is in it.
@@ -1053,6 +1137,8 @@ impl Replica {
         };
         self.seen = self.session.changes().version();
         let n = changes.len();
+        let mut made = made;
+        made.blocks = changes.iter().flat_map(|cs| new_blocks(cs)).collect();
         for (i, cs) in changes.into_iter().enumerate() {
             if cs.is_empty() {
                 continue;

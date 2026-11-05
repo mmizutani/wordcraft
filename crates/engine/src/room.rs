@@ -94,6 +94,17 @@ impl Role {
         }
     }
 
+    /// Why this role's copy doesn't run commands of `scope`, when it doesn't ([`Role::allows`]).
+    pub fn refuses(self, scope: Scope) -> Option<String> {
+        if self.allows(scope) {
+            return None;
+        }
+        Some(match scope {
+            Scope::File | Scope::Ui => "files, other documents and windows aren't part of a shared document".to_string(),
+            _ => format!("a {self} doesn't change the application's settings"),
+        })
+    }
+
     /// The role's name: `viewer`, `commenter`, `suggester`, `editor` or `owner`.
     pub fn name(self) -> &'static str {
         match self {
