@@ -41,10 +41,11 @@ on:
 permissions:
   contents: read
 
-# One deploy at a time. A push during a run queues one more run; older queued runs are dropped.
+# Only the newest push deploys: a new run cancels the one in progress, whose site would be
+# replaced straight away anyway.
 concurrency:
   group: pages
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
