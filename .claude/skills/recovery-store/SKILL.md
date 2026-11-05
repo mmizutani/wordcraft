@@ -24,7 +24,7 @@ Run it for any change to the files under Coverage: the order of the steps in `wr
 sh .claude/skills/recovery-store/check.sh
 ```
 
-It takes about 30 seconds. On a first run it downloads `tla2tools.jar` 1.7.4 from github.com and verifies its SHA-256; it needs Java 11 or later. Set `TLA2TOOLS` and `JAVA` to skip finding them. A sandboxed agent must allow github.com for that download, and `.claude/skills/` may refuse Bash writes there, so edit these files with the Write and Edit tools.
+It takes about 30 seconds. On a first run it downloads `tla2tools.jar` 1.7.4 from github.com to `~/.cache/wordcraft-tla` (each run, if that folder is refused) and verifies its SHA-256; it needs Java 11 or later. Set `TLA2TOOLS` and `JAVA` to skip finding them. A sandboxed agent must allow github.com for that download, and `.claude/skills/` may refuse Bash writes there, so edit these files with the Write and Edit tools.
 
 | Exit | Meaning | What to do |
 |---|---|---|

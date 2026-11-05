@@ -16,10 +16,10 @@ sha_of() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; }
 
 jar=${TLA2TOOLS:-}
 if [ -z "$jar" ]; then
-  # A folder the sandbox may refuse falls back to the temporary one.
+  # A cache folder the sandbox refuses falls back to this run's private folder, never a fixed path
+  # under the temporary folder: there another local user could swap the jar after its hash check.
   cache=${XDG_CACHE_HOME:-$HOME/.cache}/wordcraft-tla
-  mkdir -p "$cache" 2>/dev/null && [ -w "$cache" ] || cache=${TMPDIR:-/tmp}/wordcraft-tla
-  mkdir -p "$cache" || exit 4
+  mkdir -p "$cache" 2>/dev/null && [ -w "$cache" ] || cache=$tmp
   jar=$cache/tla2tools-$version.jar
   if [ ! -f "$jar" ]; then
     curl -fsSL --max-time 120 -o "$jar.part" \
