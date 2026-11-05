@@ -1007,3 +1007,56 @@ fn an_edit_of_a_new_comment_made_again_edits_that_comment() {
     smooth(&copies);
     same_everywhere(&copies).unwrap();
 }
+
+#[test]
+fn edits_in_a_new_text_box_made_again_are_made_in_that_box() {
+    let room = Room::new(Document::from_text("one two"));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    let boxes = |r: &Replica| {
+        let d = &r.session().doc;
+        let mut t: Vec<String> = d.parts.keys().map(|k| d.plain_text(StoryRef::Part(*k))).filter(|t| !t.is_empty()).collect();
+        t.sort();
+        t
+    };
+    // Ana and Ben each put a text box in and type "abc" in it, Ben first; then Ana types "X"
+    // over her "b". Ana's box is made again as another part, and her "X" goes in it, not in
+    // Ben's box.
+    for r in [&mut a, &mut b] {
+        run(r, "caret.docEnd", json!({}));
+        run(r, "insert.textBox", json!({}));
+        run(r, "text.insert", json!({"text": "abc"}));
+    }
+    let end = a.session().sel.focus.clone();
+    assert_ne!(end.story, StoryRef::Body);
+    let at = |off| Pos { off, ..end.clone() };
+    run(&mut a, "select.range", json!({"anchor": at(1), "focus": at(2)}));
+    run(&mut a, "text.insert", json!({"text": "X"}));
+    assert_eq!(boxes(&a), ["aXc"]);
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    assert_eq!(boxes(&a), ["aXc", "abc"]);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
+fn a_copy_refuses_file_commands_run_inside_a_macro() {
+    let room = Room::new(Document::from_text("one"));
+    // An owner, whose role runs macros (the application's settings).
+    let mut r = room.join("Ana", Role::Owner).unwrap();
+    let dir = std::env::temp_dir().join(format!("wordcraft-room-macro-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("saved.docx");
+    let _ = std::fs::remove_file(&path);
+    // A macro whose steps save the document: running it is refused at the save, which writes
+    // nothing.
+    let steps = json!([{"command": "text.insert", "params": {"text": "x"}}, {"command": "file.saveAs", "params": {"path": path}}]);
+    run(&mut r, "tools.macros", json!({"define": {"name": "save", "steps": steps}}));
+    assert!(matches!(r.run("tools.macros", &json!({"run": "save"})), Err(CmdError::Disabled(_))));
+    assert!(!path.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}

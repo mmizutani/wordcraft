@@ -84,6 +84,18 @@ impl Session {
         let ime_text_join = self.ime_text_join.take();
         let reg = self.registry.clone();
         let Some(spec) = reg.get(id) else { return Err(CmdError::Unknown(id.to_string())) };
+        // A participant's copy runs only the commands their role's scopes allow, inside other
+        // commands too (a macro's steps, Repeat): no files, other documents or windows, and the
+        // application's settings only for an owner.
+        if self.confined {
+            let refused = match crate::scope::Scope::of(id) {
+                Some(scope) => self.role.unwrap_or(crate::room::Role::Owner).refuses(scope),
+                None => Some("it has no scope".to_string()),
+            };
+            if let Some(why) = refused {
+                return Err(CmdError::Disabled(format!("{id}: {why}")));
+            }
+        }
         let join = join
             || (equation_join && matches!(id, "equation.type" | "equation.backspace"))
             || (id == "text.insert" && ime_text_join.as_ref().is_some_and(|sel| sel == &self.sel));
