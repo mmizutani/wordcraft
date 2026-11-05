@@ -79,8 +79,9 @@ crate name links to its source tree.
    Their copy undoes a command that changes more than the role lets them (`Session::role`),
    and the hub sends such a change back (`room::rules`): a commenter's must leave the document
    as it was but for their own comments, a suggester's the same once every tracked change is
-   rejected, with others' tracked changes covering what they covered. Both compare only the
-   blocks and parts the change touched.
+   rejected, with others' tracked changes covering what they covered once the suggester's own
+   are taken back (a paragraph they split joins its other half again, as Reject does it). Both
+   compare only the blocks and parts the change touched.
 3. **Layout:** `layout` turns the document into pages of positioned glyphs, boxes and images
    (display list), incrementally: an edit relayouts only what changed (1.4 ms on a 188-page
    document, measured 2026-10-06).
