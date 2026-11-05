@@ -19,7 +19,7 @@ use std::sync::{Arc, OnceLock};
 use wordcraft_doc::para::OBJ;
 use wordcraft_doc::props::{CellProps, ParaProps, RowProps, TableProps};
 use wordcraft_doc::section::SectionProps;
-use wordcraft_doc::{Block, Blocks, CharProps, Comment, Document, InlineObject, StoryRef};
+use wordcraft_doc::{Block, Blocks, CharProps, Comment, Document, InlineObject, StoryRef, StyleSheet};
 
 use super::Role;
 use crate::{Registry, Session};
@@ -220,11 +220,11 @@ fn rejected(doc: Document) -> Result<Document, String> {
 /// What each tracked change covers, in document order: the characters (with the objects among
 /// them) and paragraph marks it is on, with their formatting, and the properties of the
 /// paragraphs, sections, tables, rows and cells it changed. The tracked changes of `name` on
-/// them are taken back first (a deletion of theirs, or their formatting change), so
-/// what others' cover looks as it did before they suggested anything.
+/// them are taken back first (a deletion of theirs, their formatting change, or a paragraph
+/// they split), so what others' cover looks as it did before they suggested anything.
 fn covered(doc: &Document, name: &str) -> BTreeMap<u32, Vec<Covered>> {
     let own: BTreeSet<u32> = doc.revisions.iter().enumerate().filter(|(_, r)| r.author == name).filter_map(|(i, _)| u32::try_from(i).ok()).collect();
-    let mut c = Coverage { own, by: BTreeMap::new() };
+    let mut c = Coverage { own, by: BTreeMap::new(), styles: &doc.styles };
     c.blocks(&doc.body, 0);
     for part in doc.parts.values() {
         c.blocks(&part.blocks, 0);
@@ -246,19 +246,36 @@ enum Covered {
     Chars(String, Box<CharProps>, Vec<InlineObject>),
     Mark(Box<CharProps>),
     Para(Box<ParaProps>),
+    /// The properties of a paragraph the participant split off another, which rejecting the
+    /// split takes away, when they aren't a copy of that one's.
+    Split(Box<ParaProps>),
     Section(Box<SectionProps>),
     Table(Box<TableProps>),
     Row(Box<RowProps>),
     Cell(Box<CellProps>),
 }
 
-struct Coverage {
+/// What rejecting the participant's own paragraph marks does to a paragraph ([`Coverage::fates`]).
+#[derive(Clone, Copy, Default)]
+struct Fate {
+    /// Its properties go: whether they are a copy of those of the paragraph that stays.
+    props: Option<bool>,
+    /// Its mark goes: the paragraph goes whole, or the next one joins it.
+    mark_goes: bool,
+    /// It ends the paragraph joined from the one at this index on, whose properties and mark's
+    /// formatting the joined paragraph keeps, with this one's mark's revisions.
+    ends: Option<usize>,
+}
+
+struct Coverage<'a> {
     /// The revisions of the participant checked.
     own: BTreeSet<u32>,
     by: BTreeMap<u32, Vec<Covered>>,
+    /// The document's styles (the style Enter gives the paragraph after a heading).
+    styles: &'a StyleSheet,
 }
 
-impl Coverage {
+impl Coverage<'_> {
     fn push(&mut self, rev: u32, what: Covered) {
         if self.own.contains(&rev) {
             return;
@@ -300,11 +317,69 @@ impl Coverage {
         }
     }
 
+    /// Someone's tracked changes of the paragraph properties `props`, as `what`.
+    fn para(&mut self, props: &ParaProps, what: fn(Box<ParaProps>) -> Covered) {
+        for rev in [props.fmt_change.as_ref().map(|c| c.rev), props.num_change.as_ref().map(|c| c.rev)].into_iter().flatten() {
+            self.push(rev, what(Box::new(props.clone())));
+        }
+    }
+
+    /// What rejecting the participant's own tracked paragraph marks among `blocks` does to each
+    /// paragraph, as Reject does it (last mark first): such a mark goes, and the next paragraph
+    /// joins the one it ended, which keeps its properties and its mark's formatting, with the
+    /// revisions of the last joined paragraph's mark; or, when nothing but the participant's
+    /// insertions is in that one, it goes whole and the next stays as it is. Enter, splitting
+    /// a paragraph, copies its properties (someone else's tracked change on them too) to the
+    /// paragraph it makes, after the last character with the style's next style and no
+    /// numbering, so those of a split-off paragraph cover nothing the original doesn't.
+    fn fates(&self, blocks: &[Arc<Block>]) -> BTreeMap<usize, Fate> {
+        let para = |i: usize| match blocks.get(i).map(|b| &**b) {
+            Some(Block::Para(p)) => Some(p),
+            _ => None,
+        };
+        let mut fates: BTreeMap<usize, Fate> = BTreeMap::new();
+        // The paragraph after the one looked at, once the marks after it are rejected, and the
+        // last one joined to it.
+        let mut next: Option<(usize, usize)> = None;
+        for i in (0..blocks.len()).rev() {
+            let (Some(p), Some((j, last))) = (para(i), next) else {
+                next = para(i).map(|_| (i, i));
+                continue;
+            };
+            let Some(q) = para(j) else { continue };
+            if !p.mark.ins.is_some_and(|r| self.own.contains(&r)) {
+                next = Some((i, i));
+            } else if p.section.is_none() && p.run_ranges().all(|(_, c)| c.ins.is_some_and(|r| self.own.contains(&r))) {
+                // This one goes whole.
+                fates.insert(i, Fate { props: Some(p.props == q.props), mark_goes: true, ends: None });
+            } else {
+                // The next joins this one.
+                let copy = q.props == p.props || q.props == self.after_end(&p.props);
+                fates.entry(j).or_default().props = Some(copy);
+                fates.entry(i).or_default().mark_goes = true;
+                fates.entry(last).or_default().ends = Some(i);
+                next = Some((i, last));
+            }
+        }
+        fates
+    }
+
+    /// The properties Enter gives the paragraph it makes after the last character of one with
+    /// `props`: the style's next style, without numbering, when it has another.
+    fn after_end(&self, props: &ParaProps) -> ParaProps {
+        let next = props.style.as_deref().and_then(|st| self.styles.get(st).and_then(|x| x.next.clone()).filter(|n| n != st));
+        match next {
+            Some(n) => ParaProps { style: Some(n), numbering: None, ..props.clone() },
+            None => props.clone(),
+        }
+    }
+
     fn blocks(&mut self, blocks: &[Arc<Block>], depth: usize) {
         if depth > MAX_DEPTH {
             return;
         }
-        for b in blocks {
+        let fates = self.fates(blocks);
+        for (i, b) in blocks.iter().enumerate() {
             match &**b {
                 Block::Para(p) => {
                     let objects = p.object_offsets();
@@ -313,9 +388,26 @@ impl Coverage {
                         let here: Vec<InlineObject> = objects.iter().filter(|o| range.contains(o)).filter_map(|o| p.object_at(*o).cloned()).collect();
                         self.chars(props, |c| Covered::Chars(text.clone(), Box::new(c), here.clone()));
                     }
-                    self.chars(&p.mark, |c| Covered::Mark(Box::new(c)));
-                    for rev in [p.props.fmt_change.as_ref().map(|c| c.rev), p.props.num_change.as_ref().map(|c| c.rev)].into_iter().flatten() {
-                        self.push(rev, Covered::Para(Box::new(p.props.clone())));
+                    let fate = fates.get(&i).copied().unwrap_or_default();
+                    // The paragraph joined from `first` on ends here: its mark and properties
+                    // come after the text of all of them, as they will.
+                    let first = fate.ends.and_then(|f| match blocks.get(f).map(|b| &**b) {
+                        Some(Block::Para(f)) => Some(f),
+                        _ => None,
+                    });
+                    if let Some(f) = first {
+                        self.chars(&CharProps { ins: p.mark.ins, del: p.mark.del, ..f.mark.clone() }, |c| Covered::Mark(Box::new(c)));
+                        self.para(&f.props, Covered::Para);
+                    } else if !fate.mark_goes {
+                        self.chars(&p.mark, |c| Covered::Mark(Box::new(c)));
+                    }
+                    // A split-off paragraph's copy of someone's change covers nothing more; one
+                    // that isn't a copy is told apart (rejecting the split takes it away).
+                    match (fate.props, fate.mark_goes) {
+                        (None, false) => self.para(&p.props, Covered::Para),
+                        (Some(false), _) => self.para(&p.props, Covered::Split),
+                        // Kept, at the end of the paragraphs joined to it; or a copy.
+                        (None, true) | (Some(true), _) => {}
                     }
                     if let Some(section) = p.section.as_deref()
                         && let Some(ch) = &section.fmt_change

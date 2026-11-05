@@ -386,6 +386,96 @@ fn the_hub_holds_each_change_to_its_participant_s_role() {
     assert_eq!(resolved(doc, true), "O Hello world!");
 }
 
+/// Enter copies a paragraph's properties, with someone else's tracked change on them, to the
+/// paragraph it makes. A suggester splits paragraphs an editor restyled with Track Changes on
+/// (after a heading, inside a paragraph, at its start, and AutoCorrect leaves the editor's text
+/// alone), and the editor's changes cover what they did: rejecting the splits joins the
+/// paragraphs back. A paragraph they split off is theirs to restyle; restyling or reformatting
+/// what the editor did, or a crafted split whose new paragraph isn't a copy, is refused.
+#[test]
+fn a_suggester_splits_paragraphs_someone_else_restyled() {
+    let room = Room::new(Document::from_text("Title\nbody text"));
+    let mut ed = join(&room, "Ed");
+    run(&mut ed, "review.trackChanges", json!({"value": true}));
+    run(&mut ed, "select.text", json!({"text": "Title"}));
+    run(&mut ed, "para.heading1", json!({}));
+    run(&mut ed, "select.text", json!({"text": "body"}));
+    run(&mut ed, "para.alignCenter", json!({}));
+    run(&mut ed, "format.bold", json!({}));
+    run(&mut ed, "review.trackChanges", json!({"value": false}));
+    let sam = join_as(&room, "Sam", Role::Suggester);
+    let mut copies = [ed, sam];
+    settle(&mut copies).unwrap();
+    let [_, sam] = &mut copies;
+    run(sam, "select.text", json!({"text": "Title"}));
+    run(sam, "caret.right", json!({}));
+    run(sam, "text.newParagraph", json!({}));
+    run(sam, "text.insert", json!({"text": "Intro"}));
+    // Enter after "body" would capitalise it (it starts a sentence), untracked: it stays.
+    run(sam, "select.text", json!({"text": "body"}));
+    run(sam, "caret.right", json!({}));
+    run(sam, "text.newParagraph", json!({}));
+    run(sam, "select.text", json!({"text": "body"}));
+    run(sam, "caret.left", json!({}));
+    run(sam, "text.newParagraph", json!({}));
+    // The paragraph they split off is theirs to restyle (as a tracked change); the ones Ed
+    // restyled aren't.
+    run(sam, "select.text", json!({"text": " text"}));
+    run(sam, "para.align", json!({"value": "right"}));
+    run(sam, "select.text", json!({"text": "body"}));
+    refused(sam, "para.align", json!({"value": "right"}));
+    run(sam, "select.text", json!({"text": "Title"}));
+    refused(sam, "para.heading2", json!({}));
+    run(sam, "select.text", json!({"text": "body"}));
+    refused(sam, "format.italic", json!({}));
+    settle(&mut copies).unwrap();
+    same_everywhere(&copies).unwrap();
+    smooth(&copies);
+    let doc = room.document().1;
+    let kinds: std::collections::BTreeSet<_> = doc.revisions.iter().map(|r| (r.author.as_str(), format!("{:?}", r.kind))).collect();
+    assert_eq!(kinds, [("Ed", "Format".into()), ("Sam", "Format".into()), ("Sam", "Insert".into())].into_iter().collect());
+    let resolve = |id: &str| {
+        let mut s = Session::new(doc.clone());
+        s.run(id, &json!({})).unwrap();
+        let paras = s.doc.body.iter().filter_map(|b| b.as_para());
+        paras.map(|p| (p.text.clone(), p.props.style.clone(), p.props.align, p.props_at(0).bold)).collect::<Vec<_>>()
+    };
+    let (normal, center) = (Some("Normal".to_string()), Some(wordcraft_doc::props::Align::Center));
+    let para = |t: &str, style: Option<String>, align, bold| (t.to_string(), style, align, bold);
+    assert_eq!(resolve("review.rejectAll"), [para("Title", None, None, None), para("body text", None, None, None)]);
+    assert_eq!(
+        resolve("review.acceptAll"),
+        [
+            para("Title", Some("Heading1".into()), None, None),
+            para("Intro", normal, None, None),
+            para("", None, center, None),
+            para("body", None, center, Some(true)),
+            para(" text", None, Some(wordcraft_doc::props::Align::Right), None),
+        ]
+    );
+    // At the hub: a split whose new paragraph keeps Ed's change but isn't a copy of the one it
+    // was split from is refused; the split Enter makes goes through.
+    let mut hub = Hub::new(copies[1].session().doc.clone());
+    let sam = hub.admit("Sam", Role::Suggester).unwrap().id;
+    let base = hub.document().clone();
+    let split = |crafted: bool| {
+        change_by(&base, "Sam", true, |s| {
+            s.run("select.text", &json!({"text": "bod"})).unwrap();
+            s.run("caret.right", &json!({})).unwrap();
+            s.run("text.newParagraph", &json!({})).unwrap();
+            if crafted {
+                let path = s.sel.focus.path.clone();
+                let p = s.doc.para_mut(StoryRef::Body, &path).unwrap();
+                p.props.align = Some(wordcraft_doc::props::Align::Right);
+                p.touch();
+            }
+        })
+    };
+    let took = hub.submit(0, &split(true), sam);
+    assert!(matches!(&took, Err(Bounce::Refused(why)) if why.contains("leaves Ed's tracked changes")), "{took:?}");
+    assert_eq!(hub.submit(0, &split(false), sam).map(|t| t.version), Ok(1));
+}
+
 #[test]
 fn the_application_s_settings_are_the_owner_s() {
     let room = Room::new(Document::from_text("Hello"));

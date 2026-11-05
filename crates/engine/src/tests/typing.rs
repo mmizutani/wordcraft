@@ -517,6 +517,34 @@ fn enter_finishes_a_word_for_autocorrect() {
     assert_eq!(s.doc.plain_text(StoryRef::Body), "Hello\nThe end\n");
 }
 
+/// With Track Changes on, finishing a word corrects only text the author is inserting: a space,
+/// a full stop or Enter after someone else's word leaves it as it is (the change wouldn't be
+/// tracked), so Reject All gives back the document as it was. What they type is corrected.
+#[test]
+fn tracked_autocorrect_leaves_text_the_author_did_not_insert() {
+    let original = "teh 1st\nwww.example.org\nline";
+    let mut s = Session::new(wordcraft_doc::Document::from_text(original));
+    s.author = "Sam".into();
+    run(&mut s, "review.trackChanges", json!({"value": true}));
+    // After "teh" (a replacement and a sentence capital), "1st" (an ordinal), a web address,
+    // and "line" (a sentence capital, finished by Enter).
+    for (word, keys) in [("teh", " "), ("1st", "."), ("example.org", " "), ("line", "\n")] {
+        run(&mut s, "select.text", json!({"text": word}));
+        run(&mut s, "caret.right", json!({}));
+        typ(&mut s, keys);
+    }
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "teh  1st.\nwww.example.org \nline\n");
+    let p = s.doc.para_at(&Pos::body(0, 0)).unwrap();
+    assert_eq!(p.props_of_char(5).vert_align, None);
+    let p = s.doc.para_at(&Pos::body(1, 0)).unwrap();
+    assert_eq!(p.props_of_char(0).link, None);
+    // What they type is corrected as usual.
+    typ(&mut s, "teh end ");
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "teh  1st.\nwww.example.org \nline\nThe end ");
+    run(&mut s, "review.rejectAll", json!({}));
+    assert_eq!(s.doc.plain_text(StoryRef::Body), original);
+}
+
 /// A word after a no-break space or an ideographic space is corrected as after a plain space:
 /// replacements, sentence capitals, ordinals and links.
 #[test]
