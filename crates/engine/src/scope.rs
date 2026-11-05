@@ -104,7 +104,6 @@ pub const OVERRIDES: &[(&str, Scope)] = &[
     ("outline.selectSubtree", Scope::Selection),
     ("equation.edit", Scope::Selection),
     ("equation.exit", Scope::Selection),
-    ("equation.move", Scope::Selection),
     ("equation.inputFormat", Scope::Selection),
     ("equation.normalText", Scope::Selection),
     ("format.state", Scope::Selection),

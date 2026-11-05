@@ -32,7 +32,8 @@ fn every_override_names_a_command_and_changes_its_scope() {
 
 /// A command scoped to a participant's selection or view changes nothing everyone sees: run from
 /// a few places in the sample document, with no params and with params commands commonly take,
-/// none of them makes a change (`document.changes` would carry it to every copy).
+/// none of them makes a change (`document.changes` would carry it to every copy). One place is
+/// in an equation, with `a/b` typed and not yet built up, which leaving its slot builds up.
 #[test]
 fn selection_and_view_commands_never_change_the_document() {
     let reg = crate::cmd::registry();
@@ -40,19 +41,28 @@ fn selection_and_view_commands_never_change_the_document() {
         json!({}),
         json!({"text": "Ab", "value": true, "style": "Heading 1", "name": "x", "index": 0, "level": 2, "page": 0, "x": 100, "y": 100, "points": [[90, 90], [200, 90], [200, 200]]}),
     ];
-    let places = [("caret.docStart", json!({})), ("select.text", json!({"text": "Studio"})), ("caret.docEnd", json!({})), ("select.all", json!({}))];
+    let places: [&[(&str, Value)]; 5] = [
+        &[("caret.docStart", json!({}))],
+        &[("select.text", json!({"text": "Studio"}))],
+        &[("caret.docEnd", json!({}))],
+        &[("select.all", json!({}))],
+        &[("caret.docEnd", json!({})), ("insert.equation", json!({})), ("equation.type", json!({"text": "a/b"}))],
+    ];
     let mut s = Session::new(sample_document());
     let mut changed = Vec::new();
     let mut ran = 0;
     for spec in reg.all().iter().filter(|c| matches!(c.scope(), Scope::Selection | Scope::View | Scope::Ui)) {
         for v in &params {
-            for (place, at) in &places {
-                let _ = s.run(place, at);
+            for steps in places {
+                for (step, at) in steps {
+                    let _ = s.run(step, at);
+                }
                 let version = s.changes().version();
                 let _ = s.run(spec.id, v);
                 ran += 1;
                 if s.changes().version() != version {
-                    changed.push(format!("{} {v} after {place}", spec.id));
+                    let place: Vec<&str> = steps.iter().map(|(step, _)| *step).collect();
+                    changed.push(format!("{} {v} after {}", spec.id, place.join(", ")));
                     s = Session::new(sample_document());
                 }
             }
