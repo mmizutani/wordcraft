@@ -443,3 +443,51 @@ fn a_copy_made_for_a_session_refuses_what_a_copy_refuses() {
     let r = own.lend(&mut win, |c| c.run("tools.autocorrect", &json!({"capSentences": false}))).unwrap();
     assert!(r.is_ok(), "{r:?}");
 }
+
+#[test]
+fn a_participant_s_copy_renders_pages_follows_changes_and_takes_command_ids_as_methods() {
+    let (mut win, _, _) = window();
+    let (room, mut own) = Room::host(&mut win, "Minoru").unwrap();
+    let lobby = Lobby::default();
+    lobby.open(room.clone());
+    let key = room.invite("Agent", Role::Editor).unwrap();
+    let mut agent = lobby.join_with(&key).unwrap();
+    // A command id is a method, with its params, as the window takes it.
+    call(&mut agent, "caret.docEnd", json!({})).unwrap();
+    call(&mut agent, "text.insert", json!({"text": " four"})).unwrap();
+    assert_eq!(room.version(), 1);
+    // A page comes back as PNG in the reply, with what others changed since: here the window
+    // bolds everything, " four" included once a frame brought it in.
+    frame(&mut own, &mut win);
+    in_window(&mut own, &mut win, "select.all", json!({}));
+    in_window(&mut own, &mut win, "format.bold", json!({}));
+    let page = call(&mut agent, "ui.render", json!({"page": 1, "scale": 0.5})).unwrap();
+    assert_eq!(bold(&agent.session().doc), "one two three four");
+    let png = crate::cmd::insert::base64_decode(page["png"].as_str().unwrap()).unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(page["pages"], 1);
+    let (w, h) = (page["width"].as_u64().unwrap(), page["height"].as_u64().unwrap());
+    assert!(w > 100 && h > w, "{w}×{h}");
+    // The default scale is 2 pixels a point, and a hostile one is held to 0.1–8.
+    let width = |v: Value| v["width"].as_f64().unwrap();
+    let near = |got: f64, want: f64| (got - want).abs() <= 2.0;
+    let wide = width(call(&mut agent, "ui.render", json!({})).unwrap());
+    assert!(near(wide, w as f64 * 4.0), "{wide}");
+    let narrow = width(call(&mut agent, "ui.render", json!({"scale": -1e30})).unwrap());
+    assert!(near(narrow, w as f64 / 5.0), "{narrow}");
+    // A copy writes no files, and has the pages its document has.
+    assert!(call(&mut agent, "ui.render", json!({"path": "/tmp/page.png"})).unwrap_err().contains("path"));
+    assert!(call(&mut agent, "ui.render", json!({"page": 9})).unwrap_err().contains("no page 9"));
+    // What changed, by the agent and the window alike, in the copy's own versions.
+    let changes = call(&mut agent, "document.changes", json!({"since": 0})).unwrap();
+    assert!(changes["changes"].as_array().is_some_and(|c| c.len() >= 2), "{changes}");
+    // The feature catalog's parity, as the window gives it.
+    let parity = call(&mut agent, "ui.parity", json!({})).unwrap();
+    assert!(parity["live"].as_u64().unwrap() > 100, "{parity}");
+    // Ids that aren't commands, or are commands the copy refuses, stay errors.
+    assert!(call(&mut agent, "nonsense", json!({})).is_err());
+    assert!(call(&mut agent, "file.save", json!({"path": "/tmp/x.docx"})).is_err());
+    assert!(call(&mut agent, "ui.screenshot", json!({})).unwrap_err().contains("window"));
+    settle_all(&mut own, &mut win, std::slice::from_mut(&mut agent));
+    window_is_hub(&win, &room);
+}
