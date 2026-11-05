@@ -1,15 +1,20 @@
 //! [`Replica`]: a participant's own copy of a room's document.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::Value;
 use wordcraft_doc::change::{Anchor, Mapped, Side};
+use wordcraft_doc::edit::Fragment;
+use wordcraft_doc::props::{CharProps, ParaProps};
 use wordcraft_doc::{ChangeSet, Document, Pos};
 
 use super::{Accepted, Bounce, MAX_BATCH, Participant, ParticipantId, Room};
+use crate::cmd::edit::ClipHistory;
+use crate::cmd::moves::PendingMove;
 use crate::scope::{Place, Scope, positions};
-use crate::{CmdError, Selection, Session};
+use crate::{CmdError, FindState, Selection, Session};
 
 /// How many times a copy makes the same edit again after reading the document again before it
 /// gives up on it (the hub refused it, or the copy and the hub disagreed). Edits made again
@@ -42,6 +47,96 @@ pub struct Stats {
 /// The selection as anchors: where it starts and where the caret is.
 type SelAnchors = Option<(Anchor, Anchor)>;
 
+/// Commands that read more of their session than the document, the selection and their params
+/// ([`Inputs`]): pastes, Paste Formatting, Replace (`^c` is the clipboard), the Spike, Quick
+/// Parts and AutoText, macros and Repeat. A copy keeps those inputs with each of them, so a
+/// command made again after a clash pastes what was pasted then, not what was copied since.
+const READS_INPUTS: &[&str] = &[
+    "edit.paste",
+    "edit.pasteSpecial",
+    "edit.pasteText",
+    "edit.pasteMerge",
+    "edit.pasteClipboardItem",
+    "edit.pasteAllClipboard",
+    "edit.pasteFormat",
+    "edit.replace",
+    "edit.replaceAll",
+    "edit.insertSpike",
+    "insert.quickParts",
+    "insert.autoText",
+    "tools.macros",
+    "edit.repeat",
+];
+
+/// What a command can read from its session besides the document, the selection and its
+/// params: the clipboard and the Clipboard pane's items, the format painter's formatting, what
+/// Find looks for, the command Repeat repeats, macros and building blocks (the Spike among them).
+#[derive(Clone, Debug)]
+struct Inputs {
+    clipboard: Option<Fragment>,
+    clipboard_text: String,
+    clipboard_html: String,
+    clip_history: ClipHistory,
+    painter: Option<(CharProps, ParaProps, bool)>,
+    find: FindState,
+    last_command: Option<(String, Value)>,
+    macros: BTreeMap<String, Vec<(String, Value)>>,
+    building_blocks: BTreeMap<String, Fragment>,
+}
+
+impl Inputs {
+    /// Session `s`'s.
+    fn of(s: &Session) -> Inputs {
+        Inputs {
+            clipboard: s.clipboard.clone(),
+            clipboard_text: s.clipboard_text.clone(),
+            clipboard_html: s.clipboard_html.clone(),
+            clip_history: s.clip_history.clone(),
+            painter: s.painter.clone(),
+            find: s.find.clone(),
+            last_command: s.last_command.clone(),
+            macros: s.macros.clone(),
+            building_blocks: s.building_blocks.clone(),
+        }
+    }
+
+    /// Put them in session `s`.
+    fn put(self, s: &mut Session) {
+        let Inputs { clipboard, clipboard_text, clipboard_html, clip_history, painter, find, last_command, macros, building_blocks } = self;
+        s.clipboard = clipboard;
+        s.clipboard_text = clipboard_text;
+        s.clipboard_html = clipboard_html;
+        s.clip_history = clip_history;
+        s.painter = painter;
+        s.find = find;
+        s.last_command = last_command;
+        s.macros = macros;
+        s.building_blocks = building_blocks;
+    }
+}
+
+/// What a session holds besides its document that making edits again must leave as the
+/// participant has it now: [`Inputs`], the tracked cut a paste can make a move of, and the
+/// macro being recorded (edits made again aren't steps of it). Edits made again use and change
+/// their own while they run.
+struct Kept {
+    inputs: Inputs,
+    pending_move: Option<PendingMove>,
+    recording: Option<(String, Vec<(String, Value)>)>,
+}
+
+impl Kept {
+    fn take(s: &mut Session) -> Kept {
+        Kept { inputs: Inputs::of(s), pending_move: s.pending_move.take(), recording: s.recording.take() }
+    }
+
+    fn put(self, s: &mut Session) {
+        self.inputs.put(s);
+        s.pending_move = self.pending_move;
+        s.recording = self.recording;
+    }
+}
+
 /// A command the copy ran, with what it takes to run it again from the same place.
 #[derive(Clone, Debug)]
 struct Made {
@@ -52,6 +147,9 @@ struct Made {
     after: SelAnchors,
     /// Its params that are places in the document ([`positions`]).
     places: Vec<(String, Anchor)>,
+    /// What it read from the session besides the document and its params, for the commands that
+    /// read more ([`READS_INPUTS`]).
+    inputs: Option<Box<Inputs>>,
     /// How many times it was run again after the copy read the document again.
     tries: u32,
 }
@@ -59,7 +157,7 @@ struct Made {
 impl Made {
     /// A change made outside a command.
     fn outside() -> Made {
-        Made { command: None, before: None, after: None, places: Vec::new(), tries: 0 }
+        Made { command: None, before: None, after: None, places: Vec::new(), inputs: None, tries: 0 }
     }
 }
 
@@ -216,9 +314,11 @@ impl Replica {
             .filter(|(_, how)| *how == Place::Pos)
             .filter_map(|(key, _)| Some((key.to_string(), doc.anchor_at(&crate::cmd::parse_pos(params.get(*key)?)?)?)))
             .collect();
+        let inputs = READS_INPUTS.contains(&id).then(|| Box::new(Inputs::of(&self.session)));
         let result = self.session.run(id, params);
         self.stay_in_document();
-        let made = Made { command: Some((id.to_string(), params.clone())), before, after: selection_anchors(&self.session), places, tries };
+        let after = selection_anchors(&self.session);
+        let made = Made { command: Some((id.to_string(), params.clone())), before, after, places, inputs, tries };
         self.collect(made);
         result
     }
@@ -337,6 +437,14 @@ impl Replica {
             self.read_again();
             return;
         }
+        // The document the first edit that clashed was made on.
+        let origin = clash.and_then(|i| {
+            let mut doc = self.confirmed.clone();
+            for u in self.pending.get(..i)? {
+                doc.apply(&u.change).ok()?;
+            }
+            Some(doc)
+        });
         if self.confirmed.apply(&a.change).is_err() {
             self.read_again();
             return;
@@ -366,7 +474,7 @@ impl Replica {
         // them, and makes the dropped ones again from where they were made, moved through it.
         self.stats.clashes = self.stats.clashes.saturating_add(1);
         match self.expected() {
-            Some(doc) => self.make_again(doc, dropped, Some(&m), false),
+            Some(doc) => self.make_again(doc, dropped, Some(&m), origin, false),
             None => {
                 self.pending.extend(dropped);
                 self.read_again();
@@ -380,66 +488,91 @@ impl Replica {
         self.stats.read_again = self.stats.read_again.saturating_add(1);
         let (version, doc) = self.room.document();
         let mut dropped = std::mem::take(&mut self.pending);
-        // The changes the hub accepted are in its document already.
+        // The changes the hub accepted are in its document already. The others were made on the
+        // version the copy got last with those in it.
+        let mut origin = Some(self.confirmed.clone());
         if let Some((first, count)) = self.sent.take()
             && first <= version
         {
-            dropped.drain(..count.min(dropped.len()));
+            for u in dropped.drain(..count.min(dropped.len())) {
+                origin = origin.and_then(|mut d| d.apply(&u.change).ok().map(|_| d));
+            }
         }
         self.received = version;
         self.confirmed = doc.clone();
-        self.make_again(doc, dropped, None, true);
+        self.make_again(doc, dropped, None, origin, true);
     }
 
     /// Put `doc` in the copy and run the commands of `dropped` again: each from the selection
     /// it was made with, unless it went on from where the command before it left the caret,
-    /// and with the places in its params, moved through `first` (the change the first of them
-    /// clashed with) or found again by their paragraph. `read_again` when the copy read the
-    /// document again, which counts as a try.
-    fn make_again(&mut self, doc: Document, dropped: Vec<Unit>, first: Option<&ChangeSet>, read_again: bool) {
+    /// with the places in its params, and with what it read from the session then
+    /// ([`Inputs`]). `origin` is the document the first of them was made on; the places of each
+    /// move from the document it was made on to the one it is made again on, which holds the
+    /// change the first of them clashed with, `first`, and those made again before it (or, when
+    /// that isn't known, are found again by their paragraph). `read_again` when the copy read
+    /// the document again, which counts as a try. The session's clipboard and the rest of what
+    /// commands read stay as the participant has them now.
+    fn make_again(&mut self, doc: Document, dropped: Vec<Unit>, first: Option<&ChangeSet>, mut origin: Option<Document>, read_again: bool) {
         let now = selection_anchors(&self.session);
-        let made: Vec<Made> = dropped.into_iter().flat_map(|u| u.made).collect();
-        let last = made.last().map(|m| m.after);
+        let last = dropped.iter().flat_map(|u| &u.made).last().map(|m| m.after);
+        let kept = Kept::take(&mut self.session);
         self.session.reset_shared(doc);
         self.seen = self.session.changes().version();
         let mut went_on: Option<SelAnchors> = None;
-        for (k, m) in made.into_iter().enumerate() {
-            let through = if k == 0 { first } else { None };
-            let Made { command, before, after, places, tries } = m;
-            let tries = if read_again { tries.saturating_add(1) } else { tries };
-            let Some((id, mut params)) = command.filter(|_| tries <= MAX_TRIES) else {
-                self.stats.lost = self.stats.lost.saturating_add(1);
-                went_on = Some(after);
-                continue;
-            };
-            if went_on != Some(before)
-                && let Some(sel) = self.selection_at(before, through)
-            {
-                self.session.sel = sel;
-            }
-            for (key, at) in &places {
-                if let Some(p) = self.find(*at, through)
-                    && let Some(o) = params.as_object_mut()
-                {
-                    o.insert(key.clone(), crate::cmd::pos_json(&p));
-                }
-            }
-            went_on = Some(after);
-            match self.run_made(&id, &params, tries) {
-                Ok(_) => self.stats.made_again = self.stats.made_again.saturating_add(1),
-                Err(e) => {
+        for (k, u) in dropped.into_iter().enumerate() {
+            for (j, m) in u.made.into_iter().enumerate() {
+                let Made { command, before, after, places, inputs, tries } = m;
+                let tries = if read_again { tries.saturating_add(1) } else { tries };
+                let Some((id, mut params)) = command.filter(|_| tries <= MAX_TRIES) else {
                     self.stats.lost = self.stats.lost.saturating_add(1);
-                    self.session.status = format!("An edit made at the same time as another participant's couldn't be made again ({id}): {e}");
+                    went_on = Some(after);
+                    continue;
+                };
+                let reselect = went_on != Some(before);
+                // From the document the command was made on to the one it is made again on: the
+                // change its edits clashed with for the first, the difference for the others.
+                let between;
+                let through = match (k, j, first, &origin) {
+                    (0, 0, Some(first), _) => Some(first),
+                    (_, 0, _, Some(origin)) if reselect || !places.is_empty() => {
+                        between = ChangeSet::between(origin, &self.session.doc);
+                        Some(&between)
+                    }
+                    _ => None,
+                };
+                if reselect && let Some(sel) = self.selection_at(before, through) {
+                    self.session.sel = sel;
+                }
+                for (key, at) in &places {
+                    if let Some(p) = self.find(*at, through)
+                        && let Some(o) = params.as_object_mut()
+                    {
+                        o.insert(key.clone(), crate::cmd::pos_json(&p));
+                    }
+                }
+                if let Some(inputs) = inputs {
+                    inputs.put(&mut self.session);
+                }
+                went_on = Some(after);
+                match self.run_made(&id, &params, tries) {
+                    Ok(_) => self.stats.made_again = self.stats.made_again.saturating_add(1),
+                    Err(e) => {
+                        self.stats.lost = self.stats.lost.saturating_add(1);
+                        self.session.status = format!("An edit made at the same time as another participant's couldn't be made again ({id}): {e}");
+                    }
                 }
             }
+            origin = origin.and_then(|mut d| d.apply(&u.change).ok().map(|_| d));
         }
-        // The participant's own selection, when they moved it after their last edit, moved
-        // through the change their first edit clashed with too.
-        if last != Some(now)
-            && let Some(sel) = self.selection_at(now, first)
-        {
-            self.session.sel = sel;
-            self.session.clamp_selection();
+        kept.put(&mut self.session);
+        // The participant's own selection, when they moved it after their last edit, moves from
+        // the document they had to the one with their edits made again.
+        if last != Some(now) {
+            let between = origin.map(|origin| ChangeSet::between(&origin, &self.session.doc));
+            if let Some(sel) = self.selection_at(now, between.as_ref().or(first)) {
+                self.session.sel = sel;
+                self.session.clamp_selection();
+            }
         }
     }
 
@@ -535,5 +668,18 @@ impl Replica {
             return Err(format!("the copy's version {version} isn't the hub's"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::READS_INPUTS;
+
+    #[test]
+    fn the_commands_that_read_more_than_the_document_are_commands() {
+        let s = crate::Session::new(wordcraft_doc::Document::new());
+        for id in READS_INPUTS {
+            assert!(s.registry.get(id).is_some(), "{id}");
+        }
     }
 }
