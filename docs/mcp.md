@@ -148,7 +148,7 @@ test source in File › Options › Language and on the bar's Install.
 
 | Tool | What it does |
 |---|---|
-| `list_commands` | every command (filter with `query`) — over 270 of them |
+| `list_commands` | every command, with its scope and the params that are places (filter with `query` and `scope`; see [Command scopes](#command-scopes)) — over 650 of them |
 | `execute` | run one command: `{command: "insert.table", params: {rows: 3, cols: 4}}` |
 | `batch` | run several commands in order |
 | `new_document` | blank, sample, letter, resume, report; opens beside the open documents |
@@ -220,6 +220,38 @@ document applies it (`Document::apply`). At most `limit` changes come back (100 
 version and no changes. A version older than the document keeps (its last 1,024 changes, about
 64 MB of them) is an error: read the document again. Through `--connect` this is the app's
 `document.changes` command, so an agent sees what the person types in the window.
+
+### Command scopes
+
+Each command `list_commands` gives says what it touches (`scope`), which decides who may run it in
+a shared document, and which of its params are places in the document (`positions`):
+
+```json
+{"id": "select.range", "label": "Select Range", "params": "{\"anchor\": Pos, \"focus\": Pos}", "mutates": false,
+ "scope": "selection", "positions": {"anchor": "pos", "focus": "pos"}, …}
+```
+
+| `scope` | What the command touches | For example |
+|---|---|---|
+| `document` | the document everyone sharing it sees: its text, formatting, objects, styles, settings and properties; reading any of it | `text.insert`, `format.bold`, `review.comments`, `document.changes`, `file.properties` |
+| `selection` | what is the participant's own while they edit: the caret and selection, Find, the clipboard, the pen in hand | `caret.set`, `select.text`, `edit.find`, `edit.copy` |
+| `view` | how the participant sees the document: views, zoom, panes and dialogs, Read Aloud | `view.zoom`, `review.markup`, `styles.pane` |
+| `file` | files and the other open documents: opening, saving, exporting, printing, versions; and commands that make a new document or switch to another | `file.save`, `view.switchWindows`, `mailings.finish`, `review.compare` |
+| `app` | the application's settings and data, which every document shares | `file.options`, `tools.autocorrect`, `font.add`, `review.addToDictionary` |
+| `ui` | the app's own window commands (through `--connect`) | `ui.printSubmit` |
+
+A scope covers everything the command can do: a `selection` or `view` command never changes the
+document (a test runs each one to check), and one that can make or switch to another document is
+`file`, even when it usually works on this one. When people and agents share a document, agents
+will get `document` and `selection` commands, and files, other documents and settings stay with
+people unless the owner allows them; nothing is refused by scope yet. Paths are limited apart
+from scopes, by the roots above. `list_commands {"scope": "document"}` lists one scope's commands.
+
+`positions` gives each param that names a place in the document, and its form: `pos` (a position,
+`{story, path, off}`), `list` (a list holding positions) or `path` (a block's path). Page
+coordinates (`page`, `x`, `y`) aren't places in the text: they depend on one copy's layout. A
+command written against an older version can have its places moved through the changes made since
+(`ChangeSet::map`), so they still point at the same text.
 
 ## Character and paragraph properties
 

@@ -68,8 +68,11 @@ pub fn tool_definitions() -> Value {
         tool(
             "list_commands",
             "List commands",
-            "Every WordCraft command: id, label, ribbon location, shortcut and params. Filter with `query`.",
-            obj(json!({"query": s("Case-insensitive filter on id/label/location")}), &[]),
+            "Every WordCraft command: id, label, ribbon location, shortcut, params, whether it changes the document (`mutates`), its `scope` (document, selection, view, file, app or ui: what it touches; an agent in a shared document gets document and selection commands) and `positions`, the params that are places in the document. Filter with `query` and `scope`.",
+            obj(
+                json!({"query": s("Case-insensitive filter on id/label/location"), "scope": s("Only commands of this scope: document, selection, view, file, app or ui")}),
+                &[]
+            ),
             true
         ),
         tool(
@@ -231,6 +234,7 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
     match name {
         "list_commands" => {
             let q = st("query").unwrap_or("").to_lowercase();
+            let scope = st("scope").map(str::to_lowercase);
             match b.call("engine.commands", json!({})) {
                 Ok(Value::Array(v)) => {
                     let f: Vec<Value> = v
@@ -240,6 +244,9 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
                                 || ["id", "label", "location"]
                                     .iter()
                                     .any(|k| c.get(*k).and_then(Value::as_str).is_some_and(|x| x.to_lowercase().contains(&q)))
+                        })
+                        .filter(|c| {
+                            scope.as_deref().is_none_or(|want| c.get("scope").and_then(Value::as_str).is_some_and(|x| x.eq_ignore_ascii_case(want)))
                         })
                         .collect();
                     ToolResult::json(&Value::Array(f))

@@ -368,6 +368,24 @@ fn render_page_rejects_a_page_number_that_does_not_fit() {
     assert_eq!(r["result"]["isError"], false, "page 1 still renders: {r}");
 }
 
+/// An agent learns from the command list what each command touches (its scope) and which of its
+/// params are places in the document, and can list only the commands of one scope.
+#[test]
+fn the_command_list_gives_each_command_s_scope_and_places() {
+    let mut s = Server::new(Box::new(Headless::default()));
+    let all = tool(&mut s, "list_commands", json!({"query": "caret.set"}));
+    let set = all.as_array().and_then(|l| l.iter().find(|c| c["id"] == "caret.set")).cloned().expect("caret.set is listed");
+    assert_eq!(set["scope"], "selection", "{set}");
+    assert_eq!(set["positions"], json!({"pos": "pos"}), "{set}");
+    let document = tool(&mut s, "list_commands", json!({"scope": "document"}));
+    let document = document.as_array().expect("a list");
+    assert!(document.iter().all(|c| c["scope"] == "document"), "only document commands");
+    assert!(document.iter().any(|c| c["id"] == "format.bold") && !document.iter().any(|c| c["id"] == "file.save"));
+    let files = tool(&mut s, "list_commands", json!({"query": "save", "scope": "File"}));
+    assert!(files.as_array().is_some_and(|l| !l.is_empty() && l.iter().all(|c| c["scope"] == "file")), "{files}");
+    assert_eq!(tool(&mut s, "list_commands", json!({"scope": "nonsense"})), json!([]));
+}
+
 /// An agent reads the document, someone else types, and the agent learns what changed from the
 /// version it read: which paragraph (by the id inspect_document gave it) and what text.
 #[test]
