@@ -83,12 +83,17 @@ fn suggestions_only(before: &Document, after: &Document, name: &str) -> Result<(
     let (before, after) = (comparable(before, name)?, comparable(after, name)?);
     // Others' tracked changes cover what they covered, as it was and where it was: none was
     // accepted, rejected or moved, and what they cover wasn't changed but by tracked changes
-    // of the suggester's.
+    // of the suggester's. So do marks that name no tracked change the document has (a crafted
+    // change's): an edit marked with one is no one's suggestion, not the suggester's.
     let (was, now) = (covered(&before, name), covered(&after, name));
-    for (i, r) in before.revisions.iter().enumerate() {
-        let k = u32::try_from(i).unwrap_or(u32::MAX);
-        if r.author != name && was.get(&k) != now.get(&k) {
-            return Err(format!("a suggester leaves {}'s tracked changes for someone else to accept or reject", r.author));
+    let marks: BTreeSet<u32> = was.keys().chain(now.keys()).copied().collect();
+    for k in marks {
+        let by = author_of(&after, k).or(author_of(&before, k));
+        if by != Some(name) && was.get(&k) != now.get(&k) {
+            return Err(match by {
+                Some(author) => format!("a suggester leaves {author}'s tracked changes for someone else to accept or reject"),
+                None => format!("a suggester's tracked changes are in their own name: tracked change {k} isn't one the document has"),
+            });
         }
     }
     // With every tracked change rejected, nothing else changed: the suggester's edits are all
@@ -97,6 +102,11 @@ fn suggestions_only(before: &Document, after: &Document, name: &str) -> Result<(
         return Err("a suggester's edits are tracked changes: Track Changes stays on for them".into());
     }
     Ok(())
+}
+
+/// Who made tracked change `k` of `doc`, if it has one.
+fn author_of(doc: &Document, k: u32) -> Option<&str> {
+    usize::try_from(k).ok().and_then(|i| doc.revisions.get(i)).map(|r| r.author.as_str())
 }
 
 /// Comments of others are as they were, but for being resolved or not; those added or

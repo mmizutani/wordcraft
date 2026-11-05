@@ -189,8 +189,12 @@ fn double_space_period(s: &mut Session) -> Result<(), CmdError> {
     if !word.chars().next_back().is_some_and(|c| c.is_alphanumeric() || ")]}\"'\u{201D}\u{2019}\u{00BB}\u{203A}".contains(c)) {
         return Ok(());
     }
-    // The period takes the formatting of the space it replaces.
+    // The period takes the formatting of the space it replaces, which, with Track Changes on,
+    // is one the author is typing (anyone else's would change untracked).
     let at = word.len();
+    if !crate::cmd::tools::may_change(s, &f, at, at + 1) {
+        return Ok(());
+    }
     let p = s.doc.para_mut(f.story, &f.path)?;
     let props = p.props_at(at + 1).clone().without_symbol();
     p.delete(at, at + 1)?;
@@ -199,14 +203,17 @@ fn double_space_period(s: &mut Session) -> Result<(), CmdError> {
     Ok(())
 }
 
-/// "word -- word" → en dash, "word--word" → em dash (on the space after).
+/// "word -- word" → en dash, "word--word" → em dash (on the space after). With Track Changes
+/// on, only hyphens the author is typing become a dash ([`crate::cmd::tools::may_change`]).
 fn dash_autoformat(s: &mut Session) -> Result<bool, CmdError> {
     let f = s.sel.focus.clone();
     let Some(para) = s.doc.para_at(&f) else { return Ok(false) };
     let Some(before) = para.text.get(..f.off) else { return Ok(false) };
+    let ours = |from: usize, to: usize| crate::cmd::tools::may_change(s, &f, from, to);
     if before.ends_with(' ')
         && let Some(i) = before.trim_end().rfind(" -- ")
         && before.trim_end().get(i + 4..).is_some_and(|w| !w.is_empty() && !w.contains(' '))
+        && ours(i + 1, i + 3)
     {
         // "word -- word" → "word – word" once the next word is typed.
         let p = s.doc.para_mut(f.story, &f.path)?;
@@ -218,6 +225,7 @@ fn dash_autoformat(s: &mut Session) -> Result<bool, CmdError> {
     } else if before.ends_with(' ')
         && let Some(i) = before.trim_end().rfind(" - ")
         && !before.trim_end()[i + 3..].contains(' ')
+        && ours(i + 1, i + 2)
     {
         let p = s.doc.para_mut(f.story, &f.path)?;
         let props = p.props_at(i + 1).clone().without_symbol();
@@ -229,6 +237,7 @@ fn dash_autoformat(s: &mut Session) -> Result<bool, CmdError> {
         && let Some(i) = before.trim_end().rfind("--")
         && i > 0
         && before.trim_end()[..i].chars().next_back().is_some_and(|c| c != ' ')
+        && ours(i, i + 2)
     {
         let p = s.doc.para_mut(f.story, &f.path)?;
         let props = p.props_at(i).clone().without_symbol();
