@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{ChangeSet, MARK, NewBlock, PartChange, Splice, TextSplice, window_len};
+use super::{ChangeSet, MARK, NewBlock, PartChange, Splice, window_len};
 use crate::{Block, BlockId};
 
 /// A place in a paragraph: its id, and a byte offset in its text.
@@ -35,9 +35,15 @@ impl ChangeSet {
     /// starts; an anchor where text was put in stays before it; one in a table the change
     /// replaced whole moves to where the table was.
     pub fn map(&self, a: Anchor) -> Mapped {
+        for e in &self.edits {
+            if e.id == a.block {
+                let off = e.chars.as_ref().map_or(a.off, |c| map_pos(a.off, c.at, c.removed, c.inserted.text.len()));
+                return Mapped::At(Anchor { block: a.block, off });
+            }
+        }
         for s in &self.splices {
             if let Some(w) = window_pos(s, a) {
-                return resolve(s, map_pos(w, &s.text));
+                return resolve(s, map_pos(w, s.text.at, s.text.removed, s.text.inserted.len()));
             }
         }
         for p in &self.parts {
@@ -67,15 +73,15 @@ fn window_pos(s: &Splice, a: Anchor) -> Option<usize> {
     None
 }
 
-/// Where window position `w` is after the text splice `t`.
-fn map_pos(w: usize, t: &TextSplice) -> usize {
-    let end = t.at.saturating_add(t.removed);
-    if w <= t.at {
+/// Where position `w` is after `removed` bytes from `at` became `inserted` bytes.
+fn map_pos(w: usize, at: usize, removed: usize, inserted: usize) -> usize {
+    let end = at.saturating_add(removed);
+    if w <= at {
         w
     } else if w < end {
-        t.at
+        at
     } else {
-        w.saturating_sub(t.removed).saturating_add(t.inserted.len())
+        w.saturating_sub(removed).saturating_add(inserted)
     }
 }
 

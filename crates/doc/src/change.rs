@@ -4,13 +4,18 @@
 //! A change names blocks by their [`BlockId`], never by their place, so it still applies to a
 //! copy in which other blocks moved, came or went meanwhile. It holds:
 //!
+//! - **Paragraphs edited in place** ([`ParaEdit`]): a paragraph that kept its id and its place
+//!   but holds other characters, formatting or properties sends only the characters the edit
+//!   replaced, with their formatting and objects, and its properties when they changed. So
+//!   typing a letter in a 188-page document makes a change holding that letter, and two people
+//!   typing in the same paragraph don't stop each other ([`ChangeSet::rebase`]).
 //! - **Splices** of block lists. In each story, and in each cell of a table edited in place, the
 //!   blocks between what both versions share at the start and at the end (the same allocations,
 //!   found by address as [`Document::same_content`] does) were taken away and others put in,
-//!   whole and with their ids. A splice also holds the window's text before and after as one
-//!   character splice, with paragraph marks as U+2029 and tables as U+FFFC, which maps
-//!   positions through the edit ([`ChangeSet::map`]). So typing in a 188-page document makes a
-//!   change holding one paragraph.
+//!   whole and with their ids, unless they are paragraphs edited in place. A splice also holds
+//!   the window's text before and after as one character splice, with paragraph marks as U+2029
+//!   and tables as U+FFFC, which maps positions through the edit ([`ChangeSet::map`]). Enter,
+//!   joining paragraphs, and moving or deleting blocks are splices.
 //! - The properties of **tables edited in place**: the same rows and cells, whose blocks change
 //!   through splices of their own.
 //! - **Parts** (headers, footers, notes, comments' text, text boxes) added, removed or changed.
@@ -18,9 +23,11 @@
 //!   appended, the rest (styles, lists, settings…) whole.
 //!
 //! Applying a change checks it was made on the content it replaces: the blocks it takes away
-//! must be there, in order, holding what they held (compared by a fingerprint of their content).
-//! A copy whose content differs gets an error and is left as it was, so a change never lands on
-//! text it wasn't made on.
+//! must be there, in order, holding what they held, and so must the paragraphs it edits in place
+//! (compared by a fingerprint of their content). A copy whose content differs gets an error and
+//! is left as it was, so a change never lands on text it wasn't made on. A change made at the
+//! same time as another is moved past it with [`ChangeSet::rebase`], which says when the two
+//! clash.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -36,11 +43,15 @@ use crate::{
 };
 
 mod apply;
+mod chars;
 mod map;
+mod rebase;
 #[cfg(test)]
 mod tests;
 
+pub use chars::{CharSplice, Chars, ParaEdit, ParaShell};
 pub use map::{Anchor, Mapped};
+pub use rebase::Side;
 
 /// A paragraph mark in a window's text ([`TextSplice`]).
 pub const MARK: char = '\u{2029}';
@@ -51,6 +62,9 @@ pub const TABLE: char = '\u{FFFC}';
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ChangeSet {
+    /// Paragraphs edited in place, in document order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<ParaEdit>,
     /// Block lists whose blocks the edit replaced, in document order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub splices: Vec<Splice>,
@@ -318,6 +332,11 @@ impl<'de> Deserialize<'de> for Fingerprint {
 
 /// The [`Fingerprint`] of what `b` holds.
 pub fn fingerprint(b: &Block) -> Fingerprint {
+    fingerprint_of(b)
+}
+
+/// The [`Fingerprint`] of `v`'s JSON.
+pub(crate) fn fingerprint_of<T: Serialize + ?Sized>(v: &T) -> Fingerprint {
     /// Writes into the hash as serde_json writes, so no copy of the JSON is made.
     struct Fnv(u64);
     impl std::io::Write for Fnv {
@@ -332,9 +351,10 @@ pub fn fingerprint(b: &Block) -> Fingerprint {
         }
     }
     let mut h = Fnv(0xcbf2_9ce4_8422_2325);
-    match serde_json::to_writer(&mut h, b) {
+    match serde_json::to_writer(&mut h, v) {
         Ok(()) => Fingerprint(h.0),
-        // No block fails to serialize; a value no block's fingerprint is, so nothing matches it.
+        // Nothing fingerprinted fails to serialize; a value no fingerprint is, so nothing
+        // matches it.
         Err(_) => Fingerprint(0),
     }
 }
@@ -431,8 +451,8 @@ impl ChangeSet {
 
     /// Whether the change changes nothing.
     pub fn is_empty(&self) -> bool {
-        let ChangeSet { splices, tables, parts, fields } = self;
-        splices.is_empty() && tables.is_empty() && parts.is_empty() && fields.is_empty()
+        let ChangeSet { edits, splices, tables, parts, fields } = self;
+        edits.is_empty() && splices.is_empty() && tables.is_empty() && parts.is_empty() && fields.is_empty()
     }
 
     /// The splices for list `was` becoming `now` (container `c`, at nesting `depth`).
@@ -453,7 +473,8 @@ impl ChangeSet {
             return;
         }
         // As many blocks before as after: each against the one in its place. A table edited in
-        // place is compared cell by cell; runs of other changed blocks are spliced.
+        // place is compared cell by cell, a paragraph edited in place character by character;
+        // runs of other changed blocks are spliced.
         let mut run: Option<usize> = None;
         for k in 0..=wa.len() {
             let (x, y) = (wb.get(k), wa.get(k));
@@ -462,7 +483,14 @@ impl ChangeSet {
                 (Some(x), Some(y)) if depth < MAX_ID_DEPTH && !same && in_place(x, y) => Some((x, y)),
                 _ => None,
             };
-            let changed = x.is_some() && !same && table.is_none();
+            let edit = match (x, y) {
+                (Some(x), Some(y)) if !same && table.is_none() => chars::para_edit(c, y, x),
+                _ => None,
+            };
+            let changed = x.is_some() && !same && table.is_none() && edit.is_none();
+            if let Some(e) = edit {
+                self.edits.push(e);
+            }
             match (changed, run) {
                 (true, None) => run = Some(k),
                 (false, Some(r)) => {

@@ -201,17 +201,25 @@ changes, instead of reading it again. `inspect_document` gives the `version` it 
 for each block; `get_changes {"since": version}` gives, oldest first, each change made after it:
 
 ```json
-{"document": 3, "version": 12, "changes": [
-  {"version": 12, "edits": [{"in": {"story": "body"}, "removed": ["5f0c…"], "inserted": ["5f0c…"],
-    "at": 5, "deleted": 0, "text": " world"}]}
+{"document": 3, "version": 13, "changes": [
+  {"version": 12, "edits": [{"in": {"story": "body"}, "paragraph": "5f0c…", "at": 5, "deleted": 0,
+    "text": " world"}]},
+  {"version": 13, "edits": [{"in": {"story": "body"}, "after": "5f0c…", "before": "9a41…",
+    "removed": [], "inserted": ["c27e…"], "at": 0, "deleted": 0, "text": ""}]}
 ]}
 ```
 
-Each edit names the list of blocks it changed (`in`: the body, a header, note or text box, or a
-cell `{"cell": {"table", "row", "col"}}` of a table), the ids of the blocks it took away and put in
-(typing keeps a paragraph's id; Enter adds one after it), the blocks around it (`after`, `before`)
-and the text splice on those blocks' text, with U+2029 between paragraphs and U+FFFC for a table:
-`deleted` bytes from `at`, `text` put there. `tables` lists tables whose properties changed,
+An edit inside a paragraph (typing, deleting or formatting characters, or changing the
+paragraph's own properties) names the list it is in (`in`: the body, a header, note or text box,
+or a cell `{"cell": {"table", "row", "col"}}` of a table), the paragraph's id (`paragraph`; it
+keeps its id) and the characters it replaced, as byte offsets in its text: `deleted` bytes from
+`at`, `text` put there (U+FFFC for an object; formatting a word gives the same word back), and
+`properties: true` when its alignment, style or other paragraph properties changed. Any other
+edit names the list, the ids of the blocks it took away and put in (Enter at the end of a
+paragraph adds one after it; Enter inside one takes it away and puts back its two halves, the
+first keeping its id; joining paragraphs takes them away and puts one back), the blocks around
+it (`after`, `before`) and the text splice on those blocks' text, with U+2029 between
+paragraphs and U+FFFC for a table. `tables` lists tables whose properties changed,
 `parts` the notes, comments, text boxes and headers added, removed or changed, and `fields` the
 other things that changed (`styles`, `numbering`, `settings`, `comment 3`, `revisions`…). Undo and
 redo are changes too. `full: true` adds each change whole (`change`), as another copy of the

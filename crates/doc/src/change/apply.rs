@@ -3,12 +3,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{ChangeSet, Container, FieldChange, NewBlock, OldBlock, PartChange, Splice, TableShell, fingerprint};
+use super::chars::edit_para;
+use super::{ChangeSet, Container, FieldChange, NewBlock, OldBlock, ParaEdit, PartChange, Splice, TableShell, fingerprint};
 use crate::{Block, BlockId, Blocks, DocError, Document, Part, Path, Result, StoryRef};
 
-/// Most splices, table changes, part changes and field changes one change may hold; and most
-/// blocks it may take away or put in. A change from a real edit stays far below; the bound keeps
-/// a hostile one from making applying it slow.
+/// Most paragraph edits, splices, table changes, part changes and field changes one change may
+/// hold; and most blocks it may take away or put in. A change from a real edit stays far below;
+/// the bound keeps a hostile one from making applying it slow.
 pub const MAX_CHANGE_ITEMS: usize = 1 << 20;
 
 fn stale(what: String) -> DocError {
@@ -20,16 +21,19 @@ impl Document {
     /// copy it was made in held after it, under the same ids, wherever its other blocks are.
     ///
     /// The change must have been made on the content it replaces: the blocks it takes away must
-    /// be in this copy, in order, holding what they held; the parts it removes or changes, and
-    /// the tables it changes, must be here; the revisions must be as many as it saw. Otherwise
-    /// it is an error ([`DocError::Stale`]) and the document is left as it was. So is a change
-    /// that would leave a story or a table cell without a paragraph at its end.
+    /// be in this copy, in order, holding what they held; so must the paragraphs it edits in
+    /// place, or, for an edit moved past another edit of the same paragraph
+    /// ([`ChangeSet::rebase`]), the characters it replaces and the properties it changes; the
+    /// parts it removes or changes, and the tables it changes, must be here; the revisions must
+    /// be as many as it saw. Otherwise it is an error ([`DocError::Stale`]) and the document is
+    /// left as it was. So is a change that would leave a story or a table cell without a
+    /// paragraph at its end.
     ///
     /// It does not check that the ids of the blocks it puts in are new to this copy: copies make
     /// random ids, and the room's hub, which sees every change, renames the rare clash.
     pub fn apply(&mut self, cs: &ChangeSet) -> Result<()> {
-        let ChangeSet { splices, tables, parts, fields } = cs;
-        let items = splices.len() + tables.len() + parts.len() + fields.len();
+        let ChangeSet { edits, splices, tables, parts, fields } = cs;
+        let items = edits.len() + splices.len() + tables.len() + parts.len() + fields.len();
         let blocks: usize = splices.iter().map(|s| s.removed.len() + s.inserted.len()).sum();
         if items > MAX_CHANGE_ITEMS || blocks > MAX_CHANGE_ITEMS {
             return Err(DocError::Invalid(format!("a change of {items} items and {blocks} blocks is more than one edit makes")));
@@ -39,6 +43,7 @@ impl Document {
         for t in tables {
             d.apply_shell(t, &mut tables_at)?;
         }
+        d.apply_edits(edits, &mut tables_at)?;
         d.apply_splices(splices, &mut tables_at)?;
         for p in parts {
             d.apply_part(p)?;
@@ -66,6 +71,40 @@ impl Document {
             for (cell, shell) in row.cells.iter_mut().zip(&shell.cells) {
                 cell.props = shell.props.clone();
                 cell.controls = shell.controls.clone();
+            }
+        }
+        Ok(())
+    }
+
+    /// The paragraphs edited in place, found by id in their lists.
+    fn apply_edits(&mut self, edits: &[ParaEdit], at: &mut TableIndex) -> Result<()> {
+        let mut lists: Vec<(Container, Vec<&ParaEdit>)> = Vec::new();
+        for e in edits {
+            match lists.iter_mut().find(|(c, _)| *c == e.container) {
+                Some((_, v)) => v.push(e),
+                None => lists.push((e.container, vec![e])),
+            }
+        }
+        for (c, v) in lists {
+            let (bl, what) = match c {
+                Container::Story(story) => (self.story_mut(story).map_err(|_| stale(format!("no story {story:?}")))?, format!("{story:?}")),
+                Container::Cell { table, row, col } => {
+                    let (story, mut path) = at.find(self, table)?;
+                    path.0.extend([row, col, 0]);
+                    let cell = format!("cell {row}, {col} of table {table}");
+                    (self.container_mut(story, &path).map_err(|_| stale(format!("no {cell}")))?, cell)
+                }
+            };
+            let index: HashMap<BlockId, usize> = bl.iter().enumerate().map(|(i, b)| (b.id(), i)).collect();
+            for e in v {
+                let b = index.get(&e.id).and_then(|i| bl.get_mut(*i)).ok_or_else(|| stale(format!("paragraph {} isn't in {what}", e.id)))?;
+                if e.was.is_some_and(|was| fingerprint(b) != was) {
+                    return Err(stale(format!("paragraph {} of {what} holds other content", e.id)));
+                }
+                match Arc::make_mut(b) {
+                    Block::Para(p) => edit_para(p, e)?,
+                    Block::Table(_) => return Err(stale(format!("block {} of {what} is a table", e.id))),
+                }
             }
         }
         Ok(())

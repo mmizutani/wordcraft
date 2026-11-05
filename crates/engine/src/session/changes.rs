@@ -80,13 +80,25 @@ impl ChangeLog {
     }
 }
 
-/// About how much memory change `cs` holds: the blocks it puts in, the pictures and other
-/// files, and a flat amount for each style sheet, list set, settings or glossary it replaces
-/// whole (estimates: the cap is a bound on the memory followers' changes keep, not a count).
+/// About how much memory change `cs` holds: the characters and blocks it puts in, the pictures
+/// and other files, and a flat amount for each style sheet, list set, settings or glossary it
+/// replaces whole (estimates: the cap is a bound on the memory followers' changes keep, not a
+/// count).
 fn weight(cs: &ChangeSet) -> usize {
     const WHOLE: usize = 64 << 10;
     const SMALL: usize = 1 << 10;
     let blocks = |bl: &mut dyn Iterator<Item = &Arc<Block>>| bl.map(|b| block_weight(b, 0)).fold(0usize, usize::saturating_add);
+    let edits = cs
+        .edits
+        .iter()
+        .map(|e| {
+            let chars = e.chars.as_ref().map_or(0, |c| {
+                let ins = &c.inserted;
+                ins.text.len().saturating_add(ins.runs.len().saturating_mul(64)).saturating_add(ins.objects.len().saturating_mul(256))
+            });
+            chars.saturating_add(if e.shell.is_some() { SMALL } else { 0 }).saturating_add(64)
+        })
+        .fold(0usize, usize::saturating_add);
     let splices = cs
         .splices
         .iter()
@@ -110,7 +122,7 @@ fn weight(cs: &ChangeSet) -> usize {
             _ => SMALL,
         })
         .fold(0usize, usize::saturating_add);
-    splices.saturating_add(parts).saturating_add(fields).saturating_add(cs.tables.len().saturating_mul(SMALL))
+    edits.saturating_add(splices).saturating_add(parts).saturating_add(fields).saturating_add(cs.tables.len().saturating_mul(SMALL))
 }
 
 /// About how much memory block `b` holds.

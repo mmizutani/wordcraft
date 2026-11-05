@@ -403,14 +403,22 @@ fn an_agent_follows_the_changes_after_the_version_it_read() {
     assert_eq!(changes.len(), 1, "{r}");
     let edit = &changes[0]["edits"][0];
     assert_eq!(edit["in"], json!({"story": "body"}), "{r}");
-    assert_eq!(edit["removed"], json!([id]), "{r}");
-    assert_eq!(edit["inserted"], json!([id]), "typing keeps the paragraph's id: {r}");
+    assert_eq!(edit["paragraph"], json!(id), "typing edits the paragraph in place: {r}");
     assert_eq!((edit["at"].as_u64(), edit["deleted"].as_u64(), edit["text"].as_str()), (Some(5), Some(0), Some(" world")), "{r}");
     assert!(changes[0].get("change").is_none(), "only with full: {r}");
     // Nothing since the current version; the whole change on request.
     assert_eq!(tool(&mut s, "get_changes", json!({}))["changes"], json!([]));
     let full = tool(&mut s, "get_changes", json!({"since": read, "full": true}));
-    assert!(full["changes"][0]["change"]["splices"].is_array(), "{full}");
+    assert_eq!(full["changes"][0]["change"]["edits"][0]["chars"]["inserted"]["text"], " world", "{full}");
+    // Enter adds a paragraph after it: the blocks taken away and put in.
+    tool(&mut s, "execute", json!({"command": "text.newParagraph"}));
+    let r = tool(&mut s, "get_changes", json!({"since": read + 1}));
+    let edit = &r["changes"][0]["edits"][0];
+    assert_eq!(
+        (edit["after"].as_str(), edit["removed"].as_array().map(Vec::len), edit["inserted"].as_array().map(Vec::len)),
+        (Some(id.as_str()), Some(0), Some(1)),
+        "{r}"
+    );
     // A version the document never had is an error the agent can read.
     let r = call(&mut s, 12, "tools/call", json!({"name": "get_changes", "arguments": {"since": read + 10}}));
     assert_eq!(r["result"]["isError"], true, "{r}");

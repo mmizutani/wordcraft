@@ -1,6 +1,6 @@
 # WordCraft architecture
 
-> **Last reviewed:** 2026-10-28 · **Last updated:** 2026-11-05 · **Change:** trivial (data flow: every command has a scope, `engine::scope`, and names the params that are places); previously trivial (data flow: what a command changed becomes one change another copy applies, `doc::ChangeSet`, and agents follow, `document.changes`); previously trivial (data flow: every paragraph and table has an id, `doc::BlockId`); previously trivial (craft-proof's row says what a build without the Language data keeps: English spelling from an installed Hunspell English or the built-in list, rule hyphenation for Bulgarian, Turkish and Russian; previously minor: proofing moved out: `wordcraft-proof` is craft-libs' `craft-proof`, its Language data craft-i18n's `language-data/` embedded from `CRAFT_I18N_DIR`; previously major: crate and layer inventory, source counts, proofing languages and module boundaries re-measured from this checkout; previously minor: `proof` is per language: English and Polish; previously major: first committed version; `plan/architecture.md` is local-only) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+> **Last reviewed:** 2026-10-28 · **Last updated:** 2026-11-05 · **Change:** trivial (data flow: a paragraph edited in place sends only the characters the edit replaced, and a change made at the same time as another is moved past it, `ChangeSet::rebase`); previously trivial (data flow: every command has a scope, `engine::scope`, and names the params that are places); previously trivial (data flow: what a command changed becomes one change another copy applies, `doc::ChangeSet`, and agents follow, `document.changes`); previously trivial (data flow: every paragraph and table has an id, `doc::BlockId`); previously trivial (craft-proof's row says what a build without the Language data keeps: English spelling from an installed Hunspell English or the built-in list, rule hyphenation for Bulgarian, Turkish and Russian; previously minor: proofing moved out: `wordcraft-proof` is craft-libs' `craft-proof`, its Language data craft-i18n's `language-data/` embedded from `CRAFT_I18N_DIR`; previously major: crate and layer inventory, source counts, proofing languages and module boundaries re-measured from this checkout; previously minor: `proof` is per language: English and Polish; previously major: first committed version; `plan/architecture.md` is local-only) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
 
 How WordCraft is built today. The longer design notes in
 `plan/architecture.md` are gitignored and local to the original author's machine; this file is the
@@ -53,9 +53,13 @@ crate name links to its source tree.
    When the command ends, what it changed becomes one change (`doc::ChangeSet`) in the
    document's change log (`engine::ChangeLog`, the last 1,024): the blocks taken away and put
    in, by id, with a text splice for mapping positions, table properties, parts and document
-   fields. Another copy of the document makes the same edit with `Document::apply`, which
-   checks by id and content fingerprint that it holds what the change was made on, and is
-   left as it was otherwise. Agents follow the log (`document.changes`, MCP `get_changes`).
+   fields; a paragraph edited in place sends only the characters the edit replaced, with their
+   formatting and objects. Another copy of the document makes the same edit with
+   `Document::apply`, which checks by id and content fingerprint that it holds what the change
+   was made on, and is left as it was otherwise. A change made at the same time as another is
+   moved past it with `ChangeSet::rebase` (past the characters the other put in or took away in
+   the same paragraph), unless the two change the same characters or blocks. Agents follow the
+   log (`document.changes`, MCP `get_changes`).
    Every command has a scope (`engine::scope`: document, selection, view, file, app or UI),
    what it touches and so who may run it in a shared document, and names the params that are
    places in the document, which a change moves (`ChangeSet::map`).
@@ -82,6 +86,7 @@ crate name links to its source tree.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-05 | trivial | Data flow: a paragraph edited in place sends only the characters the edit replaced (`doc::change::ParaEdit`), and a change made at the same time as another is moved past it unless both change the same characters or blocks (`ChangeSet::rebase`) |
 | 2026-11-05 | trivial | Data flow: every command has a scope (`engine::scope`: what it touches, so who may run it in a shared document) and names the params that are places in the document |
 | 2026-11-05 | trivial | Data flow: what a command changed becomes one change (`doc::ChangeSet`) that another copy applies (`Document::apply`) and agents follow (`document.changes`, `get_changes`) |
 | 2026-11-05 | trivial | Data flow: every paragraph and table has an id of its own (`doc::BlockId`), kept through edits and given after every command to the blocks it made or copied |
