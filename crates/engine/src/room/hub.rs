@@ -116,11 +116,17 @@ impl Hub {
     }
 
     /// Admit a participant called `name` with `role`. Refused when the name is empty, too long
-    /// or holds control characters, or an invite has it ([`Hub::invite`]).
+    /// or holds control characters, or an invite ([`Hub::invite`]) or a participant has it,
+    /// whatever its case: comments and tracked changes are a participant's by their name, so
+    /// no two have the same one. (Another copy of an invited participant's joins with their
+    /// key, [`Hub::admit_with`].)
     pub fn admit(&mut self, name: &str, role: Role) -> Result<Participant, RoomError> {
         let name = valid_name(name)?;
         if self.invites.iter().any(|i| same_name(&i.name, name)) {
             return Err(RoomError::Name(format!("{name} is invited: they join with their key")));
+        }
+        if self.participants.iter().any(|p| same_name(&p.name, name)) {
+            return Err(RoomError::Name(format!("{name} is someone's name in this room already")));
         }
         self.add(name, role)
     }

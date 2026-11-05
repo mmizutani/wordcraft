@@ -84,17 +84,8 @@ impl Session {
         let ime_text_join = self.ime_text_join.take();
         let reg = self.registry.clone();
         let Some(spec) = reg.get(id) else { return Err(CmdError::Unknown(id.to_string())) };
-        // A participant's copy runs only the commands their role's scopes allow, inside other
-        // commands too (a macro's steps, Repeat): no files, other documents or windows, and the
-        // application's settings only for an owner.
-        if self.confined {
-            let refused = match crate::scope::Scope::of(id) {
-                Some(scope) => self.role.unwrap_or(crate::room::Role::Owner).refuses(scope),
-                None => Some("it has no scope".to_string()),
-            };
-            if let Some(why) = refused {
-                return Err(CmdError::Disabled(format!("{id}: {why}")));
-            }
+        if let Some(why) = self.confined_refuses(id) {
+            return Err(CmdError::Disabled(format!("{id}: {why}")));
         }
         let join = join
             || (equation_join && matches!(id, "equation.type" | "equation.backspace"))
@@ -128,13 +119,15 @@ impl Session {
         }
         // Typing, caret movement and selection outside the equation commands leave the equation.
         self.leave_math_for_command(id);
+        // Snapshotted like an edit, to be undone like one when it did more than the role allows.
+        let held = self.held_to_role(spec.mutates);
         // The undo stacks are snapshotted whole, not as a length: commands run nested commands,
         // whose checkpoints, undos and redos (and evictions at the limit) must be put back too.
-        let ime_epoch_before = spec.mutates.then_some(self.ime_body_epoch);
+        let ime_epoch_before = held.then_some(self.ime_body_epoch);
         // Commands may leave an equation (a whole-body replacement) even after they fail; put
         // the editing session back with the document.
-        let math_before = spec.mutates.then(|| self.math.clone());
-        let before_doc: Option<RunSnapshot> = if spec.mutates {
+        let math_before = held.then(|| self.math.clone());
+        let before_doc: Option<RunSnapshot> = if held {
             Some((
                 self.doc.clone(),
                 self.sel.clone(),
@@ -157,8 +150,8 @@ impl Session {
         // Whether the document has unsaved changes, and the revision its layout is keyed on: a
         // command that changes nothing leaves both as they were, and a failed one leaves no
         // trace.
-        let dirty_before = spec.mutates.then_some(self.dirty);
-        let rev_restore = spec.mutates.then_some(self.rev);
+        let dirty_before = held.then_some(self.dirty);
+        let rev_restore = held.then_some(self.rev);
         // These mutating commands can replace the open document and discard its saved versions.
         // Keep the versions until the command and the protected-region post-check have both
         // succeeded; rejected commands must leave the old document and its snapshots together.
@@ -224,7 +217,7 @@ impl Session {
             }
         };
         // In a shared document, nothing more than the participant's role lets them change.
-        let recorded = self.hold_to_role(id, home, forced, before_doc.as_ref().map(|(d, ..)| d), &mut result);
+        let recorded = self.hold_to_role(id, home, mutates, forced, before_doc.as_ref().map(|(d, ..)| d), &mut result);
         if self.document_id != home || (result.is_err() && self.order.iter().any(|d| *d >= mark)) {
             return self.finish_elsewhere(
                 ElsewhereContext { home, mark, before_doc, blocks_before, default_language_before, pending_application_change_before },

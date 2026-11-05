@@ -1,6 +1,6 @@
 # WordCraft architecture
 
-> **Last reviewed:** 2026-10-28 · **Last updated:** 2026-11-05 · **Change:** trivial (data flow: participants in a room have roles, `room::Role`, which their copy and the hub hold each change to); previously trivial (data flow: shared documents are rooms, `engine::room`: participants edit copies of their own, and the room's hub puts their changes in one order); previously trivial (data flow: a paragraph edited in place sends only the characters the edit replaced, and a change made at the same time as another is moved past it, `ChangeSet::rebase`); previously trivial (data flow: every command has a scope, `engine::scope`, and names the params that are places); previously trivial (data flow: what a command changed becomes one change another copy applies, `doc::ChangeSet`, and agents follow, `document.changes`); previously trivial (data flow: every paragraph and table has an id, `doc::BlockId`); previously trivial (craft-proof's row says what a build without the Language data keeps: English spelling from an installed Hunspell English or the built-in list, rule hyphenation for Bulgarian, Turkish and Russian; previously minor: proofing moved out: `wordcraft-proof` is craft-libs' `craft-proof`, its Language data craft-i18n's `language-data/` embedded from `CRAFT_I18N_DIR`; previously major: crate and layer inventory, source counts, proofing languages and module boundaries re-measured from this checkout; previously minor: `proof` is per language: English and Polish; previously major: first committed version; `plan/architecture.md` is local-only) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+> **Last reviewed:** 2026-10-28 · **Last updated:** 2026-11-05 · **Change:** trivial (data flow: a participant's Repeat, macros, Undo and Redo are held to their role as a whole; names in a room are its participants' own; a comment's text is its own; others' tracked changes stay where they were); previously trivial (data flow: participants in a room have roles, `room::Role`, which their copy and the hub hold each change to); previously trivial (data flow: shared documents are rooms, `engine::room`: participants edit copies of their own, and the room's hub puts their changes in one order); previously trivial (data flow: a paragraph edited in place sends only the characters the edit replaced, and a change made at the same time as another is moved past it, `ChangeSet::rebase`); previously trivial (data flow: every command has a scope, `engine::scope`, and names the params that are places); previously trivial (data flow: what a command changed becomes one change another copy applies, `doc::ChangeSet`, and agents follow, `document.changes`); previously trivial (data flow: every paragraph and table has an id, `doc::BlockId`); previously trivial (craft-proof's row says what a build without the Language data keeps: English spelling from an installed Hunspell English or the built-in list, rule hyphenation for Bulgarian, Turkish and Russian; previously minor: proofing moved out: `wordcraft-proof` is craft-libs' `craft-proof`, its Language data craft-i18n's `language-data/` embedded from `CRAFT_I18N_DIR`; previously major: crate and layer inventory, source counts, proofing languages and module boundaries re-measured from this checkout; previously minor: `proof` is per language: English and Polish; previously major: first committed version; `plan/architecture.md` is local-only) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
 
 How WordCraft is built today. The longer design notes in
 `plan/architecture.md` are gitignored and local to the original author's machine; this file is the
@@ -73,15 +73,17 @@ crate name links to its source tree.
    the caret and selection with their text), and makes its edits that clash again after the
    other's change: it runs the same commands from the same places, moved through that change.
    Each participant has a role (`room::Role`: viewer, commenter, suggester, editor or owner).
-   The room's own process joins people and agents under a name and a role; anyone else joins
-   with a key the room handed out for one (`Room::invite`, `Room::join_with`). A suggester's
-   commands make tracked changes in their name whatever the document's Track Changes setting.
-   Their copy undoes a command that changes more than the role lets them (`Session::role`),
-   and the hub sends such a change back (`room::rules`): a commenter's must leave the document
-   as it was but for their own comments, a suggester's the same once every tracked change is
-   rejected, with others' tracked changes covering what they covered once the suggester's own
-   are taken back (a paragraph they split joins its other half again, as Reject does it). Both
-   compare only the blocks and parts the change touched.
+   The room's own process joins people and agents under a name and a role, a name no one in
+   the room has (ignoring case); anyone else joins with a key the room handed out for one
+   (`Room::invite`, `Room::join_with`). A suggester's commands make tracked changes in their
+   name whatever the document's Track Changes setting. Their copy undoes a command that
+   changes more than the role lets them (`Session::role`), Repeat, a macro, Undo and Redo as a
+   whole, and the hub sends such a change back (`room::rules`): a commenter's must leave the
+   document as it was but for their own comments (each with a comment part of its own), a
+   suggester's the same once every tracked change is rejected, with others' tracked changes
+   covering what they covered, where they were, once the suggester's own are taken back (a
+   paragraph they split joins its other half again, as Reject does it). Both compare only the
+   blocks and parts the change touched.
 3. **Layout:** `layout` turns the document into pages of positioned glyphs, boxes and images
    (display list), incrementally: an edit relayouts only what changed (1.4 ms on a 188-page
    document, measured 2026-10-06).
@@ -105,6 +107,7 @@ crate name links to its source tree.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-05 | trivial | Data flow: a participant's Repeat, macros, Undo and Redo are held to their role as a whole; a name in a room is one participant's (ignoring case); a comment's text is a comment part of its own; others' tracked changes stay where they were, not only as they were |
 | 2026-11-05 | trivial | Data flow: participants in a room have roles (`room::Role`); a suggester's commands make tracked changes in their name, and their copy and the hub refuse a change beyond the role (`room::rules`), comparing only what it touched |
 | 2026-11-05 | trivial | Data flow: a document edited at once is a room (`engine::room`): each participant edits a copy of their own, the room's hub accepts, moves or sends back their changes, and copies make their clashing edits again after the other's |
 | 2026-11-05 | trivial | Data flow: a paragraph edited in place sends only the characters the edit replaced (`doc::change::ParaEdit`), and a change made at the same time as another is moved past it unless both change the same characters or blocks (`ChangeSet::rebase`) |
