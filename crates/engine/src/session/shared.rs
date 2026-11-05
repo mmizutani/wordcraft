@@ -94,6 +94,15 @@ impl Session {
         self.math = math;
         self.typing = typing;
         self.edit_marks = marks;
+        // What Reset Picture and picture styles know of a picture file holds only while the
+        // file (and the original it was made from) is the same: another participant's picture
+        // can come in under a name an edit made again no longer uses.
+        let same = |k: &String| match (before.media.get(k), now.media.get(k)) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b) || a == b,
+            _ => false,
+        };
+        self.originals.retain(|k, v| same(k) && same(v));
+        self.picture_looks.retain(|k, _| same(k));
         self.also_selected.clear();
         self.column = None;
         self.widened = None;

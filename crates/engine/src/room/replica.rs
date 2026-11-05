@@ -627,6 +627,16 @@ impl Replica {
         self.session.view.draw.lasso = lasso;
         let pending = self.session.pending.clone();
         let comments_before: Vec<u32> = self.session.doc.comments.keys().copied().collect();
+        // A comment named by the caret is kept by its id: made again, the caret may be at
+        // another participant's comment.
+        let mut kept_params = params.clone();
+        if NAMES_COMMENTS.contains(&id)
+            && params.get("id").is_none()
+            && !params.get("all").and_then(Value::as_bool).unwrap_or(false)
+            && let (Some(c), Some(o)) = (crate::cmd::review::comment_at_caret(&self.session), kept_params.as_object_mut())
+        {
+            o.insert("id".into(), Value::from(c));
+        }
         let move_before = self.session.pending_move.as_ref().map(|m| m.rev);
         let result = self.session.run(id, params);
         if self.session.registry.get(id).is_some_and(|spec| spec.mutates) {
@@ -637,7 +647,7 @@ impl Replica {
         self.stay_in_document();
         let after = selection_anchors(&self.session);
         let made = Made {
-            command: Some((id.to_string(), params.clone())),
+            command: Some((id.to_string(), kept_params)),
             before,
             after,
             around,

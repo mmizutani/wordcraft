@@ -1160,6 +1160,82 @@ fn repeat_after_another_s_change_repeats_at_the_place_it_was_made() {
 }
 
 #[test]
+fn resolving_the_comment_at_the_caret_made_again_resolves_that_comment() {
+    let room = Room::new(Document::from_text("one two three"));
+    let mut a = join(&room, "Ana");
+    let b = join(&room, "Ben");
+    run(&mut a, "select.text", json!({"text": "three"}));
+    run(&mut a, "review.newComment", json!({"text": "A"}));
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    let [mut a, mut b] = copies;
+    let ana = a.session().doc.comments.keys().next().copied().unwrap();
+    // Ana resolves the comment at her caret, at the start of the paragraph (her comment is
+    // the paragraph's only one); Ben first comments on "one" and resolves Ana's comment. Made
+    // again, hers resolves her comment, not Ben's, which is now the one at the caret.
+    run(&mut a, "caret.docStart", json!({}));
+    run(&mut a, "review.resolveComment", json!({"value": true}));
+    run(&mut b, "select.text", json!({"text": "one"}));
+    run(&mut b, "review.newComment", json!({"text": "B"}));
+    run(&mut b, "review.resolveComment", json!({"id": ana, "value": true}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    let d = &a.session().doc;
+    let resolved = |t: &str| d.comments.values().find(|c| d.plain_text(StoryRef::Part(c.part)) == t).map(|c| c.resolved);
+    assert_eq!((resolved("A"), resolved("B")), (Some(true), Some(false)));
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
+fn reset_picture_after_edits_made_again_resets_only_pictures_they_made() {
+    fn png(shade: u8) -> String {
+        let img = image::RgbaImage::from_fn(8, 8, |x, _| image::Rgba([shade, if x > 3 { 200 } else { 20 }, 30, 255]));
+        let mut b = Vec::new();
+        image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut b), image::ImageFormat::Png).unwrap();
+        crate::cmd::insert::base64_encode(&b)
+    }
+    let picture = |r: &Replica, i: usize| {
+        r.session().doc.body.get(i).and_then(|b| b.as_para()).and_then(|p| {
+            p.object_offsets().into_iter().find_map(|o| match p.object_at(o) {
+                Some(wordcraft_doc::InlineObject::Image { media, .. }) => Some(media.clone()),
+                _ => None,
+            })
+        })
+    };
+    let room = Room::new(Document::from_text("a\nb"));
+    let mut a = join(&room, "Ana");
+    let b = join(&room, "Ben");
+    run(&mut a, "caret.set", json!({"pos": Pos::body(0, 1)}));
+    run(&mut a, "insert.picture", json!({"data": png(10)}));
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    let [mut a, mut b] = copies;
+    // Ana turns her picture grey, a new picture file; Ben first puts a picture of his own in,
+    // under the same new file name. Ana's edit is made again under another name, and Reset
+    // Picture on Ben's picture leaves it as it is.
+    run(&mut a, "select.range", json!({"anchor": Pos::body(0, 1), "focus": Pos::body(0, 4)}));
+    run(&mut a, "picture.color", json!({"mode": "grayscale"}));
+    run(&mut b, "caret.set", json!({"pos": Pos::body(1, 1)}));
+    run(&mut b, "insert.picture", json!({"data": png(250)}));
+    assert_eq!(picture(&a, 0), picture(&b, 1));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    let ben = picture(&a, 1);
+    run(&mut a, "select.range", json!({"anchor": Pos::body(1, 1), "focus": Pos::body(1, 4)}));
+    let _ = a.run("picture.reset", &json!({}));
+    assert_eq!(picture(&a, 1), ben);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
 fn edits_in_a_new_text_box_made_again_are_made_in_that_box() {
     let room = Room::new(Document::from_text("one two"));
     let mut a = join(&room, "Ana");
