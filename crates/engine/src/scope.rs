@@ -43,6 +43,12 @@ pub enum Scope {
 }
 
 impl Scope {
+    /// Whether a participant's copy of a shared document runs commands of this scope: not those
+    /// on files, other documents and windows.
+    pub fn in_shared_document(self) -> bool {
+        matches!(self, Scope::Document | Scope::Selection | Scope::View | Scope::App)
+    }
+
     /// The scope of the commands whose id has this prefix (the part before the first `.`),
     /// unless [`OVERRIDES`] gives one another; `None` for a prefix with no default, under which
     /// every command must be in [`OVERRIDES`].

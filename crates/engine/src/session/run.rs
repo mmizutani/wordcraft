@@ -82,6 +82,9 @@ impl Session {
         let ime_text_join = self.ime_text_join.take();
         let reg = self.registry.clone();
         let Some(spec) = reg.get(id) else { return Err(CmdError::Unknown(id.to_string())) };
+        if self.confined && !crate::scope::Scope::of(id).is_some_and(|s| s.in_shared_document()) {
+            return Err(CmdError::Disabled(format!("{id}: files, other documents and windows aren't part of a shared document")));
+        }
         let join = join
             || (equation_join && matches!(id, "equation.type" | "equation.backspace"))
             || (id == "text.insert" && ime_text_join.as_ref().is_some_and(|sel| sel == &self.sel));

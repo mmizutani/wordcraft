@@ -91,6 +91,7 @@ impl Session {
             view,
             pending,
             last_highlight: wordcraft_doc::props::Highlight::Yellow,
+            confined: false,
             path,
             file_name,
             user_dict_path: None,

@@ -220,6 +220,9 @@ pub struct Session {
     /// More pictures and shapes selected along with the one the selection holds (Shift+click),
     /// for Group. Cleared by any edit or selection change other than adding to it.
     pub also_selected: Vec<Pos>,
+    /// A room's copy of a shared document: commands on files, other documents and windows are
+    /// refused, also when another command runs them (a macro's steps, Repeat).
+    pub(crate) confined: bool,
     /// Column (block) selection, if one was made (see [`Session::column_segments`]).
     pub column: Option<ColumnBlock>,
     /// Column selection mode (Ctrl+Shift+F8): caret movement extends the block.
