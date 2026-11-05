@@ -107,7 +107,7 @@ When `check.sh` exits 2, replay the finding. If the code really is fixed, delete
 
 The sync commit is the last commit at which someone confirmed that the model describes the covered code. Keep it on `main`, because `check.sh` compares against it and a squash merge removes a branch's commits.
 
-sync-commit: f57f5431ff021b2d7c0e7d475f33bcbc8eba1d85
+sync-commit: b0e28ce4ffe6dd69a98d86fd1162eb666e1b9c19
 
 covered-files:
 - crates/engine/src/recovery.rs
