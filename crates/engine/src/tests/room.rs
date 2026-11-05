@@ -977,3 +977,33 @@ fn highlighting_made_again_uses_the_colour_picked_for_it() {
     smooth(&copies);
     same_everywhere(&copies).unwrap();
 }
+
+#[test]
+fn an_edit_of_a_new_comment_made_again_edits_that_comment() {
+    let room = Room::new(Document::from_text("one two three"));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    let comments = |r: &Replica| {
+        let d = &r.session().doc;
+        let mut t: Vec<String> = d.comments.values().map(|c| d.plain_text(wordcraft_doc::StoryRef::Part(c.part))).collect();
+        t.sort();
+        t
+    };
+    // Ana comments on "two" and edits her comment; Ben comments on "one" first, under the same
+    // new id. Ana's comment is made again under another id, and her edit edits it, not Ben's.
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "review.newComment", json!({"text": "A"}));
+    let id = a.session().doc.comments.keys().next().copied().unwrap();
+    run(&mut a, "review.editComment", json!({"id": id, "text": "A2"}));
+    run(&mut b, "select.text", json!({"text": "one"}));
+    run(&mut b, "review.newComment", json!({"text": "B"}));
+    assert_eq!(b.session().doc.comments.keys().next().copied(), Some(id));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    assert_eq!(comments(&a), ["A2", "B"]);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}

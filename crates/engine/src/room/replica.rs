@@ -207,6 +207,16 @@ impl Inputs {
     }
 }
 
+/// The commands whose `id` param names a comment. A comment made again after a clash can get
+/// another id than it had (the other participant's new comment took it), so the edits after it
+/// that name it are made again with its new id.
+const NAMES_COMMENTS: &[&str] = &["review.reply", "review.editComment", "review.deleteComment", "review.resolveComment"];
+
+/// The ids of the comments in `doc` that aren't in `before` (sorted).
+fn new_comments(before: &[u32], doc: &Document) -> Vec<u32> {
+    doc.comments.keys().copied().filter(|id| before.binary_search(id).is_err()).collect()
+}
+
 /// What a command reads from its session besides the document, the selection, its params and
 /// [`Inputs`], and the participant can change without changing the document: the options
 /// (typing replaces the selection, Overtype, AutoCorrect, AutoFormat…), the view (Outline view,
@@ -316,6 +326,8 @@ struct Made {
     inputs: Option<Box<Inputs>>,
     /// The formatting picked at the caret for the next typed text when it was made.
     pending: Option<CharProps>,
+    /// The ids of the comments it made (sorted).
+    comments: Vec<u32>,
     /// The options, view and the rest of what it read from the session that the participant can
     /// change without an edit, shared with the commands before it while they don't change.
     context: Option<Arc<Context>>,
@@ -334,6 +346,7 @@ impl Made {
             places: Vec::new(),
             inputs: None,
             pending: None,
+            comments: Vec::new(),
             context: None,
             tries: 0,
         }
@@ -503,11 +516,23 @@ impl Replica {
         };
         self.session.view.draw.lasso = lasso;
         let pending = self.session.pending.clone();
+        let comments_before: Vec<u32> = self.session.doc.comments.keys().copied().collect();
         let result = self.session.run(id, params);
+        let comments = new_comments(&comments_before, &self.session.doc);
         self.stay_in_document();
         let after = selection_anchors(&self.session);
-        let made =
-            Made { command: Some((id.to_string(), params.clone())), before, after, around, places, inputs, pending, context: Some(context), tries };
+        let made = Made {
+            command: Some((id.to_string(), params.clone())),
+            before,
+            after,
+            around,
+            places,
+            inputs,
+            pending,
+            comments,
+            context: Some(context),
+            tries,
+        };
         self.collect(made);
         result
     }
@@ -710,15 +735,44 @@ impl Replica {
         self.session.reset_shared(doc);
         self.seen = self.session.changes().version();
         let mut went_on: Option<SelAnchors> = None;
+        // The comments the edits made, by the id each had when it was made: the id it has now,
+        // or none when it wasn't made again.
+        let mut renamed: BTreeMap<u32, Option<u32>> = BTreeMap::new();
+        let gone = |renamed: &mut BTreeMap<u32, Option<u32>>, comments: &[u32]| {
+            for c in comments {
+                renamed.insert(*c, None);
+            }
+        };
         for (k, u) in dropped.into_iter().enumerate() {
             for (j, m) in u.made.into_iter().enumerate() {
-                let Made { command, before, after, around, places, inputs, pending, context, tries } = m;
+                let Made { command, before, after, around, places, inputs, pending, comments, context, tries } = m;
                 let tries = if read_again { tries.saturating_add(1) } else { tries };
                 let Some((id, mut params)) = command.filter(|_| tries <= MAX_TRIES) else {
                     self.stats.lost = self.stats.lost.saturating_add(1);
+                    gone(&mut renamed, &comments);
                     went_on = None;
                     continue;
                 };
+                // A comment an edit before it made, named by the id it had then.
+                if NAMES_COMMENTS.contains(&id.as_str())
+                    && let Some(was) = params.get("id").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok())
+                    && let Some(&now) = renamed.get(&was)
+                {
+                    match (now, params.as_object_mut()) {
+                        (Some(now), Some(o)) => {
+                            o.insert("id".into(), Value::from(now));
+                        }
+                        _ => {
+                            self.stats.lost = self.stats.lost.saturating_add(1);
+                            self.session.status = format!(
+                                "An edit made at the same time as another participant's couldn't be made again ({id}): the comment it was made on is gone"
+                            );
+                            gone(&mut renamed, &comments);
+                            went_on = None;
+                            continue;
+                        }
+                    }
+                }
                 let reselect = went_on != Some(before) || !around.is_empty();
                 // From the document the command was made on to the one it is made again on: the
                 // change its edits clashed with for the first, the difference for the others.
@@ -735,6 +789,7 @@ impl Replica {
                 // or the text box they were in away) isn't made anywhere else.
                 if !self.made_at(reselect, before, &around, &places, &mut params, through) {
                     self.stats.lost = self.stats.lost.saturating_add(1);
+                    gone(&mut renamed, &comments);
                     self.session.status = format!(
                         "An edit made at the same time as another participant's couldn't be made again ({id}): the text it was made in is gone"
                     );
@@ -749,10 +804,21 @@ impl Replica {
                 }
                 self.session.pending = pending;
                 went_on = Some(after);
+                let comments_before: Vec<u32> = self.session.doc.comments.keys().copied().collect();
                 match self.run_made(&id, &params, tries) {
-                    Ok(_) => self.stats.made_again = self.stats.made_again.saturating_add(1),
+                    Ok(_) => {
+                        self.stats.made_again = self.stats.made_again.saturating_add(1);
+                        // Its new comments in the order they were made in, as their ids go up.
+                        let made = new_comments(&comments_before, &self.session.doc);
+                        if made.len() == comments.len() {
+                            renamed.extend(comments.iter().copied().zip(made.into_iter().map(Some)));
+                        } else {
+                            gone(&mut renamed, &comments);
+                        }
+                    }
                     Err(e) => {
                         self.stats.lost = self.stats.lost.saturating_add(1);
+                        gone(&mut renamed, &comments);
                         self.session.status = format!("An edit made at the same time as another participant's couldn't be made again ({id}): {e}");
                         went_on = None;
                     }
@@ -971,12 +1037,12 @@ impl Replica {
 
 #[cfg(test)]
 mod tests {
-    use super::READS_INPUTS;
+    use super::{NAMES_COMMENTS, READS_INPUTS};
 
     #[test]
-    fn the_commands_that_read_more_than_the_document_are_commands() {
+    fn the_commands_that_read_more_than_the_document_or_name_comments_are_commands() {
         let s = crate::Session::new(wordcraft_doc::Document::new());
-        for id in READS_INPUTS {
+        for id in READS_INPUTS.iter().chain(NAMES_COMMENTS) {
             assert!(s.registry.get(id).is_some(), "{id}");
         }
     }
