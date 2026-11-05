@@ -2,10 +2,11 @@
 
 use serde_json::{Value, json};
 use std::sync::Arc;
-use wordcraft_doc::{Block, Document, StoryRef};
+use wordcraft_doc::change::{FieldChange, PartChange};
+use wordcraft_doc::{Block, ChangeSet, Document, StoryRef};
 
 use super::{pos_json, sel_result};
-use crate::{CmdError, CmdResult, CommandSpec, Session, p};
+use crate::{CmdError, CmdResult, CommandSpec, MAX_CHANGES, Session, p};
 
 /// Longest user name kept, in characters; longer names are cut, not refused.
 /// `format` of the save commands for an `.xml` file: Word 2003 XML Document (WordprocessingML 2003).
@@ -176,6 +177,11 @@ pub fn specs() -> Vec<CommandSpec> {
             .params(r#"{} → {"removePersonalInfo": bool, "removeDateTime": bool} (file.privacyOptions changes them)"#)
             .pure(),
         CommandSpec::new("document.inspect", "Inspect Document", "Agents", inspect).params(r#"{"text"?: bool}"#).pure(),
+        CommandSpec::new("document.changes", "Document Changes", "Agents", changes)
+            .params(
+                r#"{"since"?: number (a version of this document, as document.inspect or an earlier call gave it; the current one when left out), "limit"?: number (most changes to give, oldest first: 100 when left out, at most 1024), "full"?: bool (each change whole, as another copy of the document applies it)} → {"document": id, "version": number (the current one), "changes": [{"version", "edits": [{"in", "after"?, "before"?, "removed": [block id], "inserted": [block id], "at", "deleted", "text"}], "tables"?: [table id], "parts"?: [{"added"|"removed"|"changed": id}], "fields"?: [name], "change"?: ChangeSet}], "more"?: true (ask again from the last version given)}; an error when `since` is ahead of the document or older than the changes it keeps (read the document again)"#,
+            )
+            .pure(),
         CommandSpec::new("document.text", "Document Text", "Agents", |s, v| {
             let story = super::story_param(s, v);
             Ok(json!({"text": s.doc.final_text(story)}))
@@ -551,7 +557,7 @@ fn inspect(s: &mut Session, v: &Value) -> CmdResult {
         match &**b {
             Block::Para(p) => {
                 let style = p.props.style.clone().unwrap_or_else(|| "Normal".into());
-                let mut o = json!({"index": i, "type": "paragraph", "style": style, "len": p.len()});
+                let mut o = json!({"index": i, "id": p.id, "type": "paragraph", "style": style, "len": p.len()});
                 if with_text {
                     o["text"] = json!(p.plain_text());
                 }
@@ -589,7 +595,9 @@ fn inspect(s: &mut Session, v: &Value) -> CmdResult {
                             .collect()
                     })
                     .collect();
-                blocks.push(json!({"index": i, "type": "table", "rows": t.rows.len(), "cols": t.cols(), "style": t.props.style, "cells": cells}));
+                blocks.push(
+                    json!({"index": i, "id": t.id, "type": "table", "rows": t.rows.len(), "cols": t.cols(), "style": t.props.style, "cells": cells}),
+                );
             }
         }
     }
@@ -608,7 +616,106 @@ fn inspect(s: &mut Session, v: &Value) -> CmdResult {
         "properties": s.doc.core,
         "canUndo": s.can_undo(),
         "canRedo": s.can_redo(),
+        "version": s.changes().version(),
     }))
+}
+
+/// `document.changes`: the changes the document had after version `since`, oldest first, each
+/// told in short (see [`change_summary`]) and, with `full`, whole.
+fn changes(s: &mut Session, v: &Value) -> CmdResult {
+    let log = s.changes();
+    let whole = |k: &str| match v.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(n) => n.as_u64().map(Some).ok_or_else(|| CmdError::Params(format!("`{k}` is a whole number from 0"))),
+    };
+    let since = whole("since")?.unwrap_or(log.version());
+    let limit = whole("limit")?.map_or(100, |n| usize::try_from(n).unwrap_or(usize::MAX)).clamp(1, MAX_CHANGES);
+    let full = p::bool(v, "full").unwrap_or(false);
+    let after = log.since(since).map_err(CmdError::Params)?;
+    let mut out = Vec::with_capacity(after.len().min(limit));
+    for (version, cs) in after.iter().take(limit) {
+        let mut o = change_summary(cs);
+        o["version"] = json!(version);
+        if full {
+            o["change"] = serde_json::to_value(&**cs).map_err(|e| CmdError::Failed(format!("change {version} can't be written: {e}")))?;
+        }
+        out.push(o);
+    }
+    let mut r = json!({"document": s.document_id(), "version": log.version(), "changes": out});
+    if after.len() > limit {
+        r["more"] = json!(true);
+    }
+    Ok(r)
+}
+
+/// Change `cs` in short: for each list of blocks it edited, where the list is (`in`: a story,
+/// or a cell of a table), the blocks around the edit, the ids of the blocks it took away and of
+/// those it put in, and the text splice on their text (U+2029 between paragraphs, U+FFFC for a
+/// table; byte offsets): `deleted` bytes from `at`, `text` put there. Then the tables whose
+/// properties changed, the parts (notes, comments, text boxes, headers…) added, removed or
+/// changed, and the names of the other things that changed.
+fn change_summary(cs: &ChangeSet) -> Value {
+    let edits: Vec<Value> = cs
+        .splices
+        .iter()
+        .map(|sp| {
+            let mut o = json!({
+                "in": sp.container,
+                "removed": sp.removed.iter().map(|b| b.id).collect::<Vec<_>>(),
+                "inserted": sp.inserted.iter().map(|b| b.0.id()).collect::<Vec<_>>(),
+                "at": sp.text.at,
+                "deleted": sp.text.removed,
+                "text": sp.text.inserted,
+            });
+            if let Some(a) = sp.after {
+                o["after"] = json!(a);
+            }
+            if let Some(b) = sp.before {
+                o["before"] = json!(b);
+            }
+            o
+        })
+        .collect();
+    let mut o = json!({"edits": edits});
+    if !cs.tables.is_empty() {
+        o["tables"] = json!(cs.tables.iter().map(|t| t.id).collect::<Vec<_>>());
+    }
+    if !cs.parts.is_empty() {
+        let parts: Vec<Value> = cs
+            .parts
+            .iter()
+            .map(|p| match p {
+                PartChange::Added { id, .. } => json!({"added": id}),
+                PartChange::Removed { id, .. } => json!({"removed": id}),
+                PartChange::Changed { id, .. } => json!({"changed": id}),
+            })
+            .collect();
+        o["parts"] = json!(parts);
+    }
+    if !cs.fields.is_empty() {
+        let fields: Vec<String> = cs
+            .fields
+            .iter()
+            .map(|f| match f {
+                FieldChange::LastSection(_) => "lastSection".into(),
+                FieldChange::Styles(_) => "styles".into(),
+                FieldChange::Numbering(_) => "numbering".into(),
+                FieldChange::Comment { id, .. } => format!("comment {id}"),
+                FieldChange::Revisions { .. } => "revisions".into(),
+                FieldChange::Settings(_) => "settings".into(),
+                FieldChange::Core(_) => "core".into(),
+                FieldChange::Sources(_) => "sources".into(),
+                FieldChange::CustomProps(_) => "customProps".into(),
+                FieldChange::FootnoteSeparators(_) => "footnoteSeparators".into(),
+                FieldChange::EndnoteSeparators(_) => "endnoteSeparators".into(),
+                FieldChange::Media { key, .. } => format!("media {key}"),
+                FieldChange::Passthrough { key, .. } => format!("passthrough {key}"),
+                FieldChange::Glossary(_) => "glossary".into(),
+            })
+            .collect();
+        o["fields"] = json!(fields);
+    }
+    o
 }
 
 fn paragraph(s: &mut Session, v: &Value) -> CmdResult {

@@ -131,8 +131,22 @@ pub fn tool_definitions() -> Value {
         tool(
             "inspect_document",
             "Inspect document",
-            "Structure: blocks with text, styles, formatting runs, lists, tables, sections, parts, selection, pages.",
+            "Structure: blocks (with their ids) with text, styles, formatting runs, lists, tables, sections, parts, selection, pages; and the document's version, for get_changes.",
             with_doc(obj(json!({}), &[])),
+            true
+        ),
+        tool(
+            "get_changes",
+            "Get changes",
+            "What changed in the document after a version you saw, by people or other agents (inspect_document gives the version it read; each reply gives the current one): oldest first, each change's edited blocks by id (as inspect_document lists them) with the text put in, then the tables, parts and other things it changed. Leave `since` out to learn the current version. An error when `since` is older than the changes the document keeps: read the document again.",
+            with_doc(obj(
+                json!({
+                    "since": n("A version of the document; the current one when left out"),
+                    "limit": n("Most changes to give, oldest first: 100 when left out, at most 1024; `more` says when there are others"),
+                    "full": {"type": "boolean", "description": "Each change whole, as another copy of the document applies it"}
+                }),
+                &[]
+            )),
             true
         ),
         tool(
@@ -299,6 +313,11 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
         )),
         "get_text" => wrap(exec(b, "document.text", json!({}), doc)),
         "inspect_document" => wrap(b.call("document.inspect", addressed(json!({}), doc))),
+        "get_changes" => {
+            let params: serde_json::Map<String, Value> =
+                ["since", "limit", "full"].into_iter().filter_map(|k| a.get(k).map(|v| (k.to_string(), v.clone()))).collect();
+            wrap(exec(b, "document.changes", Value::Object(params), doc))
+        }
         "parity" => wrap(b.call("ui.parity", json!({}))),
         // Pictures travel inside the reply (`png`), headless or through the app: no file with a
         // predictable name in the shared temporary folder.

@@ -17,12 +17,36 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::{Block, Blocks, Document, Path, StoryRef};
+use crate::{Block, Blocks, DocError, Document, Path, Result, StoryRef};
 
 /// Which block this is (see the [module](self) docs). [`BlockId::UNSET`] until
-/// [`Document::ensure_block_ids`] gives the block one.
+/// [`Document::ensure_block_ids`] gives the block one. Written (in a [`crate::ChangeSet`], an
+/// agent's reply) as 16 hexadecimal digits, so readers whose numbers are doubles (JavaScript)
+/// keep every bit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockId(u64);
+
+impl std::fmt::Display for BlockId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
+impl serde::Serialize for BlockId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BlockId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        if s.is_empty() || s.len() > 16 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(serde::de::Error::custom(format!("`{s}` is not a block id (16 hexadecimal digits)")));
+        }
+        u64::from_str_radix(&s, 16).map(BlockId).map_err(serde::de::Error::custom)
+    }
+}
 
 impl BlockId {
     /// No id yet: a block just made.
@@ -93,7 +117,54 @@ type IdSet = HashSet<u64, BuildHasherDefault<IdHasher>>;
 /// Tables nested deeper than this aren't walked. Edits stop at [`crate::table::MAX_TABLE_DEPTH`]
 /// and the readers soon after, so every block a document holds is well within it; the bound
 /// keeps a hostile document from overflowing the stack.
-const MAX_ID_DEPTH: usize = 64;
+pub(crate) const MAX_ID_DEPTH: usize = 64;
+
+/// The ids of the blocks inside `b` (in its table cells, as [`Document::each_block`] walks them),
+/// unset ones included: what a copy needs, beside `b` itself, to hold it with the same ids.
+pub(crate) fn inside_ids(b: &Block) -> Vec<BlockId> {
+    let mut out = Vec::new();
+    if let Block::Table(t) = b {
+        for cell in t.rows.iter().flat_map(|r| &r.cells) {
+            walk(&cell.blocks, StoryRef::Body, &mut Vec::new(), 1, &mut |_, _, inner| out.push(inner.id()));
+        }
+    }
+    out
+}
+
+/// Give the blocks inside `b` the ids [`inside_ids`] listed, in the same order. False (and `b`
+/// partly renamed) when `ids` has more or fewer than `b` holds.
+pub(crate) fn set_inside_ids(b: &mut Block, ids: &[BlockId]) -> bool {
+    let mut next = ids.iter();
+    if let Block::Table(t) = b {
+        for cell in t.rows.iter_mut().flat_map(|r| &mut r.cells) {
+            if !rename(&mut cell.blocks, 1, &mut next) {
+                return false;
+            }
+        }
+    }
+    next.next().is_none()
+}
+
+/// The blocks of `bl` and those inside them, at `depth`, take the next ids of `ids` in walk
+/// order; false when `ids` runs out.
+fn rename(bl: &mut Blocks, depth: usize, ids: &mut std::slice::Iter<'_, BlockId>) -> bool {
+    if depth > MAX_ID_DEPTH {
+        return true;
+    }
+    for b in bl.iter_mut() {
+        let Some(id) = ids.next() else { return false };
+        let b = Arc::make_mut(b);
+        *b.id_mut() = *id;
+        if let Block::Table(t) = b {
+            for cell in t.rows.iter_mut().flat_map(|r| &mut r.cells) {
+                if !rename(&mut cell.blocks, depth + 1, ids) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
 
 /// [`Document::each_block`] for one block list.
 fn walk<'a>(bl: &'a [Arc<Block>], story: StoryRef, path: &mut Vec<u32>, depth: usize, f: &mut dyn FnMut(StoryRef, &[u32], &'a Arc<Block>)) {
@@ -158,6 +229,31 @@ impl Document {
             }
         }
         assign.len()
+    }
+
+    /// Every block's id, in the order [`Document::each_block`] walks them: with the document's
+    /// JSON (which leaves ids out), what another copy needs to hold the same blocks under the
+    /// same ids ([`Document::set_block_ids`]).
+    pub fn block_ids(&self) -> Vec<BlockId> {
+        let mut out = Vec::new();
+        self.each_block(&mut |_, _, b| out.push(b.id()));
+        out
+    }
+
+    /// Give the blocks the ids [`Document::block_ids`] listed for a copy of this document. An
+    /// error, leaving the document as it was, when `ids` has more or fewer than it holds.
+    pub fn set_block_ids(&mut self, ids: &[BlockId]) -> Result<()> {
+        let mut d = self.clone();
+        let mut next = ids.iter();
+        let mut ok = rename(&mut d.body, 0, &mut next);
+        for part in d.parts.values_mut() {
+            ok = ok && rename(&mut part.blocks, 0, &mut next);
+        }
+        if !ok || next.next().is_some() {
+            return Err(DocError::Invalid(format!("{} block ids for a document of {} blocks", ids.len(), self.block_ids().len())));
+        }
+        *self = d;
+        Ok(())
     }
 
     /// The blocks [`Document::ensure_block_ids`] gives ids with no `before`: those without one,

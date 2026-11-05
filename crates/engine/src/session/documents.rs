@@ -85,6 +85,7 @@ pub struct DocState {
     pub(super) widened: Option<Widened>,
     pub(super) edit_marks: Vec<Pos>,
     pub(super) go_back_step: usize,
+    pub(super) changes: super::ChangeLog,
 }
 
 impl DocState {
@@ -94,6 +95,7 @@ impl DocState {
         doc.ensure_block_ids(None);
         let start = doc.start_of(StoryRef::Body);
         let bib_style = doc_bib_style(&doc);
+        let changes = super::ChangeLog::new(&doc);
         DocState {
             doc,
             sel: Selection::caret(start),
@@ -141,6 +143,7 @@ impl DocState {
             widened: None,
             edit_marks: Vec::new(),
             go_back_step: 0,
+            changes,
         }
     }
 
@@ -241,7 +244,9 @@ impl Session {
             widened: _,
             edit_marks: _,
             go_back_step: _,
+            changes: _,
             // Shared by every open document.
+            command_docs: _,
             user_dict_path: _,
             clipboard: _,
             clipboard_text: _,
@@ -330,6 +335,7 @@ impl Session {
             widened,
             edit_marks,
             go_back_step,
+            changes,
         } = d;
         swap(&mut self.doc, doc);
         swap(&mut self.sel, sel);
@@ -377,6 +383,7 @@ impl Session {
         swap(&mut self.widened, widened);
         swap(&mut self.edit_marks, edit_marks);
         swap(&mut self.go_back_step, go_back_step);
+        swap(&mut self.changes, changes);
     }
 
     /// Make document `id` active without anything else a switch by the user does.
@@ -643,7 +650,14 @@ impl Session {
             return;
         }
         let _ = self.with_document(id, |s| {
-            if s.doc != doc {
+            // The command may have edited this document before it left it: blocks it made get
+            // ids, and the edit is recorded like any other.
+            let edited = s.doc != doc;
+            s.doc.ensure_block_ids(Some(&doc));
+            if s.outside_commands() {
+                s.record_changes();
+            }
+            if edited {
                 return;
             }
             s.sel = sel;

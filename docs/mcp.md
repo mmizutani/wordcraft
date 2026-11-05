@@ -159,7 +159,8 @@ test source in File › Options › Language and on the bar's Install.
   one-line control refuses; at most 10,000 lines — the cap is `text.insert`'s own, so a
   control-channel or CLI call is held to it too) |
 | `select_text` | select the n-th occurrence of some text |
-| `get_text` / `inspect_document` | read the document back (verify without screenshots) |
+| `get_text` / `inspect_document` | read the document back (verify without screenshots); `inspect_document` gives each block's `id` and the document's `version` |
+| `get_changes` | what changed after a version, by people or other agents (see [Following changes](#following-changes)) |
 | `render_page` | a page as PNG |
 | `parity` | feature coverage |
 | `screenshot`, `click`, `key`, `ui_inspect` | app only (`--connect`) |
@@ -172,7 +173,7 @@ document beside the ones already open and make it the active one; their reply ca
 active again (`alreadyOpen`). `list_documents` lists the open documents with their ids.
 
 Tools work on the active document. `execute`, `batch`, `type_text`, `select_text`, `get_text`,
-`inspect_document`, `render_page` and `save_document` also take `doc`, the id of another open
+`inspect_document`, `get_changes`, `render_page` and `save_document` also take `doc`, the id of another open
 document: the tool works on that document and the active one stays active.
 
 ```json
@@ -192,6 +193,33 @@ replace it; Picture Format commands (`picture.*`, `arrange.*`) still act on it.
 Resources: `wordcraft://document` (inspect) and `wordcraft://commands`.
 
 The acceptance test `crates/mcp/src/tests.rs` writes a formatted document using MCP only.
+
+### Following changes
+
+An agent that works beside people (or other agents) reads the document once and then follows what
+changes, instead of reading it again. `inspect_document` gives the `version` it read and an `id`
+for each block; `get_changes {"since": version}` gives, oldest first, each change made after it:
+
+```json
+{"document": 3, "version": 12, "changes": [
+  {"version": 12, "edits": [{"in": {"story": "body"}, "removed": ["5f0c…"], "inserted": ["5f0c…"],
+    "at": 5, "deleted": 0, "text": " world"}]}
+]}
+```
+
+Each edit names the list of blocks it changed (`in`: the body, a header, note or text box, or a
+cell `{"cell": {"table", "row", "col"}}` of a table), the ids of the blocks it took away and put in
+(typing keeps a paragraph's id; Enter adds one after it), the blocks around it (`after`, `before`)
+and the text splice on those blocks' text, with U+2029 between paragraphs and U+FFFC for a table:
+`deleted` bytes from `at`, `text` put there. `tables` lists tables whose properties changed,
+`parts` the notes, comments, text boxes and headers added, removed or changed, and `fields` the
+other things that changed (`styles`, `numbering`, `settings`, `comment 3`, `revisions`…). Undo and
+redo are changes too. `full: true` adds each change whole (`change`), as another copy of the
+document applies it (`Document::apply`). At most `limit` changes come back (100 unless given);
+`more: true` says to ask again from the last version given. Leaving `since` out gives the current
+version and no changes. A version older than the document keeps (its last 1,024 changes, about
+64 MB of them) is an error: read the document again. Through `--connect` this is the app's
+`document.changes` command, so an agent sees what the person types in the window.
 
 ## Character and paragraph properties
 

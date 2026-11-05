@@ -204,16 +204,16 @@ fn paragraphs_deleted_and_made_again_keep_their_ids() {
     }
 }
 
-/// One step of the random edits below.
+/// One step of the random edits below (and of those in `changes.rs`).
 #[derive(Clone, Debug)]
-enum Step {
+pub(super) enum Step {
     Type(String),
     Command(&'static str, Value),
     /// Undo, then redo: the ids are those before the undo.
     UndoRedo,
 }
 
-fn step() -> impl Strategy<Value = Step> {
+pub(super) fn step() -> impl Strategy<Value = Step> {
     let commands = [
         ("text.newParagraph", json!({})),
         ("text.backspace", json!({})),

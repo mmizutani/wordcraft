@@ -51,8 +51,19 @@ impl Session {
 
     /// Run a command by id with JSON params (the single entry point for the UI, CLI, MCP and
     /// control channel). Mutating commands are undoable; a failed command leaves the document as
-    /// it was; a panic inside a command becomes an error.
+    /// it was; a panic inside a command becomes an error. Whatever the command changed in the
+    /// document is one change for agents and other copies to follow (`document.changes`).
     pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
+        let result = self.run_command(id, params);
+        // A command run inside another on this document leaves the outer one to record the
+        // whole edit.
+        if self.outside_commands() {
+            self.record_changes();
+        }
+        result
+    }
+
+    fn run_command(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
         // The document the command starts in, and the first id a document it opens can have.
         let home = self.document_id;
         let mark = document_id_mark();
@@ -185,7 +196,11 @@ impl Session {
         let mutates = spec.mutates;
         let ime_caret_before = self.current_ime_caret_state();
         let rev_before = self.rev;
+        // While it runs, a command on this document records no change of its own: this one
+        // records the whole edit when it ends.
+        self.command_docs.push(home);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::cmd::column::dispatch(self, id, mutates, run, params)));
+        self.command_docs.pop();
         let mut result = match result {
             Ok(r) => r,
             Err(p) => {
