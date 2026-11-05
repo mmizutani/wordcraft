@@ -357,6 +357,32 @@ fn a_column_edit_kept_past_one_change_and_made_again_after_another_keeps_its_col
 }
 
 #[test]
+fn an_edit_made_again_after_a_column_edit_takes_its_own_selection() {
+    let room = Room::new(Document::from_text("abc\nabc"));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    // Ana bolds the column of "b"s, leaves the column, selects the text between the same
+    // corners and deletes it, while Ben types "B" over the first "b". Made again, her delete
+    // takes that text away, not the column her bold had.
+    run(&mut a, "select.column", json!({"anchor": Pos::body(0, 1), "focus": Pos::body(1, 2)}));
+    run(&mut a, "format.bold", json!({}));
+    run(&mut a, "caret.set", json!({"pos": Pos::body(0, 0)}));
+    run(&mut a, "select.range", json!({"anchor": Pos::body(0, 1), "focus": Pos::body(1, 2)}));
+    run(&mut a, "text.delete", json!({}));
+    assert_eq!(text(&a), "ac");
+    run(&mut b, "select.text", json!({"text": "b"}));
+    run(&mut b, "text.insert", json!({"text": "B"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().made_again, a.stats().lost), (1, 2, 0));
+    assert_eq!(text(&a), "ac");
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
 fn an_edit_made_again_types_with_the_options_it_was_made_with() {
     let room = Room::new(Document::from_text("one two three"));
     // Overtype is an application option: Ana's an owner.
