@@ -213,7 +213,8 @@ An edit inside a paragraph (typing, deleting or formatting characters, or changi
 paragraph's own properties) names the list it is in (`in`: the body, a header, note or text box,
 or a cell `{"cell": {"table", "row", "col"}}` of a table), the paragraph's id (`paragraph`; it
 keeps its id) and the characters it replaced, as byte offsets in its text: `deleted` bytes from
-`at`, `text` put there (U+FFFC for an object; formatting a word gives the same word back), and
+`at`, `text` put there (U+FFFC for an object; formatting a word gives the same word back, and
+places in it keep their offsets), and
 `properties: true` when its alignment, style or other paragraph properties changed. Any other
 edit names the list, the ids of the blocks it took away and put in (Enter at the end of a
 paragraph adds one after it; Enter inside one takes it away and puts back its two halves, the

@@ -32,12 +32,16 @@ pub enum Mapped {
 impl ChangeSet {
     /// Where anchor `a` is after this change. Text past a paragraph split follows its text into
     /// the new paragraph; an anchor in text the change replaced moves to where the replacement
-    /// starts; an anchor where text was put in stays before it; one in a table the change
-    /// replaced whole moves to where the table was.
+    /// starts, and one in text whose formatting alone changed stays with its characters; an
+    /// anchor where text was put in stays before it; one in a table the change replaced whole
+    /// moves to where the table was.
     pub fn map(&self, a: Anchor) -> Mapped {
         for e in &self.edits {
             if e.id == a.block {
-                let off = e.chars.as_ref().map_or(a.off, |c| map_pos(a.off, c.at, c.removed, c.inserted.text.len()));
+                let off = e.chars.as_ref().map_or(a.off, |c| {
+                    let (at, removed, inserted) = c.replaced();
+                    map_pos(a.off, at, removed, inserted)
+                });
                 return Mapped::At(Anchor { block: a.block, off });
             }
         }

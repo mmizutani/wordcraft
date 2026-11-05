@@ -433,6 +433,41 @@ fn anchors_move_with_the_characters_put_in_before_them() {
 }
 
 #[test]
+fn anchors_stay_with_characters_whose_formatting_alone_changed() {
+    let d = sample();
+    let at = |block: usize, off| Anchor { block: d.body[block].id(), off };
+    // Bolding "wo" of "two" sends "wo" again, and moves no character.
+    let (_, cs) = edit(&d, |d| bold(d, 1, 1, 3));
+    let c = cs.edits[0].chars.as_ref().unwrap();
+    assert_eq!((c.at, c.removed, c.kept), (1, 2, KeptChars { start: 2, end: 0 }));
+    for off in 0..=3 {
+        assert_eq!(cs.map(at(1, off)), Mapped::At(at(1, off)), "{off}");
+    }
+    // Bolding "three" and typing an X after "th": the places around the X keep their
+    // characters, as in a change of the text alone.
+    let (after, cs) = edit(&d, |d| {
+        bold(d, 2, 0, 5);
+        d.insert_text(&Pos::body(2, 2), "X", &CharProps { bold: Some(true), ..CharProps::default() }).unwrap();
+    });
+    assert_eq!(text(&after, 2), "thXree");
+    let c = cs.edits[0].chars.as_ref().unwrap();
+    assert_eq!((c.at, c.removed, c.inserted.text.as_str(), c.kept), (0, 5, "thXree", KeptChars { start: 2, end: 3 }));
+    for (off, now) in [(0, 0), (1, 1), (2, 2), (3, 4), (5, 6)] {
+        assert_eq!(cs.map(at(2, off)), Mapped::At(at(2, now)), "{off}");
+    }
+    // The kept characters travel with the change.
+    assert_eq!(sent(&cs), cs);
+    // Kept counts larger than the characters, from elsewhere, are cut to fit them.
+    let mut wild = cs.clone();
+    if let Some(c) = wild.edits[0].chars.as_mut() {
+        c.kept = KeptChars { start: usize::MAX, end: usize::MAX };
+    }
+    for off in [0, 3, 5, usize::MAX] {
+        assert!(matches!(wild.map(at(2, off)), Mapped::At(a) if a.block == d.body[2].id()), "{off}");
+    }
+}
+
+#[test]
 fn two_people_typing_in_one_paragraph_both_get_their_words_in() {
     let d = sample();
     let (_, a) = edit(&d, type_at(2, 0, "and "));

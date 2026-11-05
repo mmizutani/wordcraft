@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Container, Fingerprint, fingerprint, fingerprint_of};
+use super::{Container, Fingerprint, fingerprint, fingerprint_of, text_splice};
 use crate::para::{InlineObject, OBJ, Run};
 use crate::props::{CharProps, ParaProps};
 use crate::section::SectionProps;
@@ -45,6 +45,45 @@ pub struct CharSplice {
     pub hash: Fingerprint,
     #[serde(default)]
     pub inserted: Chars,
+    /// The characters it kept: an edit of some characters' formatting or objects replaces
+    /// them with the same characters.
+    #[serde(default, skip_serializing_if = "KeptChars::is_empty")]
+    pub kept: KeptChars,
+}
+
+/// How many bytes at the start and at the end of the characters a [`CharSplice`] replaced
+/// hold the same characters after it. Places among them stay with their characters
+/// ([`ChangeSet::map`](super::ChangeSet::map)).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct KeptChars {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl KeptChars {
+    fn is_empty(&self) -> bool {
+        self.start == 0 && self.end == 0
+    }
+
+    /// The characters `was` and `now` start and end with alike ([`text_splice`]).
+    fn between(was: &str, now: &str) -> KeptChars {
+        let t = text_splice(was, now);
+        KeptChars { start: t.at, end: was.len().saturating_sub(t.at).saturating_sub(t.removed) }
+    }
+}
+
+impl CharSplice {
+    /// The characters it replaced with others, leaving out those it kept: from where, how many
+    /// bytes, and how many bytes took their place. Counts of kept bytes larger than the
+    /// characters (in a change from elsewhere) are cut to fit them.
+    pub(super) fn replaced(&self) -> (usize, usize, usize) {
+        let (removed, inserted) = (self.removed, self.inserted.text.len());
+        let start = self.kept.start.min(removed).min(inserted);
+        let end = self.kept.end.min(removed.saturating_sub(start)).min(inserted.saturating_sub(start));
+        let cut = start.saturating_add(end);
+        (self.at.saturating_add(start), removed.saturating_sub(cut), inserted.saturating_sub(cut))
+    }
 }
 
 /// A piece of a paragraph: its text, the formatting runs that cover it, and an object for each
@@ -101,11 +140,13 @@ pub(super) fn para_edit(c: Container, was: &Arc<Block>, now: &Arc<Block>) -> Opt
     let chars = (*text != a.text || *runs != a.runs || *objects != a.objects).then(|| {
         let (start, end) = common(a, b);
         let (a_end, b_end) = (a.text.len().saturating_sub(end), b.text.len().saturating_sub(end));
+        let (was, now) = (chars_of(a, start, a_end), chars_of(b, start, b_end));
         CharSplice {
             at: start,
             removed: a_end.saturating_sub(start),
-            hash: fingerprint_of(&chars_of(a, start, a_end)),
-            inserted: chars_of(b, start, b_end),
+            hash: fingerprint_of(&was),
+            kept: KeptChars::between(&was.text, &now.text),
+            inserted: now,
         }
     });
     let shell = (*props != a.props || *mark != a.mark || *section != a.section).then(|| ParaShell {

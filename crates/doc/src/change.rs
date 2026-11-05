@@ -49,7 +49,7 @@ mod rebase;
 #[cfg(test)]
 mod tests;
 
-pub use chars::{CharSplice, Chars, ParaEdit, ParaShell};
+pub use chars::{CharSplice, Chars, KeptChars, ParaEdit, ParaShell};
 pub use map::{Anchor, Mapped};
 pub use rebase::Side;
 
