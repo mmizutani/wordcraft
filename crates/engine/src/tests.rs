@@ -21,6 +21,7 @@ mod revision_checks;
 mod room;
 mod room_host;
 mod room_roles;
+mod room_undo;
 mod scopes;
 mod typing;
 mod wordart;

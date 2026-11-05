@@ -14,6 +14,7 @@ use super::{Accepted, Bounce, MAX_BATCH, Participant, ParticipantId, Room};
 use crate::cmd::edit::ClipHistory;
 use crate::cmd::moves::PendingMove;
 use crate::scope::{Place, Scope, positions};
+use crate::session::Steps;
 use crate::{CellRange, CmdError, ColumnBlock, FindState, Prefs, Selection, Session, ViewState};
 
 /// How many times a copy makes the same edit again after reading the document again before it
@@ -363,6 +364,9 @@ struct Made {
     tries: u32,
     /// Whether it left a tracked cut for the next paste to make a move of (`edit.cut`).
     moves: bool,
+    /// The undo and redo steps before it, with the changes others made since: making it again,
+    /// the copy puts them back, so that its Undo and Redo take the same steps as before.
+    steps: Option<Arc<Steps>>,
 }
 
 impl Made {
@@ -381,6 +385,7 @@ impl Made {
             context: None,
             tries: 0,
             moves: false,
+            steps: None,
         }
     }
 }
@@ -662,6 +667,7 @@ impl Replica {
         let pending = self.session.pending.clone();
         let comments_before: Vec<u32> = self.session.doc.comments.keys().copied().collect();
         let move_before = self.session.pending_move.as_ref().map(|m| m.rev);
+        let steps = Some(Arc::new(self.session.steps()));
         let result = how(&mut self.session, id, params);
         let moves = self.session.pending_move.as_ref().is_some_and(|m| Some(m.rev) != move_before);
         let comments = new_comments(&comments_before, &self.session.doc);
@@ -680,6 +686,7 @@ impl Replica {
             context: Some(context),
             tries,
             moves,
+            steps,
         };
         self.collect(made);
         result
@@ -779,6 +786,8 @@ impl Replica {
         // `through` has it as it meets each of them (it moves past each in turn), and after the
         // last it moved past.
         let mut m: ChangeSet = (*a.change).clone();
+        // Who made it: an undo step that can't be taken back past it names them.
+        let by: Arc<str> = self.room.hub().name_of(a.by).map_or_else(|| Arc::from(""), Arc::from);
         let mut moved = Vec::with_capacity(self.pending.len());
         let mut through = Vec::with_capacity(self.pending.len().saturating_add(1));
         let mut clash = None;
@@ -824,11 +833,14 @@ impl Replica {
             if let (Some(before), Some(after)) = (through.get(k), through.get(k + 1)) {
                 for made in &mut u.made {
                     made.moved(before, after);
+                    if let Some(steps) = &mut made.steps {
+                        Arc::make_mut(steps).note_theirs(before, &by);
+                    }
                 }
             }
         }
         if dropped.is_empty() {
-            if self.session.apply_change(&m).is_err() {
+            if self.session.apply_theirs(&m, &by).is_err() {
                 self.read_again();
                 return;
             }
@@ -839,7 +851,15 @@ impl Replica {
         // them, and makes the dropped ones again from where they were made, moved through it.
         self.stats.clashes = self.stats.clashes.saturating_add(1);
         match self.expected() {
-            Some(doc) => self.make_again(doc, dropped, Some(&m), origin, false),
+            Some(doc) => {
+                // The undo and redo steps as they were before the first of them, with the change
+                // made in them too.
+                let steps = dropped.first().and_then(|u| u.made.first()).and_then(|made| made.steps.as_deref().cloned()).map(|mut steps| {
+                    steps.note_theirs(&m, &by);
+                    steps
+                });
+                self.make_again(doc, dropped, Some(&m), origin, false, steps);
+            }
             None => {
                 self.pending.extend(dropped);
                 self.read_again();
@@ -865,7 +885,7 @@ impl Replica {
         }
         self.received = version;
         self.confirmed = doc.clone();
-        self.make_again(doc, dropped, None, origin, true);
+        self.make_again(doc, dropped, None, origin, true, None);
     }
 
     /// Put `doc` in the copy and run the commands of `dropped` again: each from the selection
@@ -876,14 +896,27 @@ impl Replica {
     /// change the first of them clashed with, `first`, and those made again before it (or, when
     /// that isn't known, are found again by their paragraph). `read_again` when the copy read
     /// the document again, which counts as a try. The session's clipboard and the rest of what
-    /// commands read stay as the participant has them now.
-    fn make_again(&mut self, doc: Document, dropped: Vec<Unit>, first: Option<&ChangeSet>, mut origin: Option<Document>, read_again: bool) {
+    /// commands read stay as the participant has them now. The undo and redo steps are `steps`,
+    /// those from before the first of them, when given (the edits made again make theirs
+    /// again, and Undo among them takes the same step back); otherwise none.
+    fn make_again(
+        &mut self,
+        doc: Document,
+        dropped: Vec<Unit>,
+        first: Option<&ChangeSet>,
+        mut origin: Option<Document>,
+        read_again: bool,
+        steps: Option<Steps>,
+    ) {
         let now = selection_anchors(&self.session);
         // The equation the participant is editing now, which edits made again leave them in.
         let math_now = self.session.math.as_ref().and_then(|m| Some((self.session.doc.anchor_at(&m.at)?, m.clone())));
         let last = dropped.iter().flat_map(|u| &u.made).last().map(|m| m.after);
         let kept = Kept::take(&mut self.session);
         self.session.reset_shared(doc);
+        if let Some(steps) = steps {
+            self.session.put_steps(steps);
+        }
         self.seen = self.session.changes().version();
         let mut went_on: Option<SelAnchors> = None;
         // The comments the edits made, by the id each had when it was made: the id it has now,
@@ -898,7 +931,7 @@ impl Replica {
         let mut cut = false;
         for (k, u) in dropped.into_iter().enumerate() {
             for (j, m) in u.made.into_iter().enumerate() {
-                let Made { command, before, after, around, places, inputs, pending, comments, blocks, context, tries, moves } = m;
+                let Made { command, before, after, around, places, inputs, pending, comments, blocks, context, tries, moves, steps: _ } = m;
                 // After a tracked cut made again (or given up), the cut a paste can move is that
                 // one as made again, not the revision it had.
                 let after_cut = cut;

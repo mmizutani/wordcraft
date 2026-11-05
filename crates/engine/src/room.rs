@@ -31,8 +31,12 @@
 //! [`Lobby`] (the app's control channel): each gets a copy of their own, on their connection's
 //! thread, which answers their requests ([`hosted::call`]).
 //!
-//! Next in milestone A1: undo per participant (until then a copy drops its undo steps when
-//! another participant's change arrives, [`Session::apply_change`]); presence.
+//! Undo stays each participant's own: a copy's newest undo and redo steps keep the changes
+//! others made since ([`Session::apply_theirs`]), so Undo takes the participant's step back
+//! past them, as the hub moves an edit past those it accepted meanwhile, or refuses and names
+//! who changed what the step changed. Edits made again after a clash keep the steps they had.
+//!
+//! Next in milestone A1: presence.
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;

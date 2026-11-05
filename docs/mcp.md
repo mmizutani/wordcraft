@@ -291,7 +291,9 @@ selection are its own, and its commands are held to its role (see
 [Roles](control-protocol.md#roles)): a suggester's edits are tracked changes in its name. Each
 call first brings in what the others changed since, and returns once the room took the agent's
 edit; an edit whose text another participant took away meanwhile comes back as an error that
-names the command. `get_changes` shows the window's changes and other agents' alike. Files,
+names the command. `edit.undo` and `edit.redo` take back the agent's own steps and leave
+everyone else's edits in; when someone changed what the step changed since, they fail and say
+who. `get_changes` shows the window's changes and other agents' alike. Files,
 other documents and the window (`open_document`, `save_document`, `list_documents`,
 `screenshot`, `click`, `key`, `ui_inspect`) and the room's other actions are the owner's.
 Revoking the key or stopping sharing ends the agent's connection: its next call is an error

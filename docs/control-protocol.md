@@ -223,8 +223,11 @@ With the window's key:
 | `room.stop` | — | stops sharing: the room closes and every participant's connection ends; the window keeps the document as it is. `{"stopped": bool}` |
 
 Closing the shared document's window stops sharing too. One document is shared at a time.
-Until undo per participant comes (milestone A1.4), a change another participant makes clears
-the window's undo history.
+Undo and Redo (`edit.undo`, `edit.redo`, `edit.undoTo`) take back the steps of whoever runs
+them, the window's or a participant's own, and leave others' changes in. When another
+participant changed what the step changed since (the same characters, blocks, part or document
+field), the step stays and the command fails naming them (`edit.undoTo` stops there and says
+why under `stopped`).
 
 ### Joining with an invite's key
 

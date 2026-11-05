@@ -220,6 +220,11 @@ impl Hub {
         self.member(id).filter(|m| m.here).map(|m| &m.who)
     }
 
+    /// The name of participant `id`, also after they left: their edits keep it.
+    pub fn name_of(&self, id: ParticipantId) -> Option<&str> {
+        self.member(id).map(|m| m.who.name.as_str())
+    }
+
     fn member(&self, id: ParticipantId) -> Option<&Member> {
         id.0.checked_sub(1).and_then(|n| self.participants.get(usize::try_from(n).ok()?))
     }

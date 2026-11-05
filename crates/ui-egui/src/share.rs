@@ -297,6 +297,47 @@ mod tests {
     }
 
     #[test]
+    fn the_person_s_undo_takes_their_own_edit_back_and_leaves_the_agent_s() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let ctx = egui::Context::default();
+        result(&mut a, "room.share", json!({}));
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        // The person types at the end while the agent types "2" over "two".
+        a.execute("caret.docEnd", json!({})).unwrap();
+        a.execute("text.insert", json!({"text": " four"})).unwrap();
+        agent_runs(&mut agent, "select.text", json!({"text": "two"}));
+        agent_runs(&mut agent, "text.insert", json!({"text": "2"}));
+        for _ in 0..3 {
+            a.sync_share(&ctx);
+        }
+        assert_eq!(text(&a), "one 2 three four");
+        // The person's Undo takes " four" back; the agent's "2" stays, in the window and in the
+        // agent's copy.
+        a.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(text(&a), "one 2 three");
+        for _ in 0..3 {
+            a.sync_share(&ctx);
+        }
+        window_is_hub(&a);
+        let seen = hosted::call(&mut agent, "document.inspect", &json!({"text": true})).unwrap();
+        assert!(seen.to_string().contains("one 2 three\""), "{seen}");
+        // The agent's Undo takes its "2" back, and the person's Redo puts " four" back past it.
+        agent_runs(&mut agent, "edit.undo", json!({}));
+        for _ in 0..3 {
+            a.sync_share(&ctx);
+        }
+        assert_eq!(text(&a), "one two three");
+        a.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(text(&a), "one two three four");
+        for _ in 0..3 {
+            a.sync_share(&ctx);
+        }
+        window_is_hub(&a);
+    }
+
+    #[test]
     fn the_window_catches_up_on_the_shared_document_and_stops_sharing_when_it_closes() {
         let lobby = Lobby::default();
         let mut a = window(&lobby);

@@ -122,10 +122,10 @@ fn a_session_makes_another_copy_s_change_with_its_caret_in_the_same_text() {
     assert_eq!(s.doc.plain_text(StoryRef::Body), "Title\nHi Hello world\nSecond!");
     let (a, f) = (&s.sel.anchor, &s.sel.focus);
     assert_eq!((a.path.0.clone(), a.off, f.path.0.clone(), f.off), (vec![1], 9, vec![1], 14));
-    // The session's followers see them; the undo steps from before them are gone (undo per
-    // participant comes later).
+    // The session's followers see them; its undo step stays, to take "Hi " back past them
+    // (`tests::room_undo`).
     assert_eq!(s.changes().version(), version + 3);
-    assert!(!s.can_undo());
+    assert!(s.can_undo());
     // A change that doesn't apply leaves the session as it was.
     let before = (s.doc.clone(), s.sel.clone(), s.changes().version());
     let stale = ChangeSet::between(&base, &other.doc);
