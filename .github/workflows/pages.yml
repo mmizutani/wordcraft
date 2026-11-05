@@ -1,0 +1,91 @@
+name: Web app on GitHub Pages
+
+# Builds the browser version (the same site as the release's wordcraft-web-<version>.zip, made by
+# packaging/web/package.sh like the shared release workflow's `web` job) and deploys it to this
+# repository's GitHub Pages on every push to main. Repository settings: Pages > Source must be
+# "GitHub Actions". The app needs no special headers (no SharedArrayBuffer, so no COOP/COEP; see
+# packaging/web/README.md), and Pages already serves .wasm as application/wasm, gzipped.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "ROADMAP.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deploy at a time. A push during a run queues one more run; older queued runs are dropped.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build web app
+    # Forks of this fork don't deploy unless they opt in by editing this line.
+    if: github.repository == 'mmizutani/wordcraft'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: pages-web
+      - uses: storytold/craft-common-actions/actions/install-trunk@main
+      # Same craft-fonts pin as release.yml (craft-fonts-ref), so the site embeds the same fonts.
+      - uses: storytold/craft-common-actions/actions/checkout-craft-fonts@main
+        with:
+          ref: b076417b5880bd4154bd22f00695b1d28c6bea83
+      - uses: storytold/craft-common-actions/actions/checkout-craft-i18n@main
+      - name: Build and zip
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
+        run: packaging/web/package.sh
+      - name: Unpack the zip into the Pages site
+        run: |
+          set -euo pipefail
+          zip=$(ls dist/release/wordcraft-web-*.zip)
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          unzip -q "$zip" -d "$RUNNER_TEMP/unpacked"
+          mv "$RUNNER_TEMP/unpacked"/wordcraft-web-*/ "$RUNNER_TEMP/site"
+          # Actions deploys run no Jekyll. upload-pages-artifact leaves out dotfiles, so
+          # .htaccess (Apache only) isn't published; _headers is, and Pages ignores it.
+          ls -la "$RUNNER_TEMP/site"
+          du -sh "$RUNNER_TEMP/site"
+          # Pages rejects files over 100 MB. The .wasm with craft-fonts is about 60 MB.
+          big=$(find "$RUNNER_TEMP/site" -type f -size +95M)
+          if [ -n "$big" ]; then
+            echo "::error::over GitHub Pages' 100 MB file limit (or close to it): $big"
+            exit 1
+          fi
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

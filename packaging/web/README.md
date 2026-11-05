@@ -50,6 +50,14 @@ location /wordcraft/ {
 
 Local test: `python3 -m http.server 8765` inside the folder, then open http://localhost:8765/.
 
+## GitHub Pages
+
+GitHub Pages works with no extra setup: it serves `.wasm` as `application/wasm`, gzips it, and
+the app needs no custom headers. Pages can't set `Cache-Control` (it sends `max-age=600` on every
+file), which only means browsers revalidate the hashed files more often than they need to.
+`.github/workflows/pages.yml` builds this site on every push to `main` and deploys it; in the
+repository's settings, set **Pages › Build and deployment › Source** to **GitHub Actions**.
+
 ## Embedding in a page (iframe)
 
 ```html
