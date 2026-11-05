@@ -9,9 +9,33 @@ name: Web app on GitHub Pages
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - "ROADMAP.md"
+    # Run only when a file that can change the site changes. A later pattern overrides an
+    # earlier one, so the re-included files come after the exclusion that covers them.
+    paths:
+      - "**"
+      # Docs and agent notes (the .md files the site ships are re-included below)
+      - "!docs/**"
+      - "!**/*.md"
+      - "!.claude/**"
+      - "README.md"
+      - "ATTRIBUTION.md"
+      # Other workflows and repo tooling
+      - "!.github/**"
+      - ".github/workflows/pages.yml"
+      - "!tools/**"
+      - "!xtask/**"
+      - "!clippy.toml"
+      - "!rustfmt.toml"
+      - "!sonar-project.properties"
+      # Packages not in the web app's dependency graph (cargo tree -p wordcraft-web)
+      - "!apps/wordcraft/**"
+      - "!apps/wordcraft-cli/**"
+      - "!crates/mcp/**"
+      - "!crates/control-key/**"
+      # Desktop packaging (the web package uses only env.sh and web/)
+      - "!packaging/**"
+      - "packaging/env.sh"
+      - "packaging/web/**"
   workflow_dispatch:
 
 permissions:
