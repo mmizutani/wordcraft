@@ -620,6 +620,58 @@ fn finish_recovery_covers_every_open_document() {
     assert_eq!(records(&t.0), [dirty]);
 }
 
+/// A copy waiting in `held` opens when its document is shown, so discarding it would leave that
+/// document dirty with no copy until the next edit.
+#[test]
+fn a_copy_waiting_for_its_document_cannot_be_discarded() {
+    let t = Temp::new();
+    let mut s = session(&t.0);
+    s.run("text.insert", &json!({"text": "Restored draft"})).unwrap();
+    save_now(&mut s);
+    drop(s);
+    let mut s = session(&t.0);
+    let first = s.document_id();
+    let id = s.recovery_documents()[0].id.clone();
+    s.run("file.recover", &json!({"restore": id})).unwrap();
+    s.run("file.new", &json!({})).unwrap();
+    settle(&mut s);
+    assert!(s.recovery_documents().is_empty(), "the copy waiting to open is not listed");
+    assert!(s.run("file.recover", &json!({"discard": id})).is_err());
+    settle(&mut s);
+    s.activate(first).unwrap();
+    settle(&mut s);
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "Restored draft");
+    assert!(s.dirty);
+    drop(s);
+    let s = session(&t.0);
+    assert_eq!(s.recovery_documents().len(), 1, "after a crash the restored document's copy is there");
+}
+
+/// `Store::discard` deletes the generations before steps that can still fail, so a failed discard
+/// may have taken the copy the slot says is current.
+#[test]
+fn a_discard_failing_late_leaves_the_dirty_document_a_new_copy() {
+    let t = Temp::new();
+    let mut s = session(&t.0);
+    s.run("text.insert", &json!({"text": "Unsaved work"})).unwrap();
+    save_now(&mut s);
+    let id = records(&t.0).remove(0);
+    let dir = t.0.join(&id);
+    // Store::discard deletes the generations, then fails unlinking owner.lock.
+    fs::remove_file(dir.join("owner.lock")).unwrap();
+    let value = "synthetic";
+    assert!(s.run("file.encrypt", &json!({"password": value})).is_err(), "the password is refused");
+    assert!(s.password.is_none() && s.dirty);
+    assert!(Store::files(&dir).unwrap().is_empty(), "the copy is already gone");
+    save_now(&mut s);
+    assert_eq!(Store::files(&dir).unwrap().len(), 1, "the next tick writes a new one");
+    drop(s);
+    let mut s = session(&t.0);
+    s.run("file.recover", &json!({"restore": id})).unwrap();
+    settle(&mut s);
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "Unsaved work", "after a crash the work can be recovered");
+}
+
 // Two running processes on one record: .claude/skills/recovery-store/RecoveryLock.tla. File locks on
 // separate descriptors conflict within one process, so separate `Store` values stand in for them.
 

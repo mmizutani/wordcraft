@@ -55,5 +55,6 @@ libc = { workspace = true }
 
 [dev-dependencies]
 encoding_rs = { workspace = true }
+proptest = { workspace = true }
 zip = { workspace = true }
 cfb = { workspace = true }

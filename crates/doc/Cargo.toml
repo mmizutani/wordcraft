@@ -17,11 +17,17 @@ test-support = []
 [dependencies]
 wordcraft-geom = { workspace = true }
 base64 = { workspace = true }
+# Where block ids start (`block_id.rs`): random, so copies of a document make different ids.
+getrandom = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 unicode-segmentation = { workspace = true }
+
+# The browser's `crypto.getRandomValues` for the block ids' starting point.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -93,6 +93,10 @@ impl Session {
         }
         core.last_modified_by = self.author.clone();
         core.revision = core.revision.saturating_add(1);
+        // Saving is no edit (no undo step), but copies of the document follow the metadata too.
+        if self.outside_commands() {
+            self.record_changes();
+        }
     }
 
     /// Whether typing is still collecting into one undo step (no other command since).

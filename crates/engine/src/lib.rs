@@ -22,6 +22,7 @@ pub mod print;
 pub mod recovery;
 pub mod ribbon;
 pub mod sample;
+pub mod scope;
 mod session;
 pub(crate) mod snapshot;
 pub mod speech;
@@ -34,9 +35,10 @@ use serde_json::Value;
 pub use io::Password;
 pub use keymap::KeyMap;
 pub use ribbon::RibbonLayout;
+pub use scope::{Place, Scope};
 pub use session::{
-    CellRange, ColumnBlock, DocInfo, DocState, EditSnapshot, FindState, MathEdit, Prefs, Selection, Session, StylesPaneDock, UNDO_LIST_MAX,
-    ViewState, WindowView, blank_document, next_math_session, set_system_locale,
+    CellRange, ChangeLog, ColumnBlock, DocInfo, DocState, EditSnapshot, FindState, MAX_CHANGES, MathEdit, Prefs, Selection, Session, StylesPaneDock,
+    UNDO_LIST_MAX, ViewState, WindowView, blank_document, next_math_session, set_system_locale,
 };
 /// The outcome a command reports for IME receipt classification.
 ///
@@ -135,6 +137,29 @@ impl CommandSpec {
         self.enabled = f;
         self
     }
+    /// What the command touches ([`scope`]), which decides who may run it in a shared
+    /// document. A command with none (the tests rule that out) is the application's: people only.
+    pub fn scope(&self) -> Scope {
+        Scope::of(self.id).unwrap_or(Scope::App)
+    }
+    /// The params that name places in the document, and how ([`scope::POSITIONS`]).
+    pub fn positions(&self) -> &'static [(&'static str, Place)] {
+        scope::positions(self.id)
+    }
+    /// The command for agents: id, label, location, shortcut, params, whether it changes the
+    /// document, its scope and (when it has any) the params that are places.
+    pub fn describe(&self) -> Value {
+        let mut d = serde_json::json!({
+            "id": self.id, "label": self.label, "location": self.location, "shortcut": self.shortcut, "params": self.params,
+            "mutates": self.mutates, "scope": self.scope(),
+        });
+        let places = self.positions();
+        if let (false, Value::Object(m)) = (places.is_empty(), &mut d) {
+            let places: serde_json::Map<String, Value> = places.iter().map(|(k, p)| ((*k).to_string(), serde_json::json!(p))).collect();
+            m.insert("positions".into(), Value::Object(places));
+        }
+        d
+    }
 }
 
 /// All commands by id.
@@ -157,14 +182,10 @@ impl Registry {
     pub fn all(&self) -> &[CommandSpec] {
         &self.specs
     }
-    /// Command list as JSON (for agents: `commands` / `list_commands`).
+    /// Command list as JSON (for agents: `commands` / `list_commands`), each as
+    /// [`CommandSpec::describe`] gives it.
     pub fn describe(&self) -> Value {
-        Value::Array(
-            self.specs
-                .iter()
-                .map(|s| serde_json::json!({"id": s.id, "label": s.label, "location": s.location, "shortcut": s.shortcut, "params": s.params, "mutates": s.mutates}))
-                .collect(),
-        )
+        Value::Array(self.specs.iter().map(CommandSpec::describe).collect())
     }
     /// The command bound to a shortcut, if any.
     pub fn by_shortcut(&self, key: &str) -> Option<&CommandSpec> {

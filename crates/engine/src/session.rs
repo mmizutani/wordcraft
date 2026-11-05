@@ -12,9 +12,11 @@ use crate::{CmdError, ImeEditOutcome, Registry};
 
 mod documents;
 mod views;
+pub use changes::{ChangeLog, MAX_CHANGES};
 pub use documents::{DocInfo, DocState};
 use documents::{document_id_mark, next_document_id, untitled_name};
 pub use views::WindowView;
+mod changes;
 mod history;
 mod ime;
 mod layout;
@@ -228,6 +230,14 @@ pub struct Session {
     edit_marks: Vec<Pos>,
     /// How many Go Back presses since the last edit (which place comes next).
     go_back_step: usize,
+    /// The document's recent changes, for agents and copies that follow it
+    /// (`document.changes`).
+    changes: ChangeLog,
+    /// The documents of the commands that change the document running now, outermost first.
+    /// A command run inside another on the same document records no change of its own: the
+    /// outermost records the whole edit. Changes made outside such a command (an input method
+    /// putting a snapshot back, a save stamping its metadata) record their own.
+    command_docs: Vec<u64>,
     /// The open documents other than the active one, in no particular order.
     others: Vec<DocState>,
     /// Every open document's id, the active one's too, in the order they were opened.

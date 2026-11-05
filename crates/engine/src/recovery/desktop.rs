@@ -482,9 +482,12 @@ impl Slot {
                 let now = Instant::now();
                 if *discard {
                     self.retry = Some(now + INTERVAL);
-                } else if !permanent {
-                    // A transient failure (a lock, an I/O error) is retried at the next
-                    // interval; one the snapshot itself causes waits for the next edit.
+                }
+                // A transient failure (a lock, an I/O error) is retried at the next interval; one
+                // the snapshot itself causes waits for the next edit. A failed discard counts as
+                // transient: it may have deleted the copy before it failed, so a document that
+                // still wants a copy writes a new one.
+                if !permanent {
                     self.revision = None;
                 }
                 self.due = now + INTERVAL;

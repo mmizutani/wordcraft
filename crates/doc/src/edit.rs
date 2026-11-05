@@ -682,9 +682,17 @@ impl Document {
     }
 
     /// Split the paragraph at `pos`; returns the start of the new (second) paragraph.
+    ///
+    /// The paragraph's identity ([`crate::BlockId`]) stays with its text: the first half keeps
+    /// it, unless the split is at the very start of the text, which adds an empty paragraph
+    /// before it.
     pub fn split_paragraph(&mut self, pos: &Pos) -> Result<Pos> {
         let i = pos.path.last();
-        let tail = self.para_mut(pos.story, &pos.path)?.split_off(pos.off)?;
+        let head = self.para_mut(pos.story, &pos.path)?;
+        let mut tail = head.split_off(pos.off)?;
+        if pos.off == 0 && !tail.is_empty() {
+            std::mem::swap(&mut head.id, &mut tail.id);
+        }
         let bl = self.container_mut(pos.story, &pos.path)?;
         bl.insert((i + 1).min(bl.len()), para_block(tail));
         Ok(Pos { story: pos.story, path: pos.path.with_last(i + 1), off: 0 })
@@ -824,6 +832,11 @@ impl Document {
             let sect = tail.section.take();
             let pa = self.para_mut(a.story, &a.path)?;
             let keep_props = pa.props.clone();
+            // The joined paragraph is `b`'s text when nothing of `a` is left (Backspace at the
+            // start of a paragraph after an empty one): it keeps that paragraph's identity.
+            if pa.is_empty() && !tail.is_empty() {
+                pa.id = tail.id;
+            }
             pa.append(tail);
             pa.props = keep_props;
             let before = std::mem::replace(&mut pa.section, sect);

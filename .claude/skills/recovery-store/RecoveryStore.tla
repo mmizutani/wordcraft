@@ -7,9 +7,7 @@ EXTENDS Integers, FiniteSets
 CONSTANTS
     MaxEdits,          \* edits the document can take, across all runs
     MaxFaults,         \* I/O failures the worker can hit
-    MaxCrashes,        \* process crashes or power losses
-    LateDiscardFails,  \* Store::discard can fail after it deleted the generations
-    DiscardWhileHeld   \* file.recover discard can name the copy waiting in Recovery::held
+    MaxCrashes         \* process crashes or power losses
 
 None == "none"
 OldText == 100      \* the text of the copy an earlier run left
@@ -43,7 +41,7 @@ Newest(i) == IF disk[i] = {} THEN 0
 Inventory == {i \in Ids : entries[i] # 0}
 Fresh == {i \in Ids \ {"earlier"} : disk[i] = {} /\ entries[i] = 0 /\ i \notin listed}
 \* Session::recovery_documents: listed copies, without the one this document keeps.
-Visible == listed \ {slotId}
+Visible == listed \ {slotId, held.id}
 \* Session::is_untouched_blank, with no password.
 Blank == text = Blank0 /\ ~dirty /\ rev = 0 /\ ~protected
 
@@ -104,17 +102,20 @@ EncryptDocument ==
           /\ slotId' = None /\ slotRev' = -1
           /\ protected' = TRUE /\ dirty' = TRUE
           /\ UNCHANGED faults
-       \/ \* Store::discard refuses first ("unexpected entry"): nothing changes, password refused.
+       \/ \* Store::discard refuses first ("unexpected entry"): the copy stays, password refused,
+          \* Slot::apply(Failed { discard: true }) clears Slot.revision.
           /\ slotId # None /\ faults < MaxFaults
           /\ faults' = faults + 1
-          /\ UNCHANGED << protected, dirty, slotId, slotRev, entries, disk, confirmed >>
+          /\ slotRev' = -1
+          /\ UNCHANGED << protected, dirty, slotId, entries, disk, confirmed >>
        \/ \* Store::discard fails after the generations are gone (sync_dir, remove_dir, unlink):
-          \* password refused, Slot::apply(Failed { discard: true }) keeps Slot.revision.
-          /\ slotId # None /\ LateDiscardFails /\ faults < MaxFaults
+          \* password refused, Slot.revision cleared the same way, so the next tick writes a copy.
+          /\ slotId # None /\ faults < MaxFaults
           /\ faults' = faults + 1
+          /\ slotRev' = -1
           /\ disk' = [disk EXCEPT ![slotId] = {}]
           /\ confirmed' = [confirmed EXCEPT ![slotId] = 0]
-          /\ UNCHANGED << protected, dirty, slotId, slotRev, entries >>
+          /\ UNCHANGED << protected, dirty, slotId, entries >>
 
 \* cmd/file.rs encrypt with no password: dirty is set, the revision is not.
 RemoveEncryption ==
@@ -135,9 +136,7 @@ RequestRestore ==
 \* Session::recover { discard }: the user throws away a copy that the list shows.
 RequestDiscard ==
     /\ job.kind = "none"
-    /\ \E i \in Visible :
-          /\ DiscardWhileHeld \/ held.id # i
-          /\ job' = Job("discard", i, 0, "run", 0, 0, "", 0)
+    /\ \E i \in Visible : job' = Job("discard", i, 0, "run", 0, 0, "", 0)
     /\ UNCHANGED << text, rev, dirty, protected, active, savedTexts, slotId, slotRev, copyRefused,
                     ready, listed, held, entries, disk, confirmed, replacedWork, edits, faults,
                     crashes >>
@@ -184,7 +183,9 @@ LoadedCopy == [id |-> job.id, rev |-> job.reqRev, text |-> job.text]
 Receive ==
     /\ job.kind # "none" /\ job.step = "answered" /\ ~(Loaded /\ active)
     /\ job' = NoJob /\ ready' = TRUE /\ listed' = Inventory
-    /\ slotRev' = IF job.kind = "save" /\ job.why = "transient" THEN -1 ELSE slotRev
+    /\ slotRev' = IF \/ job.kind = "save" /\ job.why = "transient"
+                     \/ job.kind = "discard" /\ job.why = "failed" /\ slotId = job.id
+                  THEN -1 ELSE slotRev
     /\ copyRefused' = (copyRefused \/ (job.kind = "save" /\ job.why = "permanent"))
     /\ slotId' = IF job.kind = "discard" /\ job.why = "ok" /\ slotId = job.id THEN None ELSE slotId
     /\ held' = IF Loaded THEN LoadedCopy ELSE held
@@ -276,7 +277,7 @@ WorkerDiscard ==
        \/ /\ faults < MaxFaults /\ faults' = faults + 1
           /\ job' = Answer(job, "failed")
           /\ UNCHANGED << disk, entries, confirmed >>
-       \/ /\ LateDiscardFails /\ faults < MaxFaults /\ faults' = faults + 1
+       \/ /\ faults < MaxFaults /\ faults' = faults + 1
           /\ disk' = [disk EXCEPT ![job.id] = {}]
           /\ confirmed' = [confirmed EXCEPT ![job.id] = 0]
           /\ job' = Answer(job, "failed")
