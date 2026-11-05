@@ -323,6 +323,59 @@ fn a_column_selection_edit_made_again_keeps_its_column() {
 }
 
 #[test]
+fn a_column_edit_kept_past_one_change_and_made_again_after_another_keeps_its_column() {
+    let room = Room::new(Document::from_text("abc\nabc"));
+    let mut a = room.join("Ana");
+    let mut b = room.join("Ben");
+    // Ana deletes the column of "b"s. Ben first types "Z" at the start, which her delete moves
+    // past, then types "B" over the first "b", which it clashes with. Made again, it still takes
+    // the column away where it moved to.
+    run(&mut a, "select.column", json!({"anchor": Pos::body(0, 1), "focus": Pos::body(1, 2)}));
+    run(&mut a, "text.delete", json!({}));
+    run(&mut b, "caret.docStart", json!({}));
+    run(&mut b, "text.insert", json!({"text": "Z"}));
+    b.send();
+    b.receive();
+    run(&mut b, "select.text", json!({"text": "b"}));
+    run(&mut b, "text.insert", json!({"text": "B"}));
+    b.send();
+    a.receive();
+    assert_eq!((a.stats().received, a.stats().clashes, a.stats().made_again, a.stats().lost), (2, 1, 1, 0));
+    assert_eq!(text(&a), "Zac\nac");
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
+fn an_edit_made_again_types_with_the_options_it_was_made_with() {
+    let room = Room::new(Document::from_text("one two three"));
+    let mut a = room.join("Ana");
+    let mut b = room.join("Ben");
+    // Ana bolds "two" and types "X" before "three" in insert mode, then turns Overtype on;
+    // Ben types "2" over "two" first. Her "X" is made again in insert mode, and Overtype stays
+    // on for her.
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "format.bold", json!({}));
+    run(&mut a, "select.text", json!({"text": "three"}));
+    run(&mut a, "caret.left", json!({}));
+    run(&mut a, "text.insert", json!({"text": "X"}));
+    run(&mut a, "text.overtype", json!({"value": true}));
+    run(&mut b, "select.text", json!({"text": "two"}));
+    run(&mut b, "text.insert", json!({"text": "2"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().made_again, a.stats().lost), (1, 2, 0));
+    assert_eq!(text(&a), "one 2 Xthree");
+    assert!(a.session().prefs.overtype);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
 fn an_edit_whose_text_is_gone_is_not_made_elsewhere() {
     let mut s = Session::new(Document::from_text("one two"));
     s.run("caret.docEnd", &json!({})).unwrap();

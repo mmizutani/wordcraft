@@ -14,7 +14,7 @@ use super::{Accepted, Bounce, MAX_BATCH, ParticipantId, Room};
 use crate::cmd::edit::ClipHistory;
 use crate::cmd::moves::PendingMove;
 use crate::scope::{Place, Scope, positions};
-use crate::{CellRange, CmdError, ColumnBlock, FindState, Selection, Session};
+use crate::{CellRange, CmdError, ColumnBlock, FindState, Prefs, Selection, Session};
 
 /// How many times a copy makes the same edit again after reading the document again before it
 /// gives up on it (the hub refused it, or the copy and the hub disagreed). Edits made again
@@ -138,22 +138,24 @@ impl Inputs {
 }
 
 /// What a session holds besides its document that making edits again must leave as the
-/// participant has it now: [`Inputs`], the tracked cut a paste can make a move of, and the
-/// macro being recorded (edits made again aren't steps of it). Edits made again use and change
-/// their own while they run.
+/// participant has it now: [`Inputs`], the options (typing, AutoCorrect, AutoFormat…), the
+/// tracked cut a paste can make a move of, and the macro being recorded (edits made again
+/// aren't steps of it). Edits made again use and change their own while they run.
 struct Kept {
     inputs: Inputs,
+    prefs: Prefs,
     pending_move: Option<PendingMove>,
     recording: Option<(String, Vec<(String, Value)>)>,
 }
 
 impl Kept {
     fn take(s: &mut Session) -> Kept {
-        Kept { inputs: Inputs::of(s), pending_move: s.pending_move.take(), recording: s.recording.take() }
+        Kept { inputs: Inputs::of(s), prefs: s.prefs.clone(), pending_move: s.pending_move.take(), recording: s.recording.take() }
     }
 
     fn put(self, s: &mut Session) {
         self.inputs.put(s);
+        s.prefs = self.prefs;
         s.pending_move = self.pending_move;
         s.recording = self.recording;
     }
@@ -174,6 +176,9 @@ struct Made {
     /// What it read from the session besides the document and its params, for the commands that
     /// read more ([`READS_INPUTS`]).
     inputs: Option<Box<Inputs>>,
+    /// The options it was made with (typing replaces the selection, Overtype, AutoCorrect and
+    /// AutoFormat…), shared with the commands before it while they don't change.
+    prefs: Option<Arc<Prefs>>,
     /// How many times it was run again after the copy read the document again.
     tries: u32,
 }
@@ -181,7 +186,7 @@ struct Made {
 impl Made {
     /// A change made outside a command.
     fn outside() -> Made {
-        Made { command: None, before: None, after: None, column: None, places: Vec::new(), inputs: None, tries: 0 }
+        Made { command: None, before: None, after: None, column: None, places: Vec::new(), inputs: None, prefs: None, tries: 0 }
     }
 }
 
@@ -225,6 +230,14 @@ impl Made {
             }
             None => false,
         });
+        // A piece whose text is gone keeps its anchor, which isn't found again: the edit is
+        // given up rather than made on the pieces left.
+        if let Some(c) = &mut self.column {
+            for (a, b) in &mut c.segments {
+                *a = moved_anchor(*a, before).unwrap_or(*a);
+                *b = moved_anchor(*b, before).unwrap_or(*b);
+            }
+        }
     }
 }
 
@@ -329,10 +342,14 @@ impl Replica {
             .filter_map(|(key, _)| Some((key.to_string(), doc.anchor_at(&crate::cmd::parse_pos(params.get(*key)?)?)?)))
             .collect();
         let inputs = READS_INPUTS.contains(&id).then(|| Box::new(Inputs::of(&self.session)));
+        let prefs = match self.pending.last().and_then(|u| u.made.last()).and_then(|m| m.prefs.clone()) {
+            Some(p) if *p == self.session.prefs => p,
+            _ => Arc::new(self.session.prefs.clone()),
+        };
         let result = self.session.run(id, params);
         self.stay_in_document();
         let after = selection_anchors(&self.session);
-        let made = Made { command: Some((id.to_string(), params.clone())), before, after, column, places, inputs, tries };
+        let made = Made { command: Some((id.to_string(), params.clone())), before, after, column, places, inputs, prefs: Some(prefs), tries };
         self.collect(made);
         result
     }
@@ -535,7 +552,7 @@ impl Replica {
         let mut went_on: Option<SelAnchors> = None;
         for (k, u) in dropped.into_iter().enumerate() {
             for (j, m) in u.made.into_iter().enumerate() {
-                let Made { command, before, after, column, places, inputs, tries } = m;
+                let Made { command, before, after, column, places, inputs, prefs, tries } = m;
                 let tries = if read_again { tries.saturating_add(1) } else { tries };
                 let Some((id, mut params)) = command.filter(|_| tries <= MAX_TRIES) else {
                     self.stats.lost = self.stats.lost.saturating_add(1);
@@ -566,6 +583,9 @@ impl Replica {
                 }
                 if let Some(inputs) = inputs {
                     inputs.put(&mut self.session);
+                }
+                if let Some(prefs) = prefs {
+                    self.session.prefs = Arc::unwrap_or_clone(prefs);
                 }
                 went_on = Some(after);
                 match self.run_made(&id, &params, tries) {
