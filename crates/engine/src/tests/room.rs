@@ -466,6 +466,36 @@ fn an_edit_in_a_cell_whose_text_changed_in_a_table_put_back_whole_is_not_made_el
 }
 
 #[test]
+fn a_merge_preview_made_again_shows_the_record_it_showed() {
+    let room = Room::new(Document::from_text("one two three "));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    run(&mut a, "mailings.recipients", json!({"rows": [{"Name": "Ada"}, {"Name": "Bob"}]}));
+    run(&mut a, "caret.docEnd", json!({}));
+    run(&mut a, "insert.field", json!({"instr": "mergefield Name", "result": ""}));
+    a.send();
+    a.receive();
+    b.receive();
+    // Ana bolds "two" and turns Preview Results on; Ben types "2" over "two" first. Made again,
+    // her preview is turned on again (not off), showing the record it showed.
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "format.bold", json!({}));
+    run(&mut a, "mailings.preview", json!({}));
+    assert!(text(&a).contains("Ada"), "{}", text(&a));
+    run(&mut b, "select.text", json!({"text": "two"}));
+    run(&mut b, "text.insert", json!({"text": "2"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    assert!(a.session().merge.preview);
+    assert!(text(&a).contains("one 2 three Ada"), "{}", text(&a));
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
 fn typing_made_again_keeps_the_formatting_picked_for_it() {
     let room = Room::new(Document::from_text("one two three "));
     let mut a = join(&room, "Ana");
