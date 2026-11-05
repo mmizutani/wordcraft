@@ -174,6 +174,8 @@ struct Inputs {
     last_command: Option<(String, Value)>,
     macros: BTreeMap<String, Vec<(String, Value)>>,
     building_blocks: BTreeMap<String, Fragment>,
+    /// The tracked cut a paste makes a move of.
+    pending_move: Option<PendingMove>,
 }
 
 impl Inputs {
@@ -189,12 +191,14 @@ impl Inputs {
             last_command: s.last_command.clone(),
             macros: s.macros.clone(),
             building_blocks: s.building_blocks.clone(),
+            pending_move: s.pending_move.clone(),
         }
     }
 
     /// Put them in session `s`.
     fn put(self, s: &mut Session) {
-        let Inputs { clipboard, clipboard_text, clipboard_html, clip_history, painter, find, last_command, macros, building_blocks } = self;
+        let Inputs { clipboard, clipboard_text, clipboard_html, clip_history, painter, find, last_command, macros, building_blocks, pending_move } =
+            self;
         s.clipboard = clipboard;
         s.clipboard_text = clipboard_text;
         s.clipboard_html = clipboard_html;
@@ -204,6 +208,11 @@ impl Inputs {
         s.last_command = last_command;
         s.macros = macros;
         s.building_blocks = building_blocks;
+        // A cut made again just before keeps the move it began (its revision can differ from
+        // the one this cut had).
+        if s.pending_move.is_none() {
+            s.pending_move = pending_move;
+        }
     }
 }
 
