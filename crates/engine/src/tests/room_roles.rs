@@ -688,6 +688,45 @@ fn commands_that_run_others_or_put_steps_back_are_held_to_the_role() {
     assert_eq!(room.version(), 0);
 }
 
+#[test]
+fn a_suggester_s_formatting_repeated_or_run_by_a_macro_is_a_tracked_change() {
+    // Track Changes is off in the document: it is on for a suggester's commands alone, and
+    // for those Repeat and a macro run, whose formatting is a suggestion like any other.
+    let mut s = Session::new(Document::from_text("Hello world again"));
+    s.author = "Sam".into();
+    s.role = Some(Role::Suggester);
+    s.run("select.text", &json!({"text": "Hello"})).unwrap();
+    s.run("format.bold", &json!({})).unwrap();
+    s.run("select.text", &json!({"text": "world"})).unwrap();
+    s.run("edit.repeat", &json!({})).unwrap();
+    let steps = json!([{"command": "select.text", "params": {"text": "again"}}, {"command": "format.italic", "params": {}}]);
+    s.run("tools.macros", &json!({"define": {"name": "it", "steps": steps}})).unwrap();
+    s.run("tools.macros", &json!({"run": "it"})).unwrap();
+    assert!(!s.doc.settings.track_changes);
+    let resolve = |id: &str| {
+        let mut r = Session::new(s.doc.clone());
+        r.run(id, &json!({})).unwrap();
+        let p = r.doc.body.first().and_then(|b| b.as_para()).unwrap().clone();
+        [0, 6, 12].map(|off| (p.props_of_char(off).bold == Some(true), p.props_of_char(off).italic == Some(true)))
+    };
+    assert_eq!(resolve("review.acceptAll"), [(true, false), (true, false), (false, true)]);
+    assert_eq!(resolve("review.rejectAll"), [(false, false); 3]);
+    // In a room, the hub takes them.
+    let room = Room::new(Document::from_text("Hello world"));
+    let mut sam = join_as(&room, "Sam", Role::Suggester);
+    run(&mut sam, "select.text", json!({"text": "Hello"}));
+    run(&mut sam, "format.bold", json!({}));
+    run(&mut sam, "select.text", json!({"text": "world"}));
+    run(&mut sam, "edit.repeat", json!({}));
+    let mut copies = [sam];
+    settle(&mut copies).unwrap();
+    assert_eq!((room.version(), copies[0].stats().lost), (2, 0));
+    let doc = room.document().1;
+    assert!(doc.revisions.iter().all(|r| r.author == "Sam" && r.kind == RevisionKind::Format), "{:?}", doc.revisions);
+    let p = doc.body.first().and_then(|b| b.as_para()).unwrap();
+    assert!([0, 6].iter().all(|off| p.props_of_char(*off).bold == Some(true) && p.props_of_char(*off).fmt_change.is_some()));
+}
+
 /// An edit for the comparison below: by Sam, the participant checked, or by Ed; with Track
 /// Changes on or off.
 fn checked_step() -> impl Strategy<Value = (bool, bool, Step)> {

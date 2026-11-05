@@ -58,9 +58,11 @@ impl Session {
     /// macro, Undo and Redo change the document through the commands they run or the steps
     /// they put back. The formatting an edit changed becomes formatting revisions now, while
     /// their tracking is on, for the check to see them (a pure command's were, by the commands
-    /// it ran); tracking forced on for it goes back. A command that did more than the role lets
-    /// them gets an error in `result`, and is undone like any failed one. Whether its
-    /// formatting revisions are recorded.
+    /// it ran), and so does that of an edit run inside another one with tracking forced on for
+    /// it, before that goes back: the outer command's check sees it as the suggestion it is.
+    /// Tracking forced on goes back. A command that did more than the role lets them gets an
+    /// error in `result`, and is undone like any failed one. Whether its formatting revisions
+    /// are recorded.
     pub(super) fn hold_to_role(
         &mut self,
         id: &str,
@@ -70,8 +72,9 @@ impl Session {
         before: Option<&Document>,
         result: &mut Result<Value, CmdError>,
     ) -> bool {
-        let checked = self.role.is_some() && self.outside_commands() && self.document_id == home;
-        let recorded = checked && mutates && result.is_ok() && before.is_some();
+        let here = self.document_id == home;
+        let checked = self.role.is_some() && self.outside_commands() && here;
+        let recorded = (checked || (forced.is_some() && here)) && mutates && result.is_ok() && before.is_some();
         if recorded && let Some(before) = before {
             crate::cmd::fmt_revisions::record(self, id, before);
         }
