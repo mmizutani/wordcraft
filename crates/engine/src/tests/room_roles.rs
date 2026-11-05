@@ -391,6 +391,50 @@ fn the_hub_holds_each_change_to_its_participant_s_role() {
 }
 
 #[test]
+fn a_suggester_s_edits_are_marked_with_tracked_changes_the_document_has() {
+    use wordcraft_doc::props::{CharProps, PropChange};
+    let mut hub = Hub::new(Document::from_text("Hello world"));
+    let sam = hub.admit("Sam", Role::Suggester).unwrap().id;
+    let base = hub.document().clone();
+    let paths = base.para_paths(StoryRef::Body);
+    let crafted = |f: &dyn Fn(&mut wordcraft_doc::Paragraph)| {
+        let mut d = base.clone();
+        let p = d.para_mut(StoryRef::Body, &paths[0]).unwrap();
+        f(p);
+        p.touch();
+        ChangeSet::between(&base, &d)
+    };
+    // Text put in, marked deleted or formatted under a tracked change the document doesn't
+    // have: rejecting every tracked change gives back the document, but the edit is no one's
+    // suggestion.
+    let inserted = crafted(&|p| {
+        p.insert_text(5, "!", &CharProps { ins: Some(999), ..CharProps::default() }).unwrap();
+    });
+    let deleted = crafted(&|p| p.format(6, 11, &|c| c.del = Some(999)).unwrap());
+    let formatted = crafted(&|p| {
+        p.format(0, 5, &|c| {
+            c.fmt_change = PropChange::boxed(999, c.formatting());
+            c.bold = Some(true);
+        })
+        .unwrap()
+    });
+    for change in [&inserted, &deleted, &formatted] {
+        let took = hub.submit(0, change, sam);
+        assert!(matches!(&took, Err(Bounce::Refused(why)) if why.contains("isn't one the document has")), "{took:?}");
+    }
+    assert_eq!(hub.version(), 0);
+    // The same edits as Sam's own tracked changes go through.
+    let by_sam = change_by(&base, "Sam", true, |s| {
+        s.run("select.text", &json!({"text": "Hello"})).unwrap();
+        s.run("caret.right", &json!({})).unwrap();
+        s.run("text.insert", &json!({"text": "!"})).unwrap();
+        s.run("select.text", &json!({"text": "world"})).unwrap();
+        s.run("text.delete", &json!({})).unwrap();
+    });
+    assert_eq!(hub.submit(0, &by_sam, sam).map(|t| t.version), Ok(1));
+}
+
+#[test]
 fn others_tracked_changes_stay_where_they_are() {
     let mut hub = Hub::new(Document::from_text("Hello world\nGoodbye"));
     let sam = hub.admit("Sam", Role::Suggester).unwrap().id;
