@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::room::Role;
+
 /// Editing preferences that persist between runs (the front end saves and restores them).
 /// File › Options sets most of them (`file.options`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -59,6 +61,63 @@ pub struct Prefs {
     /// in Word). A damaged saved value reads as the defaults.
     #[serde(deserialize_with = "crate::cmd::tools::lenient_autocorrect")]
     pub autocorrect: crate::cmd::tools::AutoCorrectPrefs,
+    /// The built-in assistant's settings (File › Options › Assistant). A damaged saved value
+    /// reads as the defaults.
+    #[serde(deserialize_with = "lenient_assistant")]
+    pub assistant: AssistantPrefs,
+}
+
+/// The built-in assistant's settings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AssistantPrefs {
+    /// The role assistants join a shared document with (`assistant.defaultRole`): suggester
+    /// unless the person changes it, so every edit an assistant makes is a tracked change in its
+    /// name. Viewer, commenter, suggester or editor; never owner, which would let an assistant
+    /// change the application's settings. A conversation may choose its own.
+    #[serde(deserialize_with = "lenient_assistant_role")]
+    pub default_role: Role,
+}
+
+impl Default for AssistantPrefs {
+    fn default() -> Self {
+        AssistantPrefs { default_role: Role::Suggester }
+    }
+}
+
+impl AssistantPrefs {
+    /// The roles an assistant may join with, from the one that may do least: every role but
+    /// owner.
+    pub const ROLES: [Role; 4] = [Role::Viewer, Role::Commenter, Role::Suggester, Role::Editor];
+
+    /// The role assistants join with: the setting, read as suggester if it is one an assistant
+    /// may not have (owner).
+    pub fn default_role(&self) -> Role {
+        if Self::ROLES.contains(&self.default_role) { self.default_role } else { Role::Suggester }
+    }
+
+    /// The role called `name` that an assistant may have: viewer, commenter, suggester or
+    /// editor. Owner and anything else are refused, with why.
+    pub fn role_named(name: &str) -> Result<Role, String> {
+        match Role::named(name.trim()) {
+            Some(Role::Owner) => Err("an assistant can't be an owner: owners change the application's settings and share the document".into()),
+            Some(role) => Ok(role),
+            None => Err(format!("`{}`: viewer, commenter, suggester or editor", name.chars().take(64).collect::<String>())),
+        }
+    }
+}
+
+/// Read the assistant's settings, the defaults for a damaged value, without discarding the other
+/// preferences.
+fn lenient_assistant<'de, D: serde::Deserializer<'de>>(d: D) -> Result<AssistantPrefs, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// A saved role an assistant may have, or suggester for owner, an unknown name or junk.
+fn lenient_assistant_role<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Role, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(value.as_str().and_then(|name| AssistantPrefs::role_named(name).ok()).unwrap_or(Role::Suggester))
 }
 
 impl Default for Prefs {
@@ -84,6 +143,7 @@ impl Default for Prefs {
             detect_language: true,
             default_language: None,
             autocorrect: Default::default(),
+            assistant: Default::default(),
         }
     }
 }
@@ -113,8 +173,9 @@ fn lenient_read_page_color<'de, D: serde::Deserializer<'de>>(d: D) -> Result<cra
 
 #[cfg(test)]
 mod tests {
-    use super::Prefs;
+    use super::{AssistantPrefs, Prefs};
     use crate::cmd::view::ReadPageColor;
+    use crate::room::Role;
 
     #[test]
     fn read_page_color_loads_from_old_and_damaged_prefs() {
@@ -129,5 +190,34 @@ mod tests {
         let saved: Prefs = serde_json::from_str(r#"{"readPageColor":"sepia"}"#).unwrap();
         assert_eq!(saved.read_page_color, ReadPageColor::Sepia);
         assert_eq!(serde_json::to_value(saved).unwrap()["readPageColor"], "sepia");
+    }
+
+    /// Assistants join as suggesters unless the person chose another role; a saved owner, an
+    /// unknown role or junk reads as suggester, and keeps the other preferences.
+    #[test]
+    fn the_assistant_role_is_suggester_unless_chosen_and_never_owner() {
+        assert_eq!(Prefs::default().assistant.default_role(), Role::Suggester);
+        let old: Prefs = serde_json::from_str(r#"{"checkSpelling":false}"#).unwrap();
+        assert_eq!(old.assistant.default_role(), Role::Suggester);
+        let editor: Prefs = serde_json::from_str(r#"{"assistant":{"defaultRole":"editor"}}"#).unwrap();
+        assert_eq!(editor.assistant.default_role(), Role::Editor);
+        assert_eq!(serde_json::to_value(&editor).unwrap()["assistant"], serde_json::json!({"defaultRole": "editor"}));
+        for bad in [
+            r#"{"assistant":{"defaultRole":"owner"},"checkSpelling":false}"#,
+            r#"{"assistant":{"defaultRole":"admin"},"checkSpelling":false}"#,
+            r#"{"assistant":{"defaultRole":42},"checkSpelling":false}"#,
+            r#"{"assistant":"editor","checkSpelling":false}"#,
+            r#"{"assistant":null,"checkSpelling":false}"#,
+        ] {
+            let prefs: Prefs = serde_json::from_str(bad).unwrap();
+            assert_eq!(prefs.assistant.default_role(), Role::Suggester, "{bad}");
+            assert!(!prefs.check_spelling, "{bad}: the other preferences are kept");
+        }
+        // Set in code to owner, it still reads as suggester.
+        let owner = AssistantPrefs { default_role: Role::Owner };
+        assert_eq!(owner.default_role(), Role::Suggester);
+        assert_eq!(AssistantPrefs::role_named(" editor ").unwrap(), Role::Editor);
+        assert!(AssistantPrefs::role_named("owner").unwrap_err().contains("owner"));
+        assert!(AssistantPrefs::role_named(&"x".repeat(10_000)).unwrap_err().len() < 200);
     }
 }
