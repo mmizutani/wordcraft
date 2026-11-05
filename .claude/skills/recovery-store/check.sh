@@ -1,5 +1,5 @@
 #!/bin/sh
-# Model-checks RecoveryStore.tla. Exit codes:
+# Model-checks RecoveryStore.tla and RecoveryLock.tla. Exit codes:
 #   0  the rules hold, each known finding still breaks its rule, the model is in sync with the code
 #   1  a rule broke: a new bug, or a model that no longer matches the code (see SKILL.md)
 #   2  a known finding stopped breaking its rule: it may be fixed (see SKILL.md)
@@ -38,9 +38,9 @@ fi
 
 # Java's default temporary folder can be outside the sandbox, and TLC unpacks its standard modules
 # there: without this it reports only "Parsing or semantic analysis failed".
-tlc() {
+tlc() { # config module
   (cd "$here" && "$java_bin" -XX:+UseParallelGC "-Djava.io.tmpdir=$tmp" -cp "$jar" tlc2.TLC \
-    -nowarning -workers auto -metadir "$tmp/states-$1" -config "$1.cfg" RecoveryStore.tla) \
+    -nowarning -workers auto -metadir "$tmp/states-$1" -config "$1.cfg" "$2.tla") \
     >"$tmp/$1.out" 2>&1
   # Out of memory, a model that doesn't parse: nothing was checked, so it says nothing about a rule.
   grep -Eq 'Model checking completed\. No error has been found\.|^Error: Invariant .* is violated|^Error: Deadlock reached' "$tmp/$1.out" \
@@ -52,21 +52,23 @@ path_of() {
 
 code=0
 
-echo "== rules (RecoveryStore.cfg)"
-tlc RecoveryStore
-if grep -q 'Model checking completed. No error has been found.' "$tmp/RecoveryStore.out"; then
-  grep -E 'states generated' "$tmp/RecoveryStore.out" | grep -v Progress
-else
-  grep -E '^Error' "$tmp/RecoveryStore.out" | head -5
-  path_of RecoveryStore
-  echo "A rule broke. Full output: $tmp/RecoveryStore.out"
-  code=1
-fi
+for module in RecoveryStore RecoveryLock; do
+  echo "== rules ($module.cfg)"
+  tlc "$module" "$module"
+  if grep -q 'Model checking completed. No error has been found.' "$tmp/$module.out"; then
+    grep -E 'states generated' "$tmp/$module.out" | grep -v Progress
+  else
+    grep -E '^Error' "$tmp/$module.out" | head -5
+    path_of "$module"
+    echo "A rule broke. Full output: $tmp/$module.out"
+    code=1
+  fi
+done
 
 known_findings=""
 for finding in $known_findings; do
   echo "== known finding ($finding.cfg)"
-  tlc "$finding"
+  tlc "$finding" RecoveryStore
   if grep -q 'Invariant UnsavedWorkHasCopy is violated' "$tmp/$finding.out"; then
     echo "still breaks UnsavedWorkHasCopy, as recorded"
   else
