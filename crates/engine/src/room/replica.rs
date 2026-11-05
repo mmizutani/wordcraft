@@ -7,14 +7,14 @@ use serde::Serialize;
 use serde_json::Value;
 use wordcraft_doc::change::{Anchor, Mapped, Side};
 use wordcraft_doc::edit::Fragment;
-use wordcraft_doc::props::{CharProps, ParaProps};
+use wordcraft_doc::props::{CharProps, Highlight, ParaProps};
 use wordcraft_doc::{BlockId, ChangeSet, Document, Path, Pos, StoryRef};
 
 use super::{Accepted, Bounce, MAX_BATCH, ParticipantId, Room};
 use crate::cmd::edit::ClipHistory;
 use crate::cmd::moves::PendingMove;
 use crate::scope::{Place, Scope, positions};
-use crate::{CellRange, CmdError, ColumnBlock, FindState, Prefs, Selection, Session};
+use crate::{CellRange, CmdError, ColumnBlock, FindState, Prefs, Selection, Session, ViewState};
 
 /// How many times a copy makes the same edit again after reading the document again before it
 /// gives up on it (the hub refused it, or the copy and the hub disagreed). Edits made again
@@ -69,13 +69,14 @@ struct MathAnchors {
 }
 
 /// What a selection held besides its ends when a command was made, as anchors: a column or
-/// whole cells, the equation being edited, and more pictures and shapes selected along with the
-/// one the selection holds.
+/// whole cells, the equation being edited, more pictures and shapes selected along with the
+/// one the selection holds, and the ink selected with the lasso (its page and the strokes).
 #[derive(Clone, Debug, Default)]
 struct Around {
     column: Option<ColumnAnchors>,
     math: Option<MathAnchors>,
     also: Vec<Anchor>,
+    lasso: Option<(usize, Vec<Anchor>)>,
 }
 
 impl Around {
@@ -85,11 +86,13 @@ impl Around {
             Some(MathAnchors { at: s.doc.anchor_at(&m.at)?, pos: m.pos.clone(), latex: s.math_latex, normal_text: s.math_normal_text })
         });
         let also = s.also_selected.iter().map(|p| s.doc.anchor_at(p)).collect::<Option<Vec<_>>>().unwrap_or_default();
-        Around { column: column_anchors(s), math, also }
+        let lasso = crate::cmd::draw::lasso_selection(s)
+            .and_then(|l| Some((l.page, l.items.iter().map(|p| s.doc.anchor_at(p)).collect::<Option<Vec<_>>>()?)));
+        Around { column: column_anchors(s), math, also, lasso }
     }
 
     fn is_empty(&self) -> bool {
-        self.column.is_none() && self.math.is_none() && self.also.is_empty()
+        self.column.is_none() && self.math.is_none() && self.also.is_empty() && self.lasso.is_none()
     }
 
     /// Move its anchors through `cs`. One whose text is gone keeps its place, which isn't found
@@ -106,6 +109,9 @@ impl Around {
             mv(&mut m.at);
         }
         self.also.iter_mut().for_each(mv);
+        if let Some((_, items)) = &mut self.lasso {
+            items.iter_mut().for_each(mv);
+        }
     }
 }
 
@@ -201,14 +207,67 @@ impl Inputs {
     }
 }
 
+/// What a command reads from its session besides the document, the selection, its params and
+/// [`Inputs`], and the participant can change without changing the document: the options
+/// (typing replaces the selection, Overtype, AutoCorrect, AutoFormat…), the view (Outline view,
+/// field codes, the pens and the rest of the Draw tab, design mode…; without the lasso, kept
+/// with the selection in [`Around`]), the highlighter colour, the editing language, the
+/// bibliography style and column selection mode.
+#[derive(Clone, Debug, PartialEq)]
+struct Context {
+    prefs: Prefs,
+    view: ViewState,
+    highlight: Highlight,
+    editing_lang: Option<String>,
+    bib_style: String,
+    column_mode: bool,
+}
+
+impl Context {
+    /// Session `s`'s, whose lasso is taken out.
+    fn of(s: &Session) -> Context {
+        Context {
+            prefs: s.prefs.clone(),
+            view: s.view.clone(),
+            highlight: s.last_highlight,
+            editing_lang: s.editing_lang.clone(),
+            bib_style: s.bib_style.clone(),
+            column_mode: s.column_mode,
+        }
+    }
+
+    /// Whether session `s`, whose lasso is taken out, has this one.
+    fn is(&self, s: &Session) -> bool {
+        self.prefs == s.prefs
+            && self.view == s.view
+            && self.highlight == s.last_highlight
+            && self.editing_lang == s.editing_lang
+            && self.bib_style == s.bib_style
+            && self.column_mode == s.column_mode
+    }
+
+    /// Put it in session `s`, which keeps its lasso.
+    fn put(self, s: &mut Session) {
+        let lasso = s.view.draw.lasso.take();
+        s.prefs = self.prefs;
+        s.view = self.view;
+        s.view.draw.lasso = lasso;
+        s.last_highlight = self.highlight;
+        s.editing_lang = self.editing_lang;
+        s.bib_style = self.bib_style;
+        s.column_mode = self.column_mode;
+    }
+}
+
 /// What a session holds besides its document that making edits again must leave as the
-/// participant has it now: [`Inputs`], the options (typing, AutoCorrect, AutoFormat…), the
+/// participant has it now: [`Inputs`], [`Context`] and the lasso, the
 /// formatting picked at the caret for the next typed text, the
 /// tracked cut a paste can make a move of, and the macro being recorded (edits made again
 /// aren't steps of it). Edits made again use and change their own while they run.
 struct Kept {
     inputs: Inputs,
-    prefs: Prefs,
+    context: Context,
+    lasso: Option<crate::cmd::draw::LassoSelection>,
     pending: Option<CharProps>,
     math_flags: (bool, bool),
     pending_move: Option<PendingMove>,
@@ -219,7 +278,8 @@ impl Kept {
     fn take(s: &mut Session) -> Kept {
         Kept {
             inputs: Inputs::of(s),
-            prefs: s.prefs.clone(),
+            context: Context::of(s),
+            lasso: s.view.draw.lasso.clone(),
             pending: s.pending.clone(),
             math_flags: (s.math_latex, s.math_normal_text),
             pending_move: s.pending_move.take(),
@@ -229,7 +289,8 @@ impl Kept {
 
     fn put(self, s: &mut Session) {
         self.inputs.put(s);
-        s.prefs = self.prefs;
+        self.context.put(s);
+        s.view.draw.lasso = self.lasso;
         s.pending = self.pending;
         (s.math_latex, s.math_normal_text) = self.math_flags;
         s.pending_move = self.pending_move;
@@ -246,7 +307,7 @@ struct Made {
     before: SelAnchors,
     after: SelAnchors,
     /// What the selection held besides its ends before it (a column or cells, the equation being
-    /// edited, more objects).
+    /// edited, more objects, the lasso).
     around: Around,
     /// Its params that are places in the document ([`positions`]).
     places: Vec<(String, Anchor)>,
@@ -255,9 +316,9 @@ struct Made {
     inputs: Option<Box<Inputs>>,
     /// The formatting picked at the caret for the next typed text when it was made.
     pending: Option<CharProps>,
-    /// The options it was made with (typing replaces the selection, Overtype, AutoCorrect and
-    /// AutoFormat…), shared with the commands before it while they don't change.
-    prefs: Option<Arc<Prefs>>,
+    /// The options, view and the rest of what it read from the session that the participant can
+    /// change without an edit, shared with the commands before it while they don't change.
+    context: Option<Arc<Context>>,
     /// How many times it was run again after the copy read the document again.
     tries: u32,
 }
@@ -273,7 +334,7 @@ impl Made {
             places: Vec::new(),
             inputs: None,
             pending: None,
-            prefs: None,
+            context: None,
             tries: 0,
         }
     }
@@ -424,16 +485,18 @@ impl Replica {
             .filter_map(|(key, _)| Some((key.to_string(), doc.anchor_at(&crate::cmd::parse_pos(params.get(*key)?)?)?)))
             .collect();
         let inputs = READS_INPUTS.contains(&id).then(|| Box::new(Inputs::of(&self.session)));
-        let prefs = match self.pending.last().and_then(|u| u.made.last()).and_then(|m| m.prefs.clone()) {
-            Some(p) if *p == self.session.prefs => p,
-            _ => Arc::new(self.session.prefs.clone()),
+        let lasso = self.session.view.draw.lasso.take();
+        let context = match self.pending.last().and_then(|u| u.made.last()).and_then(|m| m.context.clone()) {
+            Some(c) if c.is(&self.session) => c,
+            _ => Arc::new(Context::of(&self.session)),
         };
+        self.session.view.draw.lasso = lasso;
         let pending = self.session.pending.clone();
         let result = self.session.run(id, params);
         self.stay_in_document();
         let after = selection_anchors(&self.session);
         let made =
-            Made { command: Some((id.to_string(), params.clone())), before, after, around, places, inputs, pending, prefs: Some(prefs), tries };
+            Made { command: Some((id.to_string(), params.clone())), before, after, around, places, inputs, pending, context: Some(context), tries };
         self.collect(made);
         result
     }
@@ -638,7 +701,7 @@ impl Replica {
         let mut went_on: Option<SelAnchors> = None;
         for (k, u) in dropped.into_iter().enumerate() {
             for (j, m) in u.made.into_iter().enumerate() {
-                let Made { command, before, after, around, places, inputs, pending, prefs, tries } = m;
+                let Made { command, before, after, around, places, inputs, pending, context, tries } = m;
                 let tries = if read_again { tries.saturating_add(1) } else { tries };
                 let Some((id, mut params)) = command.filter(|_| tries <= MAX_TRIES) else {
                     self.stats.lost = self.stats.lost.saturating_add(1);
@@ -670,8 +733,8 @@ impl Replica {
                 if let Some(inputs) = inputs {
                     inputs.put(&mut self.session);
                 }
-                if let Some(prefs) = prefs {
-                    self.session.prefs = Arc::unwrap_or_clone(prefs);
+                if let Some(context) = context {
+                    Arc::unwrap_or_clone(context).put(&mut self.session);
                 }
                 self.session.pending = pending;
                 went_on = Some(after);
@@ -743,6 +806,13 @@ impl Replica {
             also.push(p);
         }
         self.session.also_selected = also;
+        self.session.view.draw.lasso = match &around.lasso {
+            Some((page, items)) => {
+                let Some(items) = items.iter().map(|a| self.find(*a, through)).collect::<Option<Vec<_>>>() else { return false };
+                Some(crate::cmd::draw::lasso_now(&self.session, *page, items))
+            }
+            None => None,
+        };
         for (key, at) in places {
             let Some(p) = self.find(*at, through) else { return false };
             if let Some(o) = params.as_object_mut() {

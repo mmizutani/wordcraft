@@ -527,6 +527,12 @@ pub fn lasso_selection(s: &Session) -> Option<&LassoSelection> {
     s.view.draw.lasso.as_ref().filter(|l| l.rev == s.rev() && !l.items.is_empty())
 }
 
+/// A lasso selection of `items` on `page`, for the document as it is now (a room's copy making
+/// an edit again puts the ink it was made on back in the lasso).
+pub(crate) fn lasso_now(s: &Session, page: usize, items: Vec<Pos>) -> LassoSelection {
+    LassoSelection { page, items, rev: s.rev() }
+}
+
 /// Keep `sel` selected after the mutating command running now (which bumps the revision once).
 fn keep_lasso(s: &mut Session, sel: LassoSelection) {
     s.view.draw.lasso = Some(LassoSelection { rev: s.rev().wrapping_add(1), ..sel });
