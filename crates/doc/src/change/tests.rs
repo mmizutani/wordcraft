@@ -646,6 +646,35 @@ fn an_anchor_is_found_again_by_its_paragraph_wherever_that_went() {
 }
 
 #[test]
+fn an_anchor_in_a_table_put_back_whole_stays_only_where_its_text_is_the_same() {
+    let mut d = sample();
+    let first = Pos::new(StoryRef::Body, Path(vec![3, 0, 0, 0]), 0);
+    let last = Pos::new(StoryRef::Body, Path(vec![3, 1, 1, 0]), 0);
+    d.insert_text(&first, "one two", &CharProps::default()).unwrap();
+    d.insert_text(&last, "one two three", &CharProps::default()).unwrap();
+    let kept = d.anchor_at(&Pos { off: 4, ..first.clone() }).unwrap();
+    let typed_in = d.anchor_at(&Pos { off: 8, ..last.clone() }).unwrap();
+    // A row put in above, and "Z " typed at the start of the last cell: the table goes whole.
+    let (after, cs) = edit(&d, |d| {
+        let t = d.table_mut(StoryRef::Body, &Path(vec![3])).unwrap();
+        let mut row = t.rows[0].clone();
+        row.cells.iter_mut().for_each(|c| c.blocks = vec![para_block(Paragraph::new())]);
+        t.rows.insert(0, row);
+        d.insert_text(&Pos::new(StoryRef::Body, Path(vec![3, 2, 1, 0]), 0), "Z ", &CharProps::default()).unwrap();
+    });
+    assert_eq!(cs.splices.len(), 1, "{cs:?}");
+    // The first cell's text is as it was: the anchor stays at "two".
+    assert_eq!(cs.map(kept), Mapped::At(kept));
+    assert_eq!(after.place(cs.map(kept), None), Some(Pos { off: 4, path: Path(vec![3, 1, 0, 0]), ..first }));
+    // The last cell's isn't: byte 8 would now be inside "two", so it isn't placed at all.
+    assert_eq!(cs.map(typed_in), Mapped::Gone);
+    // A change from before cells' text was kept with them doesn't place it either.
+    let mut old = cs.clone();
+    old.splices[0].removed.iter_mut().for_each(|b| b.inside_text.clear());
+    assert_eq!(old.map(kept), Mapped::Gone);
+}
+
+#[test]
 fn a_place_beside_a_block_is_at_its_start_or_end() {
     let d = sample();
     let table = d.body[3].id();

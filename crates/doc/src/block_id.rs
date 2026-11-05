@@ -123,12 +123,17 @@ pub(crate) const MAX_ID_DEPTH: usize = 64;
 /// unset ones included: what a copy needs, beside `b` itself, to hold it with the same ids.
 pub(crate) fn inside_ids(b: &Block) -> Vec<BlockId> {
     let mut out = Vec::new();
+    each_inside(b, &mut |inner| out.push(inner.id()));
+    out
+}
+
+/// Each block inside `b` (in its table cells), in the order [`inside_ids`] lists them.
+pub(crate) fn each_inside<'a>(b: &'a Block, f: &mut dyn FnMut(&'a Arc<Block>)) {
     if let Block::Table(t) = b {
         for cell in t.rows.iter().flat_map(|r| &r.cells) {
-            walk(&cell.blocks, StoryRef::Body, &mut Vec::new(), 1, &mut |_, _, inner| out.push(inner.id()));
+            walk(&cell.blocks, StoryRef::Body, &mut Vec::new(), 1, &mut |_, _, inner| f(inner));
         }
     }
-    out
 }
 
 /// Give the blocks inside `b` the ids [`inside_ids`] listed, in the same order. False (and `b`
