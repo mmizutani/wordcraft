@@ -44,6 +44,10 @@ impl WordApp {
             self.dialog = dialogs::Dialog::open(name, self);
             return Ok(json!({"pending": name}));
         }
+        // What agents changed in a shared document since the last frame counts as unsaved.
+        if discards_document(id, &params) {
+            self.catch_up_share();
+        }
         if (self.session.dirty || self.save_unconfirmed() || refused.is_some())
             && discards_document(id, &params)
             && !self.closes_only_its_window(id, &params)

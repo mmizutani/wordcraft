@@ -177,6 +177,61 @@ fn the_window_catches_up_when_it_shows_the_shared_document_again() {
 }
 
 #[test]
+fn the_window_s_copy_catches_up_on_the_shared_document_while_another_is_shown() {
+    let (mut win, shared, other) = window();
+    let (room, mut own) = Room::host(&mut win, "Minoru").unwrap();
+    let mut ben = join(&room, "Ben");
+    win.activate(other).unwrap();
+    run(&mut ben, "caret.docStart", json!({}));
+    run(&mut ben, "text.insert", json!({"text": "zero "}));
+    ben.sync();
+    // Lent with the shared document brought forward, the copy gets Ben's edit; the notes
+    // are shown again after, as they were.
+    assert_eq!(own.lend_document(&mut win, Replica::receive), Some(()));
+    assert_eq!(win.document_id(), other);
+    assert_eq!(win.doc.plain_text(StoryRef::Body), "Notes");
+    win.activate(shared).unwrap();
+    assert_eq!(win.doc.plain_text(StoryRef::Body), "zero one two three");
+    window_is_hub(&win, &room);
+    // Not for a copy made by joining, nor once the shared document is closed.
+    assert!(ben.lend_document(&mut win, Replica::receive).is_none());
+    win.activate(other).unwrap();
+    win.close_document(shared).unwrap();
+    assert!(own.lend_document(&mut win, Replica::receive).is_none());
+}
+
+#[test]
+fn a_participant_s_commands_reach_no_files() {
+    let (mut win, _, _) = window();
+    let (room, _own) = Room::host(&mut win, "Minoru").unwrap();
+    let lobby = Lobby::default();
+    lobby.open(room.clone());
+    let dir = std::env::temp_dir().join(format!("wordcraft-hosted-files-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret = dir.join("recipients.csv");
+    std::fs::write(&secret, "Name,Key\nAda,s3cret\n").unwrap();
+    let path = secret.to_string_lossy().to_string();
+    // Whatever their role, a document command that reads a file it names is refused, and
+    // nothing of the file reaches them; data they send along goes in.
+    for role in [Role::Viewer, Role::Suggester, Role::Editor] {
+        let key = room.invite(&format!("Agent {role}"), role).unwrap();
+        let mut agent = lobby.join_with(&key).unwrap();
+        let read = execute(&mut agent, "mailings.recipients", json!({"path": path}));
+        assert!(read.as_ref().is_err_and(|e| e.contains("not granted")), "{role}: {read:?}");
+        let rows = execute(&mut agent, "mailings.editRecipients", json!({})).unwrap_or_default();
+        assert!(!rows.to_string().contains("s3cret"), "{role}: {rows}");
+        if role >= Role::Editor {
+            execute(&mut agent, "mailings.recipients", json!({"rows": [{"Name": "Bob"}]})).unwrap();
+        }
+    }
+    // The person at the window reads it as before.
+    win.run("mailings.recipients", &json!({"path": path})).unwrap();
+    let rows = win.run("mailings.editRecipients", &json!({})).unwrap();
+    assert!(rows.to_string().contains("s3cret"), "{rows}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_participant_with_a_key_is_answered_by_a_copy_of_their_own() {
     let (mut win, shared, _) = window();
     let (room, mut own) = Room::host(&mut win, "Minoru").unwrap();

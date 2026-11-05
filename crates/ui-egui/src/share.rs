@@ -96,14 +96,28 @@ impl WordApp {
     }
 
     /// Stop sharing: the room closes, and the participants' copies stop answering. The window
-    /// keeps the document as it is. Whether it shared one.
+    /// keeps the document as it is, with every change the room took in it, whether it shows the
+    /// document or another one. Whether it shared one.
     pub(crate) fn stop_sharing(&mut self) -> bool {
         let Some(mut share) = self.share.take() else { return false };
-        // What the room took last is the window's too.
-        let _ = share.copy.lend(&mut self.session, Replica::receive);
+        // The room takes nothing more, and what it took last is the window's too.
         share.room.close();
+        let _ = share.copy.lend_document(&mut self.session, Replica::receive);
         self.lobby.close();
         true
+    }
+
+    /// Get what others changed in the shared document since the last frame, whichever document
+    /// the window shows: before a close asks whether the document has unsaved changes.
+    pub(crate) fn catch_up_share(&mut self) {
+        if let Some(share) = self.share.as_mut() {
+            let _ = share.copy.lend_document(&mut self.session, Replica::receive);
+        }
+    }
+
+    /// Whether the document the window shows is the one it shares.
+    pub(crate) fn shows_shared_document(&self) -> bool {
+        self.share.as_ref().is_some_and(|s| s.copy.document() == self.session.document_id())
     }
 
     /// Whether the window shares a document, which one, its version, who the window is in it and
@@ -320,6 +334,41 @@ mod tests {
         // Closing it stops sharing: the agent's copy stops answering.
         a.execute("file.close", json!({"force": true})).unwrap();
         a.sync_share(&ctx);
+        assert!(a.share.is_none());
+        assert!(hosted::call(&mut agent, "document.inspect", &json!({})).unwrap_err().contains("isn't shared"));
+    }
+
+    #[test]
+    fn stopping_or_closing_keeps_what_agents_changed() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        // Stopped while the window shows another document, the shared one keeps the agent's edit.
+        a.execute("file.new", json!({})).unwrap();
+        agent_runs(&mut agent, "caret.docStart", json!({}));
+        agent_runs(&mut agent, "text.insert", json!({"text": "zero "}));
+        assert_eq!(result(&mut a, "room.stop", json!({})), json!({"stopped": true}));
+        assert_eq!(text(&a), "");
+        a.execute("view.switchWindows", json!({"id": shared})).unwrap();
+        assert_eq!(text(&a), "zero one two three");
+        // Shared again and saved: an agent's edit the room took since the last frame is unsaved
+        // work, so a close without `force` is refused, and the person's Close asks to save.
+        result(&mut a, "room.share", json!({}));
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        a.session.dirty = false;
+        agent_runs(&mut agent, "caret.docEnd", json!({}));
+        agent_runs(&mut agent, "text.insert", json!({"text": " four"}));
+        let refused = call(&mut a, "file.close", json!({}));
+        assert!(refused["error"].as_str().is_some_and(|e| e.contains("unsaved changes")), "{refused}");
+        assert_eq!(text(&a), "zero one two three four");
+        assert!(a.share.is_some(), "still shared");
+        assert_eq!(a.run("file.close", json!({})).unwrap()["pending"], "saveChanges");
+        a.dialog = None;
+        // Closed with `force`, sharing stops; the agent's copy stops answering.
+        a.execute("file.close", json!({"force": true})).unwrap();
         assert!(a.share.is_none());
         assert!(hosted::call(&mut agent, "document.inspect", &json!({})).unwrap_err().contains("isn't shared"));
     }

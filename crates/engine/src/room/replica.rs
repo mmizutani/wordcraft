@@ -549,6 +549,24 @@ impl Replica {
         Some(f(&mut *lent.copy))
     }
 
+    /// [`Replica::lend`], with the room's document the session's active one while `f` runs when
+    /// the session shows another of its documents: to catch up on the room's before the window
+    /// stops sharing it or closes it, whichever document it shows. The one it showed is shown
+    /// again after. `None`, running nothing, when the copy isn't one made for a session, or the
+    /// room's document isn't open in `session`.
+    pub fn lend_document<R>(&mut self, session: &mut Session, f: impl FnOnce(&mut Replica) -> R) -> Option<R> {
+        let shown = session.document_id();
+        if shown == self.document {
+            return self.lend(session, f);
+        }
+        if !self.lent || session.switch_document(self.document).is_err() {
+            return None;
+        }
+        let r = self.lend(session, f);
+        let _ = session.switch_document(shown);
+        r
+    }
+
     /// The session's id for the room's document.
     pub fn document(&self) -> u64 {
         self.document

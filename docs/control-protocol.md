@@ -220,9 +220,12 @@ With the window's key:
 | `room.invite` | `name`, `role?` | a key (32 hex digits, random) for a participant called `name`, with `role` ([roles](#roles), `suggester` unless given): `{"key", "name", "role"}`. A name is someone's in the room for good, even after they left, since their comments and tracked changes keep it: up to 128 characters, no control characters, compared without case |
 | `room.revoke` | `key` | takes the invite back: nobody joins with the key any more, and the copies that joined with it are out of the room (the room refuses their changes, and their connections end). `{"revoked": bool}` |
 | `room.participants` | — | `{"shared": false}`, or what `room.share` answers |
-| `room.stop` | — | stops sharing: the room closes and every participant's connection ends; the window keeps the document as it is. `{"stopped": bool}` |
+| `room.stop` | — | stops sharing: the room closes and every participant's connection ends; the window keeps the document as it is, with every change the room took, whether it shows that document or another. `{"stopped": bool}` |
 
-Closing the shared document's window stops sharing too. One document is shared at a time.
+Closing the shared document's window stops sharing too. A close sees every change the room took
+until then: an agent's edit since the window's last frame is unsaved work, so `file.close`
+without `force` is refused for it, and the person's Close asks to save. One document is shared
+at a time.
 Until undo per participant comes (milestone A1.4), a change another participant makes clears
 the window's undo history.
 
@@ -246,7 +249,9 @@ Any other method name is a command id, as for the window. Each request first bri
 others changed since. `doc` may name the shared document only. Commands that work on files,
 other documents or windows (`file.*`, `view.switchWindows`, `ui.*`), the window's methods
 (`ui.click`, `ui.screenshot`…, `app.quit`) and the room's other methods (which are the owner's)
-are refused. `document.changes` follows what changed, by the window and others alike, in the
+are refused. Their commands reach none of the computer's files, whatever their role: a document
+command that reads or writes a file it names (mail merge's recipients `path`, a picture's) is
+refused. `document.changes` follows what changed, by the window and others alike, in the
 copy's own versions.
 
 When the invite is taken back or sharing stops, the connection's next request gets an error

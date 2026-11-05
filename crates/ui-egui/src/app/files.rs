@@ -224,7 +224,18 @@ impl WordApp {
         if self.closes_only_its_window("file.close", params) && self.close_window_only() {
             return Ok(json!({"closed": true, "window": true}));
         }
+        // What agents changed in a shared document is unsaved work too: the window gets it first.
+        self.catch_up_share();
         if let Some(e) = crate::control::close_refused(self, "file.close", params) {
+            return Err(e.into());
+        }
+        // Closing the shared document stops sharing: the room takes no change after this, and
+        // what it took last is in the document, so a change an agent was told went through is
+        // never dropped unasked.
+        if self.shows_shared_document()
+            && self.stop_sharing()
+            && let Some(e) = crate::control::close_refused(self, "file.close", params)
+        {
             return Err(e.into());
         }
         let last = self.session.documents().len() <= 1;
