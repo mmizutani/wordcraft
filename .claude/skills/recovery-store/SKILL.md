@@ -32,7 +32,7 @@ It takes about 30 seconds. On a first run it downloads `tla2tools.jar` 1.7.4 fro
 | 1 | A rule broke in the main config. | Read the result, then decide bug or modelling error. |
 | 2 | A known finding no longer breaks its rule. | See Known findings. |
 | 3 | Covered code changed after the sync commit. | See Keep it in step with the code. |
-| 4 | Java or TLC could not run. | Fix the tools. No result was produced. |
+| 4 | Java or TLC could not run, or TLC stopped without a result (out of memory, a model that doesn't parse). | Read the output it names and fix the cause. Nothing was checked. |
 
 ## Read every result with `/statechart`
 

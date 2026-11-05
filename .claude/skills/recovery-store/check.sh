@@ -4,7 +4,7 @@
 #   1  a rule broke: a new bug, or a model that no longer matches the code (see SKILL.md)
 #   2  a known finding stopped breaking its rule: it may be fixed (see SKILL.md)
 #   3  covered code changed after the sync commit: the model needs another look (see SKILL.md)
-#   4  the tools could not run
+#   4  the tools could not run, or TLC stopped without a result
 # Set TLA2TOOLS to a tla2tools.jar and JAVA to a java binary to skip finding them.
 set -u
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -42,6 +42,9 @@ tlc() {
   (cd "$here" && "$java_bin" -XX:+UseParallelGC "-Djava.io.tmpdir=$tmp" -cp "$jar" tlc2.TLC \
     -nowarning -workers auto -metadir "$tmp/states-$1" -config "$1.cfg" RecoveryStore.tla) \
     >"$tmp/$1.out" 2>&1
+  # Out of memory, a model that doesn't parse: nothing was checked, so it says nothing about a rule.
+  grep -Eq 'Model checking completed\. No error has been found\.|^Error: Invariant .* is violated|^Error: Deadlock reached' "$tmp/$1.out" \
+    || { echo "TLC gave no result for $1.cfg. Full output: $tmp/$1.out" >&2; exit 4; }
 }
 path_of() {
   grep -E '^State [0-9]+:' "$tmp/$1.out" | sed -E 's/^State ([0-9]+): <([A-Za-z]+).*/\1 \2/; s/^State ([0-9]+): <Initial predicate>/\1 Init/'
