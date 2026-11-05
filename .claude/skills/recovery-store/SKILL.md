@@ -36,11 +36,11 @@ It takes about 30 seconds. On a first run it downloads `tla2tools.jar` 1.7.4 fro
 
 ## Read every result with `/statechart`
 
-Give `/statechart` this folder's `RecoveryStore.tla` and the config that broke. It shows each break as its shortest path, in the model's action names and values. When the main config passes, it reports that the graph is over its chart budget (about 9 million states) and writes no chart; lower the constants in a scratch copy to see one. Tell the user a counterexample as that numbered path, translated through the table under How the model maps to the code. If you want `/statechart`'s view module for plainer words, write it outside the repository: this repo holds no handwritten JavaScript.
+Give `/statechart` this folder's `RecoveryStore.tla` and the config that broke. It shows each break as its shortest path, in the model's action names and values. When the main config passes, it reports that the graph is over its chart budget (about 13 million states) and writes no chart; lower the constants in a scratch copy to see one. Tell the user a counterexample as that numbered path, translated through the table under How the model maps to the code. If you want `/statechart`'s view module for plainer words, write it outside the repository: this repo holds no handwritten JavaScript.
 
 ## Bug or modelling error
 
-A counterexample is a claim about the code until it is replayed. Walk it through the Rust, one action at a time, using the table below, then write it as a test in `crates/engine/src/recovery/desktop/tests.rs` (`findings-replay.rs` shows the shape; `Temp`, `session`, `settle` and `save_now` are that file's helpers).
+A counterexample is a claim about the code until it is replayed. Walk it through the Rust, one action at a time, using the table below, then write it as a test in `crates/engine/src/recovery/desktop/tests.rs` (`a_discard_failing_late_leaves_the_dirty_document_a_new_copy` shows the shape; `Temp`, `session`, `settle` and `save_now` are that file's helpers).
 
 - If the test shows the harm, it is a bug. Report it with the path. Don't change the model or the rule to make it pass, and don't change product code unless the user asks.
 - If a step cannot happen in the code, the model is wrong. Fix the action and name which code rules the step out. Example from building this model: `Session::recovery_tick` opens a loaded copy in the frame it arrives when its document is shown, so `ReceiveAndOpen` is one action.
@@ -67,7 +67,7 @@ Text values stand for document contents, and every blank document shares `Blank0
 
 ## Scope
 
-Checked with `MaxEdits = 2`, `MaxFaults = 1`, `MaxCrashes = 1`, three record ids: about 28 million states generated, 9 million distinct. A pass covers this model at these bounds, not the whole app.
+Checked with `MaxEdits = 2`, `MaxFaults = 1`, `MaxCrashes = 1`, three record ids: about 41 million states generated, 13 million distinct. A pass covers this model at these bounds, not the whole app.
 
 Left out:
 
@@ -88,6 +88,8 @@ Each rule has been seen failing on a broken variant, made in a scratch copy of t
 |---|---|---|
 | Prune every old generation, `previous` included, before the rename is synced | `WorkerRename` replaces the record's generations | `NewestCopySurvives` |
 | `Slot::apply` keeps `revision` after a transient failure | `Receive` keeps `slotRev` | `UnsavedWorkHasCopy` |
+| `Slot::apply` keeps `revision` after a failed discard | `Receive` and `EncryptDocument` keep `slotRev` | `UnsavedWorkHasCopy` |
+| `recovery_documents` lists the copy waiting in `held` | `Visible` leaves `held.id` in | `UnsavedWorkHasCopy` |
 | `wants_copy` ignores the password | `Tick` tests `dirty` alone | `NoPlaintextOfProtected` |
 | `open_held_restore` skips the revision check | `Open` tests `TRUE` | `RestoreOnlyReplacesBlank` |
 
@@ -95,24 +97,11 @@ Moving `sync_dir` after the prune while still sparing `previous` is not a break:
 
 ## Known findings
 
-The current code breaks `UnsavedWorkHasCopy` in two ways, both replayed on the real code by `findings-replay.rs`. Each has a flag so the main config can stay green and still catch anything new. The flag turns on behaviour the code really has; the config with the flag on is the honest statement of the current code, and `check.sh` requires it to keep failing.
+None are open.
 
-**`finding-held-discard.cfg`.** `recovery_documents` still lists a copy waiting in `Recovery::held`, so the user can discard it.
+A replayed bug that won't be fixed right away stays visible without turning the main config red. Give the model a flag that turns on the behaviour the code really has, and make a `finding-<name>.cfg` with the flag on. Add `finding-<name>` to `known_findings` in `check.sh`, which then requires that config to keep breaking `UnsavedWorkHasCopy`. Write the steps here, and keep a test that replays them on the real code.
 
-1. A blank document asks to restore a copy.
-2. You switch to another document while it loads, so the copy waits in `held`.
-3. You discard the same copy from the list. The record is deleted.
-4. You switch back. The copy opens from memory, dirty, and `Slot::adopt` records it as covered.
-5. No copy is written until the next edit. A crash now loses the restored text.
-
-**`finding-late-discard.cfg`.** `Store::discard` deletes the generations before steps that can still fail, and `Slot::apply(Failed { discard: true })` keeps `revision`.
-
-1. A dirty document has a current copy.
-2. You set a password. `purge_recovery` calls `Store::discard`, which deletes the copy and then fails (`sync_dir`, unlinking `owner.lock`, `remove_dir`).
-3. The password is refused, and the document stays dirty and unprotected.
-4. The slot still says this revision is covered, so no copy is written until the next edit. A crash now loses the unsaved work.
-
-When `check.sh` exits 2, replay the finding with `findings-replay.rs`. If the code really is fixed, delete the flag from the model and its config from `check.sh` and this file, turn the replay into a regression test, and make the model's action match the fix. A fix that only changes the code leaves the flag turning on behaviour the code no longer has.
+When `check.sh` exits 2, replay the finding. If the code really is fixed, delete the flag from the model and its config from `check.sh` and this file, turn the replay into a regression test, and make the model's action match the fix. A fix that only changes the code leaves the flag turning on behaviour the code no longer has.
 
 ## Keep it in step with the code
 

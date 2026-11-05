@@ -63,7 +63,8 @@ else
   code=1
 fi
 
-for finding in finding-held-discard finding-late-discard; do
+known_findings=""
+for finding in $known_findings; do
   echo "== known finding ($finding.cfg)"
   tlc "$finding"
   if grep -q 'Invariant UnsavedWorkHasCopy is violated' "$tmp/$finding.out"; then
