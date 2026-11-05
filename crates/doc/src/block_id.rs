@@ -241,6 +241,10 @@ fn windows<'a>(a: &'a Blocks, b: &'a Blocks, story: StoryRef, path: &mut Vec<u32
                 out.was.push((story, y));
                 for (r, (rx, ry)) in tx.rows.iter().zip(&ty.rows).enumerate() {
                     for (c, (cx, cy)) in rx.cells.iter().zip(&ry.cells).enumerate() {
+                        // Most cells hold the blocks they held (typing in one cell of many).
+                        if cx.blocks.len() == cy.blocks.len() && cx.blocks.iter().zip(&cy.blocks).all(|(p, q)| Arc::ptr_eq(p, q)) {
+                            continue;
+                        }
                         path.push(r as u32);
                         path.push(c as u32);
                         windows(&cx.blocks, &cy.blocks, story, path, depth + 1, out);
