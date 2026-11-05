@@ -164,6 +164,7 @@ test source in File › Options › Language and on the bar's Install.
 | `render_page` | a page as PNG |
 | `parity` | feature coverage |
 | `screenshot`, `click`, `key`, `ui_inspect` | app only (`--connect`) |
+| `room` | share the document the app's window shows with other agents, and hand out their keys: `{action: "share" \| "invite" \| "revoke" \| "participants" \| "stop", name?, role?, key?}` (app only; see [Shared documents](#shared-documents)) |
 
 ### Several documents
 
@@ -251,16 +252,51 @@ a shared document, and which of its params are places in the document (`position
 
 A scope covers everything the command can do: a `selection` or `view` command never changes the
 document (a test runs each one to check), and one that can make or switch to another document is
-`file`, even when it usually works on this one. When people and agents share a document, agents
-will get `document` and `selection` commands, and files, other documents and settings stay with
-people unless the owner allows them; nothing is refused by scope yet. Paths are limited apart
-from scopes, by the roots above. `list_commands {"scope": "document"}` lists one scope's commands.
+`file`, even when it usually works on this one. In a shared document, every participant's copy
+runs `document`, `selection` and `view` commands (what a `document` command changes is held to
+their role), only the owner's runs `app` commands too, and none runs `file` or `ui` commands:
+those work on the app's files, other documents and windows (see
+[Shared documents](#shared-documents)). Paths are limited apart from scopes, by the roots above.
+`list_commands {"scope": "document"}` lists one scope's commands.
 
 `positions` gives each param that names a place in the document, and its form: `pos` (a position,
 `{story, path, off}`), `list` (a list holding positions) or `path` (a block's path). Page
 coordinates (`page`, `x`, `y`) aren't places in the text: they depend on one copy's layout. A
 command written against an older version can have its places moved through the changes made since
 (`ChangeSet::map`), so they still point at the same text.
+
+### Shared documents
+
+Agents and the person at the app's window can edit one document at once. Through the window's
+key (`--connect`), the `room` tool shares the document the window shows and hands out keys, each
+for a name and a role:
+
+```json
+{"name": "room", "arguments": {"action": "share"}}
+{"name": "room", "arguments": {"action": "invite", "name": "Fact checker", "role": "suggester"}}
+```
+
+The invite answers `{"key": "…", "name": "Fact checker", "role": "suggester"}`. Another agent
+joins with that key in place of the window's:
+
+```sh
+WORDCRAFT_CONTROL_KEY=<the invite's key> wordcraft-cli mcp --connect 127.0.0.1:7981
+claude mcp add fact-checker -e WORDCRAFT_CONTROL_KEY=<the invite's key> -- wordcraft-cli mcp --connect 127.0.0.1:7981
+```
+
+Its tools then work on a copy of the shared document of its own, inside the app: `execute`,
+`batch`, `type_text`, `select_text`, `get_text`, `inspect_document`, `get_changes`,
+`render_page`, `list_commands`, `parity` and `room {"action": "participants"}`. Its caret and
+selection are its own, and its commands are held to its role (see
+[Roles](control-protocol.md#roles)): a suggester's edits are tracked changes in its name. Each
+call first brings in what the others changed since, and returns once the room took the agent's
+edit; an edit whose text another participant took away meanwhile comes back as an error that
+names the command. `get_changes` shows the window's changes and other agents' alike. Files,
+other documents and the window (`open_document`, `save_document`, `list_documents`,
+`screenshot`, `click`, `key`, `ui_inspect`) and the room's other actions are the owner's.
+Revoking the key or stopping sharing ends the agent's connection: its next call is an error
+that says why. See [Shared documents](control-protocol.md#shared-documents) for the control
+channel's side.
 
 ## Character and paragraph properties
 
