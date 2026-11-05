@@ -15,6 +15,9 @@ impl Session {
         self.bib_style = doc_bib_style(&doc);
         self.doc = doc;
         self.doc.ensure_nonempty();
+        self.doc.ensure_block_ids(None);
+        // Another document, under a new id: its changes count from 0.
+        self.changes = super::ChangeLog::new(&self.doc);
         self.password = None;
         self.file_name = None;
         // The old document's equation is gone: its editing session cannot carry over.
@@ -162,6 +165,9 @@ impl Session {
             // Go Back's places, like the caret history: not part of the document.
             edit_marks: _,
             go_back_step: _,
+            // What followers of the document saw: putting a snapshot back is a change of its own.
+            changes: _,
+            command_docs: _,
         } = self;
         let head = if history.len() + SNAPSHOT_HEAD > MAX_UNDO { history.iter().take(SNAPSHOT_HEAD).cloned().collect() } else { Vec::new() };
         EditSnapshot {
@@ -208,6 +214,10 @@ impl Session {
         self.undo_evicted = evicted;
         self.autocap = None;
         self.doc = doc;
+        // Followers of the document see the snapshot put back as a change of its own.
+        if self.outside_commands() {
+            self.record_changes();
+        }
         self.sel = sel;
         self.also_selected.clear();
         self.history.truncate(history_len);

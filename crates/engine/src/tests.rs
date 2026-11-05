@@ -11,11 +11,14 @@ use wordcraft_doc::{Pos, StoryRef};
 use crate::{Session, cmd};
 
 mod bidi;
+mod block_ids;
+mod changes;
 mod documents;
 mod font_sizes;
 mod fonts;
 mod ime_noop;
 mod revision_checks;
+mod scopes;
 mod typing;
 mod wordart;
 
@@ -5981,6 +5984,9 @@ fn a_thousand_edits_of_a_large_document_keep_the_newest_steps_and_share_its_styl
             run(&mut s, "caret.left", json!({}));
         }
         after.push((text(&s), Arc::downgrade(&s.doc.styles), Arc::downgrade(&s.doc.numbering)));
+        // The changes kept for agents and other copies hold sheets too (bounded on their own):
+        // this is about the undo steps.
+        s.forget_changes();
         // Edit 50's sheet is replaced at edit 150, so the step taken before edit 150 is the last
         // to hold it. That step is the oldest one kept until edit 650 pushes it out.
         match i {

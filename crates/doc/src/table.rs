@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::ControlWrap;
 use crate::props::{CellProps, RowProps, TableProps, VMerge};
-use crate::{Blocks, Paragraph, para_block};
+use crate::{BlockId, Blocks, Paragraph, para_block};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct Cell {
@@ -56,7 +56,7 @@ impl Row {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Table {
     #[serde(default)]
     pub props: TableProps,
@@ -66,6 +66,17 @@ pub struct Table {
     /// Content controls whose content starts or ends with this table (see [`crate::control`]).
     #[serde(default, skip_serializing_if = "ControlWrap::is_empty")]
     pub controls: ControlWrap,
+    /// Which table this is ([`BlockId`]): not part of equality, never saved.
+    #[serde(skip)]
+    pub id: BlockId,
+}
+
+/// Tables are equal when they hold the same: their identity doesn't count.
+impl PartialEq for Table {
+    fn eq(&self, o: &Self) -> bool {
+        let Table { props, grid, rows, controls, id: _ } = self;
+        *props == o.props && *grid == o.grid && *rows == o.rows && *controls == o.controls
+    }
 }
 
 /// Hard limits that keep hostile input from exhausting memory.
@@ -150,7 +161,7 @@ impl Table {
             }
             props.width_pct = None;
         }
-        Table { props, grid, rows: out_rows, controls: ControlWrap::default() }
+        Table { props, grid, rows: out_rows, controls: ControlWrap::default(), id: BlockId::UNSET }
     }
 
     /// A `rows × cols` table spanning `width` points, "Table Grid" style.
@@ -175,6 +186,7 @@ impl Table {
                 })
                 .collect(),
             controls: ControlWrap::default(),
+            id: BlockId::UNSET,
         }
     }
 
@@ -267,6 +279,7 @@ impl Table {
             grid: self.grid.clone(),
             rows: self.rows.split_off(at),
             controls: ControlWrap { open: Vec::new(), close: std::mem::take(&mut self.controls.close) },
+            id: BlockId::UNSET,
         };
         if let Some(last) = self.rows.last_mut() {
             last.controls.close = last.controls.close.saturating_add(u32::try_from(open.len()).unwrap_or(u32::MAX));

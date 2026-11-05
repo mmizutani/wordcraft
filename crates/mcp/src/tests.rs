@@ -367,3 +367,53 @@ fn render_page_rejects_a_page_number_that_does_not_fit() {
     let r = call(&mut s, 31, "tools/call", json!({"name": "render_page", "arguments": {"page": 1, "scale": 0.5}}));
     assert_eq!(r["result"]["isError"], false, "page 1 still renders: {r}");
 }
+
+/// An agent learns from the command list what each command touches (its scope) and which of its
+/// params are places in the document, and can list only the commands of one scope.
+#[test]
+fn the_command_list_gives_each_command_s_scope_and_places() {
+    let mut s = Server::new(Box::new(Headless::default()));
+    let all = tool(&mut s, "list_commands", json!({"query": "caret.set"}));
+    let set = all.as_array().and_then(|l| l.iter().find(|c| c["id"] == "caret.set")).cloned().expect("caret.set is listed");
+    assert_eq!(set["scope"], "selection", "{set}");
+    assert_eq!(set["positions"], json!({"pos": "pos"}), "{set}");
+    let document = tool(&mut s, "list_commands", json!({"scope": "document"}));
+    let document = document.as_array().expect("a list");
+    assert!(document.iter().all(|c| c["scope"] == "document"), "only document commands");
+    assert!(document.iter().any(|c| c["id"] == "format.bold") && !document.iter().any(|c| c["id"] == "file.save"));
+    let files = tool(&mut s, "list_commands", json!({"query": "save", "scope": "File"}));
+    assert!(files.as_array().is_some_and(|l| !l.is_empty() && l.iter().all(|c| c["scope"] == "file")), "{files}");
+    assert_eq!(tool(&mut s, "list_commands", json!({"scope": "nonsense"})), json!([]));
+}
+
+/// An agent reads the document, someone else types, and the agent learns what changed from the
+/// version it read: which paragraph (by the id inspect_document gave it) and what text.
+#[test]
+fn an_agent_follows_the_changes_after_the_version_it_read() {
+    let mut s = Server::new(Box::new(Headless::default()));
+    tool(&mut s, "new_document", json!({}));
+    tool(&mut s, "type_text", json!({"text": "Hello"}));
+    let doc = tool(&mut s, "inspect_document", json!({}));
+    let read = doc["version"].as_u64().expect("inspect_document gives the version it read");
+    let id = doc["blocks"][0]["id"].as_str().expect("blocks have ids").to_string();
+    tool(&mut s, "type_text", json!({"text": " world"}));
+    let r = tool(&mut s, "get_changes", json!({"since": read}));
+    assert_eq!(r["version"], read + 1, "{r}");
+    let changes = r["changes"].as_array().expect("a list of changes");
+    assert_eq!(changes.len(), 1, "{r}");
+    let edit = &changes[0]["edits"][0];
+    assert_eq!(edit["in"], json!({"story": "body"}), "{r}");
+    assert_eq!(edit["removed"], json!([id]), "{r}");
+    assert_eq!(edit["inserted"], json!([id]), "typing keeps the paragraph's id: {r}");
+    assert_eq!((edit["at"].as_u64(), edit["deleted"].as_u64(), edit["text"].as_str()), (Some(5), Some(0), Some(" world")), "{r}");
+    assert!(changes[0].get("change").is_none(), "only with full: {r}");
+    // Nothing since the current version; the whole change on request.
+    assert_eq!(tool(&mut s, "get_changes", json!({}))["changes"], json!([]));
+    let full = tool(&mut s, "get_changes", json!({"since": read, "full": true}));
+    assert!(full["changes"][0]["change"]["splices"].is_array(), "{full}");
+    // A version the document never had is an error the agent can read.
+    let r = call(&mut s, 12, "tools/call", json!({"name": "get_changes", "arguments": {"since": read + 10}}));
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    let r = call(&mut s, 13, "tools/call", json!({"name": "get_changes", "arguments": {"since": "soon"}}));
+    assert_eq!(r["result"]["isError"], true, "{r}");
+}

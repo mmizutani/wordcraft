@@ -83,6 +83,7 @@ impl Session {
             widened,
             edit_marks,
             go_back_step,
+            changes,
         } = DocState::new(doc, 1, ViewState::default());
         Session {
             doc,
@@ -165,6 +166,8 @@ impl Session {
             widened,
             edit_marks,
             go_back_step,
+            changes,
+            command_docs: Vec::new(),
             others: Vec::new(),
             order: vec![document_id],
             untitled_count: 1,
