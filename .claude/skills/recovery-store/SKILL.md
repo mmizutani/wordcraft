@@ -165,7 +165,7 @@ When `check.sh` exits 2, replay the finding with `findings-replay.rs`. If the co
 
 The sync commit is the last commit at which someone confirmed that the model describes the covered code. Keep it on `main`, because `check.sh` compares against it and a squash merge removes a branch's commits.
 
-sync-commit: 6d383b9152c26ed0b27dbbc55fea2234746c3266
+sync-commit: a22d6e43bc9eb74422e3caf532f6bc1d71daf6f7
 
 covered-files:
 - crates/engine/src/recovery.rs
