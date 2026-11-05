@@ -385,3 +385,21 @@ fn others_changes_while_an_edit_waits_for_the_hub_stay_in_its_steps() {
     smooth(&c);
     same_everywhere(&c).unwrap();
 }
+
+/// A step made with a column selection puts it back when undone with nothing of others' since;
+/// undone past their changes, it puts back none: its rows were where the text was then.
+#[test]
+fn undo_past_others_changes_puts_back_no_column_selection() {
+    let (mut s, _) = session("abcd\nefgh\nijkl");
+    cmd(&mut s, "select.column", json!({"anchor": Pos::body(0, 1), "focus": Pos::body(1, 3)}));
+    cmd(&mut s, "format.bold", json!({}));
+    cmd(&mut s, "edit.undo", json!({}));
+    assert!(s.column.is_some());
+    cmd(&mut s, "edit.redo", json!({}));
+    // Ben puts a paragraph first: the rows the step had are a paragraph further down now.
+    let ben = theirs(&s.doc, &[("caret.docStart", json!({})), ("text.newParagraph", json!({}))]);
+    apply(&mut s, &ben, "Ben");
+    cmd(&mut s, "edit.undo", json!({}));
+    assert_eq!(body(&s), "\nabcd\nefgh\nijkl");
+    assert!(s.column.is_none(), "{:?}", s.column.as_ref().map(|c| &c.sel));
+}
