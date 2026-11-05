@@ -36,7 +36,7 @@ It takes about 30 seconds. On a first run it downloads `tla2tools.jar` 1.7.4 fro
 
 ## Read every result with `/statechart`
 
-Give `/statechart` this folder's `RecoveryStore.tla`, the config that broke, and `view.mjs`. It shows each break as its shortest path in plain words. When the main config passes, it reports that the graph is over its chart budget (about 9 million states) and writes no chart; lower the constants in a scratch copy to see one. Tell the user a counterexample as that numbered path, in the code's words.
+Give `/statechart` this folder's `RecoveryStore.tla` and the config that broke. It shows each break as its shortest path, in the model's action names and values. When the main config passes, it reports that the graph is over its chart budget (about 9 million states) and writes no chart; lower the constants in a scratch copy to see one. Tell the user a counterexample as that numbered path, translated through the table under How the model maps to the code. If you want `/statechart`'s view module for plainer words, write it outside the repository: this repo holds no handwritten JavaScript.
 
 ## Bug or modelling error
 

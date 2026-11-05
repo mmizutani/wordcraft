@@ -91,5 +91,6 @@ else
   fi
 fi
 
-[ "$code" -eq 1 ] || rm -rf "$tmp"
+# Exits 1 and 2 print a path under $tmp to read the result from, so they keep the folder.
+case "$code" in 1 | 2) ;; *) rm -rf "$tmp" ;; esac
 exit "$code"
