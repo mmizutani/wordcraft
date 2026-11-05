@@ -58,6 +58,57 @@ struct ColumnAnchors {
     cells: Option<(BlockId, CellRange, Vec<(u32, u32)>)>,
 }
 
+/// The equation being edited when a command was made: the equation by anchor, the caret in
+/// it, and how typing in it is read.
+#[derive(Clone, Debug)]
+struct MathAnchors {
+    at: Anchor,
+    pos: wordcraft_doc::math_edit::MathPos,
+    latex: bool,
+    normal_text: bool,
+}
+
+/// What a selection held besides its ends when a command was made, as anchors: a column or
+/// whole cells, the equation being edited, and more pictures and shapes selected along with the
+/// one the selection holds.
+#[derive(Clone, Debug, Default)]
+struct Around {
+    column: Option<ColumnAnchors>,
+    math: Option<MathAnchors>,
+    also: Vec<Anchor>,
+}
+
+impl Around {
+    /// Session `s`'s.
+    fn of(s: &Session) -> Around {
+        let math = s.math.as_ref().and_then(|m| {
+            Some(MathAnchors { at: s.doc.anchor_at(&m.at)?, pos: m.pos.clone(), latex: s.math_latex, normal_text: s.math_normal_text })
+        });
+        let also = s.also_selected.iter().map(|p| s.doc.anchor_at(p)).collect::<Option<Vec<_>>>().unwrap_or_default();
+        Around { column: column_anchors(s), math, also }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.column.is_none() && self.math.is_none() && self.also.is_empty()
+    }
+
+    /// Move its anchors through `cs`. One whose text is gone keeps its place, which isn't found
+    /// again: the edit is given up rather than made on what is left.
+    fn moved(&mut self, cs: &ChangeSet) {
+        let mv = |a: &mut Anchor| *a = moved_anchor(*a, cs).unwrap_or(*a);
+        if let Some(c) = &mut self.column {
+            for (a, b) in &mut c.segments {
+                mv(a);
+                mv(b);
+            }
+        }
+        if let Some(m) = &mut self.math {
+            mv(&mut m.at);
+        }
+        self.also.iter_mut().for_each(mv);
+    }
+}
+
 /// The row and cell of table `table` (in `story`) that place `p` is in.
 fn cell_of(story: StoryRef, table: &Path, p: &Pos) -> Option<(u32, u32)> {
     let n = table.0.len();
@@ -159,6 +210,7 @@ struct Kept {
     inputs: Inputs,
     prefs: Prefs,
     pending: Option<CharProps>,
+    math_flags: (bool, bool),
     pending_move: Option<PendingMove>,
     recording: Option<(String, Vec<(String, Value)>)>,
 }
@@ -169,6 +221,7 @@ impl Kept {
             inputs: Inputs::of(s),
             prefs: s.prefs.clone(),
             pending: s.pending.clone(),
+            math_flags: (s.math_latex, s.math_normal_text),
             pending_move: s.pending_move.take(),
             recording: s.recording.take(),
         }
@@ -178,6 +231,7 @@ impl Kept {
         self.inputs.put(s);
         s.prefs = self.prefs;
         s.pending = self.pending;
+        (s.math_latex, s.math_normal_text) = self.math_flags;
         s.pending_move = self.pending_move;
         s.recording = self.recording;
     }
@@ -191,8 +245,9 @@ struct Made {
     /// The selection before and after it.
     before: SelAnchors,
     after: SelAnchors,
-    /// The column selection or whole cells before it, when the selection was one.
-    column: Option<ColumnAnchors>,
+    /// What the selection held besides its ends before it (a column or cells, the equation being
+    /// edited, more objects).
+    around: Around,
     /// Its params that are places in the document ([`positions`]).
     places: Vec<(String, Anchor)>,
     /// What it read from the session besides the document and its params, for the commands that
@@ -210,7 +265,17 @@ struct Made {
 impl Made {
     /// A change made outside a command.
     fn outside() -> Made {
-        Made { command: None, before: None, after: None, column: None, places: Vec::new(), inputs: None, pending: None, prefs: None, tries: 0 }
+        Made {
+            command: None,
+            before: None,
+            after: None,
+            around: Around::default(),
+            places: Vec::new(),
+            inputs: None,
+            pending: None,
+            prefs: None,
+            tries: 0,
+        }
     }
 }
 
@@ -254,14 +319,7 @@ impl Made {
             }
             None => false,
         });
-        // A piece whose text is gone keeps its anchor, which isn't found again: the edit is
-        // given up rather than made on the pieces left.
-        if let Some(c) = &mut self.column {
-            for (a, b) in &mut c.segments {
-                *a = moved_anchor(*a, before).unwrap_or(*a);
-                *b = moved_anchor(*b, before).unwrap_or(*b);
-            }
-        }
+        self.around.moved(before);
     }
 }
 
@@ -358,7 +416,7 @@ impl Replica {
     /// keep what it changed as an edit of the copy's own.
     fn run_made(&mut self, id: &str, params: &Value, tries: u32) -> Result<Value, CmdError> {
         let before = selection_anchors(&self.session);
-        let column = column_anchors(&self.session);
+        let around = Around::of(&self.session);
         let doc = &self.session.doc;
         let places = positions(id)
             .iter()
@@ -375,7 +433,7 @@ impl Replica {
         self.stay_in_document();
         let after = selection_anchors(&self.session);
         let made =
-            Made { command: Some((id.to_string(), params.clone())), before, after, column, places, inputs, pending, prefs: Some(prefs), tries };
+            Made { command: Some((id.to_string(), params.clone())), before, after, around, places, inputs, pending, prefs: Some(prefs), tries };
         self.collect(made);
         result
     }
@@ -571,6 +629,8 @@ impl Replica {
     /// commands read stay as the participant has them now.
     fn make_again(&mut self, doc: Document, dropped: Vec<Unit>, first: Option<&ChangeSet>, mut origin: Option<Document>, read_again: bool) {
         let now = selection_anchors(&self.session);
+        // The equation the participant is editing now, which edits made again leave them in.
+        let math_now = self.session.math.as_ref().and_then(|m| Some((self.session.doc.anchor_at(&m.at)?, m.clone())));
         let last = dropped.iter().flat_map(|u| &u.made).last().map(|m| m.after);
         let kept = Kept::take(&mut self.session);
         self.session.reset_shared(doc);
@@ -578,14 +638,14 @@ impl Replica {
         let mut went_on: Option<SelAnchors> = None;
         for (k, u) in dropped.into_iter().enumerate() {
             for (j, m) in u.made.into_iter().enumerate() {
-                let Made { command, before, after, column, places, inputs, pending, prefs, tries } = m;
+                let Made { command, before, after, around, places, inputs, pending, prefs, tries } = m;
                 let tries = if read_again { tries.saturating_add(1) } else { tries };
                 let Some((id, mut params)) = command.filter(|_| tries <= MAX_TRIES) else {
                     self.stats.lost = self.stats.lost.saturating_add(1);
                     went_on = None;
                     continue;
                 };
-                let reselect = went_on != Some(before) || column.is_some();
+                let reselect = went_on != Some(before) || !around.is_empty();
                 // From the document the command was made on to the one it is made again on: the
                 // change its edits clashed with for the first, the difference for the others.
                 let between;
@@ -599,7 +659,7 @@ impl Replica {
                 };
                 // An edit whose selection or places are gone (another participant took their text
                 // or the text box they were in away) isn't made anywhere else.
-                if !self.made_at(reselect, before, column.as_ref(), &places, &mut params, through) {
+                if !self.made_at(reselect, before, &around, &places, &mut params, through) {
                     self.stats.lost = self.stats.lost.saturating_add(1);
                     self.session.status = format!(
                         "An edit made at the same time as another participant's couldn't be made again ({id}): the text it was made in is gone"
@@ -627,15 +687,18 @@ impl Replica {
             origin = origin.and_then(|mut d| d.apply(&u.change).ok().map(|_| d));
         }
         kept.put(&mut self.session);
-        // The participant's own selection, when they moved it after their last edit, moves from
-        // the document they had to the one with their edits made again.
-        if last != Some(now) {
-            let between = origin.map(|origin| ChangeSet::between(&origin, &self.session.doc));
-            if let Some(sel) = self.selection_at(now, between.as_ref().or(first)) {
-                self.session.sel = sel;
-                self.session.clamp_selection();
-            }
+        // The participant's own selection, when they moved it after their last edit, and the
+        // equation they are editing move from the document they had to the one with their edits
+        // made again.
+        let moved_sel = last != Some(now);
+        let between = (moved_sel || math_now.is_some()).then(|| origin.map(|origin| ChangeSet::between(&origin, &self.session.doc))).flatten();
+        let through = between.as_ref().or(first);
+        if moved_sel && let Some(sel) = self.selection_at(now, through) {
+            self.session.sel = sel;
+            self.session.clamp_selection();
         }
+        self.session.math = math_now.and_then(|(a, m)| Some(crate::MathEdit { at: self.find(a, through)?, ..m }));
+        self.session.also_selected.clear();
     }
 
     /// Put the selection a command was made with back (when `reselect`), with its column or
@@ -645,7 +708,7 @@ impl Replica {
         &mut self,
         reselect: bool,
         before: SelAnchors,
-        column: Option<&ColumnAnchors>,
+        around: &Around,
         places: &[(String, Anchor)],
         params: &mut Value,
         through: Option<&ChangeSet>,
@@ -654,10 +717,27 @@ impl Replica {
             let Some(sel) = self.selection_at(before, through) else { return false };
             self.session.sel = sel;
         }
-        if let Some(c) = column {
+        if let Some(c) = &around.column {
             let Some(block) = self.column_at(c, through) else { return false };
             self.session.column = Some(block);
         }
+        // The equation it was typed in, or none: a command made again outside an equation
+        // isn't made in the one the participant is editing now.
+        self.session.math = match &around.math {
+            Some(m) => {
+                let (Some(at), Some(session)) = (self.find(m.at, through), crate::next_math_session()) else { return false };
+                self.session.math_latex = m.latex;
+                self.session.math_normal_text = m.normal_text;
+                Some(crate::MathEdit { at, pos: m.pos.clone(), session })
+            }
+            None => None,
+        };
+        let mut also = Vec::with_capacity(around.also.len());
+        for a in &around.also {
+            let Some(p) = self.find(*a, through) else { return false };
+            also.push(p);
+        }
+        self.session.also_selected = also;
         for (key, at) in places {
             let Some(p) = self.find(*at, through) else { return false };
             if let Some(o) = params.as_object_mut() {
