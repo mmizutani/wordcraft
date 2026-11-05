@@ -18,6 +18,8 @@ struct SuccessContext<'a> {
     ime_caret_before: ImeCaretState,
     rev_before: u64,
     sel_before: &'a Selection,
+    /// Whether its formatting changes are formatting revisions already.
+    recorded: bool,
 }
 
 struct ElsewhereContext {
@@ -85,7 +87,7 @@ impl Session {
         let join = join
             || (equation_join && matches!(id, "equation.type" | "equation.backspace"))
             || (id == "text.insert" && ime_text_join.as_ref().is_some_and(|sel| sel == &self.sel));
-        if let Some(why) = (spec.enabled)(self) {
+        if let Some(why) = (spec.enabled)(self).or_else(|| self.refused_by_role(spec.mutates)) {
             return Err(CmdError::Disabled(format!("{id}: {why}")));
         }
         // Restrict Editing: refused outright, or allowed as long as it only edits the exceptions.
@@ -196,6 +198,7 @@ impl Session {
         let mutates = spec.mutates;
         let ime_caret_before = self.current_ime_caret_state();
         let rev_before = self.rev;
+        let forced = self.force_tracking(mutates);
         // While it runs, a command on this document records no change of its own: this one
         // records the whole edit when it ends.
         self.command_docs.push(home);
@@ -208,6 +211,8 @@ impl Session {
                 Err(CmdError::Failed(format!("{id} panicked: {msg}")))
             }
         };
+        // In a shared document, nothing more than the participant's role lets them change.
+        let recorded = self.hold_to_role(id, home, forced, before_doc.as_ref().map(|(d, ..)| d), &mut result);
         if self.document_id != home || (result.is_err() && self.order.iter().any(|d| *d >= mark)) {
             return self.finish_elsewhere(
                 ElsewhereContext { home, mark, before_doc, blocks_before, default_language_before, pending_application_change_before },
@@ -237,6 +242,7 @@ impl Session {
                 ime_caret_before,
                 rev_before,
                 sel_before: &sel_before,
+                recorded,
             }),
             Err(e) => {
                 self.ime_edit_outcome = ImeEditOutcome::default();
@@ -305,11 +311,12 @@ impl Session {
             ime_caret_before,
             rev_before,
             sel_before,
+            recorded,
         } = context;
         let mut no_op = false;
         if spec.mutates {
             // Formatting changed while tracking becomes a formatting revision.
-            if let Some((before, ..)) = before_doc {
+            if !recorded && let Some((before, ..)) = before_doc {
                 crate::cmd::fmt_revisions::record(self, id, before);
             }
             self.doc.ensure_nonempty();

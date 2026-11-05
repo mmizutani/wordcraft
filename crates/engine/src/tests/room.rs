@@ -12,18 +12,26 @@ use wordcraft_doc::{ChangeSet, Document, StoryRef};
 
 use super::block_ids::{Step, step};
 use super::changes::{difference, edit_step};
-use crate::room::{Bounce, Hub, ParticipantId, Replica, Room};
+use crate::room::{Bounce, Hub, ParticipantId, Replica, Role, Room};
 use crate::sample::sample_document;
 use crate::{CmdError, Session};
 
-fn run(r: &mut Replica, id: &str, v: Value) -> Value {
+/// Join `room` as an editor called `name`.
+pub(super) fn join(room: &Arc<Room>, name: &str) -> Replica {
+    match room.join(name, Role::Editor) {
+        Ok(r) => r,
+        Err(e) => panic!("{name} can't join: {e}"),
+    }
+}
+
+pub(super) fn run(r: &mut Replica, id: &str, v: Value) -> Value {
     match r.run(id, &v) {
         Ok(out) => out,
         Err(e) => panic!("{id} {v}: {e}"),
     }
 }
 
-fn text(r: &Replica) -> String {
+pub(super) fn text(r: &Replica) -> String {
     r.session().doc.plain_text(StoryRef::Body)
 }
 
@@ -43,7 +51,7 @@ fn bold(r: &Replica) -> String {
 }
 
 /// Sync every copy until none has edits the hub hasn't accepted and each has every change.
-fn settle(copies: &mut [Replica]) -> Result<(), String> {
+pub(super) fn settle(copies: &mut [Replica]) -> Result<(), String> {
     for _ in 0..50 {
         for r in copies.iter_mut() {
             r.sync();
@@ -58,14 +66,14 @@ fn settle(copies: &mut [Replica]) -> Result<(), String> {
 }
 
 /// No copy lost an edit or had to read the whole document again.
-fn smooth(copies: &[Replica]) {
+pub(super) fn smooth(copies: &[Replica]) {
     for r in copies {
         assert_eq!((r.stats().lost, r.stats().read_again), (0, 0), "{}", r.id());
     }
 }
 
 /// Every copy holds the hub's document, under the same block ids, and is as it should be.
-fn same_everywhere(copies: &[Replica]) -> Result<(), String> {
+pub(super) fn same_everywhere(copies: &[Replica]) -> Result<(), String> {
     let Some(room) = copies.first().map(|r| r.room().clone()) else { return Ok(()) };
     let (_, hub) = room.document();
     for r in copies {
@@ -128,22 +136,22 @@ fn a_session_makes_another_copy_s_change_with_its_caret_in_the_same_text() {
 #[test]
 fn a_copy_starts_with_the_room_s_document() {
     let room = Room::new(sample_document());
-    let r = room.join("Ana");
+    let r = join(&room, "Ana");
     let (version, doc) = room.document();
     assert_eq!(version, 0);
     assert_eq!(r.session().doc, doc);
     assert_eq!(r.session().doc.block_ids(), doc.block_ids());
     assert_eq!(r.session().author, "Ana");
     assert_eq!(r.id(), ParticipantId(1));
-    assert_eq!(room.join("Ben").id(), ParticipantId(2));
+    assert_eq!(join(&room, "Ben").id(), ParticipantId(2));
     r.check().unwrap();
 }
 
 #[test]
 fn two_copies_typing_in_one_paragraph_both_get_through() {
     let room = Room::new(Document::from_text("Hello world"));
-    let mut a = room.join("Ana");
-    let mut b = room.join("Ben");
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
     run(&mut a, "caret.docEnd", json!({}));
     run(&mut a, "text.insert", json!({"text": " from Ana"}));
     run(&mut b, "caret.docStart", json!({}));
@@ -171,7 +179,7 @@ fn two_copies_typing_in_one_paragraph_both_get_through() {
 #[test]
 fn text_typed_at_the_same_place_goes_in_the_order_the_hub_took_it() {
     let room = Room::new(Document::from_text("ab"));
-    let mut copies = [room.join("Ana"), room.join("Ben"), room.join("Cy")];
+    let mut copies = [join(&room, "Ana"), join(&room, "Ben"), join(&room, "Cy")];
     for (r, t) in copies.iter_mut().zip(["1", "2", "3"]) {
         run(r, "caret.docEnd", json!({}));
         run(r, "text.insert", json!({"text": t}));
@@ -189,8 +197,8 @@ fn text_typed_at_the_same_place_goes_in_the_order_the_hub_took_it() {
 #[test]
 fn a_clash_makes_the_edit_again_on_the_new_version() {
     let room = Room::new(Document::from_text("one two three"));
-    let mut a = room.join("Ana");
-    let mut b = room.join("Ben");
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
     // Ana bolds "two" and puts her caret before "three", while Ben types over "two".
     run(&mut a, "select.text", json!({"text": "two"}));
     run(&mut a, "format.bold", json!({}));
@@ -220,8 +228,8 @@ fn a_clash_makes_the_edit_again_on_the_new_version() {
 #[test]
 fn the_hub_takes_the_edits_before_a_clash_and_sends_back_the_rest() {
     let room = Room::new(Document::from_text("one two three"));
-    let mut a = room.join("Ana");
-    let mut b = room.join("Ben");
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
     // Ana types at the end, bolds "two" and types at the start, without sending.
     run(&mut a, "caret.docEnd", json!({}));
     run(&mut a, "text.insert", json!({"text": "!"}));
@@ -251,8 +259,8 @@ fn the_hub_takes_the_edits_before_a_clash_and_sends_back_the_rest() {
 #[test]
 fn edits_not_sent_yet_move_past_others_as_they_arrive() {
     let room = Room::new(Document::from_text("Hello world"));
-    let mut a = room.join("Ana");
-    let mut b = room.join("Ben");
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
     run(&mut a, "caret.docEnd", json!({}));
     for t in [" and", " more", " words"] {
         run(&mut a, "text.insert", json!({"text": t}));
@@ -278,8 +286,8 @@ fn edits_not_sent_yet_move_past_others_as_they_arrive() {
 #[test]
 fn the_caret_and_selection_move_with_the_text_they_are_in() {
     let room = Room::new(Document::from_text("Hello world"));
-    let mut a = room.join("Ana");
-    let mut b = room.join("Ben");
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
     // Ana selects "world".
     run(&mut a, "select.text", json!({"text": "world"}));
     let id = a.session().doc.body[0].id();
@@ -318,8 +326,8 @@ fn the_caret_and_selection_move_with_the_text_they_are_in() {
 #[test]
 fn a_copy_that_falls_behind_reads_the_document_again() {
     let room = Room::with_hub(Hub::new(Document::from_text("first\nsecond")).keeping(2));
-    let mut a = room.join("Ana");
-    let mut b = room.join("Ben");
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
     run(&mut b, "caret.docEnd", json!({}));
     run(&mut b, "text.insert", json!({"text": " paragraph"}));
     run(&mut a, "caret.docStart", json!({}));
@@ -350,7 +358,7 @@ fn the_hub_sends_back_what_it_cannot_take() {
     s.run("caret.docEnd", &json!({})).unwrap();
     s.run("text.newParagraph", &json!({})).unwrap();
     let change = ChangeSet::between(&base, &s.doc);
-    let by = ParticipantId(1);
+    let by = hub.admit("Ana", Role::Editor).unwrap().id;
     assert!(matches!(hub.submit(1, &change, by), Err(Bounce::Version(_))), "a version the document never had");
     assert!(matches!(hub.submit(0, &ChangeSet::default(), by), Err(Bounce::Refused(_))), "a change that changes nothing");
     assert!(matches!(hub.submit_all(0, &[], by), Err(Bounce::Refused(_))));
@@ -381,7 +389,7 @@ fn the_hub_sends_back_what_it_cannot_take() {
 #[test]
 fn a_copy_has_the_room_s_document_only() {
     let room = Room::new(sample_document());
-    let mut r = room.join("Ana");
+    let mut r = join(&room, "Ana");
     for id in ["file.new", "file.open", "file.save", "file.close", "view.switchWindows", "review.compare", "ui.anything"] {
         assert!(matches!(r.run(id, &json!({})), Err(CmdError::Disabled(_))), "{id}");
     }
@@ -403,7 +411,7 @@ fn copies_on_threads_end_up_holding_the_same_document() {
             .map(|w| {
                 let (room, done, quiet) = (room.clone(), done.clone(), quiet.clone());
                 scope.spawn(move || {
-                    let mut r = room.join(&format!("writer {w}"));
+                    let mut r = join(&room, &format!("writer {w}"));
                     let places = [("caret.docStart", json!({})), ("select.text", json!({"text": "Studio"})), ("caret.docEnd", json!({}))];
                     let (place, at) = &places[w % places.len()];
                     let _ = r.run(place, at);
@@ -498,7 +506,7 @@ fn copies_at_once(warm: &[Step], places: &[usize], acts: &[(usize, Act)]) -> Res
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let mut r = room.join(&format!("copy {i}"));
+            let mut r = join(&room, &format!("copy {i}"));
             if let Some((id, v)) = at.get(*p) {
                 _ = r.run(id, v);
             }

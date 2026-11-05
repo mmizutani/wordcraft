@@ -7,7 +7,7 @@ use serde_json::Value;
 use wordcraft_doc::change::{Anchor, Mapped, Side};
 use wordcraft_doc::{ChangeSet, Document, Pos};
 
-use super::{Accepted, Bounce, MAX_BATCH, ParticipantId, Room};
+use super::{Accepted, Bounce, MAX_BATCH, Participant, ParticipantId, Room};
 use crate::scope::{Place, Scope, positions};
 use crate::{CmdError, Selection, Session};
 
@@ -112,7 +112,7 @@ impl Made {
 /// its own calls them when it likes: the copy is never wrong, only behind.
 pub struct Replica {
     room: Arc<Room>,
-    id: ParticipantId,
+    who: Participant,
     session: Session,
     /// The session's id for the room's document, the only one the copy has open.
     document: u64,
@@ -134,12 +134,12 @@ pub struct Replica {
 }
 
 impl Replica {
-    pub(super) fn new(room: Arc<Room>, id: ParticipantId, session: Session, version: u64, confirmed: Document) -> Replica {
+    pub(super) fn new(room: Arc<Room>, who: Participant, session: Session, version: u64, confirmed: Document) -> Replica {
         let document = session.document_id();
         let seen = session.changes().version();
         Replica {
             room,
-            id,
+            who,
             session,
             document,
             received: version,
@@ -154,7 +154,12 @@ impl Replica {
 
     /// Which participant this is.
     pub fn id(&self) -> ParticipantId {
-        self.id
+        self.who.id
+    }
+
+    /// Who the participant is: their number, name and role.
+    pub fn participant(&self) -> &Participant {
+        &self.who
     }
 
     /// The room.
@@ -185,11 +190,17 @@ impl Replica {
 
     /// Run command `id` in the copy ([`Session::run`]): what it changes is in the copy at once,
     /// and goes to the hub with the next [`Replica::send`]. Commands on files, other documents
-    /// and windows are refused: a copy has the room's document only.
+    /// and windows are refused: a copy has the room's document only. So are commands the
+    /// participant's role doesn't allow ([`super::Role::allows`]), and the session undoes one
+    /// that changed more than the role lets them ([`Session::role`]).
     pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
-        match Scope::of(id) {
-            Some(Scope::Document | Scope::Selection | Scope::View | Scope::App) => {}
-            _ => return Err(CmdError::Disabled(format!("{id}: files, other documents and windows aren't part of a shared document"))),
+        let Some(scope) = Scope::of(id) else { return Err(CmdError::Unknown(id.to_string())) };
+        if !self.who.role.allows(scope) {
+            let why = match scope {
+                Scope::File | Scope::Ui => "files, other documents and windows aren't part of a shared document".to_string(),
+                _ => format!("a {} doesn't change the application's settings", self.who.role),
+            };
+            return Err(CmdError::Disabled(format!("{id}: {why}")));
         }
         self.capture();
         self.run_made(id, params, 0)
@@ -225,7 +236,7 @@ impl Replica {
         let changes: Vec<ChangeSet> = self.pending.iter().take(n).map(|u| u.change.clone()).collect();
         let serials: Vec<u64> = self.pending.iter().take(n).map(|u| u.serial).collect();
         self.stats.sent = self.stats.sent.saturating_add(n as u64);
-        let took = self.room.submit(self.received, &changes, self.id);
+        let took = self.room.submit(self.received, &changes, self.who.id);
         let back = match took {
             Ok(took) => {
                 self.sent = Some((took.version, took.accepted));

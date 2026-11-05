@@ -23,6 +23,7 @@ mod ime;
 mod layout;
 mod lifecycle;
 mod query;
+mod roles;
 mod run;
 mod shared;
 mod snapshot;
@@ -85,6 +86,11 @@ pub struct Session {
     pub registry: Arc<Registry>,
     /// Author name for comments and tracked changes.
     pub author: String,
+    /// In a shared document ([`crate::room`]): the participant's role, which [`Session::run`]
+    /// holds each command to. A suggester's commands make tracked changes whatever the
+    /// document's Track Changes setting, and a command that changes more than the role lets
+    /// them is undone and refused. `None` outside a room.
+    pub role: Option<crate::room::Role>,
     /// Initials for comments (File › Options › General); empty = the name's initials.
     pub initials: String,
     /// Format painter: copied formatting waiting to be applied (and whether it stays on).

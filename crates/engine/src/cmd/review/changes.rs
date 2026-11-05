@@ -205,6 +205,11 @@ fn resolve_all(s: &mut Session, accept: bool) -> CmdResult {
     sel_result(s)
 }
 
+/// Reject every tracked change of the session's document, as Reject All does.
+pub(crate) fn reject_all(s: &mut Session) -> Result<(), CmdError> {
+    resolve_all(s, false).map(|_| ())
+}
+
 /// Accept or Reject All; with `stopTracking`, Track Changes is turned off as well.
 pub(super) fn resolve_all_then(s: &mut Session, v: &Value, accept: bool) -> CmdResult {
     let out = resolve_all(s, accept)?;

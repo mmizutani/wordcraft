@@ -32,15 +32,18 @@ log = { workspace = true }
 chrono = { workspace = true }
 regex = { workspace = true }
 regex-automata = { workspace = true }
+# Room invite keys (`room/hub.rs`) and the names of recovery files.
+getrandom = { workspace = true }
 image = { workspace = true }
 zeroize = { workspace = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 # The browser clock for `now_iso` (`SystemTime::now()` panics on wasm32-unknown-unknown).
 js-sys = "0.3"
+# The browser's `crypto.getRandomValues` for room invite keys.
+getrandom = { workspace = true, features = ["wasm_js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-getrandom = { workspace = true }
 # Language packs (CP4.3): downloaded, verified and unpacked by the suite's font store.
 craft-font-store = { workspace = true }
 craft-font-catalog = { workspace = true }

@@ -89,6 +89,8 @@ impl Session {
             page_hint: _,
             registry: _,
             author: _,
+            // Like the author: who edits, not an edit.
+            role: _,
             initials: _,
             painter: _,
             status: _,

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use wordcraft_doc::change::Side;
 use wordcraft_doc::{ChangeSet, Document};
 
-use super::ParticipantId;
+use super::{Participant, ParticipantId, Role, RoomError, rules};
 
 /// Most changes a hub keeps for copies that are behind; a copy further behind reads the document
 /// again.
@@ -18,6 +18,15 @@ pub const MAX_KEPT_BYTES: usize = 64 << 20;
 
 /// Most changes one [`Hub::submit_all`] takes.
 pub const MAX_BATCH: usize = 1024;
+
+/// Most participants a hub admits.
+pub const MAX_PARTICIPANTS: usize = 4096;
+
+/// Most invites a hub keeps.
+pub const MAX_INVITES: usize = 4096;
+
+/// Most characters in a participant's name.
+const MAX_NAME: usize = 128;
 
 /// A change the hub accepted.
 #[derive(Clone, Debug)]
@@ -64,9 +73,24 @@ pub enum Bounce {
     Refused(String),
 }
 
-/// The hub of a shared document: the document as of its latest version, and the changes that
-/// made the latest versions. Changes reach it one at a time ([`super::Room`] holds it behind a
-/// lock).
+/// A key the hub handed out ([`Hub::invite`]).
+#[derive(Clone)]
+struct Invite {
+    key: String,
+    name: String,
+    role: Role,
+}
+
+impl std::fmt::Debug for Invite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The key stays out of logs.
+        f.debug_struct("Invite").field("name", &self.name).field("role", &self.role).finish_non_exhaustive()
+    }
+}
+
+/// The hub of a shared document: the document as of its latest version, the changes that made
+/// the latest versions, and who may change it. Changes reach it one at a time ([`super::Room`]
+/// holds it behind a lock).
 #[derive(Clone, Debug)]
 pub struct Hub {
     doc: Document,
@@ -76,6 +100,10 @@ pub struct Hub {
     bytes: usize,
     /// Most changes kept: [`MAX_KEPT`], fewer in tests.
     most: usize,
+    /// Who joined, in the order they did: participant `n` is the `n`th.
+    participants: Vec<Participant>,
+    /// The keys handed out.
+    invites: Vec<Invite>,
 }
 
 impl Hub {
@@ -84,7 +112,71 @@ impl Hub {
     pub fn new(mut doc: Document) -> Hub {
         doc.ensure_nonempty();
         doc.ensure_block_ids(None);
-        Hub { doc, version: 0, kept: VecDeque::new(), bytes: 0, most: MAX_KEPT }
+        Hub { doc, version: 0, kept: VecDeque::new(), bytes: 0, most: MAX_KEPT, participants: Vec::new(), invites: Vec::new() }
+    }
+
+    /// Admit a participant called `name` with `role`. Refused when the name is empty, too long
+    /// or holds control characters, or an invite has it ([`Hub::invite`]).
+    pub fn admit(&mut self, name: &str, role: Role) -> Result<Participant, RoomError> {
+        let name = valid_name(name)?;
+        if self.invites.iter().any(|i| same_name(&i.name, name)) {
+            return Err(RoomError::Name(format!("{name} is invited: they join with their key")));
+        }
+        self.add(name, role)
+    }
+
+    /// A key for a participant called `name` with `role` ([`Hub::admit_with`]): 32 hex digits
+    /// from the system's random source. Refused like [`Hub::admit`], or when another invite
+    /// or a participant has the name.
+    pub fn invite(&mut self, name: &str, role: Role) -> Result<String, RoomError> {
+        let name = valid_name(name)?;
+        if self.invites.iter().any(|i| same_name(&i.name, name)) || self.participants.iter().any(|p| same_name(&p.name, name)) {
+            return Err(RoomError::Name(format!("{name} is someone's name in this room already")));
+        }
+        if self.invites.len() >= MAX_INVITES {
+            return Err(RoomError::Full(format!("the room holds {MAX_INVITES} invites at most")));
+        }
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).map_err(|e| RoomError::Full(format!("no key could be made: {e}")))?;
+        let key: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        self.invites.push(Invite { key: key.clone(), name: name.to_string(), role });
+        Ok(key)
+    }
+
+    /// Take back the invite with `key`. Whether there was one.
+    pub fn revoke(&mut self, key: &str) -> bool {
+        let before = self.invites.len();
+        self.invites.retain(|i| !same_key(&i.key, key));
+        self.invites.len() != before
+    }
+
+    /// Admit the participant the invite with `key` names, with its role. The same key admits
+    /// them again (another copy of theirs) until it is revoked.
+    pub fn admit_with(&mut self, key: &str) -> Result<Participant, RoomError> {
+        // Every invite is compared, so how long it takes says nothing about the key.
+        let found = self.invites.iter().fold(None, |found, i| if same_key(&i.key, key) { Some(i) } else { found });
+        let Invite { name, role, .. } = found.cloned().ok_or(RoomError::UnknownKey)?;
+        self.add(&name, role)
+    }
+
+    fn add(&mut self, name: &str, role: Role) -> Result<Participant, RoomError> {
+        if self.participants.len() >= MAX_PARTICIPANTS {
+            return Err(RoomError::Full(format!("the room holds {MAX_PARTICIPANTS} participants at most")));
+        }
+        let n = u32::try_from(self.participants.len()).map_err(|_| RoomError::Full("too many participants".into()))?;
+        let who = Participant { id: ParticipantId(n.saturating_add(1)), name: name.to_string(), role };
+        self.participants.push(who.clone());
+        Ok(who)
+    }
+
+    /// Participant `id`, if they joined.
+    pub fn participant(&self, id: ParticipantId) -> Option<&Participant> {
+        id.0.checked_sub(1).and_then(|n| self.participants.get(usize::try_from(n).ok()?))
+    }
+
+    /// The participants who joined, in the order they did.
+    pub fn participants(&self) -> impl Iterator<Item = &Participant> {
+        self.participants.iter()
     }
 
     /// The same hub, keeping at most `most` changes (at least one).
@@ -129,13 +221,19 @@ impl Hub {
     /// the rest, which were made after it; the copy that made them finds the same clash, drops
     /// them and makes them again. All are sent back, leaving the hub as it was, when the first
     /// clashes, when `base` is not a version the hub can move them from, when one doesn't
-    /// apply, or when one puts in a block under an id the document already has.
+    /// apply, when one puts in a block under an id the document already has, or when one is
+    /// more than `by`'s role lets them change (a viewer changes nothing; a commenter only
+    /// comments of their own; a suggester also tracked changes in their name).
     pub fn submit_all(&mut self, base: u64, changes: &[ChangeSet], by: ParticipantId) -> Result<Took, Bounce> {
         if changes.len() > MAX_BATCH {
             return Err(Bounce::Refused(format!("{} changes at once are more than the {MAX_BATCH} the hub takes", changes.len())));
         }
         if changes.is_empty() || changes.iter().any(ChangeSet::is_empty) {
             return Err(Bounce::Refused("a change that changes nothing".into()));
+        }
+        let who = self.participant(by).cloned().ok_or_else(|| Bounce::Refused(format!("{by} isn't in the room")))?;
+        if who.role == Role::Viewer {
+            return Err(Bounce::Refused(format!("{} is a viewer, who changes nothing", who.name)));
         }
         let missed = self.since(base)?;
         let mut mine: Vec<ChangeSet> = changes.to_vec();
@@ -167,10 +265,14 @@ impl Hub {
         let first = self.version.checked_add(1).ok_or_else(|| Bounce::Refused("the document has had as many changes as it can count".into()))?;
         let mut doc = self.doc.clone();
         for (k, c) in mine.iter().enumerate() {
+            let before = (who.role < Role::Editor).then(|| doc.clone());
             doc.apply(c)
                 .map_err(|e| Bounce::Refused(format!("change {} of {} doesn't apply to version {}: {e}", k + 1, changes.len(), self.version)))?;
             if let Some(id) = doc.repeated_id(&c.ids_put_in()) {
                 return Err(Bounce::Refused(format!("it puts in a block under id {id}, which the document already has")));
+            }
+            if let Some(before) = before {
+                rules::check(who.role, &who.name, &before, &doc).map_err(|why| Bounce::Refused(format!("{}: {why}", who.name)))?;
             }
         }
         let accepted = mine.len();
@@ -187,4 +289,30 @@ impl Hub {
         }
         Ok(Took { version: first, accepted, moved_past: missed.len(), clash })
     }
+}
+
+/// `name` with spaces around it trimmed, when it can be a participant's: not empty, at most
+/// [`MAX_NAME`] characters, no control characters.
+fn valid_name(name: &str) -> Result<&str, RoomError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(RoomError::Name("a participant needs a name".into()));
+    }
+    if name.chars().count() > MAX_NAME {
+        return Err(RoomError::Name(format!("a participant's name has {MAX_NAME} characters at most")));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(RoomError::Name("a participant's name has no control characters".into()));
+    }
+    Ok(name)
+}
+
+/// Whether two names are the same, whatever their case.
+fn same_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// Whether two keys are the same, comparing every byte whatever the first difference.
+fn same_key(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }

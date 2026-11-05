@@ -19,6 +19,7 @@ mod fonts;
 mod ime_noop;
 mod revision_checks;
 mod room;
+mod room_roles;
 mod scopes;
 mod typing;
 mod wordart;

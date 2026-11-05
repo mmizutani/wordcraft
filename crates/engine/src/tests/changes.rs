@@ -323,7 +323,7 @@ fn a_new_document_starts_its_changes_at_version_zero() {
 }
 
 /// Run one random step, whatever it gives.
-fn run_step(s: &mut Session, st: &Step) {
+pub(super) fn run_step(s: &mut Session, st: &Step) {
     match st {
         Step::Type(t) => _ = s.run("text.insert", &json!({"text": t})),
         Step::Command(id, v) => _ = s.run(id, v),

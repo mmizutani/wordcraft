@@ -254,6 +254,8 @@ impl Session {
             clip_history: _,
             registry: _,
             author: _,
+            // The participant's role in a shared document, like their name.
+            role: _,
             initials: _,
             painter: _,
             status: _,

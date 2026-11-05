@@ -18,23 +18,31 @@
 //! from the same places, the caret, the selection and the places in their params moved
 //! through the other change.
 //!
-//! Next in milestone A1: agents' copies on threads of their own, with keys and roles; undo per
-//! participant (until then a copy drops its undo steps when another participant's change
-//! arrives, [`Session::apply_change`]); presence.
+//! Each participant has a [`Role`]. The room's own process joins people and agents under a
+//! name and a role ([`Room::join`]); anyone else joins with a key the room handed out for a
+//! name and a role ([`Room::invite`], [`Room::join_with`]), so they can't claim another's name.
+//! A viewer changes nothing; a commenter changes comments of their own; a suggester's edits are
+//! tracked changes in their name, which others accept or reject. Their copies hold each
+//! command to that ([`Session::run`] undoes one that does more), and the hub each change.
+//!
+//! Next in milestone A1: agents' copies on threads of their own; undo per participant (until
+//! then a copy drops its undo steps when another participant's change arrives,
+//! [`Session::apply_change`]); presence.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use wordcraft_doc::{ChangeSet, Document};
 
+use crate::scope::Scope;
 use crate::{Registry, Session};
 
 mod hub;
 mod replica;
+pub(crate) mod rules;
 
-pub use hub::{Accepted, Bounce, Hub, MAX_BATCH, MAX_KEPT, MAX_KEPT_BYTES, Took};
+pub use hub::{Accepted, Bounce, Hub, MAX_BATCH, MAX_INVITES, MAX_KEPT, MAX_KEPT_BYTES, MAX_PARTICIPANTS, Took};
 pub use replica::{Replica, Stats};
 
 /// A participant of a room, numbered from 1 in the order they joined.
@@ -47,6 +55,86 @@ impl std::fmt::Display for ParticipantId {
     }
 }
 
+/// What a participant may do in a room. Each role may do what the ones before it may, and more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Role {
+    /// Reads the document, and moves their own caret, selection and view; changes nothing.
+    Viewer,
+    /// Also adds comments and replies, and edits and deletes their own.
+    Commenter,
+    /// Also edits, always as tracked changes in their name (Track Changes is on for them
+    /// alone), which others accept or reject; withdraws their own.
+    Suggester,
+    /// Also edits directly, and accepts and rejects tracked changes.
+    Editor,
+    /// Also changes the application's settings in their copy.
+    Owner,
+}
+
+impl Role {
+    /// Every role, from the one that may do least.
+    pub const ALL: [Role; 5] = [Role::Viewer, Role::Commenter, Role::Suggester, Role::Editor, Role::Owner];
+
+    /// Whether this role may run commands of `scope` in its copy. Everyone reads the document
+    /// and moves their own selection and view; what a command changes in the document is held
+    /// to the role once it ran ([`Session::role`]). The application's settings are the owner's.
+    /// Files, other documents and windows are no copy's: the shared document is the room's.
+    pub fn allows(self, scope: Scope) -> bool {
+        match scope {
+            Scope::Document | Scope::Selection | Scope::View => true,
+            Scope::App => self == Role::Owner,
+            Scope::File | Scope::Ui => false,
+        }
+    }
+
+    /// The role's name: `viewer`, `commenter`, `suggester`, `editor` or `owner`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Viewer => "viewer",
+            Role::Commenter => "commenter",
+            Role::Suggester => "suggester",
+            Role::Editor => "editor",
+            Role::Owner => "owner",
+        }
+    }
+
+    /// The role called `name` ([`Role::name`]).
+    pub fn named(name: &str) -> Option<Role> {
+        Role::ALL.into_iter().find(|r| r.name() == name)
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Who a participant is: their number in the room, their name (the author of their comments
+/// and tracked changes) and their role.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Participant {
+    pub id: ParticipantId,
+    pub name: String,
+    pub role: Role,
+}
+
+/// Why a room didn't let someone in.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RoomError {
+    /// No invite has the key, or it was taken back.
+    #[error("no invite has this key")]
+    UnknownKey,
+    /// The name can't be a participant's, or an invite has it already.
+    #[error("{0}")]
+    Name(String),
+    /// The room has as many participants or invites as it holds, or no key could be made.
+    #[error("{0}")]
+    Full(String),
+}
+
 /// One shared document: its hub, and what its participants' copies share.
 pub struct Room {
     hub: Mutex<Hub>,
@@ -54,8 +142,6 @@ pub struct Room {
     changed: Condvar,
     /// The commands, shared by the copies' sessions.
     registry: Arc<Registry>,
-    /// Participants who joined so far.
-    joined: AtomicU32,
 }
 
 impl Room {
@@ -66,7 +152,7 @@ impl Room {
 
     /// A room whose hub is `hub`.
     pub fn with_hub(hub: Hub) -> Arc<Room> {
-        Arc::new(Room { hub: Mutex::new(hub), changed: Condvar::new(), registry: Arc::new(crate::cmd::registry()), joined: AtomicU32::new(0) })
+        Arc::new(Room { hub: Mutex::new(hub), changed: Condvar::new(), registry: Arc::new(crate::cmd::registry()) })
     }
 
     /// The hub, whatever a thread that panicked while holding it left (the hub changes its
@@ -87,13 +173,51 @@ impl Room {
     }
 
     /// Join the room as a new participant called `name` (the author of their comments and
-    /// tracked changes), with a copy of the document as of its latest version.
-    pub fn join(self: &Arc<Self>, name: &str) -> Replica {
-        let id = ParticipantId(self.joined.fetch_add(1, Ordering::Relaxed).saturating_add(1));
-        let (version, doc) = self.document();
+    /// tracked changes) with `role`, and a copy of the document as of its latest version. For
+    /// the room's own process: anyone else joins with a key ([`Room::join_with`]).
+    pub fn join(self: &Arc<Self>, name: &str, role: Role) -> Result<Replica, RoomError> {
+        let (who, version, doc) = {
+            let mut hub = self.hub();
+            let who = hub.admit(name, role)?;
+            (who, hub.version(), hub.document().clone())
+        };
+        Ok(self.copy_for(who, version, doc))
+    }
+
+    /// A key for a participant called `name` with `role`: whoever holds it joins as them
+    /// ([`Room::join_with`]), and can't join as anyone else. Refused when the name is empty,
+    /// too long or holds control characters, or another invite has it.
+    pub fn invite(&self, name: &str, role: Role) -> Result<String, RoomError> {
+        self.hub().invite(name, role)
+    }
+
+    /// Take back the invite with `key`: no one joins with it any more (copies that joined with
+    /// it stay). Whether there was one.
+    pub fn revoke(&self, key: &str) -> bool {
+        self.hub().revoke(key)
+    }
+
+    /// Join the room with a key [`Room::invite`] handed out, under its name and role.
+    pub fn join_with(self: &Arc<Self>, key: &str) -> Result<Replica, RoomError> {
+        let (who, version, doc) = {
+            let mut hub = self.hub();
+            let who = hub.admit_with(key)?;
+            (who, hub.version(), hub.document().clone())
+        };
+        Ok(self.copy_for(who, version, doc))
+    }
+
+    /// The participants who joined, in the order they did.
+    pub fn participants(&self) -> Vec<Participant> {
+        self.hub().participants().cloned().collect()
+    }
+
+    /// A copy of version `version` of the document, `doc`, for participant `who`.
+    fn copy_for(self: &Arc<Self>, who: Participant, version: u64, doc: Document) -> Replica {
         let mut session = Session::with_registry(doc.clone(), self.registry.clone());
-        session.author = name.to_string();
-        Replica::new(self.clone(), id, session, version, doc)
+        session.author = who.name.clone();
+        session.role = Some(who.role);
+        Replica::new(self.clone(), who, session, version, doc)
     }
 
     /// Wait until the document is past `version`, or `timeout` has passed; the latest version.
