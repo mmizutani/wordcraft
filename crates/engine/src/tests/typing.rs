@@ -545,6 +545,38 @@ fn tracked_autocorrect_leaves_text_the_author_did_not_insert() {
     assert_eq!(s.doc.plain_text(StoryRef::Body), original);
 }
 
+/// With Track Changes on, a space after someone else's hyphens or space leaves them as they are:
+/// AutoFormat's dashes and the double-space full stop change only text the author is typing
+/// (the change wouldn't be tracked), so Reject All gives back the document as it was, and a
+/// suggester's space there isn't refused for an untracked change. What they type is formatted.
+#[test]
+fn tracked_dashes_and_full_stops_leave_text_the_author_did_not_insert() {
+    let original = "e--f\na -- b\nc - d\nend ";
+    let mut s = Session::new(wordcraft_doc::Document::from_text(original));
+    s.author = "Sam".into();
+    run(&mut s, "tools.autocorrect", json!({"doubleSpacePeriod": true}));
+    run(&mut s, "review.trackChanges", json!({"value": true}));
+    for word in ["f", "b", "d", "end "] {
+        run(&mut s, "select.text", json!({"text": word}));
+        run(&mut s, "caret.right", json!({}));
+        typ(&mut s, " ");
+    }
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "e--f \na -- b \nc - d \nend  ");
+    // What they type is formatted as usual.
+    typ(&mut s, "x--y and p -- q and r  ");
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "e--f \na -- b \nc - d \nend  x\u{2014}y and p \u{2013} q and r. ");
+    run(&mut s, "review.rejectAll", json!({}));
+    assert_eq!(s.doc.plain_text(StoryRef::Body), original);
+    // A suggester's space after someone else's hyphens goes through, as a tracked space.
+    let mut s = Session::new(wordcraft_doc::Document::from_text("word--word"));
+    s.author = "Sam".into();
+    s.role = Some(crate::room::Role::Suggester);
+    run(&mut s, "caret.docEnd", json!({}));
+    run(&mut s, "text.insert", json!({"text": " "}));
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "word--word ");
+    assert!(!s.doc.settings.track_changes && !s.doc.revisions.is_empty() && s.doc.revisions.iter().all(|r| r.author == "Sam"));
+}
+
 /// A word after a no-break space or an ideographic space is corrected as after a plain space:
 /// replacements, sentence capitals, ordinals and links.
 #[test]

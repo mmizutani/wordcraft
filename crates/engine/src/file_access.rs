@@ -76,6 +76,13 @@ impl AutomationRoots {
         Ok(Some(Arc::new(Self { read, write })))
     }
 
+    /// No folder at all: every path a command reads or writes is refused. For the copies the
+    /// process hosts for participants who joined a shared document with a key
+    /// ([`crate::room::hosted::call`]), whose commands reach none of the computer's files.
+    pub fn none() -> Arc<Self> {
+        Arc::new(Self { read: None, write: None })
+    }
+
     /// The read root, absolute with its links followed.
     pub fn read_root(&self) -> Option<&Path> {
         self.read.as_ref().map(|r| r.shown.as_path())

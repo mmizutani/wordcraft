@@ -295,7 +295,9 @@ names the command. `edit.undo` and `edit.redo` take back the agent's own steps a
 everyone else's edits in; when someone changed what the step changed since, they fail and say
 who. `get_changes` shows the window's changes and other agents' alike. Files,
 other documents and the window (`open_document`, `save_document`, `list_documents`,
-`screenshot`, `click`, `key`, `ui_inspect`) and the room's other actions are the owner's.
+`screenshot`, `click`, `key`, `ui_inspect`) and the room's other actions are the owner's, and
+its commands reach none of the computer's files: one that reads or writes a file it names (mail
+merge's recipients `path`, a picture's) is refused.
 Revoking the key or stopping sharing ends the agent's connection: its next call is an error
 that says why. See [Shared documents](control-protocol.md#shared-documents) for the control
 channel's side.

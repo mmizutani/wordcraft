@@ -124,7 +124,7 @@ pub fn comment_range_at_caret(s: &Session) -> Option<u32> {
 }
 
 /// Comment anchored around the caret, else the first one in its paragraph.
-pub(super) fn comment_at_caret(s: &Session) -> Option<u32> {
+pub(crate) fn comment_at_caret(s: &Session) -> Option<u32> {
     let f = &s.sel.focus;
     let p = s.doc.para_at(f)?;
     comment_range_at_caret(s).or_else(|| {

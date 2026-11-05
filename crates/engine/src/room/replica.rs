@@ -240,8 +240,8 @@ fn new_blocks(cs: &ChangeSet) -> Vec<BlockId> {
 /// (typing replaces the selection, Overtype, AutoCorrect, AutoFormat…), the view (Outline view,
 /// field codes, the pens and the rest of the Draw tab, design mode…; without the lasso, kept
 /// with the selection in [`Around`]), the highlighter colour, the editing language, the
-/// bibliography style, column selection mode, and the name and initials new comments and
-/// tracked changes are made under.
+/// bibliography style, column selection mode, the name and initials new comments and
+/// tracked changes are made under, and mail merge's recipients and preview.
 #[derive(Clone, Debug, PartialEq)]
 struct Context {
     prefs: Prefs,
@@ -252,6 +252,8 @@ struct Context {
     column_mode: bool,
     author: String,
     initials: String,
+    /// Mail merge's recipients, the record previewed and whether results are previewed.
+    merge: crate::cmd::mailings::MergeState,
 }
 
 impl Context {
@@ -266,6 +268,7 @@ impl Context {
             column_mode: s.column_mode,
             author: s.author.clone(),
             initials: s.initials.clone(),
+            merge: s.merge.clone(),
         }
     }
 
@@ -279,6 +282,7 @@ impl Context {
             && self.column_mode == s.column_mode
             && self.author == s.author
             && self.initials == s.initials
+            && self.merge == s.merge
     }
 
     /// Put it in session `s`, which keeps its lasso.
@@ -293,6 +297,7 @@ impl Context {
         s.column_mode = self.column_mode;
         s.author = self.author;
         s.initials = self.initials;
+        s.merge = self.merge;
     }
 }
 
@@ -400,6 +405,18 @@ struct Unit {
     serial: u64,
 }
 
+/// The places in the params of the command session `s`'s Repeat repeats, as anchors in its
+/// document (a param that names no paragraph is repeated as it is).
+fn repeat_places(s: &Session) -> Vec<(String, Option<Anchor>)> {
+    let Some((id, params)) = &s.last_command else { return Vec::new() };
+    let doc = &s.doc;
+    positions(id)
+        .iter()
+        .filter(|(_, how)| *how == Place::Pos)
+        .filter_map(|(key, _)| Some((key.to_string(), Some(doc.anchor_at(&crate::cmd::parse_pos(params.get(*key)?)?)?))))
+        .collect()
+}
+
 /// Name the comment command `id` names in `params` ([`NAMES_COMMENTS`]) by the id `renamed`
 /// gives it, when an edit made again made it under another id. False when it is gone.
 fn rename_comment(id: &str, params: &mut Value, renamed: &BTreeMap<u32, Option<u32>>) -> bool {
@@ -487,6 +504,9 @@ pub struct Replica {
     /// these ids, not moved by comparing documents, which would take a block another
     /// participant put in at the same place for one of them.
     reborn: BTreeMap<BlockId, Option<BlockId>>,
+    /// The places in the params of the command Repeat repeats ([`Session::last_command`]), as
+    /// anchors moved with the text since; `None` for one that is gone.
+    repeat: Vec<(String, Option<Anchor>)>,
 }
 
 impl Replica {
@@ -510,6 +530,7 @@ impl Replica {
             stats: Stats::default(),
             lent: false,
             reborn: BTreeMap::new(),
+            repeat: Vec::new(),
         }
     }
 
@@ -547,6 +568,24 @@ impl Replica {
         std::mem::swap(&mut self.session, session);
         let lent = Lent { copy: self, session };
         Some(f(&mut *lent.copy))
+    }
+
+    /// [`Replica::lend`], with the room's document the session's active one while `f` runs when
+    /// the session shows another of its documents: to catch up on the room's before the window
+    /// stops sharing it or closes it, whichever document it shows. The one it showed is shown
+    /// again after. `None`, running nothing, when the copy isn't one made for a session, or the
+    /// room's document isn't open in `session`.
+    pub fn lend_document<R>(&mut self, session: &mut Session, f: impl FnOnce(&mut Replica) -> R) -> Option<R> {
+        let shown = session.document_id();
+        if shown == self.document {
+            return self.lend(session, f);
+        }
+        if !self.lent || session.switch_document(self.document).is_err() {
+            return None;
+        }
+        let r = self.lend(session, f);
+        let _ = session.switch_document(shown);
+        r
     }
 
     /// The session's id for the room's document.
@@ -614,9 +653,18 @@ impl Replica {
         // the comments it names like any other (made again as Repeat, it would repeat the
         // command as saved, with the ids it had then).
         if id == "edit.repeat" {
-            let Some((again, p)) = self.session.last_command.clone().filter(|(again, _)| again != id) else {
+            let Some((again, mut p)) = self.session.last_command.clone().filter(|(again, _)| again != id) else {
                 return Err(CmdError::Failed("nothing to repeat".into()));
             };
+            // At the places it was made at, moved with the text since.
+            for (key, at) in &self.repeat {
+                let Some(pos) = at.and_then(|a| self.session.doc.pos_of(a, None)) else {
+                    return Err(CmdError::Failed(format!("{again}: the place it was made at is gone")));
+                };
+                if let Some(o) = p.as_object_mut() {
+                    o.insert(key.clone(), crate::cmd::pos_json(&pos));
+                }
+            }
             return self.run(&again, &p);
         }
         // A macro's steps run one by one as the copy's commands, so that each keeps its places
@@ -666,15 +714,28 @@ impl Replica {
         self.session.view.draw.lasso = lasso;
         let pending = self.session.pending.clone();
         let comments_before: Vec<u32> = self.session.doc.comments.keys().copied().collect();
+        // A comment named by the caret is kept by its id: made again, the caret may be at
+        // another participant's comment.
+        let mut kept_params = params.clone();
+        if NAMES_COMMENTS.contains(&id)
+            && params.get("id").is_none()
+            && !params.get("all").and_then(Value::as_bool).unwrap_or(false)
+            && let (Some(c), Some(o)) = (crate::cmd::review::comment_at_caret(&self.session), kept_params.as_object_mut())
+        {
+            o.insert("id".into(), Value::from(c));
+        }
         let move_before = self.session.pending_move.as_ref().map(|m| m.rev);
         let steps = Some(Arc::new(self.session.steps()));
         let result = how(&mut self.session, id, params);
+        if self.session.registry.get(id).is_some_and(|spec| spec.mutates) {
+            self.repeat = repeat_places(&self.session);
+        }
         let moves = self.session.pending_move.as_ref().is_some_and(|m| Some(m.rev) != move_before);
         let comments = new_comments(&comments_before, &self.session.doc);
         self.stay_in_document();
         let after = selection_anchors(&self.session);
         let made = Made {
-            command: Some((id.to_string(), params.clone())),
+            command: Some((id.to_string(), kept_params)),
             before,
             after,
             around,
@@ -844,6 +905,7 @@ impl Replica {
                 self.read_again();
                 return;
             }
+            self.repeat_through(&m);
             self.seen = self.session.changes().version();
             return;
         }
@@ -913,6 +975,8 @@ impl Replica {
         let math_now = self.session.math.as_ref().and_then(|m| Some((self.session.doc.anchor_at(&m.at)?, m.clone())));
         let last = dropped.iter().flat_map(|u| &u.made).last().map(|m| m.after);
         let kept = Kept::take(&mut self.session);
+        let repeat = std::mem::take(&mut self.repeat);
+        let was = (!repeat.is_empty()).then(|| self.session.doc.clone());
         self.session.reset_shared(doc);
         if let Some(steps) = steps {
             self.session.put_steps(steps);
@@ -1037,6 +1101,12 @@ impl Replica {
             && !rename_comment(id, params, &renamed)
         {
             self.session.last_command = None;
+        }
+        // Its places move from the document the participant had to the one with their edits
+        // made again.
+        self.repeat = repeat;
+        if let Some(was) = was {
+            self.repeat_through(&ChangeSet::between(&was, &self.session.doc));
         }
         // A tracked cut made again is the one the participant's next paste can move: under the
         // revision it has now, or none when it was given up or something after it took it.
@@ -1172,6 +1242,17 @@ impl Replica {
         // paragraph may hold other text now, and the old offset would be somewhere else in it.
         let m = through.map_or(Mapped::At(a), |cs| cs.map(a));
         self.session.doc.place(m, None)
+    }
+
+    /// Move the places of the command Repeat repeats through `cs`, a change made in the copy's
+    /// document since; one left beside blocks, not in its text, is gone.
+    fn repeat_through(&mut self, cs: &ChangeSet) {
+        for (_, at) in &mut self.repeat {
+            *at = at.and_then(|a| match cs.map(a) {
+                Mapped::At(a) => Some(a),
+                _ => None,
+            });
+        }
     }
 
     /// The selection `sel` names now ([`Replica::find`]).

@@ -2,9 +2,12 @@
 //! each answers its participant's requests, on their connection's thread, with the control
 //! channel's methods for one document (`docs/control-protocol.md`, Shared documents).
 
+use std::sync::{Arc, OnceLock};
+
 use serde_json::{Value, json};
 
 use super::{Replica, Role};
+use crate::file_access::AutomationRoots;
 use crate::scope::Scope;
 
 /// Most times [`call`] sends a command's edit to the hub: the hub sends one back when it
@@ -45,7 +48,17 @@ pub fn ended(copy: &Replica) -> Option<String> {
 ///
 /// A `doc` other than the copy's own document is refused (it holds that one only), and so are
 /// the window's methods (`ui.*`, `app.quit`), and sharing and inviting, which are the owner's.
+/// Their commands reach none of the computer's files, whatever their role: one that reads or
+/// writes a file it names (mail merge's recipients, a picture) is refused
+/// ([`crate::file_access::AutomationRoots::none`]).
 pub fn call(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, String> {
+    static NO_FILES: OnceLock<Arc<AutomationRoots>> = OnceLock::new();
+    let none = NO_FILES.get_or_init(AutomationRoots::none);
+    crate::file_access::confine(Some(none), || answer(copy, method, params))
+}
+
+/// [`call`], with no file in reach.
+fn answer(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, String> {
     if let Some(why) = ended(copy) {
         return Err(why);
     }

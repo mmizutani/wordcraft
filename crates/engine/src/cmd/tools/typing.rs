@@ -192,11 +192,11 @@ pub fn autocorrect_word(s: &mut Session, on_enter: bool) -> Result<(), CmdError>
     Ok(())
 }
 
-/// Whether AutoCorrect may change the text of the paragraph at `f` from `from` to `to`: with
-/// Track Changes on, only text the author is inserting (their own tracked insertion, not
-/// deleted), since changing anyone else's text here wouldn't be tracked. WordCraft's own rule,
-/// as for `*bold*` and `_italic_` marks.
-fn may_change(s: &Session, f: &Pos, from: usize, to: usize) -> bool {
+/// Whether AutoCorrect (or AutoFormat's dashes and double-space full stop) may change the text
+/// of the paragraph at `f` from `from` to `to`: with Track Changes on, only text the author is
+/// inserting (their own tracked insertion, not deleted), since changing anyone else's text here
+/// wouldn't be tracked. WordCraft's own rule, as for `*bold*` and `_italic_` marks.
+pub(crate) fn may_change(s: &Session, f: &Pos, from: usize, to: usize) -> bool {
     if !s.doc.settings.track_changes {
         return true;
     }
