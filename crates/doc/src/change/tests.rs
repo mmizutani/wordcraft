@@ -215,6 +215,34 @@ fn a_change_made_on_other_content_is_refused_and_changes_nothing() {
 }
 
 #[test]
+fn a_part_taken_away_must_hold_what_it_held() {
+    let (d, _) = edit(&sample(), |d| {
+        let header = para_block(Paragraph::with_text("Header", CharProps::default()));
+        d.parts.insert(7, Part { kind: PartKind::Header, blocks: vec![header], body: Default::default() });
+    });
+    let (gone, cs) = edit(&d, |d| {
+        d.parts.remove(&7);
+    });
+    // Meanwhile, someone typed in the header: its paragraph keeps its id, and the removal made
+    // without their words is refused rather than taking them away with the part.
+    let (mut other, _) = edit(&copy(&d), |d| {
+        d.insert_text(&Pos::new(StoryRef::Part(7), Path::top(0), 0), "My ", &CharProps::default()).unwrap();
+    });
+    let was = other.clone();
+    assert!(matches!(other.apply(&sent(&cs)), Err(DocError::Stale(_))));
+    assert_same(&other, &was);
+    // Or pressed Enter in it.
+    let (mut other, _) = edit(&copy(&d), |d| {
+        d.split_paragraph(&Pos::new(StoryRef::Part(7), Path::top(0), 3)).unwrap();
+    });
+    assert!(matches!(other.apply(&sent(&cs)), Err(DocError::Stale(_))));
+    // A copy holding what the part held takes it away.
+    let mut other = copy(&d);
+    other.apply(&sent(&cs)).unwrap();
+    assert_same(&other, &gone);
+}
+
+#[test]
 fn a_change_that_would_empty_a_story_is_refused() {
     let d = sample();
     let mut cs = ChangeSet::between(&d, &d);

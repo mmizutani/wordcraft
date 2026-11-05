@@ -127,8 +127,14 @@ impl Document {
             }
             PartChange::Removed { id, blocks } => {
                 let Some(part) = self.parts.get(id) else { return Err(stale(format!("no part {id} to take away"))) };
-                if !part.blocks.iter().map(|b| b.id()).eq(blocks.iter().map(|b| b.id)) {
+                if part.blocks.len() != blocks.len() {
                     return Err(stale(format!("part {id} holds other blocks")));
+                }
+                // An edit made meanwhile keeps its blocks' ids, so their content is checked too:
+                // taking the part away would take that edit with it.
+                let what = format!("part {id}");
+                for (b, old) in part.blocks.iter().zip(blocks) {
+                    check(Some(b), old, &what)?;
                 }
                 self.parts.remove(id);
             }
