@@ -1,5 +1,5 @@
 #!/bin/sh
-# Model-checks RecoveryStore.tla. Exit codes:
+# Model-checks RecoveryStore.tla and RecoveryLock.tla. Exit codes:
 #   0  the rules hold, each known finding still breaks its rule, the model is in sync with the code
 #   1  a rule broke: a new bug, or a model that no longer matches the code (see SKILL.md)
 #   2  a known finding stopped breaking its rule: it may be fixed (see SKILL.md)
@@ -38,9 +38,9 @@ fi
 
 # Java's default temporary folder can be outside the sandbox, and TLC unpacks its standard modules
 # there: without this it reports only "Parsing or semantic analysis failed".
-tlc() {
+tlc() { # config module
   (cd "$here" && "$java_bin" -XX:+UseParallelGC "-Djava.io.tmpdir=$tmp" -cp "$jar" tlc2.TLC \
-    -nowarning -workers auto -metadir "$tmp/states-$1" -config "$1.cfg" RecoveryStore.tla) \
+    -nowarning -workers auto -metadir "$tmp/states-$1" -config "$1.cfg" "$2.tla") \
     >"$tmp/$1.out" 2>&1
 }
 path_of() {
@@ -49,25 +49,31 @@ path_of() {
 
 code=0
 
-echo "== rules (RecoveryStore.cfg)"
-tlc RecoveryStore
-if grep -q 'Model checking completed. No error has been found.' "$tmp/RecoveryStore.out"; then
-  grep -E 'states generated' "$tmp/RecoveryStore.out" | grep -v Progress
-else
-  grep -E '^Error' "$tmp/RecoveryStore.out" | head -5
-  path_of RecoveryStore
-  echo "A rule broke. Full output: $tmp/RecoveryStore.out"
-  code=1
-fi
-
-for finding in finding-held-discard finding-late-discard; do
-  echo "== known finding ($finding.cfg)"
-  tlc "$finding"
-  if grep -q 'Invariant UnsavedWorkHasCopy is violated' "$tmp/$finding.out"; then
-    echo "still breaks UnsavedWorkHasCopy, as recorded"
+for module in RecoveryStore RecoveryLock; do
+  echo "== rules ($module.cfg)"
+  tlc "$module" "$module"
+  if grep -q 'Model checking completed. No error has been found.' "$tmp/$module.out"; then
+    grep -E 'states generated' "$tmp/$module.out" | grep -v Progress
   else
-    grep -E '^Error|No error' "$tmp/$finding.out" | head -5
-    echo "It no longer breaks UnsavedWorkHasCopy. Full output: $tmp/$finding.out"
+    grep -E '^Error' "$tmp/$module.out" | head -5
+    path_of "$module"
+    echo "A rule broke. Full output: $tmp/$module.out"
+    code=1
+  fi
+done
+
+for known in "finding-held-discard RecoveryStore UnsavedWorkHasCopy" \
+             "finding-late-discard RecoveryStore UnsavedWorkHasCopy" \
+             "finding-lock-orphan RecoveryLock LiveOwnerIsAlone"; do
+  # shellcheck disable=SC2086 # three words, split on purpose
+  set -- $known
+  echo "== known finding ($1.cfg)"
+  tlc "$1" "$2"
+  if grep -q "Invariant $3 is violated" "$tmp/$1.out"; then
+    echo "still breaks $3, as recorded"
+  else
+    grep -E '^Error|No error' "$tmp/$1.out" | head -5
+    echo "It no longer breaks $3. Full output: $tmp/$1.out"
     [ "$code" -ne 0 ] || code=2
   fi
 done
