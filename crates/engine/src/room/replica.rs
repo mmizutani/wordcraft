@@ -174,6 +174,8 @@ struct Inputs {
     last_command: Option<(String, Value)>,
     macros: BTreeMap<String, Vec<(String, Value)>>,
     building_blocks: BTreeMap<String, Fragment>,
+    /// The tracked cut a paste makes a move of.
+    pending_move: Option<PendingMove>,
 }
 
 impl Inputs {
@@ -189,12 +191,14 @@ impl Inputs {
             last_command: s.last_command.clone(),
             macros: s.macros.clone(),
             building_blocks: s.building_blocks.clone(),
+            pending_move: s.pending_move.clone(),
         }
     }
 
     /// Put them in session `s`.
     fn put(self, s: &mut Session) {
-        let Inputs { clipboard, clipboard_text, clipboard_html, clip_history, painter, find, last_command, macros, building_blocks } = self;
+        let Inputs { clipboard, clipboard_text, clipboard_html, clip_history, painter, find, last_command, macros, building_blocks, pending_move } =
+            self;
         s.clipboard = clipboard;
         s.clipboard_text = clipboard_text;
         s.clipboard_html = clipboard_html;
@@ -204,6 +208,11 @@ impl Inputs {
         s.last_command = last_command;
         s.macros = macros;
         s.building_blocks = building_blocks;
+        // A cut made again just before keeps the move it began (its revision can differ from
+        // the one this cut had).
+        if s.pending_move.is_none() {
+            s.pending_move = pending_move;
+        }
     }
 }
 
@@ -1087,14 +1096,9 @@ impl Replica {
         if let Some(now) = self.reborn.get(&a.block) {
             return self.session.doc.pos_of(Anchor { block: (*now)?, ..a }, None);
         }
+        // Not looked for by its paragraph's id when the change moved it beside blocks: that
+        // paragraph may hold other text now, and the old offset would be somewhere else in it.
         let m = through.map_or(Mapped::At(a), |cs| cs.map(a));
-        // A change that replaced the blocks around it whole (a table with a row put in) leaves
-        // it beside them; when its paragraph is still there, it is in it.
-        if let Mapped::Before(_) | Mapped::After(_) = m
-            && let Some(p) = self.session.doc.pos_of(a, None)
-        {
-            return Some(p);
-        }
         self.session.doc.place(m, None)
     }
 

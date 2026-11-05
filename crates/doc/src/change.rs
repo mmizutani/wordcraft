@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::block_id::{MAX_ID_DEPTH, inside_ids, set_inside_ids};
+use crate::block_id::{MAX_ID_DEPTH, each_inside, inside_ids, set_inside_ids};
 use crate::control::ControlWrap;
 use crate::props::{CellProps, RowProps, TableProps};
 use crate::{
@@ -122,6 +122,10 @@ pub struct OldBlock {
     /// The ids of the blocks in a table's cells, as [`Document::each_block`] walks them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inside: Vec<BlockId>,
+    /// [`text_fingerprint`] of each block in `inside`, in the same order: whether a paragraph
+    /// a table put back in its place still has the text an offset in it counted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inside_text: Vec<Fingerprint>,
 }
 
 /// A block an edit put in: whole, with its id and the ids of the blocks inside it.
@@ -335,6 +339,15 @@ pub fn fingerprint(b: &Block) -> Fingerprint {
     fingerprint_of(b)
 }
 
+/// The [`Fingerprint`] of a paragraph's text alone (the default for a table): what byte offsets
+/// in it count, which formatting doesn't change.
+pub(crate) fn text_fingerprint(b: &Block) -> Fingerprint {
+    match b {
+        Block::Para(p) => fingerprint_of(&p.text),
+        Block::Table(_) => Fingerprint::default(),
+    }
+}
+
 /// The [`Fingerprint`] of `v`'s JSON.
 pub(crate) fn fingerprint_of<T: Serialize + ?Sized>(v: &T) -> Fingerprint {
     /// Writes into the hash as serde_json writes, so no copy of the JSON is made.
@@ -407,7 +420,9 @@ pub(crate) fn text_splice(a: &str, b: &str) -> TextSplice {
 
 impl OldBlock {
     fn of(b: &Block) -> OldBlock {
-        OldBlock { id: b.id(), len: window_len(b), hash: fingerprint(b), inside: inside_ids(b) }
+        let mut inside_text = Vec::new();
+        each_inside(b, &mut |inner| inside_text.push(text_fingerprint(inner)));
+        OldBlock { id: b.id(), len: window_len(b), hash: fingerprint(b), inside: inside_ids(b), inside_text }
     }
 }
 

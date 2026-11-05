@@ -437,6 +437,35 @@ fn a_cells_edit_made_again_clears_the_same_cells_after_rows_put_in_before_them()
 }
 
 #[test]
+fn an_edit_in_a_cell_whose_text_changed_in_a_table_put_back_whole_is_not_made_elsewhere() {
+    let mut s = Session::new(Document::from_text("r1\tone three"));
+    s.run("select.all", &json!({})).unwrap();
+    s.run("table.fromText", &json!({})).unwrap();
+    let room = Room::with_hub(Hub::new(s.doc.clone()).keeping(1));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    // Ana types "X" over "three" while Ben puts a row in above and types "Zone" over "one". Her
+    // copy misses both changes and reads the document again: the cell's text changed with the
+    // table sent whole, so where "three" was isn't known and her edit is given up, not made
+    // over "e thre".
+    run(&mut a, "select.text", json!({"text": "three"}));
+    run(&mut a, "text.insert", json!({"text": "X"}));
+    run(&mut b, "select.text", json!({"text": "r1"}));
+    run(&mut b, "table.insertRowAbove", json!({}));
+    b.sync();
+    run(&mut b, "select.text", json!({"text": "one"}));
+    run(&mut b, "text.insert", json!({"text": "Zone"}));
+    b.sync();
+    assert_eq!(room.version(), 2);
+    a.send();
+    assert_eq!((a.stats().read_again, a.stats().lost), (1, 1));
+    assert_eq!(text(&a).split_whitespace().collect::<Vec<_>>(), ["r1", "Zone", "three"]);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
 fn typing_made_again_keeps_the_formatting_picked_for_it() {
     let room = Room::new(Document::from_text("one two three "));
     let mut a = join(&room, "Ana");
@@ -1111,6 +1140,36 @@ fn a_comment_made_again_keeps_the_name_it_was_made_under() {
     by.sort();
     assert_eq!(by, [("A".to_string(), "Ana".to_string()), ("B".to_string(), "Ben".to_string())]);
     assert_eq!(a.session().author, "Zoe");
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
+fn a_tracked_paste_made_again_still_moves_what_was_cut() {
+    let room = Room::new(Document::from_text("First one.\nSecond one.\nThird one."));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    run(&mut a, "review.trackChanges", json!({"value": true}));
+    // Ana cuts the second paragraph, and the hub takes the cut; then she pastes it at the start
+    // while Ben types at the end first, a tracked insertion of his own. Her paste, made again,
+    // is still the other end of the move her cut began.
+    run(&mut a, "select.range", json!({"anchor": Pos::body(1, 0), "focus": Pos::body(2, 0)}));
+    run(&mut a, "edit.cut", json!({}));
+    a.send();
+    a.receive();
+    b.receive();
+    run(&mut a, "caret.set", json!({"pos": Pos::body(0, 0)}));
+    run(&mut a, "edit.paste", json!({}));
+    let moves = |r: &Replica| r.session().doc.revisions.iter().filter(|r| r.move_name.is_some()).count();
+    assert_eq!(moves(&a), 2);
+    run(&mut b, "caret.docEnd", json!({}));
+    run(&mut b, "text.insert", json!({"text": " Ben"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    assert_eq!(moves(&a), 2);
     let mut copies = [a, b];
     settle(&mut copies).unwrap();
     smooth(&copies);
