@@ -208,11 +208,7 @@ impl Inputs {
         s.last_command = last_command;
         s.macros = macros;
         s.building_blocks = building_blocks;
-        // A cut made again just before keeps the move it began (its revision can differ from
-        // the one this cut had).
-        if s.pending_move.is_none() {
-            s.pending_move = pending_move;
-        }
+        s.pending_move = pending_move;
     }
 }
 
@@ -951,8 +947,10 @@ impl Replica {
                     continue;
                 }
                 if let Some(mut inputs) = inputs {
-                    if after_cut {
-                        inputs.pending_move = None;
+                    // A cut it could move that was made again before it is that cut as made
+                    // again (another revision, or none when it was given up); none stays none.
+                    if after_cut && inputs.pending_move.is_some() {
+                        inputs.pending_move = self.session.pending_move.clone();
                     }
                     inputs.put(&mut self.session);
                 }
@@ -1009,7 +1007,8 @@ impl Replica {
         }
         // A tracked cut made again is the one the participant's next paste can move: under the
         // revision it has now, or none when it was given up or something after it took it.
-        if cut {
+        // When the participant has let it go since (Bold turned on at the caret), it stays gone.
+        if cut && self.session.pending_move.is_some() {
             self.session.pending_move = cut_now;
         }
         // The participant's own selection, when they moved it after their last edit, and the

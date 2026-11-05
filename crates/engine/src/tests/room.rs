@@ -1235,6 +1235,68 @@ fn a_tracked_cut_made_again_is_the_one_its_paste_moves() {
 }
 
 #[test]
+fn a_paste_that_moved_nothing_made_again_after_its_cut_still_moves_nothing() {
+    let room = Room::new(Document::from_text("First one.\nSecond one.\nThird one. "));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    run(&mut a, "review.trackChanges", json!({"value": true}));
+    a.send();
+    a.receive();
+    b.receive();
+    // Ana cuts the second paragraph, turns Bold on at the end of the last (which changes no
+    // text, but lets the cut go: the paste after it is no move) and pastes; Ben types at the
+    // end of the first first. Made again, her cut is a cut a paste could move, but her paste
+    // still isn't a move.
+    run(&mut a, "select.range", json!({"anchor": Pos::body(1, 0), "focus": Pos::body(2, 0)}));
+    run(&mut a, "edit.cut", json!({}));
+    run(&mut a, "caret.set", json!({"pos": Pos::body(2, "Third one. ".len())}));
+    run(&mut a, "format.bold", json!({}));
+    run(&mut a, "edit.paste", json!({}));
+    let moves = |r: &Replica| r.session().doc.revisions.iter().filter(|r| r.move_name.is_some()).count();
+    assert_eq!(moves(&a), 0);
+    run(&mut b, "caret.set", json!({"pos": Pos::body(0, "First one.".len())}));
+    run(&mut b, "text.insert", json!({"text": " Ben"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    assert_eq!(moves(&a), 0);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
+fn a_cut_let_go_before_its_edits_are_made_again_stays_let_go() {
+    let room = Room::new(Document::from_text("First one.\nSecond one.\nThird one. "));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    run(&mut a, "review.trackChanges", json!({"value": true}));
+    a.send();
+    a.receive();
+    b.receive();
+    // Ana cuts the second paragraph and turns Bold on at the end of the last, which lets the
+    // cut go; Ben types at the end of the first first. Once her cut is made again, the paste
+    // she makes next still isn't a move.
+    run(&mut a, "select.range", json!({"anchor": Pos::body(1, 0), "focus": Pos::body(2, 0)}));
+    run(&mut a, "edit.cut", json!({}));
+    run(&mut a, "caret.set", json!({"pos": Pos::body(2, "Third one. ".len())}));
+    run(&mut a, "format.bold", json!({}));
+    run(&mut b, "caret.set", json!({"pos": Pos::body(0, "First one.".len())}));
+    run(&mut b, "text.insert", json!({"text": " Ben"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    run(&mut a, "edit.paste", json!({}));
+    let moves = |r: &Replica| r.session().doc.revisions.iter().filter(|r| r.move_name.is_some()).count();
+    assert_eq!(moves(&a), 0);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
 fn a_tracked_paste_made_again_still_moves_what_was_cut() {
     let room = Room::new(Document::from_text("First one.\nSecond one.\nThird one."));
     let mut a = join(&room, "Ana");
