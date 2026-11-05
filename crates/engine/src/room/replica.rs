@@ -717,10 +717,15 @@ impl Replica {
             let Some(sel) = self.selection_at(before, through) else { return false };
             self.session.sel = sel;
         }
-        if let Some(c) = &around.column {
-            let Some(block) = self.column_at(c, through) else { return false };
-            self.session.column = Some(block);
-        }
+        // Its column or cells, or none: a command made without one isn't made on the column a
+        // command made again before it had.
+        self.session.column = match &around.column {
+            Some(c) => {
+                let Some(block) = self.column_at(c, through) else { return false };
+                Some(block)
+            }
+            None => None,
+        };
         // The equation it was typed in, or none: a command made again outside an equation
         // isn't made in the one the participant is editing now.
         self.session.math = match &around.math {
