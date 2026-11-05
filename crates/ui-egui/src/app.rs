@@ -105,6 +105,8 @@ impl WordApp {
             updates_rt: updates_ui::Runtime::default(),
             packs_rt: Default::default(),
             control_rx: None,
+            lobby: Default::default(),
+            share: None,
             shots: crate::control::Shots::default(),
             capture_epoch: 0,
             surface_geometry: None,
@@ -320,6 +322,8 @@ impl WordApp {
             self.poll_printing(ctx);
         }
         self.drain_control(ctx);
+        // What others changed in the shared document, before it's drawn.
+        self.sync_share(ctx);
         // The active window's own work; with native windows each window does it again as it
         // draws, for itself.
         self.window_work(ctx);

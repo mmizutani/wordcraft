@@ -182,6 +182,12 @@ pub fn handle(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) -> O
             Err(e) => return err(e),
         }
     }
+    if let Some(r) = crate::share::room_method(app, &req.method, p) {
+        return match r {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        };
+    }
     let s = |k: &str| p.get(k).and_then(Value::as_str);
     let f = |k: &str| p.get(k).and_then(Value::as_f64).map(|v| v as f32);
     match req.method.as_str() {

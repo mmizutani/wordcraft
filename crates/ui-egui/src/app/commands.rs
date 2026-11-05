@@ -199,10 +199,11 @@ impl WordApp {
         let math_session = self.session.math.as_ref().map(|m| m.session);
         let composing_before = !self.canvas.ime_preedit.is_empty();
         let old_path = self.session.path.clone();
-        let r = if self.ime_origin {
-            self.session.run_ime(id, &params).map_err(|e| e.to_string())
-        } else {
-            self.session.run(id, &params).map_err(|e| e.to_string())
+        // In the document the window shares, through its copy.
+        let r = match self.run_shared(id, &params, self.ime_origin) {
+            Some(r) => r.map_err(|e| e.to_string()),
+            None if self.ime_origin => self.session.run_ime(id, &params).map_err(|e| e.to_string()),
+            None => self.session.run(id, &params).map_err(|e| e.to_string()),
         };
         if self.session.ime_body_epoch() != body_epoch {
             self.canvas.ime_interrupted_preedit |= composing_before;

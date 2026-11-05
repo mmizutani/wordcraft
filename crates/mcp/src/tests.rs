@@ -425,3 +425,36 @@ fn an_agent_follows_the_changes_after_the_version_it_read() {
     let r = call(&mut s, 13, "tools/call", json!({"name": "get_changes", "arguments": {"since": "soon"}}));
     assert_eq!(r["result"]["isError"], true, "{r}");
 }
+
+/// The `room` tool calls the app's `room.*` methods with the arguments they take; a headless
+/// session has no window to share a document from.
+#[test]
+fn the_room_tool_calls_the_app_s_room_methods() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut s = Server::new(Box::new(FakeApp { calls: calls.clone() }));
+    let tools = call(&mut s, 1, "tools/list", json!({}));
+    assert!(tools["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "room"));
+    for (args, method, params) in [
+        (json!({"action": "share"}), "room.share", json!({})),
+        (
+            json!({"action": "invite", "name": "Copy editor", "role": "suggester", "page": 3}),
+            "room.invite",
+            json!({"name": "Copy editor", "role": "suggester"}),
+        ),
+        (json!({"action": "revoke", "key": "abc", "name": null}), "room.revoke", json!({"key": "abc"})),
+        (json!({"action": "participants"}), "room.participants", json!({})),
+        (json!({"action": "stop"}), "room.stop", json!({})),
+    ] {
+        call(&mut s, 2, "tools/call", json!({"name": "room", "arguments": args}));
+        assert_eq!(calls.lock().unwrap().pop(), Some((method.to_string(), params)), "{method}");
+    }
+    for args in [json!({}), json!({"action": "kick"}), json!({"action": 5})] {
+        let r = call(&mut s, 3, "tools/call", json!({"name": "room", "arguments": args}));
+        assert_eq!(r["result"]["isError"], true, "{args}");
+    }
+    assert!(calls.lock().unwrap().is_empty());
+    let mut s = Server::new(Box::new(Headless::default()));
+    let r = call(&mut s, 4, "tools/call", json!({"name": "room", "arguments": {"action": "share"}}));
+    assert_eq!(r["result"]["isError"], true);
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("needs the desktop app"), "{r}");
+}

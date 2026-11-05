@@ -86,7 +86,7 @@ fn answer_on(session: &mut Session, method: &str, params: Value) -> Result<Value
             let png = img.to_png();
             Ok(json!({"png": wordcraft_engine::cmd::insert::base64_encode(&png), "width": img.width, "height": img.height, "pages": l.pages.len()}))
         }
-        m if m.starts_with("ui.") => Err(format!("`{m}` {NEEDS_APP}")),
+        m if m.starts_with("ui.") || m.starts_with("room.") => Err(format!("`{m}` {NEEDS_APP}")),
         other => session.run(other, &params).map_err(|e| e.to_string()),
     }
 }

@@ -553,10 +553,13 @@ fn main() -> eframe::Result {
                 app.mac_titlebar = bar;
             }
             let mut key_file = None;
+            // Where participants with a key find the document the window shares.
+            let lobby = wordcraft_engine::room::Lobby::default();
             if let Some(port) = control_port
-                && let Some((rx, file)) = control_server::start(port, cc.egui_ctx.clone(), wordcraft_control_key::settings_dir().as_deref())
+                && let Some((rx, file)) =
+                    control_server::start(port, cc.egui_ctx.clone(), wordcraft_control_key::settings_dir().as_deref(), lobby.clone())
             {
-                app = app.with_control(rx);
+                app = app.with_control(rx).with_lobby(lobby);
                 key_file = file;
             }
             // Nothing to open (no files, no sample, no control channel driving the editor): start
