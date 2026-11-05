@@ -8,7 +8,7 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 use serde_json::{Value, json};
-use wordcraft_doc::{ChangeSet, Document, StoryRef};
+use wordcraft_doc::{ChangeSet, Document, Pos, StoryRef};
 
 use super::block_ids::{Step, step};
 use super::changes::{difference, edit_step};
@@ -296,6 +296,56 @@ fn a_cut_made_again_leaves_the_clipboard_as_the_participant_has_it() {
     let mut copies = [a, b];
     settle(&mut copies).unwrap();
     smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
+fn a_column_selection_edit_made_again_keeps_its_column() {
+    let room = Room::new(Document::from_text("abc\nabc"));
+    let mut a = room.join("Ana");
+    let mut b = room.join("Ben");
+    // Ana selects the "b" of both lines as a column and deletes them, while Ben types "B" over
+    // the first. Her delete, made again, still takes the column away, not the text between its
+    // corners.
+    run(&mut a, "select.column", json!({"anchor": Pos::body(0, 1), "focus": Pos::body(1, 2)}));
+    run(&mut a, "text.delete", json!({}));
+    assert_eq!(text(&a), "ac\nac");
+    run(&mut b, "select.text", json!({"text": "b"}));
+    run(&mut b, "text.insert", json!({"text": "B"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().made_again, a.stats().lost), (1, 1, 0));
+    assert_eq!(text(&a), "ac\nac");
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
+fn an_edit_whose_text_is_gone_is_not_made_elsewhere() {
+    let mut s = Session::new(Document::from_text("one two"));
+    s.run("caret.docEnd", &json!({})).unwrap();
+    s.run("insert.textBox", &json!({})).unwrap();
+    s.run("text.insert", &json!({"text": "box"})).unwrap();
+    let in_box = s.sel.focus.clone();
+    assert_ne!(in_box.story, StoryRef::Body);
+    let room = Room::new(s.doc.clone());
+    let mut a = room.join("Ana");
+    let mut b = room.join("Ben");
+    // Ana types in the text box while Ben types over the whole body, which takes the box away
+    // with its anchor. Ana's typing is given up, not made in the body.
+    run(&mut a, "caret.set", json!({"pos": in_box}));
+    run(&mut a, "text.insert", json!({"text": " more"}));
+    run(&mut b, "select.all", json!({}));
+    run(&mut b, "text.insert", json!({"text": "gone"}));
+    b.send();
+    a.send();
+    assert_eq!(a.stats().clashes, 1);
+    assert_eq!((a.stats().made_again, a.stats().lost), (0, 1));
+    assert_eq!(text(&a), "gone");
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
     same_everywhere(&copies).unwrap();
 }
 

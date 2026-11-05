@@ -8,13 +8,13 @@ use serde_json::Value;
 use wordcraft_doc::change::{Anchor, Mapped, Side};
 use wordcraft_doc::edit::Fragment;
 use wordcraft_doc::props::{CharProps, ParaProps};
-use wordcraft_doc::{ChangeSet, Document, Pos};
+use wordcraft_doc::{BlockId, ChangeSet, Document, Path, Pos};
 
 use super::{Accepted, Bounce, MAX_BATCH, ParticipantId, Room};
 use crate::cmd::edit::ClipHistory;
 use crate::cmd::moves::PendingMove;
 use crate::scope::{Place, Scope, positions};
-use crate::{CmdError, FindState, Selection, Session};
+use crate::{CellRange, CmdError, ColumnBlock, FindState, Selection, Session};
 
 /// How many times a copy makes the same edit again after reading the document again before it
 /// gives up on it (the hub refused it, or the copy and the hub disagreed). Edits made again
@@ -46,6 +46,28 @@ pub struct Stats {
 
 /// The selection as anchors: where it starts and where the caret is.
 type SelAnchors = Option<(Anchor, Anchor)>;
+
+/// A column selection, or whole table cells, as anchors: its line pieces, and the table its
+/// cells are in by id.
+#[derive(Clone, Debug)]
+struct ColumnAnchors {
+    anchor_x: f32,
+    focus_x: f32,
+    segments: Vec<(Anchor, Anchor)>,
+    cells: Option<(BlockId, CellRange)>,
+}
+
+/// Session `s`'s column selection or whole cells, when the selection is one, as anchors (`None`
+/// when a piece isn't in a paragraph).
+fn column_anchors(s: &Session) -> Option<ColumnAnchors> {
+    let c = s.column.as_ref().filter(|c| c.sel == s.sel)?;
+    let segments = c.segments.iter().map(|(a, b)| Some((s.doc.anchor_at(a)?, s.doc.anchor_at(b)?))).collect::<Option<Vec<_>>>()?;
+    let cells = match &c.cells {
+        Some(r) => Some((s.doc.block(r.story, &r.table)?.id(), r.clone())),
+        None => None,
+    };
+    Some(ColumnAnchors { anchor_x: c.anchor_x, focus_x: c.focus_x, segments, cells })
+}
 
 /// Commands that read more of their session than the document, the selection and their params
 /// ([`Inputs`]): pastes, Paste Formatting, Replace (`^c` is the clipboard), the Spike, Quick
@@ -145,6 +167,8 @@ struct Made {
     /// The selection before and after it.
     before: SelAnchors,
     after: SelAnchors,
+    /// The column selection or whole cells before it, when the selection was one.
+    column: Option<ColumnAnchors>,
     /// Its params that are places in the document ([`positions`]).
     places: Vec<(String, Anchor)>,
     /// What it read from the session besides the document and its params, for the commands that
@@ -157,7 +181,7 @@ struct Made {
 impl Made {
     /// A change made outside a command.
     fn outside() -> Made {
-        Made { command: None, before: None, after: None, places: Vec::new(), inputs: None, tries: 0 }
+        Made { command: None, before: None, after: None, column: None, places: Vec::new(), inputs: None, tries: 0 }
     }
 }
 
@@ -297,6 +321,7 @@ impl Replica {
     /// keep what it changed as an edit of the copy's own.
     fn run_made(&mut self, id: &str, params: &Value, tries: u32) -> Result<Value, CmdError> {
         let before = selection_anchors(&self.session);
+        let column = column_anchors(&self.session);
         let doc = &self.session.doc;
         let places = positions(id)
             .iter()
@@ -307,7 +332,7 @@ impl Replica {
         let result = self.session.run(id, params);
         self.stay_in_document();
         let after = selection_anchors(&self.session);
-        let made = Made { command: Some((id.to_string(), params.clone())), before, after, places, inputs, tries };
+        let made = Made { command: Some((id.to_string(), params.clone())), before, after, column, places, inputs, tries };
         self.collect(made);
         result
     }
@@ -510,14 +535,14 @@ impl Replica {
         let mut went_on: Option<SelAnchors> = None;
         for (k, u) in dropped.into_iter().enumerate() {
             for (j, m) in u.made.into_iter().enumerate() {
-                let Made { command, before, after, places, inputs, tries } = m;
+                let Made { command, before, after, column, places, inputs, tries } = m;
                 let tries = if read_again { tries.saturating_add(1) } else { tries };
                 let Some((id, mut params)) = command.filter(|_| tries <= MAX_TRIES) else {
                     self.stats.lost = self.stats.lost.saturating_add(1);
-                    went_on = Some(after);
+                    went_on = None;
                     continue;
                 };
-                let reselect = went_on != Some(before);
+                let reselect = went_on != Some(before) || column.is_some();
                 // From the document the command was made on to the one it is made again on: the
                 // change its edits clashed with for the first, the difference for the others.
                 let between;
@@ -529,15 +554,15 @@ impl Replica {
                     }
                     _ => None,
                 };
-                if reselect && let Some(sel) = self.selection_at(before, through) {
-                    self.session.sel = sel;
-                }
-                for (key, at) in &places {
-                    if let Some(p) = self.find(*at, through)
-                        && let Some(o) = params.as_object_mut()
-                    {
-                        o.insert(key.clone(), crate::cmd::pos_json(&p));
-                    }
+                // An edit whose selection or places are gone (another participant took their text
+                // or the text box they were in away) isn't made anywhere else.
+                if !self.made_at(reselect, before, column.as_ref(), &places, &mut params, through) {
+                    self.stats.lost = self.stats.lost.saturating_add(1);
+                    self.session.status = format!(
+                        "An edit made at the same time as another participant's couldn't be made again ({id}): the text it was made in is gone"
+                    );
+                    went_on = None;
+                    continue;
                 }
                 if let Some(inputs) = inputs {
                     inputs.put(&mut self.session);
@@ -548,6 +573,7 @@ impl Replica {
                     Err(e) => {
                         self.stats.lost = self.stats.lost.saturating_add(1);
                         self.session.status = format!("An edit made at the same time as another participant's couldn't be made again ({id}): {e}");
+                        went_on = None;
                     }
                 }
             }
@@ -563,6 +589,58 @@ impl Replica {
                 self.session.clamp_selection();
             }
         }
+    }
+
+    /// Put the selection a command was made with back (when `reselect`), with its column or
+    /// cells, and its places in `params`, each moved through `through` or found by its
+    /// paragraph. False, when one of them is gone.
+    fn made_at(
+        &mut self,
+        reselect: bool,
+        before: SelAnchors,
+        column: Option<&ColumnAnchors>,
+        places: &[(String, Anchor)],
+        params: &mut Value,
+        through: Option<&ChangeSet>,
+    ) -> bool {
+        if reselect && before.is_some() {
+            let Some(sel) = self.selection_at(before, through) else { return false };
+            self.session.sel = sel;
+        }
+        if let Some(c) = column {
+            let Some(block) = self.column_at(c, through) else { return false };
+            self.session.column = Some(block);
+        }
+        for (key, at) in places {
+            let Some(p) = self.find(*at, through) else { return false };
+            if let Some(o) = params.as_object_mut() {
+                o.insert(key.clone(), crate::cmd::pos_json(&p));
+            }
+        }
+        true
+    }
+
+    /// The column selection or whole cells `c` names now, for the session's selection
+    /// ([`Replica::find`]; the cells' table by its id, which must still have them).
+    fn column_at(&self, c: &ColumnAnchors, through: Option<&ChangeSet>) -> Option<ColumnBlock> {
+        let segments = c.segments.iter().map(|(a, b)| Some((self.find(*a, through)?, self.find(*b, through)?))).collect::<Option<Vec<_>>>()?;
+        let cells = match &c.cells {
+            Some((id, r)) => {
+                let mut at = None;
+                self.session.doc.each_block(&mut |story, path, b| {
+                    if at.is_none() && b.id() == *id {
+                        at = Some((story, Path(path.to_vec()), b.as_table().map_or(0, |t| t.rows.len())));
+                    }
+                });
+                let (story, table, rows) = at?;
+                if r.rows.1 >= rows {
+                    return None;
+                }
+                Some(CellRange { story, table, ..r.clone() })
+            }
+            None => None,
+        };
+        Some(ColumnBlock { sel: self.session.sel.clone(), anchor_x: c.anchor_x, focus_x: c.focus_x, segments, cells })
     }
 
     /// Where anchor `a` is now: moved through `through`, which the copy's document had made
