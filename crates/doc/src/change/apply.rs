@@ -30,7 +30,8 @@ impl Document {
     /// paragraph at its end.
     ///
     /// It does not check that the ids of the blocks it puts in are new to this copy: copies make
-    /// random ids, and the room's hub, which sees every change, renames the rare clash.
+    /// random ids, and the room's hub, which sees every change, sends back the rare one that
+    /// repeats an id ([`Document::repeated_id`]), and its copy makes the edit again.
     pub fn apply(&mut self, cs: &ChangeSet) -> Result<()> {
         let ChangeSet { edits, splices, tables, parts, fields } = cs;
         let items = edits.len() + splices.len() + tables.len() + parts.len() + fields.len();

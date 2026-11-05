@@ -18,6 +18,7 @@ mod font_sizes;
 mod fonts;
 mod ime_noop;
 mod revision_checks;
+mod room;
 mod scopes;
 mod typing;
 mod wordart;

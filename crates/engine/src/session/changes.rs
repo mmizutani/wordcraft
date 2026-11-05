@@ -84,7 +84,7 @@ impl ChangeLog {
 /// and other files, and a flat amount for each style sheet, list set, settings or glossary it
 /// replaces whole (estimates: the cap is a bound on the memory followers' changes keep, not a
 /// count).
-fn weight(cs: &ChangeSet) -> usize {
+pub(crate) fn weight(cs: &ChangeSet) -> usize {
     const WHOLE: usize = 64 << 10;
     const SMALL: usize = 1 << 10;
     let blocks = |bl: &mut dyn Iterator<Item = &Arc<Block>>| bl.map(|b| block_weight(b, 0)).fold(0usize, usize::saturating_add);

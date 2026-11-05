@@ -1,6 +1,6 @@
 # WordCraft architecture
 
-> **Last reviewed:** 2026-10-28 · **Last updated:** 2026-11-05 · **Change:** trivial (data flow: a paragraph edited in place sends only the characters the edit replaced, and a change made at the same time as another is moved past it, `ChangeSet::rebase`); previously trivial (data flow: every command has a scope, `engine::scope`, and names the params that are places); previously trivial (data flow: what a command changed becomes one change another copy applies, `doc::ChangeSet`, and agents follow, `document.changes`); previously trivial (data flow: every paragraph and table has an id, `doc::BlockId`); previously trivial (craft-proof's row says what a build without the Language data keeps: English spelling from an installed Hunspell English or the built-in list, rule hyphenation for Bulgarian, Turkish and Russian; previously minor: proofing moved out: `wordcraft-proof` is craft-libs' `craft-proof`, its Language data craft-i18n's `language-data/` embedded from `CRAFT_I18N_DIR`; previously major: crate and layer inventory, source counts, proofing languages and module boundaries re-measured from this checkout; previously minor: `proof` is per language: English and Polish; previously major: first committed version; `plan/architecture.md` is local-only) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+> **Last reviewed:** 2026-10-28 · **Last updated:** 2026-11-05 · **Change:** trivial (data flow: shared documents are rooms, `engine::room`: participants edit copies of their own, and the room's hub puts their changes in one order); previously trivial (data flow: a paragraph edited in place sends only the characters the edit replaced, and a change made at the same time as another is moved past it, `ChangeSet::rebase`); previously trivial (data flow: every command has a scope, `engine::scope`, and names the params that are places); previously trivial (data flow: what a command changed becomes one change another copy applies, `doc::ChangeSet`, and agents follow, `document.changes`); previously trivial (data flow: every paragraph and table has an id, `doc::BlockId`); previously trivial (craft-proof's row says what a build without the Language data keeps: English spelling from an installed Hunspell English or the built-in list, rule hyphenation for Bulgarian, Turkish and Russian; previously minor: proofing moved out: `wordcraft-proof` is craft-libs' `craft-proof`, its Language data craft-i18n's `language-data/` embedded from `CRAFT_I18N_DIR`; previously major: crate and layer inventory, source counts, proofing languages and module boundaries re-measured from this checkout; previously minor: `proof` is per language: English and Polish; previously major: first committed version; `plan/architecture.md` is local-only) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
 
 How WordCraft is built today. The longer design notes in
 `plan/architecture.md` are gitignored and local to the original author's machine; this file is the
@@ -29,7 +29,7 @@ crate name links to its source tree.
 | L2 | [`layout`](../crates/layout/src) | 35,990 | Paragraph line layout (`para`), page/section flow and table layout, then display-list generation (`display`); hit testing maps points to document positions. `para` owns shaping, breaks, tabs and line geometry; page flow composes paragraphs, tables, headers/footers, notes and floats. |
 | L3 | [`pdf`](../crates/pdf/src) | 4,513 | krilla PDF export: font subsets, selectable text, links, outline and tagging |
 | L3 | [`render`](../crates/render/src) | 4,499 | vello_cpu rasterizer: pages and thumbnails from the display list; PNG/JPEG |
-| L4 | [`engine`](../crates/engine/src) | 72,851 | `Session` and editing state; command registry in `cmd/`; file dispatch in `io`; catalog, keymap, recovery, ribbon model, speech and view state |
+| L4 | [`engine`](../crates/engine/src) | 72,851 | `Session` and editing state; command registry in `cmd/`; file dispatch in `io`; shared documents in `room`; catalog, keymap, recovery, ribbon model, speech and view state |
 | L5 | [`mcp`](../crates/mcp/src) | 1,822 | MCP server exposing commands as tools; headless or bridged to the running app |
 | L5 | [`zotero`](../crates/zotero/src) | 2,372 | Zotero word-processor integration protocol answered against a `Session` |
 | L6 | [`ui-egui`](../crates/ui-egui/src) | 81,759 | Front end: ribbon, keytips, mini-toolbar, Backstage, canvas, rulers, panes, dialogs, i18n, themes, control channel and headless `ui_shot` example |
@@ -63,6 +63,15 @@ crate name links to its source tree.
    Every command has a scope (`engine::scope`: document, selection, view, file, app or UI),
    what it touches and so who may run it in a shared document, and names the params that are
    places in the document, which a change moves (`ChangeSet::map`).
+   A document people and agents edit at once is a room (`engine::room`): each participant
+   edits a copy of their own (`room::Replica`, a `Session`), whose commands change it at once,
+   and sends each command's change to the room's hub (`room::Hub`) with the version it was
+   made on. The hub accepts a change made on its latest version as it is, moves one made on an
+   earlier version past the changes it accepted since, and sends back one that clashes with
+   them; every copy makes the accepted changes in that order. A copy moves the changes the hub
+   hasn't accepted yet past the others' as those arrive (`Session::apply_change`, which moves
+   the caret and selection with their text), and makes its edits that clash again after the
+   other's change: it runs the same commands from the same places, moved through that change.
 3. **Layout:** `layout` turns the document into pages of positioned glyphs, boxes and images
    (display list), incrementally: an edit relayouts only what changed (1.4 ms on a 188-page
    document, measured 2026-10-06).
@@ -86,6 +95,7 @@ crate name links to its source tree.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-05 | trivial | Data flow: a document edited at once is a room (`engine::room`): each participant edits a copy of their own, the room's hub accepts, moves or sends back their changes, and copies make their clashing edits again after the other's |
 | 2026-11-05 | trivial | Data flow: a paragraph edited in place sends only the characters the edit replaced (`doc::change::ParaEdit`), and a change made at the same time as another is moved past it unless both change the same characters or blocks (`ChangeSet::rebase`) |
 | 2026-11-05 | trivial | Data flow: every command has a scope (`engine::scope`: what it touches, so who may run it in a shared document) and names the params that are places in the document |
 | 2026-11-05 | trivial | Data flow: what a command changed becomes one change (`doc::ChangeSet`) that another copy applies (`Document::apply`) and agents follow (`document.changes`, `get_changes`) |

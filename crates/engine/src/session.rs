@@ -12,6 +12,7 @@ use crate::{CmdError, ImeEditOutcome, Registry};
 
 mod documents;
 mod views;
+pub(crate) use changes::weight as change_weight;
 pub use changes::{ChangeLog, MAX_CHANGES};
 pub use documents::{DocInfo, DocState};
 use documents::{document_id_mark, next_document_id, untitled_name};
@@ -23,6 +24,7 @@ mod layout;
 mod lifecycle;
 mod query;
 mod run;
+mod shared;
 mod snapshot;
 
 use crate::doc_state;

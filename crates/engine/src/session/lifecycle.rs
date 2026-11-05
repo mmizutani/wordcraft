@@ -35,7 +35,7 @@ impl Session {
     }
 
     /// Initialise session defaults while sharing the immutable command registry with previews.
-    pub(super) fn with_registry(doc: Document, registry: Arc<Registry>) -> Self {
+    pub(crate) fn with_registry(doc: Document, registry: Arc<Registry>) -> Self {
         let DocState {
             doc,
             sel,

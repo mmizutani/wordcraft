@@ -53,7 +53,7 @@ impl Copy {
 }
 
 /// Where two documents differ, in short: the first field whose JSON differs.
-fn difference(a: &Document, b: &Document) -> String {
+pub(super) fn difference(a: &Document, b: &Document) -> String {
     let (Ok(Value::Object(x)), Ok(Value::Object(y))) = (serde_json::to_value(a), serde_json::to_value(b)) else {
         return "(no JSON)".into();
     };
@@ -399,7 +399,7 @@ fn at_once(warm: &[Step], place: usize, a: &[Step], b: &[Step]) -> Result<AtOnce
 
 /// A step of someone editing beside others: mostly typing, selecting, deleting and formatting
 /// characters and paragraphs where they are, and now and then any step of the edits above.
-fn edit_step() -> impl Strategy<Value = Step> {
+pub(super) fn edit_step() -> impl Strategy<Value = Step> {
     let commands = [
         ("caret.left", json!({})),
         ("caret.right", json!({})),

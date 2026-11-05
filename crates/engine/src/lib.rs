@@ -21,6 +21,7 @@ pub(crate) mod prefs;
 pub mod print;
 pub mod recovery;
 pub mod ribbon;
+pub mod room;
 pub mod sample;
 pub mod scope;
 mod session;

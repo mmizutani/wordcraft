@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{ChangeSet, MARK, NewBlock, PartChange, Splice, window_len};
-use crate::{Block, BlockId};
+use crate::{Block, BlockId, Document, Path, Pos, StoryRef};
 
 /// A place in a paragraph: its id, and a byte offset in its text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +58,76 @@ impl ChangeSet {
             }
         }
         Mapped::At(a)
+    }
+}
+
+impl Document {
+    /// The anchor of place `p`: its paragraph's id, and its offset there (moved back to a
+    /// character boundary in the text). `None` when no paragraph is at `p`.
+    pub fn anchor_at(&self, p: &Pos) -> Option<Anchor> {
+        self.para_at(p).map(|para| Anchor { block: para.id, off: para.clamp(p.off) })
+    }
+
+    /// Where anchor `a` is in this document: in the paragraph with its id, at its offset (moved
+    /// back to a character boundary in the text). The paragraph at `hint`, where the anchor
+    /// was before, is looked at first. An anchor at a table is at the start of its first
+    /// paragraph, or at the end of its last when its offset is past 0. `None` when no block has
+    /// the id.
+    pub fn pos_of(&self, a: Anchor, hint: Option<&Pos>) -> Option<Pos> {
+        if let Some(h) = hint
+            && let Some(p) = self.para_at(h)
+            && p.id == a.block
+        {
+            return Some(Pos { story: h.story, path: h.path.clone(), off: p.clamp(a.off) });
+        }
+        let mut found = None;
+        let mut table = false;
+        self.each_block(&mut |story, path, b| {
+            if found.is_none() && b.id() == a.block {
+                match &**b {
+                    Block::Para(p) => found = Some(Pos { story, path: Path(path.to_vec()), off: p.clamp(a.off) }),
+                    Block::Table(_) => table = true,
+                }
+            }
+        });
+        if table && found.is_none() {
+            return self.block_edge(a.block, a.off > 0);
+        }
+        found
+    }
+
+    /// Where an anchor [`ChangeSet::map`] mapped through a change this document has had now
+    /// is: [`Mapped::At`] as [`Document::pos_of`] finds it; [`Mapped::Before`] and
+    /// [`Mapped::After`] at the start or end of the block (of the first or last paragraph in a
+    /// table). `None` when it is gone, or the change didn't come from this document.
+    pub fn place(&self, m: Mapped, hint: Option<&Pos>) -> Option<Pos> {
+        match m {
+            Mapped::At(a) => self.pos_of(a, hint),
+            Mapped::Before(id) => self.block_edge(id, false),
+            Mapped::After(id) => self.block_edge(id, true),
+            Mapped::Gone => None,
+        }
+    }
+
+    /// The start (`end` false) or the end of block `id`: of the paragraph, or of the first or
+    /// last paragraph in the table.
+    fn block_edge(&self, id: BlockId, end: bool) -> Option<Pos> {
+        let mut at: Option<(StoryRef, Path)> = None;
+        self.each_block(&mut |story, path, b| {
+            if at.is_none() && b.id() == id {
+                at = Some((story, Path(path.to_vec())));
+            }
+        });
+        let (story, path) = at?;
+        let path = match self.block(story, &path)? {
+            Block::Para(_) => path,
+            Block::Table(_) => {
+                let mut inside = self.para_paths(story).into_iter().filter(|q| q.0.len() > path.0.len() && q.0.starts_with(&path.0));
+                if end { inside.next_back() } else { inside.next() }?
+            }
+        };
+        let off = if end { self.para(story, &path)?.len() } else { 0 };
+        Some(Pos { story, path, off })
     }
 }
 

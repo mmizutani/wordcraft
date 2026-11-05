@@ -449,6 +449,21 @@ impl ChangeSet {
             || self.parts.iter().any(|p| matches!(p, PartChange::Added { blocks, .. } if blocks.iter().any(unnamed)))
     }
 
+    /// The ids of the blocks the change puts in, and of the blocks inside them: ids the copy it
+    /// is applied to must not already hold elsewhere ([`Document::repeated_id`]).
+    pub fn ids_put_in(&self) -> Vec<BlockId> {
+        let mut out = Vec::new();
+        let added = self.parts.iter().flat_map(|p| match p {
+            PartChange::Added { blocks, .. } => blocks.as_slice(),
+            _ => &[],
+        });
+        for NewBlock(b) in self.splices.iter().flat_map(|s| &s.inserted).chain(added) {
+            out.push(b.id());
+            out.extend(inside_ids(b));
+        }
+        out
+    }
+
     /// Whether the change changes nothing.
     pub fn is_empty(&self) -> bool {
         let ChangeSet { edits, splices, tables, parts, fields } = self;

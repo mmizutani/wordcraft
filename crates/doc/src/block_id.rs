@@ -256,6 +256,25 @@ impl Document {
         Ok(())
     }
 
+    /// The first of `ids` that more than one block of the stories has, if any: after a change
+    /// was applied, one of the blocks it put in ([`crate::ChangeSet::ids_put_in`]) whose id the
+    /// document already held.
+    pub fn repeated_id(&self, ids: &[BlockId]) -> Option<BlockId> {
+        if ids.is_empty() {
+            return None;
+        }
+        let wanted: IdSet = ids.iter().map(|id| id.0).collect();
+        let mut seen = IdSet::default();
+        let mut repeated = None;
+        self.each_block(&mut |_, _, b| {
+            let id = b.id().0;
+            if repeated.is_none() && wanted.contains(&id) && !seen.insert(id) {
+                repeated = Some(BlockId(id));
+            }
+        });
+        repeated
+    }
+
     /// The blocks [`Document::ensure_block_ids`] gives ids with no `before`: those without one,
     /// and all but the first of the blocks sharing one.
     fn unnamed(&self) -> Vec<(StoryRef, Path)> {

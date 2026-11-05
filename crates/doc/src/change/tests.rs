@@ -614,3 +614,72 @@ fn junk_paragraph_edits_are_errors_not_panics() {
         let _ = cs.rebase(&bad, Side::Before);
     }
 }
+
+#[test]
+fn an_anchor_is_found_again_by_its_paragraph_wherever_that_went() {
+    let d = sample();
+    // In the second paragraph, and in the last cell of the table.
+    let two = Pos::body(1, 2);
+    let cell = Pos::new(StoryRef::Body, Path(vec![3, 1, 1, 0]), 0);
+    let a = d.anchor_at(&two).unwrap();
+    let c = d.anchor_at(&cell).unwrap();
+    assert_eq!(a, Anchor { block: d.body[1].id(), off: 2 });
+    assert_eq!(d.anchor_at(&Pos::body(99, 0)), None);
+    // Two paragraphs put in before them: same paragraphs, other paths.
+    let (after, _) = edit(&d, |d| {
+        d.body.insert(0, para_block(Paragraph::new()));
+        d.body.insert(0, para_block(Paragraph::new()));
+    });
+    assert_eq!(after.pos_of(a, Some(&two)), Some(Pos::body(3, 2)));
+    assert_eq!(after.pos_of(c, None), Some(Pos::new(StoryRef::Body, Path(vec![5, 1, 1, 0]), 0)));
+    // An offset past the text, or inside a character, moves back into it.
+    assert_eq!(after.pos_of(Anchor { off: 99, ..a }, None), Some(Pos::body(3, 3)));
+    let mut e = d.clone();
+    e.insert_text(&Pos::body(1, 0), "é", &CharProps::default()).unwrap();
+    assert_eq!(e.pos_of(Anchor { off: 1, ..a }, None), Some(Pos::body(1, 0)));
+    // A paragraph no longer there.
+    let (gone, _) = edit(&d, |d| {
+        d.body.remove(1);
+    });
+    assert_eq!(gone.pos_of(a, Some(&two)), None);
+    assert_eq!(gone.place(Mapped::Gone, None), None);
+}
+
+#[test]
+fn a_place_beside_a_block_is_at_its_start_or_end() {
+    let d = sample();
+    let table = d.body[3].id();
+    let first_cell = Pos::new(StoryRef::Body, Path(vec![3, 0, 0, 0]), 0);
+    let last_cell = Pos::new(StoryRef::Body, Path(vec![3, 1, 1, 0]), 0);
+    assert_eq!(d.place(Mapped::Before(table), None), Some(first_cell.clone()));
+    assert_eq!(d.place(Mapped::After(table), None), Some(last_cell.clone()));
+    assert_eq!(d.place(Mapped::Before(d.body[2].id()), None), Some(Pos::body(2, 0)));
+    assert_eq!(d.place(Mapped::After(d.body[2].id()), None), Some(Pos::body(2, 5)));
+    // An anchor at a table is at the start of its first paragraph, or the end of its last.
+    assert_eq!(d.pos_of(Anchor { block: table, off: 0 }, None), Some(first_cell));
+    assert_eq!(d.pos_of(Anchor { block: table, off: usize::MAX }, None), Some(last_cell));
+    assert_eq!(d.place(Mapped::Before(BlockId::UNSET), None), None);
+}
+
+#[test]
+fn the_ids_a_change_puts_in_are_listed_and_a_repeated_one_found() {
+    let d = sample();
+    // A table and a paragraph put in: the table's id, its cells' paragraphs' and the paragraph's.
+    let (after, cs) = edit(&d, |d| {
+        d.body.insert(0, Arc::new(Block::Table(Table::new(1, 2, 400.0))));
+        d.body.insert(0, para_block(Paragraph::new()));
+    });
+    let ids = cs.ids_put_in();
+    assert_eq!(ids.len(), 4, "{ids:?}");
+    assert!(ids.contains(&after.body[0].id()) && ids.contains(&after.body[1].id()));
+    assert_eq!(after.repeated_id(&ids), None);
+    assert_eq!(after.repeated_id(&[]), None);
+    // The same change applied twice puts the paragraph in under an id the document has.
+    let mut twice = after.clone();
+    let again = cs.rebase(&cs, Side::After).unwrap();
+    twice.apply(&again).unwrap();
+    assert!(twice.repeated_id(&again.ids_put_in()).is_some());
+    // Typing puts no block in.
+    let (_, typed) = edit(&d, type_at(0, 1, "x"));
+    assert!(typed.ids_put_in().is_empty());
+}
