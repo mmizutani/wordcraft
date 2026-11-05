@@ -440,6 +440,73 @@ fn typing_made_again_keeps_the_formatting_picked_for_it() {
 }
 
 #[test]
+fn typing_in_an_equation_made_again_is_typed_in_that_equation() {
+    let mut s = Session::new(Document::from_text("one two"));
+    s.run("caret.docEnd", &json!({})).unwrap();
+    s.run("text.newParagraph", &json!({})).unwrap();
+    s.run("insert.equation", &json!({"linear": "x"})).unwrap();
+    s.run("equation.exit", &json!({})).unwrap();
+    let base = s.doc.clone();
+    let room = Room::new(base.clone());
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    // Ana bolds "two", then types in the equation and leaves it; Ben types "2" over "two"
+    // first. Her typing is made again in the equation, and she is left outside it.
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "format.bold", json!({}));
+    run(&mut a, "caret.docEnd", json!({}));
+    run(&mut a, "equation.edit", json!({}));
+    run(&mut a, "equation.type", json!({"text": "+1"}));
+    run(&mut a, "equation.exit", json!({}));
+    let typed = a.session().doc.body.get(1).cloned();
+    assert_ne!(typed, base.body.get(1).cloned());
+    run(&mut b, "select.text", json!({"text": "two"}));
+    run(&mut b, "text.insert", json!({"text": "2"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    assert_eq!(a.session().doc.body.get(1).cloned(), typed);
+    assert!(a.session().math.is_none());
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
+fn grouping_made_again_groups_every_object_that_was_selected() {
+    let mut s = Session::new(Document::from_text("one two"));
+    s.run("caret.docEnd", &json!({})).unwrap();
+    for x in [100, 300] {
+        s.run("insert.shape", &json!({"kind": "rectangle", "width": 40, "height": 40})).unwrap();
+        s.run("arrange.bounds", &json!({"page": 0, "x": x, "y": 100})).unwrap();
+        s.run("select.collapse", &json!({"end": true})).unwrap();
+    }
+    let room = Room::new(s.doc.clone());
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    // Ana bolds "two" and groups the two shapes; Ben types "2" over "two" first. Her grouping
+    // is made again with both shapes selected.
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "format.bold", json!({}));
+    run(&mut a, "select.addObject", json!({"index": 0}));
+    run(&mut a, "select.addObject", json!({"index": 1}));
+    run(&mut a, "arrange.group", json!({}));
+    let grouped = a.session().doc.clone();
+    run(&mut b, "select.text", json!({"text": "two"}));
+    run(&mut b, "text.insert", json!({"text": "2"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().made_again, a.stats().lost), (1, 2, 0));
+    let count = |d: &Document| d.body.iter().filter_map(|b| b.as_para()).map(|p| p.text.matches(wordcraft_doc::para::OBJ).count()).sum::<usize>();
+    assert_eq!(count(&a.session().doc), count(&grouped));
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
 fn an_edit_whose_text_is_gone_is_not_made_elsewhere() {
     let mut s = Session::new(Document::from_text("one two"));
     s.run("caret.docEnd", &json!({})).unwrap();
