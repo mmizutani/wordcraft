@@ -208,11 +208,7 @@ impl Inputs {
         s.last_command = last_command;
         s.macros = macros;
         s.building_blocks = building_blocks;
-        // A cut made again just before keeps the move it began (its revision can differ from
-        // the one this cut had).
-        if s.pending_move.is_none() {
-            s.pending_move = pending_move;
-        }
+        s.pending_move = pending_move;
     }
 }
 
@@ -875,8 +871,10 @@ impl Replica {
                     continue;
                 }
                 if let Some(mut inputs) = inputs {
-                    if after_cut {
-                        inputs.pending_move = None;
+                    // A cut it could move that was made again before it is that cut as made
+                    // again (another revision, or none when it was given up); none stays none.
+                    if after_cut && inputs.pending_move.is_some() {
+                        inputs.pending_move = self.session.pending_move.clone();
                     }
                     inputs.put(&mut self.session);
                 }
