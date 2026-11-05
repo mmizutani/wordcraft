@@ -218,6 +218,88 @@ fn a_clash_makes_the_edit_again_on_the_new_version() {
 }
 
 #[test]
+fn edits_made_again_after_a_clash_each_start_where_they_were_made() {
+    let room = Room::new(Document::from_text("one two three four"));
+    let mut a = room.join("Ana");
+    let mut b = room.join("Ben");
+    // Ana bolds "two", then selects "three" and types "X" over it, while Ben types "2" over
+    // "two" and sends first. Both of Ana's edits are made again: the second from "three" as it
+    // is after Ben's change and her bold made again, not from the offsets it had before them.
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "format.bold", json!({}));
+    run(&mut a, "select.text", json!({"text": "three"}));
+    run(&mut a, "text.insert", json!({"text": "X"}));
+    run(&mut a, "caret.docStart", json!({}));
+    run(&mut b, "select.text", json!({"text": "two"}));
+    run(&mut b, "text.insert", json!({"text": "2"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().made_again, a.stats().lost), (1, 2, 0));
+    assert_eq!(text(&a), "one 2 X four");
+    assert_eq!(bold(&a), "2");
+    // Her caret, which she put at the start after her last edit, stays there.
+    let s = &a.session().sel;
+    assert_eq!((s.anchor.path.0.clone(), s.anchor.off, s.focus.off), (vec![0], 0, 0));
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    assert_eq!(text(&copies[1]), "one 2 X four");
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
+fn a_paste_made_again_pastes_what_was_copied_then() {
+    let room = Room::new(Document::from_text("one two three"));
+    let mut a = room.join("Ana");
+    let mut b = room.join("Ben");
+    // Ana copies "one", pastes it over "two" and copies "three"; Ben types "2" over "two" and
+    // sends first. Ana's paste is made again with "one", and her clipboard still holds "three".
+    run(&mut a, "select.text", json!({"text": "one"}));
+    run(&mut a, "edit.copy", json!({}));
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "edit.paste", json!({}));
+    run(&mut a, "select.text", json!({"text": "three"}));
+    run(&mut a, "edit.copy", json!({}));
+    run(&mut b, "select.text", json!({"text": "two"}));
+    run(&mut b, "text.insert", json!({"text": "2"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().made_again, a.stats().lost), (1, 1, 0));
+    assert_eq!(text(&a), "one one three");
+    assert_eq!(a.session().clipboard_text, "three");
+    assert_eq!(a.session().clip_history.len(), 2);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
+fn a_cut_made_again_leaves_the_clipboard_as_the_participant_has_it() {
+    let room = Room::new(Document::from_text("one two three"));
+    let mut a = room.join("Ana");
+    let mut b = room.join("Ben");
+    // Ana cuts "two" and copies "three"; Ben types "2" over "two" first. Making her cut again
+    // cuts "2", but her clipboard keeps "three" and its pane the two items she put there.
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "edit.cut", json!({}));
+    run(&mut a, "select.text", json!({"text": "three"}));
+    run(&mut a, "edit.copy", json!({}));
+    run(&mut b, "select.text", json!({"text": "two"}));
+    run(&mut b, "text.insert", json!({"text": "2"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().made_again, a.stats().lost), (1, 1, 0));
+    assert_eq!(text(&a), "one  three");
+    assert_eq!(a.session().clipboard_text, "three");
+    assert_eq!(a.session().clip_history.len(), 2);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
 fn the_hub_takes_the_edits_before_a_clash_and_sends_back_the_rest() {
     let room = Room::new(Document::from_text("one two three"));
     let mut a = room.join("Ana");
