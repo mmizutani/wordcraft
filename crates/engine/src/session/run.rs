@@ -299,6 +299,8 @@ impl Session {
             }
             self.doc.ensure_nonempty();
             self.doc.prune_text_boxes();
+            // Blocks the command made or copied get ids of their own; the rest keep theirs.
+            self.doc.ensure_block_ids(before_doc.as_ref().map(|(before, ..)| before));
             // Whether the command left the document, the selection and the formatting
             // waiting at the caret as they were. A command that replaces the document —
             // a mail merge, a comparison — is not an edit of this one, whatever the new

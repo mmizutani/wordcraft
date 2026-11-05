@@ -1,6 +1,6 @@
 # WordCraft architecture
 
-> **Last reviewed:** 2026-10-28 · **Last updated:** 2026-11-02 · **Change:** trivial (craft-proof's row says what a build without the Language data keeps: English spelling from an installed Hunspell English or the built-in list, rule hyphenation for Bulgarian, Turkish and Russian; previously minor: proofing moved out: `wordcraft-proof` is craft-libs' `craft-proof`, its Language data craft-i18n's `language-data/` embedded from `CRAFT_I18N_DIR`; previously major: crate and layer inventory, source counts, proofing languages and module boundaries re-measured from this checkout; previously minor: `proof` is per language: English and Polish; previously major: first committed version; `plan/architecture.md` is local-only) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+> **Last reviewed:** 2026-10-28 · **Last updated:** 2026-11-05 · **Change:** trivial (data flow: every paragraph and table has an id, `doc::BlockId`); previously trivial (craft-proof's row says what a build without the Language data keeps: English spelling from an installed Hunspell English or the built-in list, rule hyphenation for Bulgarian, Turkish and Russian; previously minor: proofing moved out: `wordcraft-proof` is craft-libs' `craft-proof`, its Language data craft-i18n's `language-data/` embedded from `CRAFT_I18N_DIR`; previously major: crate and layer inventory, source counts, proofing languages and module boundaries re-measured from this checkout; previously minor: `proof` is per language: English and Polish; previously major: first committed version; `plan/architecture.md` is local-only) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
 
 How WordCraft is built today. The longer design notes in
 `plan/architecture.md` are gitignored and local to the original author's machine; this file is the
@@ -45,7 +45,11 @@ crate name links to its source tree.
 2. **Edit:** every user-visible action is a command id run through `Session::run` (ribbon,
    shortcuts, command search, CLI, control channel and MCP all dispatch by id). `Session::run`
    snapshots for undo (blocks are `Arc`-shared, so snapshots are cheap) and catches an escaped
-   panic, restoring the document (never-crash standard).
+   panic, restoring the document (never-crash standard). After the command it gives the blocks
+   the command made or copied ids of their own (`doc::BlockId`, random, never saved): a block
+   keeps its id while it is edited, so a co-edited change can say which blocks it touched.
+   `Document::ensure_block_ids` compares the edited document with the snapshot `Session::run`
+   took before the command and looks only at the blocks that aren't the same allocations.
 3. **Layout:** `layout` turns the document into pages of positioned glyphs, boxes and images
    (display list), incrementally: an edit relayouts only what changed (1.4 ms on a 188-page
    document, measured 2026-10-06).
@@ -69,6 +73,7 @@ crate name links to its source tree.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-05 | trivial | Data flow: every paragraph and table has an id of its own (`doc::BlockId`), kept through edits and given after every command to the blocks it made or copied |
 | 2026-11-02 | trivial | craft-proof's row: without the Language data English spelling falls back to an installed Hunspell English or the built-in Moby list, and only pattern hyphenation is off (#5202 review) |
 | 2026-11-01 | minor | `proof` left the workspace: it is `craft-proof` in storytold/craft-libs (with its history), and the spelling and hyphenation data is craft-i18n's `language-data/` (`CRAFT_I18N_DIR`); `assets/spelling` and `assets/hyphenation` are gone |
 | 2026-10-28 | major | Recounted workspace crates, layers and Rust source lines; refreshed proofing languages and documented current engine/layout module boundaries and source links |

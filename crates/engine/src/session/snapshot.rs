@@ -15,6 +15,7 @@ impl Session {
         self.bib_style = doc_bib_style(&doc);
         self.doc = doc;
         self.doc.ensure_nonempty();
+        self.doc.ensure_block_ids(None);
         self.password = None;
         self.file_name = None;
         // The old document's equation is gone: its editing session cannot carry over.

@@ -11,6 +11,7 @@ use wordcraft_doc::{Pos, StoryRef};
 use crate::{Session, cmd};
 
 mod bidi;
+mod block_ids;
 mod documents;
 mod font_sizes;
 mod fonts;

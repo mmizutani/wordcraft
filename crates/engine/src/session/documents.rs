@@ -88,8 +88,10 @@ pub struct DocState {
 }
 
 impl DocState {
-    /// A fresh document state: caret at the start, no history, not dirty, a new id.
-    pub(super) fn new(doc: Document, untitled: u32, view: ViewState) -> Self {
+    /// A fresh document state: caret at the start, no history, not dirty, a new id. Every block
+    /// gets an id of its own.
+    pub(super) fn new(mut doc: Document, untitled: u32, view: ViewState) -> Self {
+        doc.ensure_block_ids(None);
         let start = doc.start_of(StoryRef::Body);
         let bib_style = doc_bib_style(&doc);
         DocState {
