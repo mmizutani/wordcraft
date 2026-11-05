@@ -914,3 +914,66 @@ fn copies_editing_at_once_end_up_holding_the_same_document() {
         "{CASES} cases: {moved} with changes moved past others, {clashed} with clashes ({made_again} commands made again, {lost} lost), {bounced} with changes the hub sent back"
     );
 }
+
+#[test]
+fn deleting_ink_made_again_deletes_the_ink_lassoed_for_it() {
+    let mut s = Session::new(Document::from_text("one two three"));
+    s.run("draw.stroke", &json!({"page": 0, "points": [[100, 100], [140, 110]]})).unwrap();
+    s.run("draw.stroke", &json!({"page": 0, "points": [[300, 300], [340, 310]]})).unwrap();
+    let room = Room::new(s.doc.clone());
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    let ink =
+        |r: &Replica| r.session().doc.body.iter().filter_map(|b| b.as_para()).flat_map(|p| p.objects.iter()).filter(|o| o.ink().is_some()).count();
+    // Ana bolds "two", lassoes the first stroke and deletes it; Ben types "2" over "two"
+    // first. Her delete is made again on the stroke she lassoed, and the other stays.
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "format.bold", json!({}));
+    run(&mut a, "draw.lasso", json!({"page": 0, "points": [[80, 80], [200, 80], [200, 150], [80, 150]]}));
+    run(&mut a, "draw.lassoDelete", json!({}));
+    assert_eq!(ink(&a), 1);
+    run(&mut b, "select.text", json!({"text": "two"}));
+    run(&mut b, "text.insert", json!({"text": "2"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    assert_eq!((text(&a).as_str(), ink(&a)), ("one 2 three", 1));
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
+fn highlighting_made_again_uses_the_colour_picked_for_it() {
+    let room = Room::new(Document::from_text("one two three"));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    let highlight = |r: &Replica, word: &str| {
+        let d = &r.session().doc;
+        let p = d.body.iter().find_map(|b| b.as_para())?;
+        let at = p.text.find(word)?;
+        p.props_of_char(at).highlight
+    };
+    // Ana highlights "two" with the last colour (yellow), then picks green with the caret
+    // elsewhere; Ben types "2" over "two" first. Her highlight is made again in yellow, and
+    // green stays picked for her.
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "format.highlight", json!({}));
+    let yellow = highlight(&a, "two");
+    assert!(yellow.is_some_and(|h| h != wordcraft_doc::props::Highlight::None));
+    run(&mut a, "select.collapse", json!({"end": true}));
+    run(&mut a, "format.highlight", json!({"color": "green"}));
+    run(&mut b, "select.text", json!({"text": "two"}));
+    run(&mut b, "text.insert", json!({"text": "2"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    assert_eq!(text(&a), "one 2 three");
+    assert_eq!(highlight(&a, "2"), yellow);
+    assert_eq!(a.session().last_highlight, wordcraft_doc::props::Highlight::BrightGreen);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}

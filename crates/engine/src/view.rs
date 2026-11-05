@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use wordcraft_layout::{NumeralMode, ViewMode};
 
 /// View state that commands can change (ribbon View tab, status bar).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewState {
     pub zoom: f32,
