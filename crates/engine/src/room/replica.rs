@@ -8,7 +8,7 @@ use serde_json::Value;
 use wordcraft_doc::change::{Anchor, Mapped, Side};
 use wordcraft_doc::edit::Fragment;
 use wordcraft_doc::props::{CharProps, ParaProps};
-use wordcraft_doc::{BlockId, ChangeSet, Document, Path, Pos};
+use wordcraft_doc::{BlockId, ChangeSet, Document, Path, Pos, StoryRef};
 
 use super::{Accepted, Bounce, MAX_BATCH, ParticipantId, Room};
 use crate::cmd::edit::ClipHistory;
@@ -54,7 +54,17 @@ struct ColumnAnchors {
     anchor_x: f32,
     focus_x: f32,
     segments: Vec<(Anchor, Anchor)>,
-    cells: Option<(BlockId, CellRange)>,
+    /// Whole cells: their table's id, the range, and the row and cell each piece starts in.
+    cells: Option<(BlockId, CellRange, Vec<(u32, u32)>)>,
+}
+
+/// The row and cell of table `table` (in `story`) that place `p` is in.
+fn cell_of(story: StoryRef, table: &Path, p: &Pos) -> Option<(u32, u32)> {
+    let n = table.0.len();
+    if p.story != story || p.path.0.get(..n)? != table.0.as_slice() {
+        return None;
+    }
+    Some((*p.path.0.get(n)?, *p.path.0.get(n + 1)?))
 }
 
 /// Session `s`'s column selection or whole cells, when the selection is one, as anchors (`None`
@@ -63,7 +73,10 @@ fn column_anchors(s: &Session) -> Option<ColumnAnchors> {
     let c = s.column.as_ref().filter(|c| c.sel == s.sel)?;
     let segments = c.segments.iter().map(|(a, b)| Some((s.doc.anchor_at(a)?, s.doc.anchor_at(b)?))).collect::<Option<Vec<_>>>()?;
     let cells = match &c.cells {
-        Some(r) => Some((s.doc.block(r.story, &r.table)?.id(), r.clone())),
+        Some(r) => {
+            let at = c.segments.iter().map(|(a, _)| cell_of(r.story, &r.table, a)).collect::<Option<Vec<_>>>()?;
+            Some((s.doc.block(r.story, &r.table)?.id(), r.clone(), at))
+        }
         None => None,
     };
     Some(ColumnAnchors { anchor_x: c.anchor_x, focus_x: c.focus_x, segments, cells })
@@ -139,23 +152,32 @@ impl Inputs {
 
 /// What a session holds besides its document that making edits again must leave as the
 /// participant has it now: [`Inputs`], the options (typing, AutoCorrect, AutoFormat…), the
+/// formatting picked at the caret for the next typed text, the
 /// tracked cut a paste can make a move of, and the macro being recorded (edits made again
 /// aren't steps of it). Edits made again use and change their own while they run.
 struct Kept {
     inputs: Inputs,
     prefs: Prefs,
+    pending: Option<CharProps>,
     pending_move: Option<PendingMove>,
     recording: Option<(String, Vec<(String, Value)>)>,
 }
 
 impl Kept {
     fn take(s: &mut Session) -> Kept {
-        Kept { inputs: Inputs::of(s), prefs: s.prefs.clone(), pending_move: s.pending_move.take(), recording: s.recording.take() }
+        Kept {
+            inputs: Inputs::of(s),
+            prefs: s.prefs.clone(),
+            pending: s.pending.clone(),
+            pending_move: s.pending_move.take(),
+            recording: s.recording.take(),
+        }
     }
 
     fn put(self, s: &mut Session) {
         self.inputs.put(s);
         s.prefs = self.prefs;
+        s.pending = self.pending;
         s.pending_move = self.pending_move;
         s.recording = self.recording;
     }
@@ -176,6 +198,8 @@ struct Made {
     /// What it read from the session besides the document and its params, for the commands that
     /// read more ([`READS_INPUTS`]).
     inputs: Option<Box<Inputs>>,
+    /// The formatting picked at the caret for the next typed text when it was made.
+    pending: Option<CharProps>,
     /// The options it was made with (typing replaces the selection, Overtype, AutoCorrect and
     /// AutoFormat…), shared with the commands before it while they don't change.
     prefs: Option<Arc<Prefs>>,
@@ -186,7 +210,7 @@ struct Made {
 impl Made {
     /// A change made outside a command.
     fn outside() -> Made {
-        Made { command: None, before: None, after: None, column: None, places: Vec::new(), inputs: None, prefs: None, tries: 0 }
+        Made { command: None, before: None, after: None, column: None, places: Vec::new(), inputs: None, pending: None, prefs: None, tries: 0 }
     }
 }
 
@@ -346,10 +370,12 @@ impl Replica {
             Some(p) if *p == self.session.prefs => p,
             _ => Arc::new(self.session.prefs.clone()),
         };
+        let pending = self.session.pending.clone();
         let result = self.session.run(id, params);
         self.stay_in_document();
         let after = selection_anchors(&self.session);
-        let made = Made { command: Some((id.to_string(), params.clone())), before, after, column, places, inputs, prefs: Some(prefs), tries };
+        let made =
+            Made { command: Some((id.to_string(), params.clone())), before, after, column, places, inputs, pending, prefs: Some(prefs), tries };
         self.collect(made);
         result
     }
@@ -552,7 +578,7 @@ impl Replica {
         let mut went_on: Option<SelAnchors> = None;
         for (k, u) in dropped.into_iter().enumerate() {
             for (j, m) in u.made.into_iter().enumerate() {
-                let Made { command, before, after, column, places, inputs, prefs, tries } = m;
+                let Made { command, before, after, column, places, inputs, pending, prefs, tries } = m;
                 let tries = if read_again { tries.saturating_add(1) } else { tries };
                 let Some((id, mut params)) = command.filter(|_| tries <= MAX_TRIES) else {
                     self.stats.lost = self.stats.lost.saturating_add(1);
@@ -587,6 +613,7 @@ impl Replica {
                 if let Some(prefs) = prefs {
                     self.session.prefs = Arc::unwrap_or_clone(prefs);
                 }
+                self.session.pending = pending;
                 went_on = Some(after);
                 match self.run_made(&id, &params, tries) {
                     Ok(_) => self.stats.made_again = self.stats.made_again.saturating_add(1),
@@ -645,7 +672,7 @@ impl Replica {
     fn column_at(&self, c: &ColumnAnchors, through: Option<&ChangeSet>) -> Option<ColumnBlock> {
         let segments = c.segments.iter().map(|(a, b)| Some((self.find(*a, through)?, self.find(*b, through)?))).collect::<Option<Vec<_>>>()?;
         let cells = match &c.cells {
-            Some((id, r)) => {
+            Some((id, r, was)) => {
                 let mut at = None;
                 self.session.doc.each_block(&mut |story, path, b| {
                     if at.is_none() && b.id() == *id {
@@ -653,10 +680,21 @@ impl Replica {
                     }
                 });
                 let (story, table, rows) = at?;
-                if r.rows.1 >= rows {
+                // The cells are the same ones when each piece is in the same cell of its row and
+                // every row moved by as much (rows put in or taken away before them); otherwise
+                // which cells were meant isn't known.
+                let now = segments.iter().map(|(a, _)| cell_of(story, &table, a)).collect::<Option<Vec<_>>>()?;
+                let shift = match (was.first(), now.first()) {
+                    (Some(w), Some(n)) => i64::from(n.0) - i64::from(w.0),
+                    _ => 0,
+                };
+                let same = now.len() == was.len() && now.iter().zip(was).all(|(n, w)| n.1 == w.1 && i64::from(n.0) - i64::from(w.0) == shift);
+                let row = |r: usize| usize::try_from(i64::try_from(r).ok()?.checked_add(shift)?).ok();
+                let moved = (row(r.rows.0)?, row(r.rows.1)?);
+                if !same || moved.1 >= rows {
                     return None;
                 }
-                Some(CellRange { story, table, ..r.clone() })
+                Some(CellRange { story, table, rows: moved, ..r.clone() })
             }
             None => None,
         };
@@ -667,6 +705,13 @@ impl Replica {
     /// since, or found by its paragraph.
     fn find(&self, a: Anchor, through: Option<&ChangeSet>) -> Option<Pos> {
         let m = through.map_or(Mapped::At(a), |cs| cs.map(a));
+        // A change that replaced the blocks around it whole (a table with a row put in) leaves
+        // it beside them; when its paragraph is still there, it is in it.
+        if let Mapped::Before(_) | Mapped::After(_) = m
+            && let Some(p) = self.session.doc.pos_of(a, None)
+        {
+            return Some(p);
+        }
         self.session.doc.place(m, None)
     }
 

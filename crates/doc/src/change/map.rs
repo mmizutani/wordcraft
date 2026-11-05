@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{ChangeSet, MARK, NewBlock, PartChange, Splice, window_len};
+use super::{ChangeSet, MARK, NewBlock, PartChange, Splice, inside_ids, window_len};
 use crate::{Block, BlockId, Document, Path, Pos, StoryRef};
 
 /// A place in a paragraph: its id, and a byte offset in its text.
@@ -46,6 +46,11 @@ impl ChangeSet {
             }
         }
         for s in &self.splices {
+            // A paragraph in a table the change replaced whole that is in the table put there
+            // (a row put in, a cell's properties changed) is still there: the anchor stays in it.
+            if s.removed.iter().any(|old| old.inside.contains(&a.block)) && s.inserted.iter().any(|b| inside_ids(&b.0).contains(&a.block)) {
+                return Mapped::At(a);
+            }
             if let Some(w) = window_pos(s, a) {
                 return resolve(s, map_pos(w, s.text.at, s.text.removed, s.text.inserted.len()));
             }
