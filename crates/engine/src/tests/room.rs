@@ -1060,3 +1060,59 @@ fn a_copy_refuses_file_commands_run_inside_a_macro() {
     assert!(!path.exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_macro_made_again_makes_its_steps_where_they_were_made() {
+    let room = Room::new(Document::from_text("one two three four"));
+    // Macros are the application's: an owner's to run.
+    let mut a = room.join("Ana", Role::Owner).unwrap();
+    let mut b = join(&room, "Ben");
+    // Ana bolds "two", then runs a macro that selects "three" by its offsets and types "X" over
+    // it; Ben types "2" over "two" first. The macro's selection moves with "three".
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "format.bold", json!({}));
+    let steps = json!([
+        {"command": "select.range", "params": {"anchor": Pos::body(0, 8), "focus": Pos::body(0, 13)}},
+        {"command": "text.insert", "params": {"text": "X"}},
+    ]);
+    run(&mut a, "tools.macros", json!({"define": {"name": "x", "steps": steps}}));
+    run(&mut a, "tools.macros", json!({"run": "x"}));
+    assert_eq!(text(&a), "one two X four");
+    run(&mut b, "select.text", json!({"text": "two"}));
+    run(&mut b, "text.insert", json!({"text": "2"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    assert_eq!(text(&a), "one 2 X four");
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
+fn a_comment_made_again_keeps_the_name_it_was_made_under() {
+    let room = Room::new(Document::from_text("one two three"));
+    // The user name is the application's: an owner's to change.
+    let mut a = room.join("Ana", Role::Owner).unwrap();
+    let mut b = join(&room, "Ben");
+    // Ana comments on "two" and then changes her name to Zoe; Ben comments on "one" first,
+    // under the same new id. Ana's comment is made again under her name then.
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "review.newComment", json!({"text": "A"}));
+    run(&mut a, "file.setAuthor", json!({"name": "Zoe"}));
+    run(&mut b, "select.text", json!({"text": "one"}));
+    run(&mut b, "review.newComment", json!({"text": "B"}));
+    b.send();
+    a.send();
+    assert_eq!((a.stats().clashes, a.stats().lost), (1, 0));
+    let d = &a.session().doc;
+    let mut by: Vec<(String, String)> = d.comments.values().map(|c| (d.plain_text(StoryRef::Part(c.part)), c.author.clone())).collect();
+    by.sort();
+    assert_eq!(by, [("A".to_string(), "Ana".to_string()), ("B".to_string(), "Ben".to_string())]);
+    assert_eq!(a.session().author, "Zoe");
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    smooth(&copies);
+    same_everywhere(&copies).unwrap();
+}
