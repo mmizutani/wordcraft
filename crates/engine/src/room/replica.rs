@@ -234,7 +234,8 @@ fn new_blocks(cs: &ChangeSet) -> Vec<BlockId> {
 /// (typing replaces the selection, Overtype, AutoCorrect, AutoFormat…), the view (Outline view,
 /// field codes, the pens and the rest of the Draw tab, design mode…; without the lasso, kept
 /// with the selection in [`Around`]), the highlighter colour, the editing language, the
-/// bibliography style and column selection mode.
+/// bibliography style, column selection mode, and the name and initials new comments and
+/// tracked changes are made under.
 #[derive(Clone, Debug, PartialEq)]
 struct Context {
     prefs: Prefs,
@@ -243,6 +244,8 @@ struct Context {
     editing_lang: Option<String>,
     bib_style: String,
     column_mode: bool,
+    author: String,
+    initials: String,
 }
 
 impl Context {
@@ -255,6 +258,8 @@ impl Context {
             editing_lang: s.editing_lang.clone(),
             bib_style: s.bib_style.clone(),
             column_mode: s.column_mode,
+            author: s.author.clone(),
+            initials: s.initials.clone(),
         }
     }
 
@@ -266,6 +271,8 @@ impl Context {
             && self.editing_lang == s.editing_lang
             && self.bib_style == s.bib_style
             && self.column_mode == s.column_mode
+            && self.author == s.author
+            && self.initials == s.initials
     }
 
     /// Put it in session `s`, which keeps its lasso.
@@ -278,6 +285,8 @@ impl Context {
         s.editing_lang = self.editing_lang;
         s.bib_style = self.bib_style;
         s.column_mode = self.column_mode;
+        s.author = self.author;
+        s.initials = self.initials;
     }
 }
 
@@ -503,6 +512,26 @@ impl Replica {
     pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
         if !Scope::of(id).is_some_and(Scope::in_shared_document) {
             return Err(CmdError::Disabled(format!("{id}: files, other documents and windows aren't part of a shared document")));
+        }
+        // A macro's steps run one by one as the copy's commands, so that each keeps its places
+        // and the rest of what it takes to make it again (made again whole, a macro would make
+        // its steps at the offsets they had). A step that fails stops the macro; the steps
+        // before it stay made.
+        if id == "tools.macros"
+            && let Some(name) = params.get("run").and_then(Value::as_str)
+        {
+            let mut rest = params.clone();
+            if let Some(o) = rest.as_object_mut() {
+                o.remove("run");
+            }
+            if rest.as_object().is_some_and(|o| !o.is_empty()) {
+                self.run(id, &rest)?;
+            }
+            let steps = self.session.macros.get(name).cloned().ok_or_else(|| CmdError::Params(format!("no macro `{name}`")))?;
+            for (step, p) in steps.iter().take(10_000).filter(|(step, _)| step != "tools.macros") {
+                self.run(step, p)?;
+            }
+            return Ok(serde_json::json!({"ran": name, "steps": steps.len()}));
         }
         self.capture();
         self.run_made(id, params, 0)
