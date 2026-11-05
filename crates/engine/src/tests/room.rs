@@ -428,6 +428,35 @@ fn a_cells_edit_made_again_clears_the_same_cells_after_rows_put_in_before_them()
 }
 
 #[test]
+fn an_edit_in_a_cell_whose_text_changed_in_a_table_put_back_whole_is_not_made_elsewhere() {
+    let mut s = Session::new(Document::from_text("r1\tone three"));
+    s.run("select.all", &json!({})).unwrap();
+    s.run("table.fromText", &json!({})).unwrap();
+    let room = Room::with_hub(Hub::new(s.doc.clone()).keeping(1));
+    let mut a = room.join("Ana");
+    let mut b = room.join("Ben");
+    // Ana types "X" over "three" while Ben puts a row in above and types "Zone" over "one". Her
+    // copy misses both changes and reads the document again: the cell's text changed with the
+    // table sent whole, so where "three" was isn't known and her edit is given up, not made
+    // over "e thre".
+    run(&mut a, "select.text", json!({"text": "three"}));
+    run(&mut a, "text.insert", json!({"text": "X"}));
+    run(&mut b, "select.text", json!({"text": "r1"}));
+    run(&mut b, "table.insertRowAbove", json!({}));
+    b.sync();
+    run(&mut b, "select.text", json!({"text": "one"}));
+    run(&mut b, "text.insert", json!({"text": "Zone"}));
+    b.sync();
+    assert_eq!(room.version(), 2);
+    a.send();
+    assert_eq!((a.stats().read_again, a.stats().lost), (1, 1));
+    assert_eq!(text(&a).split_whitespace().collect::<Vec<_>>(), ["r1", "Zone", "three"]);
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    same_everywhere(&copies).unwrap();
+}
+
+#[test]
 fn typing_made_again_keeps_the_formatting_picked_for_it() {
     let room = Room::new(Document::from_text("one two three "));
     let mut a = room.join("Ana");

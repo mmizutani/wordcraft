@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{ChangeSet, MARK, NewBlock, PartChange, Splice, inside_ids, window_len};
+use super::{ChangeSet, Fingerprint, MARK, NewBlock, PartChange, Splice, text_fingerprint, window_len};
+use crate::block_id::each_inside;
 use crate::{Block, BlockId, Document, Path, Pos, StoryRef};
 
 /// A place in a paragraph: its id, and a byte offset in its text.
@@ -34,7 +35,8 @@ impl ChangeSet {
     /// the new paragraph; an anchor in text the change replaced moves to where the replacement
     /// starts, and one in text whose formatting alone changed stays with its characters; an
     /// anchor where text was put in stays before it; one in a table the change replaced whole
-    /// moves to where the table was.
+    /// stays in its paragraph when the table put there has it with the same text, is gone when
+    /// that text changed, and otherwise moves to where the table was.
     pub fn map(&self, a: Anchor) -> Mapped {
         for e in &self.edits {
             if e.id == a.block {
@@ -47,9 +49,14 @@ impl ChangeSet {
         }
         for s in &self.splices {
             // A paragraph in a table the change replaced whole that is in the table put there
-            // (a row put in, a cell's properties changed) is still there: the anchor stays in it.
-            if s.removed.iter().any(|old| old.inside.contains(&a.block)) && s.inserted.iter().any(|b| inside_ids(&b.0).contains(&a.block)) {
-                return Mapped::At(a);
+            // (a row put in, a cell's properties changed) is still there: the anchor stays in it
+            // when its text is the same. Whose text changed too, the change doesn't say how,
+            // so where in it the anchor is now isn't known.
+            if let Some(was) =
+                s.removed.iter().find_map(|old| old.inside.iter().position(|id| *id == a.block).map(|i| old.inside_text.get(i).copied()))
+                && let Some(now) = s.inserted.iter().find_map(|b| text_inside(&b.0, a.block))
+            {
+                return if was == Some(now) { Mapped::At(a) } else { Mapped::Gone };
             }
             if let Some(w) = window_pos(s, a) {
                 return resolve(s, map_pos(w, s.text.at, s.text.removed, s.text.inserted.len()));
@@ -190,6 +197,17 @@ fn resolve(s: &Splice, w: usize) -> Mapped {
         // A list with nothing in it, which no document has.
         (None, None) => Mapped::Gone,
     }
+}
+
+/// [`text_fingerprint`] of block `id` inside table `b`, if it is there.
+fn text_inside(b: &Block, id: BlockId) -> Option<Fingerprint> {
+    let mut found = None;
+    each_inside(b, &mut |inner| {
+        if found.is_none() && inner.id() == id {
+            found = Some(text_fingerprint(inner));
+        }
+    });
+    found
 }
 
 /// The first paragraph inside table `b`, in document order.

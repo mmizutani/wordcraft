@@ -1020,14 +1020,9 @@ impl Replica {
         if let Some(now) = self.reborn.get(&a.block) {
             return self.session.doc.pos_of(Anchor { block: (*now)?, ..a }, None);
         }
+        // Not looked for by its paragraph's id when the change moved it beside blocks: that
+        // paragraph may hold other text now, and the old offset would be somewhere else in it.
         let m = through.map_or(Mapped::At(a), |cs| cs.map(a));
-        // A change that replaced the blocks around it whole (a table with a row put in) leaves
-        // it beside them; when its paragraph is still there, it is in it.
-        if let Mapped::Before(_) | Mapped::After(_) = m
-            && let Some(p) = self.session.doc.pos_of(a, None)
-        {
-            return Some(p);
-        }
         self.session.doc.place(m, None)
     }
 
