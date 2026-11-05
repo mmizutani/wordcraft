@@ -28,7 +28,7 @@ Run it for any change to the files under Coverage: the order of the steps in `wr
 sh .claude/skills/recovery-store/check.sh
 ```
 
-It takes about a minute. On a first run it downloads `tla2tools.jar` 1.7.4 from github.com to `~/.cache/wordcraft-tla` (each run, if that folder is refused) and verifies its SHA-256; it needs Java 11 or later. Set `TLA2TOOLS` and `JAVA` to skip finding them. A sandboxed agent must allow github.com for that download, and `.claude/skills/` may refuse Bash writes there, so edit these files with the Write and Edit tools. In such a shell, a `cargo test` that replays a finding needs `CARGO_HOME` in the scratch folder with a real `registry` folder (a symlink to `~/.cargo/registry` cannot be written) and `CARGO_NET_GIT_FETCH_WITH_CLI=true` (cargo's built-in git stalls behind the proxy; the first fetch takes about 10 minutes).
+It takes about two minutes. On a first run it downloads `tla2tools.jar` 1.7.4 from github.com to `~/.cache/wordcraft-tla` (each run, if that folder is refused) and verifies its SHA-256; it needs Java 11 or later. Set `TLA2TOOLS` and `JAVA` to skip finding them. A sandboxed agent must allow github.com for that download, and `.claude/skills/` may refuse Bash writes there, so edit these files with the Write and Edit tools. In such a shell, a `cargo test` that replays a finding needs `CARGO_HOME` in the scratch folder with a real `registry` folder (a symlink to `~/.cargo/registry` cannot be written) and `CARGO_NET_GIT_FETCH_WITH_CLI=true` (cargo's built-in git stalls behind the proxy; the first fetch takes about 10 minutes).
 
 | Exit | Meaning | What to do |
 |---|---|---|
@@ -154,7 +154,7 @@ When `check.sh` exits 2, replay the finding. If the code really is fixed, delete
 
 The sync commit is the last commit at which someone confirmed that the model describes the covered code. Keep it on `main`, because `check.sh` compares against it and a squash merge removes a branch's commits.
 
-sync-commit: a22d6e43bc9eb74422e3caf532f6bc1d71daf6f7
+sync-commit: 96083f9fa752f7057e948d2efa458ea50ce76cd9
 
 covered-files:
 - crates/engine/src/recovery.rs
