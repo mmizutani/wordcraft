@@ -89,9 +89,20 @@ pub(crate) struct AgentSetup {
     generation: u64,
     /// The pass each window last drew the page in: egui counts passes per window.
     passes: HashMap<egui::ViewportId, u64>,
-    /// The person's focus and selection in a window from before the control channel's input
-    /// there, while that input lasts and one pass after: put back when it moved them.
-    focus: Option<(egui::ViewportId, Focus)>,
+    /// In each window, the person's focus and selection from before the control channel's input
+    /// there, while that input lasts and after it: put back when it moved them.
+    focus: HashMap<egui::ViewportId, Guard>,
+}
+
+/// Where the person's keys went in a window before the control channel's input there.
+struct Guard {
+    focus: Focus,
+    /// Whether that input left a pointer button down (a press never released): until it is
+    /// released, and one pass after (its release may click), focus is put back each pass.
+    held: bool,
+    /// Whether there was input from it since focus and selection were last put back: then both
+    /// are; else (while a press is held) only which widget has focus, as the person types on.
+    since: bool,
 }
 
 /// A settings file that can't be read.
@@ -115,6 +126,21 @@ impl Focus {
         let id = ctx.memory(|m| m.focused());
         let selection = id.and_then(|id| egui::text_edit::TextEditState::load(ctx, id)).and_then(|s| s.cursor.char_range());
         Focus { id, selection }
+    }
+
+    /// Give focus back to this widget (or none) if it moved, leaving selections as they are.
+    /// Whether it had.
+    fn put_back_focus(self, ctx: &egui::Context) -> bool {
+        let now = ctx.memory(|m| m.focused());
+        if now == self.id {
+            return false;
+        }
+        match (self.id, now) {
+            (Some(id), _) => ctx.memory_mut(|m| m.request_focus(id)),
+            (None, Some(moved)) => ctx.memory_mut(|m| m.surrender_focus(moved)),
+            (None, None) => {}
+        }
+        true
     }
 
     /// Put this focus and selection back where they moved. Whether they had.
@@ -191,7 +217,7 @@ impl AgentSetup {
             damaged: None,
             generation: fresh(),
             passes: HashMap::new(),
-            focus: None,
+            focus: HashMap::new(),
         };
         setup.reload();
         setup
@@ -230,7 +256,10 @@ impl AgentSetup {
 
     /// The drafts changed: work out what they would save.
     fn edited(&mut self) {
-        self.check = settings_over(&self.saved, &self.original, &self.drafts);
+        self.check = settings_over(&self.saved, &self.original, &self.drafts).and_then(|settings| {
+            written(&settings, &self.saved, &self.read)?;
+            Ok(settings)
+        });
         self.notice = None;
     }
 }
@@ -285,6 +314,17 @@ fn settings_over(base: &AgentSettings, original: &[Draft], drafts: &[Draft]) -> 
         return Err(tl!("the agents' settings would be larger than the 1 MiB their file may hold").to_string());
     }
     Ok(read)
+}
+
+/// The file `file` (what `before` was read from) with what `settings` change written into it,
+/// the data the page doesn't show included, or why it can't be saved: more than the 1 MiB the
+/// file may hold.
+fn written(settings: &AgentSettings, before: &AgentSettings, file: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let written = settings.written_over(before, file);
+    if !AgentSettings::value_fits(&written) {
+        return Err(tl!("the agents' settings would be larger than the 1 MiB their file may hold").to_string());
+    }
+    Ok(written)
 }
 
 /// One agent's settings: each field of `d` changed from `o` (what the page read; `None`: all of
@@ -407,9 +447,7 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
                 // Shown again: the file may have changed (kept while there are edits: Save
                 // writes them over the file as it is then), and so may what is installed. Focus
                 // kept from before isn't the person's now.
-                if s.focus.is_some_and(|(w, _)| w == viewport) {
-                    s.focus = None;
-                }
+                s.focus.remove(&viewport);
                 if !s.touched() {
                     s.reload();
                 }
@@ -429,16 +467,34 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
     let from_control = app.input_from_control(&ctx);
     let before = from_control.then(|| setup.drafts.clone());
     let mut put_back = false;
-    match (setup.focus, from_control) {
-        // The first pass after it in its window, before the page's widgets see the person's
-        // input: put back what its click or key moved, including what egui moves at the end of
-        // a pass (an arrow key) or at the start of the next (Shift+Tab).
-        (Some((w, focus)), false) if w == viewport => {
-            put_back = focus.put_back(&ctx);
-            setup.focus = None;
+    if from_control {
+        match setup.focus.get_mut(&viewport) {
+            // New input while a press is held: where the person's keys go now, as they typed on.
+            Some(guard) if !guard.since => {
+                guard.focus = Focus::now(&ctx);
+                guard.since = true;
+            }
+            Some(_) => {}
+            None => {
+                if setup.focus.len() >= MOST_WINDOWS {
+                    setup.focus.clear();
+                }
+                setup.focus.insert(viewport, Guard { focus: Focus::now(&ctx), held: false, since: true });
+            }
         }
-        (None, true) => setup.focus = Some((viewport, Focus::now(&ctx))),
-        _ => {}
+    } else if let Some(guard) = setup.focus.get_mut(&viewport) {
+        // The first pass after it in this window, before the page's widgets see the person's
+        // input: put back what its click or key moved, including what egui moves at the end of
+        // a pass (an arrow key) or at the start of the next (Shift+Tab). After a press it left
+        // down, each pass until one after its release, with no drag of what it pressed.
+        put_back = if guard.since { guard.focus.put_back(&ctx) } else { guard.focus.put_back_focus(&ctx) };
+        guard.since = false;
+        if guard.held {
+            ctx.stop_dragging();
+            guard.held = ctx.input(|i| i.pointer.any_down());
+        } else {
+            setup.focus.remove(&viewport);
+        }
     }
     let t = Tokens::get(&ctx);
     if let Some(damage) = &setup.damaged {
@@ -481,8 +537,17 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
                     m.surrender_focus(id);
                 }
             });
-            setup.focus = Some((viewport, Focus { id: None, selection: None }));
+            let held = setup.focus.get(&viewport).is_some_and(|g| g.held);
+            setup.focus.insert(viewport, Guard { focus: Focus { id: None, selection: None }, held, since: true });
             put_back = true;
+        }
+        // A press it leaves down starts no drag (a field being dragged takes focus each pass),
+        // and holds the put-back until it is released.
+        if ctx.input(|i| i.pointer.any_down()) {
+            ctx.stop_dragging();
+            if let Some(guard) = setup.focus.get_mut(&viewport) {
+                guard.held = true;
+            }
         }
         (edited, save, discard) = (false, false, false);
     }
@@ -533,6 +598,8 @@ fn save_setup(app: &mut WordApp, setup: &mut AgentSetup) {
     let read = AgentSettings::read_value(&setup.dir);
     let (file, now) = match &read {
         Ok(Some(file)) => (file.clone(), AgentSettings::from_value(file)),
+        // Gone since it went bad after the page read it: what's here, as below.
+        Ok(None) if setup.damaged.as_ref().is_some_and(|d| d.after_read) => (setup.read.clone(), setup.saved.clone()),
         Ok(None) => (serde_json::Value::Null, AgentSettings::default()),
         Err(why) if setup.damaged.is_none() => {
             // It could be read when the page read it: say so before saving over it.
@@ -555,7 +622,14 @@ fn save_setup(app: &mut WordApp, setup: &mut AgentSetup) {
             return;
         }
     };
-    let written = settings.written_over(&now, &file);
+    // Measured before a damaged file is set aside, so a save that can't be written leaves it.
+    let written = match written(&settings, &now, &file) {
+        Ok(written) => written,
+        Err(why) => {
+            setup.notice = Some((fmt(tl!("Not saved: {why}"), &[("why", &why)]), true));
+            return;
+        }
+    };
     let aside = match read {
         Ok(_) => None,
         Err(_) => match AgentSettings::set_aside(&setup.dir) {
@@ -586,8 +660,14 @@ fn save_setup(app: &mut WordApp, setup: &mut AgentSetup) {
             ask_again(app, setup);
         }
         Err(e) => {
-            // The error names the file, never what it holds.
+            // The error names the file, never what it holds. A damaged file set aside goes back,
+            // so the page still says it can't be read and the next Save sets it aside again.
             log::warn!("couldn't save the agents' settings: {e}");
+            if aside.is_some()
+                && let Err(e) = AgentSettings::put_back_aside(&setup.dir)
+            {
+                log::warn!("couldn't put the damaged agents' settings back: {e}");
+            }
             setup.notice = Some((fmt(tl!("Couldn't save the agents' settings: {error}"), &[("error", &e.to_string())]), true));
         }
     }

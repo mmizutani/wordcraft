@@ -120,7 +120,9 @@ both for finding its program and for what it runs, so it must hold every folder 
 logged; for a screen reader each row says whether it is open, and each value field and Remove
 button is named after its variable. Save waits until what you typed can be kept, and says why
 not: a variable with a value but no name, a name with `=` in it, a name given twice, more than
-64 arguments or variables, or settings larger than the 1 MiB the file may hold. What is saved
+64 arguments or variables, or settings larger than the 1 MiB the file may hold (measured as
+written, with what the page doesn't show; a file only pretty-printing would take past it is
+written compact). What is saved
 applies the next time the agent starts; one already running keeps what it started with.
 
 Save writes only what you changed, over the file as it is when you save: an agent you didn't
@@ -136,14 +138,16 @@ replaced in silence: the page says it can't be read, and Save first keeps it as
 `assistant-agents.json.damaged` (replacing an older one) beside the new file. If it became
 unreadable after the page read it, the first Save writes nothing and says so, and the page says it
 shows the file as it was when read; the next Save keeps it aside and saves what the page shows:
-that read, with your edits.
+that read, with your edits (also when the file has gone missing since). If that write fails, the
+file set aside is put back, so nothing is lost and Save can try again.
 
 No command reads or writes these settings: they say which program WordCraft starts and may hold
 your keys, so they are yours alone, set in the page or in the file. Input from the control
 channel (MCP's `click`, `key` and `type`, or `ui.*`) changes nothing on the page: what it typed
 or clicked is put back, its fields start afresh so undo can't bring it back, where your keys go
-(the focused field and its selection) is put back too, so your next keys don't land where it
-clicked or tabbed, and the page says only you can change these settings. A script picks an agent with `assist.backend`, whose answer
+(the focused field and its selection) is put back too, in each window, so your next keys don't
+land where it clicked or tabbed, and a press it never releases starts no drag and can't take
+focus until it is released. The page says only you can change these settings. A script picks an agent with `assist.backend`, whose answer
 says whether each one is ready, and never holds its environment.
 
 They are kept in `<settings>/assistant-agents.json` (`<settings>` is the folder

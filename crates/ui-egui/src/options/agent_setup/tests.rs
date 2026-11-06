@@ -268,10 +268,15 @@ fn a_huge_paste_into_the_arguments_is_cut_to_fit() {
 /// Send the control channel's `method` (what MCP's `click`, `key` and `type` send), and run the
 /// passes that deliver it, as the window does.
 fn faked(h: &mut egui_kittest::Harness<'static, WordApp>, method: &str, params: serde_json::Value) {
+    faked_for(h, method, params, 20);
+}
+
+/// Input the control channel makes, then `steps` passes.
+fn faked_for(h: &mut egui_kittest::Harness<'static, WordApp>, method: &str, params: serde_json::Value, steps: usize) {
     let (req, _rx) = crate::control::ControlRequest::new(method, params);
     let ctx = h.ctx.clone();
     assert!(matches!(crate::control::handle(h.state_mut(), &ctx, &req), crate::control::Outcome::Done(_)), "{method} is queued");
-    for _ in 0..20 {
+    for _ in 0..steps {
         let ctx = h.ctx.clone();
         let mut raw = std::mem::take(h.input_mut());
         h.state_mut().raw_input_hook(&ctx, &mut raw);
@@ -961,5 +966,157 @@ fn the_notes_say_a_path_variable_replaces_wordcrafts() {
     assert_eq!(open, 2, "Codex's and the custom agent's notes are open");
     assert_eq!(notes("replaces WordCraft's own PATH"), open, "each note says it");
     assert_eq!(showing(&h, "comes first"), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Third review (#24): each test below failed before its fix.
+
+/// A file holding codex's key, a custom agent and a large array WordCraft doesn't read: compact,
+/// it fits the 1 MiB the file may hold; pretty-printed, it doesn't.
+fn with_a_large_log(dir: &Path) -> AgentPrefs {
+    let custom = AgentPrefs { command: "/opt/mine".into(), args: vec!["--acp".into()], ..AgentPrefs::default() };
+    let file = json!({
+        "agents": {"codex": {"env": {"OPENAI_API_KEY": "sk-kept"}}, "custom": {"command": "/opt/mine", "args": ["--acp"]}},
+        "log": vec![0; 300_000],
+    });
+    std::fs::write(dir.join(SETTINGS_FILE), file.to_string()).unwrap();
+    custom
+}
+
+/// confirmed[0]: a Save over a file damaged after the page read it, whose write fails, loses
+/// nothing: the file is put back, and the next Save writes the page's last good read.
+#[test]
+fn a_save_over_a_damaged_file_that_fails_loses_nothing() {
+    let dir = folder("damaged-write-fails");
+    let file = dir.join(SETTINGS_FILE);
+    let custom = with_a_large_log(&dir);
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    type_into(&mut h, "Command:", 0, "2");
+    std::fs::write(&file, "").unwrap();
+    for _ in 0..3 {
+        button(&h, "Save").click();
+        h.run_steps(4);
+    }
+    let saved = AgentSettings::load(&dir);
+    assert_eq!(saved.agent("codex").env.get("OPENAI_API_KEY").map(String::as_str), Some("sk-kept"), "an agent not touched is kept");
+    assert_eq!(saved.agent("custom"), AgentPrefs { command: "/opt/mine2".into(), ..custom.clone() });
+    assert!(draft_of(&h, "codex").env.iter().any(|v| v.name == "OPENAI_API_KEY"), "the page still shows it");
+    // A write that fails after the damaged file was set aside puts it back (the new file's
+    // temporary name is taken by a folder, so it can't be made).
+    type_into(&mut h, "Command:", 0, "3");
+    std::fs::write(&file, "junk").unwrap();
+    button(&h, "Save").click();
+    h.run_steps(4);
+    let blocker = dir.join(format!(".{SETTINGS_FILE}.{}.tmp", std::process::id()));
+    std::fs::create_dir_all(blocker.join("x")).unwrap();
+    button(&h, "Save").click();
+    h.run_steps(4);
+    assert!(showing(&h, "Couldn't save") > 0, "the write failed");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "junk", "the damaged file is back");
+    std::fs::remove_dir_all(&blocker).unwrap();
+    button(&h, "Save").click();
+    h.run_steps(4);
+    let saved = AgentSettings::load(&dir);
+    assert_eq!(saved.agent("codex").env.get("OPENAI_API_KEY").map(String::as_str), Some("sk-kept"), "kept after a failed write");
+    assert_eq!(saved.agent("custom").command, "/opt/mine23");
+    // A file that went bad and then went missing: what the page shows is saved, not just edits.
+    type_into(&mut h, "Command:", 0, "4");
+    std::fs::write(&file, "junk").unwrap();
+    button(&h, "Save").click();
+    h.run_steps(4);
+    std::fs::remove_file(&file).unwrap();
+    button(&h, "Save").click();
+    h.run_steps(4);
+    let saved = AgentSettings::load(&dir);
+    assert_eq!(saved.agent("codex").env.get("OPENAI_API_KEY").map(String::as_str), Some("sk-kept"), "kept when the file went missing");
+    assert_eq!(saved.agent("custom").command, "/opt/mine234");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// confirmed[1]: what Save would write, the file's data the page doesn't show included, is
+/// measured: a file that only pretty-printing takes over 1 MiB saves, and one that the edits
+/// take over it keeps Save off and says why.
+#[test]
+fn save_measures_what_it_writes() {
+    let dir = folder("measured");
+    with_a_large_log(&dir);
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Codex");
+    type_value(&mut h, 0, "-new");
+    button(&h, "Save").click();
+    h.run_steps(4);
+    assert_eq!(AgentSettings::load(&dir).agent("codex").env.get("OPENAI_API_KEY").map(String::as_str), Some("sk-kept-new"), "saved");
+    let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap()).unwrap();
+    assert_eq!(raw["log"].as_array().map(Vec::len), Some(300_000), "with what the page doesn't show");
+    // Near the limit with data the page doesn't show: a long value would take it over.
+    let file = json!({"agents": {}, "pad": "x".repeat(1_048_576 - 2_000)});
+    std::fs::write(dir.join(SETTINGS_FILE), file.to_string()).unwrap();
+    let before = std::fs::read(dir.join(SETTINGS_FILE)).unwrap();
+    button(&h, "Check again").click();
+    h.run_steps(4);
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "BIG");
+    type_value(&mut h, 0, &"x".repeat(4_000));
+    assert!(showing(&h, "1 MiB") > 0, "the page says why");
+    assert!(button(&h, "Save").accesskit_node().is_disabled(), "and keeps Save off");
+    assert_eq!(std::fs::read(dir.join(SETTINGS_FILE)).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// confirmed[2]: a press the control channel never releases can't take the person's keys: no
+/// drag of the field it pressed starts, and focus stays put back until it is released.
+#[test]
+fn a_control_press_never_released_cant_take_the_keys() {
+    let dir = folder("held-press");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "API_KEY");
+    type_value(&mut h, 0, "sk-");
+    let c = h.get_by_label("Command:").rect().center();
+    faked(&mut h, "ui.press", json!({"x": c.x, "y": c.y}));
+    h.event(egui::Event::Text(SECRET.into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains(SECRET), "the key never lands in the command");
+    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}").as_str()));
+    // Released: the click it makes is put back too.
+    faked(&mut h, "ui.release", json!({"x": c.x, "y": c.y}));
+    h.event(egui::Event::Text("x".into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains('x'), "nor after the release");
+    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}x").as_str()));
+    // The person's own release soon after its press clicks the field it pressed: put back too.
+    faked_for(&mut h, "ui.press", json!({"x": c.x, "y": c.y}), 3);
+    h.event(egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(1);
+    h.event(egui::Event::Text("y".into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains('y'), "nor after the person's release");
+    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}xy").as_str()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// confirmed[3]: each window keeps its own put-back: one left in another window, where the page
+/// was then hidden, doesn't turn it off here.
+#[test]
+fn another_windows_leftover_focus_doesnt_turn_the_put_back_off() {
+    let dir = folder("two-windows");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "API_KEY");
+    type_value(&mut h, 0, "sk-");
+    let leftover = super::Guard { focus: super::Focus { id: None, selection: None }, held: false, since: false };
+    h.state_mut().assist.setup.as_mut().unwrap().focus.insert(egui::ViewportId::from_hash_of("window A"), leftover);
+    let command = h.get_by_label("Command:").rect().center();
+    faked_click(&mut h, command);
+    h.event(egui::Event::Text(SECRET.into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains(SECRET), "the key never lands in the command");
+    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}").as_str()));
     let _ = std::fs::remove_dir_all(&dir);
 }
