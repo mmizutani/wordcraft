@@ -10,7 +10,9 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+#[cfg(not(windows))]
+use std::process::Child;
+use std::process::{ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -116,9 +118,14 @@ impl Tail {
     }
 }
 
+#[cfg(not(windows))]
+type AgentChild = Child;
+#[cfg(windows)]
+type AgentChild = Box<dyn process_wrap::std::ChildWrapper>;
+
 /// A running agent.
 pub struct Process {
-    child: Child,
+    child: AgentChild,
     /// Lines for the writer thread; `None` once WordCraft closed the agent's stdin.
     outbox: Option<SyncSender<String>>,
     incoming: Receiver<Queued>,
@@ -137,13 +144,23 @@ impl Process {
     pub fn spawn(launch: &Launch, cwd: &Path, env: Vec<(OsString, OsString)>) -> std::io::Result<Process> {
         let mut command = Command::new(&launch.program);
         command.args(&launch.args).current_dir(cwd).env_clear().envs(env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        #[cfg(windows)]
-        // The desktop app must not open a console window for each agent.
-        std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000);
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        #[cfg(windows)]
+        let mut child = {
+            use process_wrap::std::{CommandWrap, CreationFlags, JobObject};
+            let mut wrapped = CommandWrap::from(command);
+            wrapped.wrap(CreationFlags(windows::Win32::System::Threading::CREATE_NO_WINDOW));
+            wrapped.wrap(JobObject);
+            wrapped.spawn()?
+        };
+        #[cfg(not(windows))]
         let mut child = command.spawn()?;
-        let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
+        #[cfg(windows)]
+        let pipes = (child.stdin().take(), child.stdout().take(), child.stderr().take());
+        #[cfg(not(windows))]
+        let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+        let (Some(stdin), Some(stdout), Some(stderr)) = pipes else {
             let _ = child.kill();
             let _ = child.wait();
             return Err(std::io::Error::other("the agent's stdin, stdout or stderr couldn't be piped"));
@@ -242,6 +259,10 @@ impl Process {
             #[cfg(not(target_os = "openbsd"))]
             {
                 self.reaped = self.child.try_wait().ok().flatten();
+                #[cfg(windows)]
+                if self.reaped.is_some() {
+                    let _ = self.child.start_kill();
+                }
             }
             // shortcut: OpenBSD has no nonreaping waitid; retain the leader until stop,
             // and add nonreaping exit detection if prompt-level detection is needed there.
@@ -283,6 +304,10 @@ impl Process {
     /// `grace` for it to exit, then kill it (on Unix, its whole process group), and wait for it.
     pub fn stop(&mut self, grace: Duration) {
         self.outbox = None;
+        #[cfg(windows)]
+        if self.reaped.is_some() {
+            let _ = self.child.start_kill();
+        }
         let until = Instant::now() + grace;
         while self.exit_status().is_none() && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(10));

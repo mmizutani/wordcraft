@@ -31,3 +31,8 @@ getrandom = { workspace = true }
 # Ending an ACP agent's whole process group: an adapter run through npx is a few processes.
 # Already in the lock as a dependency of other crates.
 rustix = { version = "1", features = ["process"] }
+
+[target.'cfg(windows)'.dependencies]
+# Safe ownership of the agent's whole process tree; no Windows FFI in this crate.
+process-wrap = { version = "10.0.1", default-features = false, features = ["std", "job-object", "creation-flags"] }
+windows = { version = "0.62.2", features = ["Win32_System_Threading"] }

@@ -473,6 +473,45 @@ fn ending_a_conversation_whose_agent_is_stuck_kills_it() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn ending_a_cmd_launched_agent_ends_its_worker_and_removes_its_folder() {
+    use std::os::windows::process::CommandExt;
+    let dir = std::env::temp_dir().join(format!("wordcraft-cmd-agent-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shim = dir.join("agent.cmd");
+    std::fs::write(&shim, "@echo off\r\n\"%TEST_AGENT_EXE%\" --exact acp::tests::fake_agent --nocapture --test-threads 1 -q\r\n").unwrap();
+    let mut script = Script::default();
+    script.replies.insert("Hang".into(), vec![Step::Report, Step::Hang]);
+    let mut spec = spec(&script);
+    spec.launch = Launch::new(&shim, Vec::<String>::new());
+    spec.env.push(("TEST_AGENT_EXE".into(), std::env::current_exe().unwrap().to_string_lossy().into_owned()));
+    spec.cancel_timeout = Duration::from_millis(300);
+    let mut c = Chat::new(spec, PermissionPolicy::Reject);
+    c.a.ask("Hang", None).unwrap();
+    c.until("the worker to start", |c| c.answer().starts_with('{'));
+    let report = c.report();
+    let cwd = std::path::PathBuf::from(report["cwd"].as_str().unwrap());
+    let pid = report["pid"].as_u64().unwrap();
+    c.a.end();
+    let until = Instant::now() + Duration::from_secs(10);
+    while cwd.exists() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = std::process::Command::new("tasklist.exe")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .creation_flags(0x0800_0000)
+        .output()
+        .unwrap();
+    let alive = String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""));
+    if alive {
+        let _ = std::process::Command::new("taskkill.exe").args(["/PID", &pid.to_string(), "/T", "/F"]).creation_flags(0x0800_0000).status();
+    }
+    assert!(!alive, "the launcher ended but its worker survived");
+    assert!(!cwd.exists(), "the worker held its cwd open");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn the_agent_gets_none_of_wordcrafts_own_variables_but_those_it_is_given() {
     let base = [("PATH", "/bin"), ("WORDCRAFT_CONTROL_KEY", "window-key"), ("wordcraft_settings", "x"), ("HOME", "/home/m")]
