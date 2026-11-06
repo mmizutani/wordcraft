@@ -1,7 +1,7 @@
 //! The Assistant pane (#15, #17): a conversation with the built-in assistant.
 //!
-//! At the top, the assistant new conversations use (whether it is ready, and if not what to do)
-//! and who it is in the document: its name and role, which the person can change for the
+//! At the top, the assistant new conversations use (whether it is ready, and if not what to do:
+//! for ChatGPT, Continue with ChatGPT, #19) and who it is in the document: its name and role, which the person can change for the
 //! conversation. Then the conversation: the prompts, the answers, thoughts folded away, a row per
 //! tool call folded to how it went (open: what it said, and the way to the change it made, #23),
 //! the plan as a checklist, permission requests with their options while they wait, errors, and
@@ -117,6 +117,15 @@ fn picker(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
             Readiness::Unavailable { why } => fmt(tl!("Unavailable: {why}"), &[("why", why)]),
         };
         wrapped(ui, RichText::new(text).small().color(t.orange));
+        // ChatGPT signs in from here too, without a trip to File › Options › Account (#19).
+        #[cfg(not(target_arch = "wasm32"))]
+        if o.id == wordcraft_assist::chatgpt::ID
+            && matches!(o.readiness, Readiness::SignIn { .. })
+            && crate::assist::desktop(app)
+            && app.services.settings_dir.is_some()
+        {
+            crate::assist::chatgpt::controls(app, ui, true);
+        }
     }
 }
 

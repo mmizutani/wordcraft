@@ -19,6 +19,12 @@
 //! `assist.showChange` selects what one of the assistant's tool calls changed, by the version of
 //! the shared document it made.
 //!
+//! Sign in with ChatGPT (#19): `assist.chatgpt.signIn` has the window open the browser to sign
+//! in, `assist.chatgpt.cancelSignIn` stops a sign-in that waits for it, and
+//! `assist.chatgpt.signOut` revokes and deletes the sign-in (File › Options › Account, and the
+//! Assistant pane's Continue with ChatGPT). They are the person's alone: the window refuses them
+//! from a script or an agent ([`AssistantStatus::chatgpt`] says where the sign-in stands).
+//!
 //! A writing action is a prompt of ours ([`prompts`]) asked like any other, so its edits are the
 //! assistant's: tracked changes in its name while it is a suggester. The window gives the
 //! assistant's copy the person's selection, or the caret at its end (`"at": "end"`) for what is
@@ -47,6 +53,22 @@ pub struct AssistantStatus {
     /// No assistant runs in this app: the web app's backends would sign in or start agents,
     /// which take the desktop app (#26), so the buttons say that rather than how to set one up.
     pub desktop_only: bool,
+    /// Where the window's ChatGPT sign-in stands (#19).
+    pub chatgpt: ChatGptStatus,
+}
+
+/// Where the window's ChatGPT sign-in stands, for the Account commands (#19).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChatGptStatus {
+    /// Nobody is signed in.
+    #[default]
+    SignedOut,
+    /// A sign-in waits for the person to finish it in their browser.
+    SigningIn,
+    /// Someone is signed in.
+    SignedIn,
+    /// A sign-out is under way.
+    SigningOut,
 }
 
 /// Why `assist.*` does nothing here.
@@ -55,6 +77,14 @@ const NO_WINDOW: &str = "the assistant works in the WordCraft window, with the A
 pub const NOT_SET_UP: &str = "Set up an assistant first: open the Assistant pane (Home › Assistant) to sign in or set up an agent";
 /// Why a prompt can't start a turn in the web app.
 pub const NEEDS_DESKTOP: &str = "The assistant needs the WordCraft desktop app: a web page can't sign in to ChatGPT or start an agent";
+/// Why a sign-in or a sign-out waits.
+const SIGNING_OUT: &str = "WordCraft is signing out of ChatGPT: wait for it to finish";
+/// Why there is no sign-in to cancel.
+const NO_SIGN_IN: &str = "no ChatGPT sign-in is waiting for your browser";
+/// Why a sign-out waits for the sign-in.
+const CANCEL_FIRST: &str = "a ChatGPT sign-in is waiting for your browser: cancel it first";
+/// Why there is nothing to sign out of.
+const NOT_SIGNED_IN: &str = "you aren't signed in to ChatGPT";
 /// Why a prompt waits.
 const ANSWERING: &str = "the assistant is still answering: stop it first";
 /// Why there is nothing to stop.
@@ -103,6 +133,27 @@ pub fn specs() -> Vec<CommandSpec> {
             .params(r#"{"version": number (a tool call's last: the shared document's version once its changes were in), "from"?: number (its first; omit for one change)} → the text the conversation's assistant put in or changed in those versions is selected (others' changes among them left out), and the Review tab opens"#)
             .when(in_window)
             .pure(),
+        CommandSpec::new("assist.chatgpt.signIn", "Sign In with ChatGPT", "File › Options › Account", |s, _| {
+            s.push_ui_request(json!({"assist": "chatgptSignIn"}));
+            Ok(json!({"signingIn": true}))
+        })
+        .params(r#"{} → your browser opens to sign in with your ChatGPT account (Plus or Pro), and the assistant can use ChatGPT once you have; while that sign-in waits, it opens again. Yours alone: from a script or an agent (control channel, MCP) it is an error"#)
+        .when(can_sign_in)
+        .pure(),
+        CommandSpec::new("assist.chatgpt.cancelSignIn", "Cancel Signing In with ChatGPT", "File › Options › Account", |s, _| {
+            s.push_ui_request(json!({"assist": "chatgptCancel"}));
+            Ok(json!({"cancelled": true}))
+        })
+        .params(r#"{} → the sign-in waiting for your browser stops. Yours alone, as signing in is"#)
+        .when(signing_in)
+        .pure(),
+        CommandSpec::new("assist.chatgpt.signOut", "Sign Out of ChatGPT", "File › Options › Account", |s, _| {
+            s.push_ui_request(json!({"assist": "chatgptSignOut"}));
+            Ok(json!({"signingOut": true}))
+        })
+        .params(r#"{} → WordCraft deletes your ChatGPT sign-in and asks ChatGPT to end it. Yours alone, as signing in is"#)
+        .when(can_sign_out)
+        .pure(),
         CommandSpec::new("assist.draft", "Draft with the Assistant", "Home › Assistant", draft)
             .params(r#"{"about": string (what to write)} → the assistant writes it at the caret (after the selection, if there is one)"#)
             .when(can_ask)
@@ -146,6 +197,37 @@ pub fn can_ask(s: &Session) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// The ChatGPT sign-in is the window's, on the desktop.
+fn account(s: &Session) -> Option<&'static str> {
+    if !s.assistant.window {
+        Some(NO_WINDOW)
+    } else if s.assistant.desktop_only {
+        Some(NEEDS_DESKTOP)
+    } else {
+        None
+    }
+}
+
+/// A sign-in can start, or the browser open again for the one that waits.
+fn can_sign_in(s: &Session) -> Option<&'static str> {
+    account(s).or((s.assistant.chatgpt == ChatGptStatus::SigningOut).then_some(SIGNING_OUT))
+}
+
+/// A sign-in waits for the browser.
+fn signing_in(s: &Session) -> Option<&'static str> {
+    account(s).or((s.assistant.chatgpt != ChatGptStatus::SigningIn).then_some(NO_SIGN_IN))
+}
+
+/// Someone is signed in, and nothing else is under way.
+fn can_sign_out(s: &Session) -> Option<&'static str> {
+    account(s).or(match s.assistant.chatgpt {
+        ChatGptStatus::SignedIn => None,
+        ChatGptStatus::SigningIn => Some(CANCEL_FIRST),
+        ChatGptStatus::SigningOut => Some(SIGNING_OUT),
+        ChatGptStatus::SignedOut => Some(NOT_SIGNED_IN),
+    })
 }
 
 /// An action on the selected text can start: [`can_ask`], with text selected.

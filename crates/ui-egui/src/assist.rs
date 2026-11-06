@@ -21,6 +21,9 @@
 //! The web app (#26) has the pane and the commands but no assistant: its backends would sign in
 //! through a loopback port or start agents, which take the desktop app ([`desktop`]). The pane
 //! says so, and the buttons' tooltips too.
+//!
+//! Signing in to ChatGPT (#19) is [`chatgpt`]'s: File › Options › Account and the pane start it,
+//! and [`tick`] takes how it ended, so ChatGPT is offered ready at once.
 
 use std::sync::Arc;
 
@@ -30,6 +33,8 @@ use wordcraft_engine::cmd::assist::AssistantStatus;
 use wordcraft_engine::room::Role;
 
 use crate::WordApp;
+
+pub(crate) mod chatgpt;
 
 /// Seconds between two askings of what is offered while the pane is open (a sign-in or an
 /// install done meanwhile shows up).
@@ -78,6 +83,8 @@ pub(crate) struct AssistState {
     /// the agents' settings file, never logged.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) setup: Option<crate::options::agent_setup::AgentSetup>,
+    /// The ChatGPT sign-in (#19): who is signed in, and a sign-in or sign-out under way.
+    pub(crate) chatgpt: chatgpt::ChatGptState,
 }
 
 /// One conversation, and the document it is about.
@@ -167,7 +174,7 @@ fn status(app: &WordApp) -> AssistantStatus {
     let live = app.conversation().filter(|a| !a.has_ended());
     let scripted = app.assist.next.is_some() && desktop(app);
     let ready = app.has_document() && (scripted || live.is_some() || chosen(app).is_some_and(|o| o.readiness == Readiness::Ready));
-    AssistantStatus { window: true, ready, busy: live.is_some_and(Assistant::is_busy), desktop_only: !desktop(app) }
+    AssistantStatus { window: true, ready, busy: live.is_some_and(Assistant::is_busy), desktop_only: !desktop(app), chatgpt: chatgpt::status(app) }
 }
 
 /// Every frame: take what came back, end a conversation whose shared document closed, ask
@@ -193,10 +200,13 @@ pub(crate) fn tick(app: &mut WordApp) {
             a.answer(id, Answer::Cancelled);
         }
     }
-    let stale = match app.assist.offers_at {
-        None => true,
-        Some(at) => app.session.view.assistant_pane && crate::clock::now_ms() - at > OFFERS_EVERY * 1000.0,
-    };
+    // A sign-in or a sign-out that ended changes what ChatGPT's offer says: ask again now.
+    let account_changed = chatgpt::tick(app);
+    let stale = account_changed
+        || match app.assist.offers_at {
+            None => true,
+            Some(at) => app.session.view.assistant_pane && crate::clock::now_ms() - at > OFFERS_EVERY * 1000.0,
+        };
     if stale {
         refresh_offers(app);
     }
@@ -271,6 +281,9 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
             let last = req.get("version").and_then(Value::as_u64).unwrap_or(0);
             show_change(app, req.get("from").and_then(Value::as_u64).unwrap_or(last), last)
         }
+        "chatgptSignIn" => chatgpt::sign_in(app),
+        "chatgptCancel" => chatgpt::cancel(app),
+        "chatgptSignOut" => chatgpt::sign_out(app),
         other => Err(format!("`{}`: not an assistant request", other.chars().take(40).collect::<String>())),
     };
     app.session.assistant = status(app);

@@ -1069,6 +1069,9 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "assist.backend"
             | "assist.defaultRole"
             | "assist.allowUnattended"
+            | "assist.chatgpt.signIn"
+            | "assist.chatgpt.cancelSignIn"
+            | "assist.chatgpt.signOut"
     ) || id.starts_with("help.")
 }
 

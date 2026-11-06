@@ -20,8 +20,10 @@
 //! `{"run": "assist.ask", "params": {"prompt": …}}`, and answers it per `assist.allowUnattended`
 //! in a program's: one from `engine.execute`, or typed with `ui.text` and sent with `ui.key`,
 //! which the window doesn't take as the person's). `{"run": id, "params": {…}}` runs command `id`
-//! as the person's own click does. `{"settingsDir": "/abs/dir"}` gives the window a settings
-//! folder (the agents' settings in File › Options › Assistant read and save there), and
+//! as the person's own click does (`WordApp::run`), for what a script may not do, such as
+//! signing in to ChatGPT (`assist.chatgpt.signIn`, #19; no browser opens here).
+//! `{"settingsDir": "/abs/dir"}` gives the window a settings folder (the agents' settings in
+//! File › Options › Assistant read and save there, and a ChatGPT sign-in is kept there), and
 //! `{"web": true}` has it offer what the web app does: no assistant.
 
 use wordcraft_engine::Session;
@@ -103,8 +105,10 @@ fn main() -> Result<(), String> {
             harness.state_mut().assist_with(Box::new(scripted_assistant(turns)?));
             step_n(&mut harness, 2);
         } else if let Some(id) = l.get("run").and_then(|v| v.as_str()) {
+            // A command as the person runs it, which a script can't: a prompt whose agent's
+            // permission requests the pane asks (#23), Continue with ChatGPT (#19).
             let r = harness.state_mut().run(id, l.get("params").cloned().unwrap_or_else(|| serde_json::json!({})));
-            println!("{id}: {r:?}");
+            println!("{id}: {}", r.map_or_else(|e| e, |v| v.to_string()));
             step_n(&mut harness, 2);
         } else if let Some(n) = l.get("steps").and_then(|v| v.as_u64()) {
             step_n(&mut harness, n as usize);

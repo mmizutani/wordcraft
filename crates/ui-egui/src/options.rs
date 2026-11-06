@@ -130,6 +130,7 @@ fn pane_label(id: &str) -> &'static str {
         "accessibility" => "Accessibility",
         "advanced" => "Advanced",
         "agents" => "Agents",
+        "account" => "Account",
         "assistant" => "Assistant",
         _ => "General",
     }
@@ -183,6 +184,7 @@ pub fn page(app: &mut WordApp, ui: &mut Ui) {
                 "accessibility" => accessibility(app, ui),
                 "advanced" => advanced(app, ui),
                 "agents" => agents(ui),
+                "account" => account(app, ui),
                 "assistant" => assistant(app, ui),
                 _ => general(app, ui),
             }
@@ -702,6 +704,27 @@ fn templates_folder(app: &mut WordApp, ui: &mut Ui) {
 fn agents(ui: &mut Ui) {
     section(ui, "Agents");
     ui.label(tl!("Every command is available to scripts and AI agents: run `wordcraft-cli mcp` for an MCP server, or start the app with `--control <port>` for the JSON control channel."));
+}
+
+/// The accounts the assistant signs in with (#19): ChatGPT's, with who is signed in, whether
+/// they let WordCraft use their plan, and Continue with ChatGPT or Sign Out. Desktop only, as
+/// the sign-in is (#26).
+fn account(app: &mut WordApp, ui: &mut Ui) {
+    section(ui, "ChatGPT");
+    if !crate::assist::desktop(app) {
+        note(ui, "Signing in to ChatGPT takes the WordCraft desktop app: a web page can't keep a sign-in safe.");
+        return;
+    }
+    if app.services.settings_dir.is_none() {
+        note(ui, "WordCraft has no settings folder here to keep a sign-in in.");
+        return;
+    }
+    crate::assist::chatgpt::controls(app, ui, false);
+    ui.add_space(8.0);
+    note(
+        ui,
+        "WordCraft keeps your sign-in in a file in its settings folder that only you can read, never in a document. Signing out deletes it and asks ChatGPT to end it.",
+    );
 }
 
 /// The built-in assistant (#15): the role assistants join a shared document with

@@ -58,6 +58,7 @@ to go on.
 
 | Id | Backend | What runs it |
 |---|---|---|
+| `chatgpt` | ChatGPT | your ChatGPT Plus or Pro plan, through Sign in with ChatGPT: see [Signing in to ChatGPT](#signing-in-to-chatgpt) |
 | `acp:claude-code` | Claude Code | its ACP adapter, `claude-agent-acp`, with your Claude sign-in |
 | `acp:codex` | Codex | its ACP adapter, `codex-acp`, with your ChatGPT sign-in or an API key |
 | `acp:pi` | Pi | its ACP adapter, `pi-acp`, which runs `pi` with the model providers you signed it in to |
@@ -72,6 +73,26 @@ first turn: the pane shows "Start Claude Code" while it starts) and speaks the A
 Protocol with over its standard input and output. The agent runs its own model loop with its own
 account; WordCraft gives it the document through its MCP server (Pi: through its shell, see
 [Pi](#pi)) and shows what it says, thinks, plans and does in the pane.
+
+### Signing in to ChatGPT
+
+File › Options › Account has **Continue with ChatGPT**, and so does the Assistant pane while
+ChatGPT waits for a sign-in. Your browser opens at ChatGPT's sign-in; WordCraft waits for it on
+a port of its own on `127.0.0.1` ("Waiting for your browser…", with Open the Browser Again and
+Cancel) and never holds up the window meanwhile. Once you have signed in, the page shows who is
+signed in and whether you let WordCraft use your plan, and ChatGPT is ready in the pane at once.
+Plan usage takes ChatGPT Plus or Pro: if you didn't allow it, the page says so, and **Sign In
+Again** asks you again. **Sign Out** deletes the sign-in and asks ChatGPT to end it; if ChatGPT
+can't be reached, the sign-in is deleted here anyway and the page says you can disconnect
+WordCraft in ChatGPT's settings.
+
+The sign-in is kept in `chatgpt-credentials.json` in the settings folder, which only you may
+read (mode 0600 on Unix), never in a document, a recovery copy or the log. Signing in and out
+are yours alone: `assist.chatgpt.signIn`, `assist.chatgpt.cancelSignIn` and
+`assist.chatgpt.signOut` run from the buttons, Search, the Quick Access Toolbar or a key of
+yours, and from a script or an agent (the control channel, MCP) they are an error, as is a click
+or key the control channel made. The address the browser opens may carry your last sign-in as a
+hint, so no command's answer holds it.
 
 ### Setting up an agent
 
@@ -233,7 +254,8 @@ The web app has the Assistant pane and every `assist.*` command, but no assistan
 The pane says the assistant needs the desktop app, without a role to choose; the prompt box's
 Send and the writing actions stay greyed out, their tooltips saying the same, and a script's
 `assist.ask` is refused with that reason. File › Options › Assistant has no role, permission or
-agent to set there, only the same reason.
+agent to set there, only the same reason, and
+File › Options › Account says signing in to ChatGPT takes the desktop app.
 Both kinds of backend are desktop only (`wordcraft_assist::offers::DESKTOP`: the web build
 compiles them out):
 

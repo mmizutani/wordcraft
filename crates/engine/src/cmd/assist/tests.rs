@@ -191,6 +191,8 @@ fn a_participants_copy_cant_run_the_assistant() {
             ("assist.backend", json!({"id": "fake"})),
             ("assist.defaultRole", json!({"value": "editor"})),
             ("assist.allowUnattended", json!({"value": true})),
+            ("assist.chatgpt.signIn", json!({})),
+            ("assist.chatgpt.signOut", json!({})),
             ("assist.showChange", json!({"version": 1})),
         ] {
             let why = disabled(copy.run(id, &v));
@@ -393,4 +395,40 @@ fn bad_action_params_are_refused_and_nothing_is_asked() {
         assert!(matches!(s.run(id, &bad), Err(CmdError::Params(_))), "{id} {bad}");
     }
     assert!(requests(&mut s).is_empty());
+}
+
+/// Sign in with ChatGPT (#19): the window's alone (it refuses a script's), greyed out where it
+/// can't be done, saying why, and each command hands the window its request.
+#[test]
+fn the_chatgpt_account_commands_ask_the_window_and_grey_out_with_the_sign_in() {
+    use super::ChatGptStatus::{SignedIn, SignedOut, SigningIn, SigningOut};
+    let ids = ["assist.chatgpt.signIn", "assist.chatgpt.cancelSignIn", "assist.chatgpt.signOut"];
+    // No window (the MCP server, `wordcraft-cli run`): nothing to sign in with.
+    let mut s = Session::new(Document::new());
+    for id in ids {
+        assert!(disabled(s.run(id, &json!({}))).contains("WordCraft window"), "{id}");
+    }
+    // The web app: the desktop app signs in.
+    s.assistant = AssistantStatus { window: true, desktop_only: true, ..AssistantStatus::default() };
+    for id in ids {
+        assert!(disabled(s.run(id, &json!({}))).contains("desktop app"), "{id}");
+    }
+    let mut s = in_window();
+    let why = |s: &Session| ids.map(|id| s.why_disabled(id));
+    s.assistant.chatgpt = SignedOut;
+    assert_eq!(why(&s), [None, Some(super::NO_SIGN_IN), Some(super::NOT_SIGNED_IN)]);
+    s.assistant.chatgpt = SigningIn;
+    assert_eq!(why(&s), [None, None, Some(super::CANCEL_FIRST)]);
+    s.assistant.chatgpt = SignedIn;
+    assert_eq!(why(&s), [None, Some(super::NO_SIGN_IN), None]);
+    s.assistant.chatgpt = SigningOut;
+    assert_eq!(why(&s), [Some(super::SIGNING_OUT), Some(super::NO_SIGN_IN), Some(super::SIGNING_OUT)]);
+    // Each asks the window, which does it, and changes nothing in the document.
+    s.assistant.chatgpt = SigningIn;
+    assert_eq!(s.run("assist.chatgpt.signIn", &json!({"junk": [1, 2]})).unwrap(), json!({"signingIn": true}));
+    s.run("assist.chatgpt.cancelSignIn", &json!(null)).unwrap();
+    s.assistant.chatgpt = SignedIn;
+    s.run("assist.chatgpt.signOut", &json!({})).unwrap();
+    assert_eq!(requests(&mut s), [json!({"assist": "chatgptSignIn"}), json!({"assist": "chatgptCancel"}), json!({"assist": "chatgptSignOut"})]);
+    assert!(!s.can_undo() && !s.dirty);
 }
