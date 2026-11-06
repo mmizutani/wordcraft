@@ -285,6 +285,25 @@ fn faked_for(h: &mut egui_kittest::Harness<'static, WordApp>, method: &str, para
     }
 }
 
+/// The value of the custom agent's first variable, as the page holds it.
+fn first_value(h: &egui_kittest::Harness<'static, WordApp>) -> String {
+    draft_of(h, "custom").env.first().map(|v| v.value.clone()).unwrap_or_default()
+}
+
+/// Whether any widget has keyboard focus.
+fn focused(h: &egui_kittest::Harness<'static, WordApp>) -> bool {
+    h.ctx.memory(|m| m.focused()).is_some()
+}
+
+/// The person's own click at `pos`: a press and, a pass later, its release.
+fn person_click(h: &mut egui_kittest::Harness<'static, WordApp>, pos: egui::Pos2) {
+    h.event(egui::Event::PointerMoved(pos));
+    h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(1);
+}
+
 /// A click the control channel makes at `pos`.
 fn faked_click(h: &mut egui_kittest::Harness<'static, WordApp>, pos: egui::Pos2) {
     faked(h, "ui.click", json!({"x": pos.x, "y": pos.y}));
@@ -823,10 +842,12 @@ fn variables_merge_one_by_one_with_renames_and_swaps() {
     assert_eq!(env_over(&file, &read, &page, "x").unwrap(), map(&[("A", "1"), ("B", "2"), ("Z", "z")]));
 }
 
-/// confirmed[0]: the control channel can't move the person's focus or selection on the page: a
-/// faked click or Tab is put back, so the person's next keys go where they were going.
+/// Control-channel input lets go of keyboard focus and of the focused field's selection: a
+/// faked click, Tab, Shift+Tab or select-all never leaves the person's next keys going into a
+/// field (or button) it picked, nor replacing their text; the person clicks their field again.
+/// (Second and fourth reviews: before, an agent's click left focus in the plain Command field.)
 #[test]
-fn control_channel_focus_and_selection_are_put_back() {
+fn control_channel_input_lets_go_of_focus_and_selection() {
     let dir = folder("faked-focus");
     let mut h = harness(Some(&dir));
     open(&mut h, "Custom agent");
@@ -838,29 +859,35 @@ fn control_channel_focus_and_selection_are_put_back() {
     let command = h.get_by_label("Command:").rect().center();
     faked_click(&mut h, command);
     assert!(showing(&h, "Only you can change the agents' settings") > 0, "the page says why");
+    assert!(!focused(&h), "nothing has focus");
     h.event(egui::Event::Text(SECRET.into()));
     h.run_steps(2);
     assert!(!draft_of(&h, "custom").command.contains(SECRET), "the key never lands in the command");
-    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}").as_str()), "it goes on in its field");
+    assert_eq!(first_value(&h), "sk-", "nor anywhere: the person clicks their field again");
+    type_value(&mut h, 0, SECRET);
+    assert_eq!(first_value(&h), format!("sk-{SECRET}"), "and goes on there");
     // A faked Tab onto Remove, then the person's Space: nothing is removed.
     faked(&mut h, "ui.key", json!({"key": "Tab"}));
     h.key_press(egui::Key::Space);
     h.run_steps(2);
     assert_eq!(draft_of(&h, "custom").env.len(), 1, "Space didn't press Remove");
-    // A faked Shift+Tab (egui moves focus at the next pass): the person's next characters still
-    // go on in their field, not into its name.
+    // A faked Shift+Tab (egui moves focus at the next pass): the person's next characters go
+    // nowhere, not into the variable's name.
+    type_value(&mut h, 0, "");
     faked(&mut h, "ui.key", json!({"key": "Tab", "shift": true}));
+    assert!(!focused(&h), "nothing has focus");
     h.event(egui::Event::Text("x".into()));
     h.run_steps(2);
     assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.name.as_str()), Some("API_KEY"), "the name is as typed");
-    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}x").as_str()));
-    // A faked select-all in the person's field: their next character doesn't replace the key.
-    let before = draft_of(&h, "custom").env.first().map(|v| v.value.clone()).unwrap();
+    // A faked select-all in the person's field: their next character replaces nothing, and
+    // back in the field, they type on at its end.
+    type_value(&mut h, 0, "");
     faked(&mut h, "ui.key", json!({"key": "a", "cmd": true}));
     h.event(egui::Event::Text("Z".into()));
     h.run_steps(2);
-    let after = draft_of(&h, "custom").env.first().map(|v| v.value.clone()).unwrap();
-    assert!(after.starts_with(&before), "the selection was put back: {} → {} characters", before.len(), after.len());
+    assert_eq!(first_value(&h), format!("sk-{SECRET}"), "the key isn't replaced");
+    type_value(&mut h, 0, "Z");
+    assert_eq!(first_value(&h), format!("sk-{SECRET}Z"), "no selection is left");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1060,13 +1087,24 @@ fn save_measures_what_it_writes() {
     type_into(&mut h, "Name", 0, "BIG");
     type_value(&mut h, 0, &"x".repeat(4_000));
     assert!(showing(&h, "1 MiB") > 0, "the page says why");
+    assert!(showing(&h, "click Check again") > 0, "and what to do");
     assert!(button(&h, "Save").accesskit_node().is_disabled(), "and keeps Save off");
     assert_eq!(std::fs::read(dir.join(SETTINGS_FILE)).unwrap(), before);
+    // Fourth review confirmed[0]: the person makes room in the file and clicks Check again: Save
+    // is on, and saves what they typed.
+    std::fs::write(dir.join(SETTINGS_FILE), r#"{"agents": {}}"#).unwrap();
+    button(&h, "Check again").click();
+    h.run_steps(4);
+    assert!(!button(&h, "Save").accesskit_node().is_disabled(), "Save is on again");
+    button(&h, "Save").click();
+    h.run_steps(4);
+    assert_eq!(AgentSettings::load(&dir).agent("codex").env.get("BIG").map(String::len), Some(4_000), "the typed value is saved");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// confirmed[2]: a press the control channel never releases can't take the person's keys: no
-/// drag of the field it pressed starts, and focus stays put back until it is released.
+/// Third review confirmed[2]: a press the control channel never releases can't take the
+/// person's keys: no drag of the field it pressed starts, and while it is held, focus is let go
+/// of each pass, so its release (the agent's or the person's) leaves nothing focused.
 #[test]
 fn a_control_press_never_released_cant_take_the_keys() {
     let dir = folder("held-press");
@@ -1081,26 +1119,25 @@ fn a_control_press_never_released_cant_take_the_keys() {
     h.event(egui::Event::Text(SECRET.into()));
     h.run_steps(2);
     assert!(!draft_of(&h, "custom").command.contains(SECRET), "the key never lands in the command");
-    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}").as_str()));
-    // Released: the click it makes is put back too.
+    assert!(!focused(&h), "nothing has focus while it is held");
+    // Released: its click leaves nothing focused either.
     faked(&mut h, "ui.release", json!({"x": c.x, "y": c.y}));
     h.event(egui::Event::Text("x".into()));
     h.run_steps(2);
     assert!(!draft_of(&h, "custom").command.contains('x'), "nor after the release");
-    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}x").as_str()));
-    // The person's own release soon after its press clicks the field it pressed: put back too.
+    // The person's own release soon after its press clicks the field it pressed: let go too.
     faked_for(&mut h, "ui.press", json!({"x": c.x, "y": c.y}), 3);
     h.event(egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
     h.run_steps(1);
     h.event(egui::Event::Text("y".into()));
     h.run_steps(2);
     assert!(!draft_of(&h, "custom").command.contains('y'), "nor after the person's release");
-    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}xy").as_str()));
+    assert_eq!(first_value(&h), "sk-", "and the key field is as the person left it");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// confirmed[3]: each window keeps its own put-back: one left in another window, where the page
-/// was then hidden, doesn't turn it off here.
+/// Third review confirmed[3]: what the control channel's input left in another window, where
+/// the page was then hidden, doesn't change what its input does here.
 #[test]
 fn another_windows_leftover_focus_doesnt_turn_the_put_back_off() {
     let dir = folder("two-windows");
@@ -1110,13 +1147,68 @@ fn another_windows_leftover_focus_doesnt_turn_the_put_back_off() {
     h.run_steps(3);
     type_into(&mut h, "Name", 0, "API_KEY");
     type_value(&mut h, 0, "sk-");
-    let leftover = super::Guard { focus: super::Focus { id: None, selection: None }, held: false, since: false };
-    h.state_mut().assist.setup.as_mut().unwrap().focus.insert(egui::ViewportId::from_hash_of("window A"), leftover);
+    h.state_mut().assist.setup.as_mut().unwrap().agent_input.insert(egui::ViewportId::from_hash_of("window A"), true);
     let command = h.get_by_label("Command:").rect().center();
     faked_click(&mut h, command);
     h.event(egui::Event::Text(SECRET.into()));
     h.run_steps(2);
     assert!(!draft_of(&h, "custom").command.contains(SECRET), "the key never lands in the command");
-    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}").as_str()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Fourth review (#24): each test below failed before its fix.
+
+/// confirmed[2]: a control step right after the person's release of a press the agent made
+/// doesn't make the field that release clicked the person's: nothing is left focused.
+#[test]
+fn a_control_step_after_the_persons_release_leaves_nothing_focused() {
+    let dir = folder("release-then-step");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "API_KEY");
+    type_value(&mut h, 0, "sk-");
+    let c = h.get_by_label("Command:").rect().center();
+    faked_for(&mut h, "ui.press", json!({"x": c.x, "y": c.y}), 3);
+    h.event(egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(1);
+    faked_for(&mut h, "ui.move", json!({"x": c.x, "y": c.y}), 3);
+    h.event(egui::Event::Text(SECRET.into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains(SECRET), "the key never lands in the command");
+    assert!(!focused(&h));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// confirmed[3]: the person's own click right after an agent's click stands: their keys go into
+/// the field they clicked, not back into the one they had before.
+#[test]
+fn the_persons_click_right_after_an_agents_click_stands() {
+    let dir = folder("click-after-click");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "API_KEY");
+    type_into(&mut h, "Command:", 0, "x");
+    let elsewhere = h.get_by_label_contains("Values are hidden here").rect().center();
+    faked_for(&mut h, "ui.click", json!({"x": elsewhere.x, "y": elsewhere.y}), 3);
+    let value = value_field(&h, 0).rect().center();
+    person_click(&mut h, value);
+    h.event(egui::Event::Text(SECRET.into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains(SECRET), "the key never lands in the command");
+    assert_eq!(first_value(&h), SECRET, "it goes where the person clicked");
+    // Exactly at the boundary, the person's click in the first pass after the agent's release
+    // (set up as that pass sees it: egui runs the release's pass again, which hides it here):
+    // letting go of what the agent left focused, at the start of that pass, leaves their click.
+    type_into(&mut h, "Command:", 0, "y");
+    h.state_mut().assist.setup.as_mut().unwrap().agent_input.insert(egui::ViewportId::ROOT, false);
+    person_click(&mut h, value);
+    h.event(egui::Event::Text("z".into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains('z'), "the key never lands in the command");
+    assert!(first_value(&h).contains('z'), "it goes where the person clicked");
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -255,14 +255,20 @@ impl AgentSettings {
         fits_in_a_file(file)
     }
 
-    /// Put the file [`AgentSettings::set_aside`] set aside in `dir` back, when no settings file
-    /// has taken its place: after a save that failed. Whether it was put back.
+    /// Put the file [`AgentSettings::set_aside`] set aside in `dir` back, after a save that
+    /// failed, never over a settings file that took its place (saved meanwhile by another
+    /// WordCraft, say): a hard link, which fails where a file is, then the aside name removed.
+    /// Whether it was put back; when not (a file is there, or `Err`: no hard links there), it
+    /// stays aside.
     pub fn put_back_aside(dir: &Path) -> std::io::Result<bool> {
-        let path = dir.join(SETTINGS_FILE);
-        if std::fs::symlink_metadata(&path).is_ok() {
-            return Ok(false);
+        let aside = dir.join(format!("{SETTINGS_FILE}{SET_ASIDE_SUFFIX}"));
+        match std::fs::hard_link(&aside, dir.join(SETTINGS_FILE)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(e) => return Err(e),
         }
-        std::fs::rename(dir.join(format!("{SETTINGS_FILE}{SET_ASIDE_SUFFIX}")), &path)?;
+        // Back under its name; a second name left over holds the same bytes.
+        let _ = std::fs::remove_file(&aside);
         Ok(true)
     }
 
