@@ -1520,6 +1520,37 @@ fn a_participants_changes_are_found_by_their_versions() {
     assert!(room.where_changed(3..=3, Some("Ana")).is_none(), "its text is gone");
 }
 
+/// Once a change's text is all taken out, the change is gone: text someone puts in at that place
+/// afterwards isn't shown as it (its ends were carried apart by that text before).
+#[test]
+fn text_put_in_where_a_change_was_taken_out_isnt_that_change() {
+    let room = Room::new(Document::from_text("one three"));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    // "big " can only have gone in at 4 ("two " could read as "wo t" at 5).
+    run(&mut a, "caret.set", json!({"pos": Pos::body(0, 4)}));
+    run(&mut a, "text.insert", json!({"text": "big "}));
+    a.send();
+    let put_in = room.version();
+    b.receive();
+    run(&mut b, "select.text", json!({"text": "big "}));
+    run(&mut b, "text.delete", json!({}));
+    b.send();
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    assert!(room.where_changed(put_in..=put_in, Some("Ana")).is_none(), "its text is gone");
+    let [a, mut b] = copies;
+    run(&mut b, "caret.set", json!({"pos": Pos::body(0, 4)}));
+    run(&mut b, "text.insert", json!({"text": "XY"}));
+    b.send();
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    let (_, doc) = room.document();
+    assert_eq!(doc.plain_text(StoryRef::Body), "one XYthree");
+    assert!(room.where_changed(put_in..=put_in, Some("Ana")).is_none(), "Ben's XY isn't Ana's change");
+    assert!(room.where_changed(put_in..=put_in, None).is_none());
+}
+
 /// A change is found again by the version it made, where its text is now: past the changes made
 /// after it, in its paragraph or across the paragraphs it put in, or where it took text out; a
 /// version the hub no longer keeps, or never had, finds nothing.

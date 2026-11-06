@@ -308,15 +308,8 @@ impl Room {
         let mut places = Vec::new();
         for (i, (start, end)) in spans {
             let after = changes.get(i.saturating_add(1)..).unwrap_or_default();
-            // Text put in right before the change's own isn't part of it: its start moves past
-            // that text, its end stays before text put in right after it.
-            let put_in = start != end;
-            let (Some(s), Some(e)) = (carry(start, after, put_in), carry(end, after, false)) else { continue };
-            if put_in && s == e {
-                // The text it put in or changed is gone (rejected, deleted).
-                continue;
-            }
-            places.extend([doc.place(s, None), doc.place(e, None)].into_iter().flatten());
+            let Some((s, e)) = carry(start, end, after) else { continue };
+            places.extend([doc.place(Mapped::At(s), None), doc.place(Mapped::At(e), None)].into_iter().flatten());
         }
         let story = if places.iter().any(|p| p.story == StoryRef::Body) { StoryRef::Body } else { places.first()?.story };
         let mut there = places.iter().filter(|p| p.story == story);
@@ -476,15 +469,23 @@ impl std::fmt::Debug for Lobby {
 /// Most places of a change [`Room::where_changed`] looks for.
 const MOST_PLACES: usize = 256;
 
-/// Where anchor `a` is once `after` (the changes accepted after it, in order) are in: `past`
-/// moves it past text put in right at it. `None` when its part is gone.
-fn carry(a: Anchor, after: &[hub::Accepted], past: bool) -> Option<Mapped> {
-    let mut m = Mapped::At(a);
+/// Where the span `start`..`end` a change put in or changed is once `after` (the changes
+/// accepted after it, in order) are in, its ends carried together: text put in right before
+/// the span isn't part of it (its start moves past that text), nor text put in right after it
+/// (its end stays before). `None` when its part is gone, or when it held text and a later
+/// change took all of that text out (rejected, deleted): text put in at that place afterwards
+/// isn't the change's either.
+fn carry(start: Anchor, end: Anchor, after: &[hub::Accepted]) -> Option<(Anchor, Anchor)> {
+    let held_text = start != end;
+    let (mut s, mut e) = (start, end);
     for later in after {
-        let a = anchor(m)?;
-        m = if past { later.change.map_past(a) } else { later.change.map(a) };
+        s = anchor(if held_text { later.change.map_past(s) } else { later.change.map(s) })?;
+        e = anchor(later.change.map(e))?;
+        if held_text && s == e {
+            return None;
+        }
     }
-    anchor(m).map(Mapped::At)
+    Some((s, e))
 }
 
 /// Mapped place `m` as an anchor: the start or the end of a block it is before or after.
