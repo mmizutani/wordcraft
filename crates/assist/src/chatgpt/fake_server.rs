@@ -3,7 +3,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,9 @@ pub(crate) enum Part {
     Wait(Duration),
     /// Send nothing more until the server stops (at most 30 seconds), then close.
     Hold,
+    /// Send these bytes again and again, with this wait between, until the server stops or the
+    /// client goes away (at most 30 seconds).
+    Trickle(Vec<u8>, Duration),
     /// Close the connection here, without ending the body.
     Cut,
 }
@@ -102,6 +105,8 @@ pub(crate) struct Server {
     base: String,
     requests: Arc<Mutex<Vec<Request>>>,
     stop: Arc<AtomicBool>,
+    /// Answers the client went away from before they were sent whole.
+    closed: Arc<AtomicUsize>,
 }
 
 impl Server {
@@ -111,20 +116,30 @@ impl Server {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests: Arc<Mutex<Vec<Request>>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicUsize::new(0));
         let handler: Arc<Handler> = Arc::new(handler);
-        let (seen, stopping) = (requests.clone(), stop.clone());
+        let (seen, stopping, gone) = (requests.clone(), stop.clone(), closed.clone());
         std::thread::spawn(move || {
             while !stopping.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let (seen, stopping, handler) = (seen.clone(), stopping.clone(), handler.clone());
-                        std::thread::spawn(move || serve(stream, &seen, &stopping, handler.as_ref()));
+                        let (seen, stopping, gone, handler) = (seen.clone(), stopping.clone(), gone.clone(), handler.clone());
+                        std::thread::spawn(move || {
+                            if !serve(stream, &seen, &stopping, handler.as_ref()) {
+                                gone.fetch_add(1, Ordering::Relaxed);
+                            }
+                        });
                     }
                     Err(_) => std::thread::sleep(Duration::from_millis(5)),
                 }
             }
         });
-        Server { base, requests, stop }
+        Server { base, requests, stop, closed }
+    }
+
+    /// How many answers the client went away from before they were sent whole.
+    pub(crate) fn closed(&self) -> usize {
+        self.closed.load(Ordering::Relaxed)
     }
 
     /// `http://127.0.0.1:<port>`.
@@ -149,11 +164,12 @@ impl Drop for Server {
     }
 }
 
-fn serve(mut stream: TcpStream, seen: &Mutex<Vec<Request>>, stop: &AtomicBool, handler: &Handler) {
+/// Answer one connection: false when the client went away before the answer was sent whole.
+fn serve(mut stream: TcpStream, seen: &Mutex<Vec<Request>>, stop: &AtomicBool, handler: &Handler) -> bool {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let Some(request) = read_request(&mut stream) else {
-        return;
+        return true;
     };
     let n = {
         let mut all = seen.lock().unwrap();
@@ -174,14 +190,11 @@ fn serve(mut stream: TcpStream, seen: &Mutex<Vec<Request>>, stop: &AtomicBool, h
         head.push_str(&format!("Content-Length: {length}\r\n\r\n"));
     }
     if stream.write_all(head.as_bytes()).is_err() {
-        return;
+        return false;
     }
     for part in reply.parts {
         let sent = match part {
-            Part::Bytes(b) if reply.chunked => {
-                stream.write_all(format!("{:x}\r\n", b.len()).as_bytes()).and_then(|()| stream.write_all(&b)).and_then(|()| stream.write_all(b"\r\n"))
-            }
-            Part::Bytes(b) => stream.write_all(&b),
+            Part::Bytes(b) => send(&mut stream, &b, reply.chunked),
             Part::Wait(d) => {
                 std::thread::sleep(d);
                 Ok(())
@@ -191,18 +204,41 @@ fn serve(mut stream: TcpStream, seen: &Mutex<Vec<Request>>, stop: &AtomicBool, h
                 while !stop.load(Ordering::Relaxed) && Instant::now() < until {
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                return;
+                return true;
             }
-            Part::Cut => return,
+            Part::Trickle(b, every) => {
+                let until = Instant::now() + Duration::from_secs(30);
+                while !stop.load(Ordering::Relaxed) && Instant::now() < until {
+                    if send(&mut stream, &b, reply.chunked).is_err() {
+                        return false;
+                    }
+                    std::thread::sleep(every);
+                }
+                return true;
+            }
+            Part::Cut => return true,
         };
-        if sent.and_then(|()| stream.flush()).is_err() {
-            return;
+        if sent.is_err() {
+            return false;
         }
     }
     if reply.chunked {
         let _ = stream.write_all(b"0\r\n\r\n");
     }
     let _ = stream.flush();
+    true
+}
+
+/// Send `b` (as a chunk of its own when `chunked`), and flush.
+fn send(stream: &mut TcpStream, b: &[u8], chunked: bool) -> std::io::Result<()> {
+    if chunked {
+        stream.write_all(format!("{:x}\r\n", b.len()).as_bytes())?;
+        stream.write_all(b)?;
+        stream.write_all(b"\r\n")?;
+    } else {
+        stream.write_all(b)?;
+    }
+    stream.flush()
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<Request> {

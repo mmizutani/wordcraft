@@ -3,7 +3,9 @@
 //!
 //! A line or an event longer than [`MAX_EVENT`], or a stream longer than [`MAX_STREAM`], is an
 //! error; comments (`:` lines, keep-alives) and the `event`, `id` and `retry` fields are skipped
-//! (each event's JSON says its type). The last event counts even without its blank line.
+//! (each event's JSON says its type). The last event counts even without its blank line. The
+//! reader's caller is asked before each read whether to go on, so a stream that sends only
+//! comments, or a byte at a time, can still be stopped.
 
 use std::io::{BufRead, BufReader, Read};
 
@@ -31,11 +33,11 @@ impl<R: Read> Events<R> {
         Events { reader: BufReader::with_capacity(64 << 10, reader), read: 0, data: Vec::new(), has_data: false, ended: false }
     }
 
-    /// The next event's data: None once the stream ended; an error when it can't be read or
-    /// is too long.
-    pub(crate) fn next_event(&mut self) -> Result<Option<String>, String> {
+    /// The next event's data: None once the stream ended; an error when it can't be read, is
+    /// too long, or `watch` (asked before each read) says to stop.
+    pub(crate) fn next_event(&mut self, watch: &mut impl FnMut() -> Result<(), String>) -> Result<Option<String>, String> {
         while !self.ended {
-            let Some(line) = self.line()? else {
+            let Some(line) = self.line(watch)? else {
                 self.ended = true;
                 break;
             };
@@ -76,9 +78,10 @@ impl<R: Read> Events<R> {
     }
 
     /// The next line without its end (`\n` or `\r\n`), or None at the stream's end.
-    fn line(&mut self) -> Result<Option<Vec<u8>>, String> {
+    fn line(&mut self, watch: &mut impl FnMut() -> Result<(), String>) -> Result<Option<Vec<u8>>, String> {
         let mut line = Vec::new();
         loop {
+            watch()?;
             let buf = match self.reader.fill_buf() {
                 Ok(b) => b,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -115,10 +118,14 @@ impl<R: Read> Events<R> {
 mod tests {
     use super::*;
 
+    fn go_on() -> Result<(), String> {
+        Ok(())
+    }
+
     fn all(bytes: &[u8]) -> Result<Vec<String>, String> {
         let mut events = Events::new(bytes);
         let mut out = Vec::new();
-        while let Some(e) = events.next_event()? {
+        while let Some(e) = events.next_event(&mut go_on)? {
             out.push(e);
         }
         Ok(out)
@@ -134,9 +141,42 @@ mod tests {
         assert_eq!(all(b"data: \xff\xfe\n\n").unwrap(), ["\u{fffd}\u{fffd}"]);
         // Once it ended, it stays ended.
         let mut events = Events::new(&b"data: a\n\n"[..]);
-        assert_eq!(events.next_event().unwrap().as_deref(), Some("a"));
-        assert_eq!(events.next_event().unwrap(), None);
-        assert_eq!(events.next_event().unwrap(), None);
+        assert_eq!(events.next_event(&mut go_on).unwrap().as_deref(), Some("a"));
+        assert_eq!(events.next_event(&mut go_on).unwrap(), None);
+        assert_eq!(events.next_event(&mut go_on).unwrap(), None);
+    }
+
+    /// A stream that sends one byte at a time, without end.
+    struct Trickle(u8);
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match buf.first_mut() {
+                Some(b) => {
+                    *b = self.0;
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn the_watch_is_asked_before_every_read_even_between_comments() {
+        // Blank lines without end, or a comment and then a line a byte at a time: the watch
+        // still stops it.
+        for endless in [Box::new(std::io::repeat(b'\n')) as Box<dyn Read>, Box::new(b": keep-alive\n".as_slice().chain(Trickle(b'x')))] {
+            let mut events = Events::new(endless);
+            let mut asked = 0;
+            let mut watch = || {
+                asked += 1;
+                if asked > 1000 { Err("stopped".to_string()) } else { Ok(()) }
+            };
+            assert_eq!(events.next_event(&mut watch), Err("stopped".to_string()));
+        }
+        // It is asked before the event it lets through, too.
+        let mut events = Events::new(&b"data: a\n\n"[..]);
+        assert_eq!(events.next_event(&mut || Err("no".to_string())), Err("no".to_string()));
     }
 
     #[test]

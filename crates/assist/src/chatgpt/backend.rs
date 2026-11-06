@@ -10,14 +10,21 @@
 //! Each request runs on a thread of its own, which takes the token (refreshing it, and once
 //! more when the API turns it away), sends, and reads the stream into a channel; the turn's
 //! thread reads the channel, and checks Stop every [`POLL`], so a Stop ends the turn at once
-//! even while the network hangs. Errors become plain sentences without tokens, and are retried
-//! as the API's error codes say (a busy plan with backoff; a usage limit never).
+//! even while the network hangs. The request thread stops once its attempt is over, however it
+//! ended (a later turn's start doesn't undo a Stop): a request whose token came after a Stop
+//! isn't sent, and a stream is let go of within one read. A stream has an hour in all, and five
+//! minutes between events (comments don't count). Errors become plain sentences without
+//! tokens, and are retried as the API's error codes say (a busy plan with backoff; a usage
+//! limit never).
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, channel, sync_channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -63,7 +70,8 @@ const MAX_REQUEST: usize = 16 << 20;
 /// Most attempts at one request.
 const MAX_ATTEMPTS: u32 = 4;
 
-/// How the turn's requests are retried (tests make them quick).
+/// How the turn's requests are retried and how long their answers may stream (tests make them
+/// quick).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Tuning {
     pub(crate) max_rounds: usize,
@@ -71,11 +79,21 @@ pub(crate) struct Tuning {
     pub(crate) backoff: Duration,
     /// Longest `Retry-After` waited for; a longer one ends the turn.
     pub(crate) max_wait: Duration,
+    /// Longest an answer streams in all.
+    pub(crate) max_stream: Duration,
+    /// Longest an answer streams without an event (comments, keep-alives, don't count).
+    pub(crate) max_quiet: Duration,
 }
 
 impl Default for Tuning {
     fn default() -> Self {
-        Tuning { max_rounds: MAX_ROUNDS, backoff: Duration::from_secs(1), max_wait: Duration::from_secs(20) }
+        Tuning {
+            max_rounds: MAX_ROUNDS,
+            backoff: Duration::from_secs(1),
+            max_wait: Duration::from_secs(20),
+            max_stream: Duration::from_secs(60 * 60),
+            max_quiet: Duration::from_secs(5 * 60),
+        }
     }
 }
 
@@ -237,12 +255,14 @@ impl ChatGpt {
         }
     }
 
-    /// One request: sent on a thread of its own, its stream read here as it comes.
+    /// One request: sent on a thread of its own, its stream read here as it comes. The thread
+    /// stops once this returns, however it returns.
     fn attempt(&self, ctx: &mut TurnCtx<'_>, body: Vec<u8>, progress: &mut Progress) -> Attempt {
         let (tx, rx) = sync_channel(64);
-        let job = Job { settings: self.settings.clone(), endpoints: self.endpoints.clone(), body };
-        let cancel = ctx.cancel().clone();
-        let spawned = std::thread::Builder::new().name("chatgpt request".into()).spawn(move || fetch(&job, &tx, &cancel));
+        let job = Job { settings: self.settings.clone(), endpoints: self.endpoints.clone(), body, tuning: self.tuning.clone() };
+        let over = Over(Arc::new(AtomicBool::new(false)));
+        let stop = Stop { over: over.0.clone(), cancel: ctx.cancel().clone() };
+        let spawned = std::thread::Builder::new().name("chatgpt request".into()).spawn(move || fetch(job, &tx, &stop));
         if let Err(e) = spawned {
             return Attempt::Failed(Failure::Network(format!("the request can't start here: {e}")), false);
         }
@@ -584,17 +604,43 @@ struct Job {
     settings: PathBuf,
     endpoints: Endpoints,
     body: Vec<u8>,
+    tuning: Tuning,
+}
+
+/// Whether a request thread stops: its attempt is over, or the turn was stopped. A later turn
+/// clearing the turn's [`Cancel`] doesn't undo the first.
+struct Stop {
+    over: Arc<AtomicBool>,
+    cancel: Cancel,
+}
+
+impl Stop {
+    fn is_set(&self) -> bool {
+        self.over.load(Ordering::Relaxed) || self.cancel.is_set()
+    }
+}
+
+/// An attempt that isn't over yet: it is, once this is dropped.
+struct Over(Arc<AtomicBool>);
+
+impl Drop for Over {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// The request thread: take the token, send, and read the answer into `tx`. A token the API
-/// turns away is refreshed, and the request sent again, once.
-fn fetch(job: &Job, tx: &SyncSender<Msg>, cancel: &Cancel) {
+/// turns away is refreshed, and the request sent again, once. Nothing is sent once `stop` is
+/// set, and the body is let go of once it was taken.
+fn fetch(job: Job, tx: &SyncSender<Msg>, stop: &Stop) {
+    let Job { settings, endpoints, body, tuning } = job;
+    let mut body = Some(body);
     let mut refused: Option<String> = None;
     for _ in 0..2 {
-        if cancel.is_set() {
+        if stop.is_set() {
             return;
         }
-        let token = match access_token(&job.settings, &job.endpoints, refused.as_deref()) {
+        let token = match access_token(&settings, &endpoints, refused.as_deref()) {
             Ok(c) if !c.plan_usage() => Err(AuthError::Denied),
             Ok(c) => Ok(c.access_token),
             Err(e) => Err(e),
@@ -606,14 +652,18 @@ fn fetch(job: &Job, tx: &SyncSender<Msg>, cancel: &Cancel) {
                 return;
             }
         };
-        let agent = http::agent(job.endpoints.is_local(), true);
-        let url = format!("{}/responses", job.endpoints.api.trim_end_matches('/'));
+        // Stopped while the token was taken (a refresh, or a wait for another one): not sent.
+        if stop.is_set() {
+            return;
+        }
+        let agent = http::agent(endpoints.is_local(), true);
+        let url = format!("{}/responses", endpoints.api.trim_end_matches('/'));
         let sent = agent
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
-            .send(job.body.as_slice());
+            .send(body.as_deref().unwrap_or_default());
         let response = match sent {
             Ok(r) => r,
             Err(e) => {
@@ -627,6 +677,8 @@ fn fetch(job: &Job, tx: &SyncSender<Msg>, cancel: &Cancel) {
             refused = Some(token);
             continue;
         }
+        // Taken: not kept for as long as the answer streams.
+        drop(body.take());
         if !(200..300).contains(&status) {
             let mut reply = http::read(response, http::MAX_ERROR_BODY).unwrap_or(Reply { status, ..Reply::default() });
             // A server that repeats the token back doesn't get it shown.
@@ -634,27 +686,53 @@ fn fetch(job: &Job, tx: &SyncSender<Msg>, cancel: &Cancel) {
             let _ = tx.send(Msg::Refused(reply));
             return;
         }
-        stream(http::body_reader(response), tx, cancel);
+        stream(http::body_reader(response), tx, stop, &tuning);
         return;
     }
 }
 
-/// Read the stream's events into `tx` until it ends, breaks, the turn stops, or nobody reads.
-fn stream(reader: impl Read, tx: &SyncSender<Msg>, cancel: &Cancel) {
+/// Read the stream's events into `tx` until it ends, breaks, `stop` is set, or nobody reads.
+/// `stop` is looked at before each read (the stream is let go of within one), and so are the
+/// limits: [`Tuning::max_stream`] in all, [`Tuning::max_quiet`] without an event.
+fn stream(reader: impl Read, tx: &SyncSender<Msg>, stop: &Stop, tuning: &Tuning) {
     let mut events = sse::Events::new(reader);
-    loop {
-        if cancel.is_set() {
-            return;
+    let started = Instant::now();
+    let last_event = Cell::new(started);
+    let mut watch = || {
+        if stop.is_set() {
+            return Err(String::new());
         }
-        let msg = match events.next_event() {
-            Ok(Some(data)) => Msg::Data(data),
+        if started.elapsed() > tuning.max_stream {
+            return Err(format!("it took longer than {}", span(tuning.max_stream)));
+        }
+        if last_event.get().elapsed() > tuning.max_quiet {
+            return Err(format!("it sent nothing for {}", span(tuning.max_quiet)));
+        }
+        Ok(())
+    };
+    loop {
+        let msg = match events.next_event(&mut watch) {
+            Ok(Some(data)) => {
+                last_event.set(Instant::now());
+                Msg::Data(data)
+            }
             Ok(None) => Msg::End,
+            Err(_) if stop.is_set() => return,
             Err(why) => Msg::Broken(why),
         };
         let last = !matches!(msg, Msg::Data(_));
         if tx.send(msg).is_err() || last {
             return;
         }
+    }
+}
+
+/// `d` as the person reads it: `300 ms`, `20 s`, `5 min`.
+fn span(d: Duration) -> String {
+    match d.as_secs() {
+        0 => format!("{} ms", d.as_millis()),
+        s if s < 120 => format!("{s} s"),
+        s => format!("{} min", s / 60),
     }
 }
 
@@ -667,6 +745,9 @@ fn next(rx: &Receiver<Msg>, ctx: &TurnCtx<'_>) -> Option<Msg> {
         match rx.recv_timeout(POLL) {
             Ok(msg) => return Some(msg),
             Err(RecvTimeoutError::Timeout) => {}
+            // A request thread stops without a word when the turn was stopped, and may see the
+            // Stop before this does.
+            Err(RecvTimeoutError::Disconnected) if ctx.is_cancelled() => return None,
             Err(RecvTimeoutError::Disconnected) => return Some(Msg::Broken("the request stopped unexpectedly".into())),
         }
     }

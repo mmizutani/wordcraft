@@ -3,6 +3,7 @@
 //! and the history.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -12,8 +13,8 @@ use wordcraft_engine::room::{Replica, Room};
 
 use super::backend::Tuning;
 use super::fake_server::{Part, Reply, Request, Server};
-use super::tests::{Folder, Script, WAIT, no_api, signed_in};
-use super::{AUTHOR, ChatGpt, Endpoints, ID, USAGE_PAGE};
+use super::tests::{Folder, Script, WAIT, eventually, expire, no_api, signed_in};
+use super::{AUTHOR, ChatGpt, Endpoints, ID, USAGE_PAGE, choose_model};
 use crate::{Assistant, Backend, Entry, Options, StopReason, ToolStatus};
 
 /// The window: its session, showing `text`, shared under the name Minoru.
@@ -65,7 +66,7 @@ struct Chat {
 }
 
 fn quick() -> Tuning {
-    Tuning { max_rounds: 25, backoff: Duration::from_millis(10), max_wait: Duration::from_secs(2) }
+    Tuning { max_rounds: 25, backoff: Duration::from_millis(10), max_wait: Duration::from_secs(2), ..Tuning::default() }
 }
 
 /// A conversation in a window showing `text`, whose `/v1/responses` answers come from `api`.
@@ -107,6 +108,16 @@ impl Chat {
 
     fn answer(&self) -> Option<String> {
         self.assistant.transcript().last_answer()
+    }
+
+    /// Frames until the turn shows some of its answer.
+    fn wait_for_answer(&mut self) {
+        let until = Instant::now() + WAIT;
+        while self.answer().is_none() {
+            assert!(Instant::now() < until, "nothing streamed");
+            self.assistant.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// The last turn's error.
@@ -350,37 +361,92 @@ fn junk_tool_calls_get_error_outputs_and_the_history_stays_whole() {
 }
 
 #[test]
-fn stop_ends_the_turn_at_once_mid_stream_and_before_the_answer_starts() {
+fn stop_ends_the_turn_mid_stream_and_before_the_answer_starts_without_waiting_for_the_server() {
+    // The server holds the stream open for longer than the test waits (30 s): only Stop can end
+    // the turn in time.
     let held = Reply::stream(vec![event(&created()), event(&delta("Partial")), Part::Hold]);
     let mut c = chat("one two three", replies(vec![held, says("After.")]));
     c.assistant.ask("Write a lot", None).unwrap();
-    let until = Instant::now() + WAIT;
-    while c.answer().is_none() {
-        assert!(Instant::now() < until, "nothing streamed");
-        c.assistant.poll();
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let stopping = Instant::now();
+    c.wait_for_answer();
     c.assistant.cancel();
-    assert!(c.assistant.wait_idle(WAIT));
-    assert!(stopping.elapsed() < Duration::from_secs(2), "{:?}", stopping.elapsed());
+    assert!(c.assistant.wait_idle(WAIT), "the stop waited for the server");
     assert_eq!(c.stopped(), Some(StopReason::Cancelled));
     assert_eq!(c.answer().as_deref(), Some("Partial"));
     // The conversation goes on.
     c.ask("Go on");
     assert_eq!(c.answer().as_deref(), Some("After."));
-    // A server that doesn't answer at all.
-    let mut c = chat("one", |_, _| {
-        std::thread::sleep(Duration::from_secs(4));
+    // A server that doesn't answer at all (until the test lets it, once the turn has ended).
+    let release = Arc::new(AtomicBool::new(false));
+    let late = release.clone();
+    let mut c = chat("one", move |_, _| {
+        let until = Instant::now() + Duration::from_secs(30);
+        while !late.load(Ordering::Relaxed) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         says("Too late.")
     });
     c.assistant.ask("Hello", None).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
-    let stopping = Instant::now();
+    eventually("the request is sent", || c.server.to("/v1/responses").len() == 1);
+    c.assistant.cancel();
+    assert!(c.assistant.wait_idle(WAIT), "the stop waited for the server");
+    assert_eq!(c.stopped(), Some(StopReason::Cancelled));
+    release.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn a_stop_while_the_token_is_renewed_sends_nothing_even_once_the_next_turn_starts() {
+    let mut c = chat("x", replies(vec![says("After.")]));
+    choose_model(c.folder.path(), Some("gpt-test")).unwrap();
+    expire(c.folder.path());
+    *c.script.slow.lock().unwrap() = Duration::from_secs(1);
+    c.assistant.ask("Hello", None).unwrap();
+    eventually("the token is being renewed", || c.server.to("/oauth/token").len() == 2);
     c.assistant.cancel();
     assert!(c.assistant.wait_idle(WAIT));
-    assert!(stopping.elapsed() < Duration::from_secs(1), "{:?}", stopping.elapsed());
     assert_eq!(c.stopped(), Some(StopReason::Cancelled));
+    // Asked again at once: the new turn starts (and clears the stop) while the stopped one still
+    // renews the token. Only the new turn's request goes out.
+    *c.script.slow.lock().unwrap() = Duration::ZERO;
+    c.ask("Go on");
+    assert_eq!(c.answer().as_deref(), Some("After."));
+    assert_eq!(c.bodies().len(), 1, "{:?}", c.bodies());
+    assert_eq!(bodies_input(&c, 0), [user("Go on")]);
+}
+
+#[test]
+fn stop_lets_go_of_a_stream_that_only_trickles_comments() {
+    let keep_alive = Part::Trickle(b": keep-alive\n".to_vec(), Duration::from_millis(20));
+    let trickle = Reply::stream(vec![event(&created()), event(&delta("Partial")), keep_alive]);
+    let mut c = chat("x", replies(vec![trickle]));
+    c.assistant.ask("Write", None).unwrap();
+    c.wait_for_answer();
+    c.assistant.cancel();
+    assert!(c.assistant.wait_idle(WAIT));
+    assert_eq!(c.stopped(), Some(StopReason::Cancelled), "{:?}", c.error());
+    // The request thread lets go of the connection: the server's next keep-alive can't be sent.
+    eventually("the stream is let go of", || c.server.closed() == 1);
+}
+
+#[test]
+fn a_stream_that_goes_quiet_or_runs_too_long_breaks_off() {
+    // Only keep-alives after the start, for longer than an answer may go without an event
+    // (nothing was shown, so it is tried once more).
+    let quiet = Reply::stream(vec![event(&created()), Part::Trickle(b": keep-alive\n".to_vec(), Duration::from_millis(20))]);
+    let tuning = Tuning { max_quiet: Duration::from_millis(300), ..quick() };
+    let mut c = chat_with("x", tuning, replies(vec![quiet]), |e| e);
+    c.ask("Hi");
+    let e = c.error().unwrap();
+    assert!(e.contains("cut off") && e.contains("sent nothing for 300 ms"), "{e}");
+    assert_eq!(c.bodies().len(), 2);
+    // Text that keeps trickling in for longer than an answer may take: what came stays.
+    let endless = Reply::stream(vec![event(&created()), Part::Trickle(format!("data: {}\n\n", delta("a")).into_bytes(), Duration::from_millis(20))]);
+    let tuning = Tuning { max_stream: Duration::from_secs(1), ..quick() };
+    let mut c = chat_with("x", tuning, replies(vec![endless]), |e| e);
+    c.ask("Hi");
+    let e = c.error().unwrap();
+    assert!(e.contains("cut off") && e.contains("took longer than 1 s"), "{e}");
+    assert!(c.answer().is_some_and(|a| !a.is_empty() && a.chars().all(|ch| ch == 'a')), "{:?}", c.answer());
+    assert_eq!(c.bodies().len(), 1);
 }
 
 #[test]
@@ -547,6 +613,17 @@ fn a_turned_away_token_is_refreshed_once_and_then_the_person_signs_in_again() {
     assert_eq!(super::account(c.folder.path()), None);
     c.ask("Hello?");
     assert!(c.error().unwrap().starts_with("Sign in with ChatGPT first"), "{:?}", c.error());
+}
+
+#[test]
+fn a_models_list_that_turns_the_token_away_doesnt_end_the_sign_in() {
+    let mut c = chat("x", replies(vec![says("Here.")]));
+    c.script.turned_away.lock().unwrap().push("access-0".into());
+    c.ask("Hello");
+    assert_eq!(c.answer().as_deref(), Some("Here."), "{:?}", c.error());
+    assert_eq!(c.server.to("/oauth/token").len(), 2, "the exchange, then one refresh");
+    assert_eq!(c.server.to("/v1/responses")[0].header("authorization"), Some("Bearer access-1"));
+    assert!(super::account(c.folder.path()).is_some());
 }
 
 #[test]
