@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use wordcraft_assist::acp::fake_agent::{Call, SCRIPT_VAR, Script, Step};
 use wordcraft_assist::acp::presets::{AgentPrefs, AgentSettings};
 use wordcraft_assist::acp::{Acp, AgentSpec, Launch, Reach, RoomPort};
-use wordcraft_assist::{Assistant, Host, Options, Readiness};
+use wordcraft_assist::{Answer, Assistant, Host, Options, PermissionPolicy, Readiness};
 use wordcraft_doc::{Document, StoryRef};
 use wordcraft_engine::Session;
 use wordcraft_engine::room::{Lobby, Replica, Role, Room};
@@ -165,6 +165,49 @@ fn each_turn_selects_the_persons_range_in_the_agents_mcp_copy() {
         assert_eq!(w.accepted(), expected);
     }
     assert!(w.authors().iter().all(|author| author == "Fake Agent"));
+    a.end();
+}
+
+#[test]
+fn the_selected_range_follows_edits_while_the_agent_waits_for_sign_in() {
+    let mut w = Window::new();
+    let script = Script {
+        needs_auth: true,
+        auth_methods: vec!["browser".into()],
+        turns: vec![vec![Step::Mcp { calls: vec![Call::new("type_text", json!({"text": "3"}))] }]],
+        ..Script::default()
+    };
+    w.own.lend(&mut w.session, |copy| copy.run("select.text", &json!({"text": "three"}))).unwrap().unwrap();
+    let anchor = w.session.doc.anchor_at(&w.session.sel.anchor).unwrap();
+    let focus = w.session.doc.anchor_at(&w.session.sel.focus).unwrap();
+    let options = Options { permissions: PermissionPolicy::Ask, ..Options::default() };
+    let mut a = Assistant::start(&w.room, Box::new(Acp::new(w.agent(&script))), options).unwrap();
+    a.ask_at("Rewrite the selected text", None, Some((anchor, focus))).unwrap();
+    let until = Instant::now() + WAIT;
+    loop {
+        a.poll();
+        if a.pending_permission().is_some() {
+            break;
+        }
+        assert!(Instant::now() < until, "the sign-in question never arrived");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    w.own
+        .lend(&mut w.session, |copy| {
+            copy.run("caret.docStart", &json!({}))?;
+            copy.run("text.insert", &json!({"text": "Oh, "}))
+        })
+        .unwrap()
+        .unwrap();
+    w.settle();
+    assert_eq!(w.accepted(), "Oh, one two three");
+    assert_eq!(request(&w.port, a.key(), "document.inspect")["ok"], true, "the agent's copy has received the edit before sign-in finishes");
+    let id = a.pending_permission().unwrap().id;
+    assert!(a.answer(id, Answer::Selected { option: "browser".into() }));
+    assert!(a.wait_idle(WAIT), "the turn did not end");
+    assert!(a.transcript().last_answer().unwrap_or_default().contains("type_text: ok"));
+    w.settle();
+    assert_eq!(w.accepted(), "Oh, one two 3");
     a.end();
 }
 

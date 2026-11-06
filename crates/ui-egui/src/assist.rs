@@ -268,7 +268,18 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     // paragraphs moved with edits it has and the window hasn't yet.
     let doc = &app.session.doc;
     let (anchor, focus) = if at_end {
-        let end = app.session.sel.ordered().1;
+        let (start, mut end) = app.session.sel.ordered();
+        // Select Paragraph includes the next sibling's start; insert before the selected paragraph's mark.
+        if start.story == end.story
+            && start.path != end.path
+            && end.off == 0
+            && let Some(i) = end.path.last().checked_sub(1)
+            && let previous = end.path.with_last(i)
+            && let Some(p) = doc.para(end.story, &previous)
+        {
+            end.off = p.len();
+            end.path = previous;
+        }
         (end.clone(), end)
     } else {
         (app.session.sel.anchor.clone(), app.session.sel.focus.clone())

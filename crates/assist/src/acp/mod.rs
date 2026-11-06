@@ -597,6 +597,13 @@ impl Backend for Acp {
                 None => note.clone(),
             });
         }
+        if let Some((anchor, focus)) = turn.selection
+            && let Some((_, room)) = self.spec.reach.checked()?
+        {
+            let seat = self.seat.as_ref().ok_or("the assistant has no seat in the shared document")?;
+            let mut remote = wordcraft_mcp::Remote::connect_with_key(&room.to_string(), &seat.key).map_err(|e| e.to_string())?;
+            remote.call("select.range", json!({"anchor": anchor, "focus": focus}))?;
+        }
         // An agent that stopped since the last turn starts again.
         if self.running.as_mut().is_some_and(|r| !r.process.is_running()) {
             self.stop_agent(STUCK_GRACE);
@@ -604,13 +611,6 @@ impl Backend for Acp {
         let fresh = self.running.is_none();
         if fresh && !self.start_shown(ctx)? {
             return Ok(StopReason::Cancelled);
-        }
-        if let Some((anchor, focus)) = turn.selection
-            && let Some((_, room)) = self.spec.reach.checked()?
-        {
-            let seat = self.seat.as_ref().ok_or("the assistant has no seat in the shared document")?;
-            let mut remote = wordcraft_mcp::Remote::connect_with_key(&room.to_string(), &seat.key).map_err(|e| e.to_string())?;
-            remote.call("select.range", json!({"anchor": anchor, "focus": focus}))?;
         }
         // A new session gets the note, which the agent's model reads first.
         let note = if fresh { self.note.as_deref() } else { None };

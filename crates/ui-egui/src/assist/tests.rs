@@ -338,6 +338,47 @@ fn draft_writes_at_the_caret() {
 }
 
 #[test]
+fn writing_after_a_selected_paragraph_stays_before_the_next_paragraph() {
+    for (id, params, steps, expected) in [
+        (
+            "assist.draft",
+            json!({"about": "a date"}),
+            vec![Step::tool("type_text", json!({"text": " (May 2)"}))],
+            "First. (May 2)\nRent is the obvious reason.",
+        ),
+        (
+            "assist.summarize",
+            json!({"insert": true}),
+            vec![Step::tool("execute", json!({"command": "text.newParagraph"})), Step::tool("type_text", json!({"text": "In short: rent."}))],
+            "First.\nIn short: rent.\nRent is the obvious reason.",
+        ),
+    ] {
+        let mut a = window("First.\nRent is the obvious reason.");
+        a.execute("select.paragraph", json!({})).unwrap();
+        assert_eq!(a.session.sel.ordered().1, wordcraft_doc::Pos::body(1, 0));
+        act(&mut a, id, params, steps);
+        assert_eq!(accepted(&a), expected, "{id}");
+    }
+}
+
+#[test]
+fn user_ask_and_draft_open_the_prompt_while_scripts_require_parameters() {
+    let mut a = window("one two three");
+    super::tick(&mut a);
+    for (id, draft) in [("assist.draft", true), ("assist.ask", false)] {
+        a.session.view.assistant_pane = false;
+        a.assist.draft = !draft;
+        a.assist.focus_prompt = 0;
+        assert!(a.execute(id, json!({})).is_err(), "{id}: scripts still need text");
+        assert_eq!(a.run(id, json!({})).unwrap(), json!({"pending": "assistant"}));
+        assert!(a.session.view.assistant_pane, "{id}");
+        assert_eq!(a.assist.draft, draft, "{id}");
+        assert!(a.assist.focus_prompt > 0, "{id}");
+        assert!(a.conversation().is_none(), "{id}: opening the box does not ask a question");
+    }
+}
+
+#[test]
 fn summarize_comments_on_the_selection_or_writes_after_it() {
     let mut a = selected("Rent is the obvious reason.");
     let comment = Step::tool("execute", json!({"command": "review.newComment", "params": {"text": "Why rent isn't the reason."}}));

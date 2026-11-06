@@ -44,6 +44,13 @@ impl WordApp {
             self.dialog = dialogs::Dialog::open(name, self);
             return Ok(json!({"pending": name}));
         }
+        if ((id == "assist.draft" && params.get("about").is_none()) || (id == "assist.ask" && params.get("prompt").is_none()))
+            && widgets::enabled(self, id)
+        {
+            self.run("assist.pane", json!({"value": true}))?;
+            self.assist.draft = id == "assist.draft";
+            return Ok(json!({"pending": "assistant"}));
+        }
         // What agents changed in a shared document since the last frame counts as unsaved.
         if discards_document(id, &params) {
             self.catch_up_share();
