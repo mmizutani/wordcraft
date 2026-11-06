@@ -264,6 +264,21 @@ document is shared.
 `wordcraft-cli mcp --connect 127.0.0.1:7981` with `WORDCRAFT_CONTROL_KEY` set to the invite's
 key gives an agent its copy through MCP's tools (see [MCP](mcp.md#shared-documents)).
 
+### The room's own port
+
+The desktop app also listens for the shared document's room alone, on `127.0.0.1` and a port
+the system picks, whether or not it runs with `--control`. The built-in assistant's agents reach
+their copies there: an agent gets `wordcraft-cli mcp --connect 127.0.0.1:<port>` with its
+invite's key in `WORDCRAFT_CONTROL_KEY`, and nothing else.
+
+It speaks this protocol, and only invites' keys open it: a connection's first request must carry
+one, and from then on it is served as above. The window's key opens nothing there (the port
+doesn't know it, and no key file names the port), nor does any other key, and while no document
+is shared no key does: the request gets `{"ok": false, "error": "unauthorized"}` and the
+connection closes. The limits are the control channel's: a line over 1 MiB, a line that isn't
+UTF-8 or JSON, or no request with an invite's key within 30 s of the connection being accepted
+closes it. At most 64 connections are served at once.
+
 ### Roles
 
 | Role | May |

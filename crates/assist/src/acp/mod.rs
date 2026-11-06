@@ -5,7 +5,11 @@
 //! The agent runs its own model loop with its own sign-in. WordCraft offers it no file and no
 //! terminal: it starts in a new empty folder of its own, and every request for the computer's
 //! files or a terminal is refused. It reaches the shared document as the participant the
-//! conversation joined as, through WordCraft's MCP server.
+//! conversation joined as ([`Reach`]): `session/new` gives it WordCraft's MCP server
+//! (`wordcraft-cli mcp --connect`), which joins the room at its own port ([`RoomPort`]) with
+//! the invite's key, and so works on a copy of its own, held to its role, reaching no file. The
+//! window's own key reaches the agent by no path: not in `session/new`, not in its environment
+//! (WordCraft's `WORDCRAFT_*` variables are left out), and the room's port doesn't take it.
 //!
 //! The agent starts with the conversation's first turn, so Stop can interrupt it (an adapter
 //! run through `npx` may first be downloaded) and a failure is that turn's error; it starts
@@ -14,12 +18,14 @@
 //! Desktop only: the web build starts no process.
 
 pub mod fake_agent;
+mod room_port;
 mod rpc;
 #[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -27,8 +33,9 @@ use serde_json::{Value, json};
 
 use crate::backend::{
     Answer, Backend, BackendInfo, Event, MAX_OPTIONS, MAX_PLAN, PermissionKind, PermissionOption, PermissionPolicy, PermissionRequest, PlanEntry,
-    PlanStatus, Priority, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, label,
+    PlanStatus, Priority, Seat, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, label,
 };
+pub use room_port::RoomPort;
 pub use rpc::{AUTH_REQUIRED, MAX_LINE, METHOD_NOT_FOUND, STDERR_TAIL};
 use rpc::{Incoming, Message, Process, RpcError, classify};
 
@@ -71,6 +78,44 @@ impl Launch {
     }
 }
 
+/// How an agent reaches the shared document.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Reach {
+    /// It doesn't: no tools (a test of the protocol alone).
+    #[default]
+    Nothing,
+    /// Through WordCraft's MCP server, which `session/new` gives it: `cli mcp --connect room`
+    /// (the room's own port, [`RoomPort`]), with the invite's key in the server's environment.
+    /// It joins as the conversation's participant, with its role, and reaches no file.
+    Mcp {
+        /// `wordcraft-cli`, an absolute path.
+        cli: PathBuf,
+        /// Where the room listens: `127.0.0.1` and a port.
+        room: SocketAddr,
+    },
+}
+
+impl Reach {
+    /// WordCraft's MCP server for an agent that joins with invite `key`, as `session/new`'s
+    /// `mcpServers` has it: none for [`Reach::Nothing`].
+    pub fn mcp_servers(&self, key: &str) -> Result<Vec<Value>, String> {
+        let Reach::Mcp { cli, room } = self else { return Ok(Vec::new()) };
+        let command = cli
+            .to_str()
+            .filter(|_| cli.is_absolute())
+            .ok_or_else(|| format!("WordCraft's MCP server, {}, isn't an absolute path the agent can be given", label(&cli.to_string_lossy())))?;
+        if room.ip() != Ipv4Addr::LOCALHOST {
+            return Err(format!("the shared document's room listens on {room}, not on 127.0.0.1, where WordCraft's MCP server sends keys"));
+        }
+        Ok(vec![json!({
+            "name": "wordcraft",
+            "command": command,
+            "args": ["mcp", "--connect", room.to_string()],
+            "env": [{"name": "WORDCRAFT_CONTROL_KEY", "value": key}],
+        })])
+    }
+}
+
 /// An ACP agent's set-up: what it is, how it's started and how long it may take.
 #[derive(Clone, Debug)]
 pub struct AgentSpec {
@@ -90,6 +135,8 @@ pub struct AgentSpec {
     /// How long a stopped turn waits for the agent to say it stopped, before the agent is
     /// stopped too (it starts again with the next turn).
     pub cancel_timeout: Duration,
+    /// How it reaches the shared document.
+    pub reach: Reach,
 }
 
 impl AgentSpec {
@@ -106,6 +153,7 @@ impl AgentSpec {
             env: Vec::new(),
             start_timeout: Duration::from_secs(120),
             cancel_timeout: Duration::from_secs(10),
+            reach: Reach::Nothing,
         }
     }
 }
@@ -129,6 +177,8 @@ struct Running {
 /// An ACP agent as a backend.
 pub struct Acp {
     spec: AgentSpec,
+    /// The conversation's seat in the shared document: the agent joins with its invite's key.
+    seat: Option<Seat>,
     running: Option<Running>,
     /// The note of the conversation's first turn, which every session the agent starts gets.
     note: Option<String>,
@@ -139,7 +189,7 @@ pub struct Acp {
 impl Acp {
     /// A backend that runs the agent `spec` sets up.
     pub fn new(spec: AgentSpec) -> Acp {
-        Acp { spec, running: None, note: None, calls: HashMap::new() }
+        Acp { spec, seat: None, running: None, note: None, calls: HashMap::new() }
     }
 
     /// The agent's name, for messages.
@@ -147,9 +197,13 @@ impl Acp {
         &self.spec.label
     }
 
-    /// The MCP servers the agent gets in `session/new`.
-    fn mcp_servers(&self) -> Vec<Value> {
-        Vec::new()
+    /// The MCP servers the agent gets in `session/new`: WordCraft's, with the seat's key.
+    fn mcp_servers(&self) -> Result<Vec<Value>, String> {
+        let key = self.seat.as_ref().map(|s| s.key.as_str()).unwrap_or_default();
+        if key.is_empty() && self.spec.reach != Reach::Nothing {
+            return Err(format!("{} has no seat in the shared document", self.name()));
+        }
+        self.spec.reach.mcp_servers(key).map_err(|e| format!("{} can't reach the document: {e}", self.name()))
     }
 
     /// Start the agent, shown as a row of the turn: whether it started (not when the turn was
@@ -184,6 +238,7 @@ impl Acp {
     /// `None` when the turn was stopped meanwhile.
     fn start(&mut self, ctx: &mut TurnCtx<'_>) -> Result<Option<(Running, Option<String>)>, String> {
         let name = self.name().to_string();
+        let mcp_servers = self.mcp_servers()?;
         let folder = Folder::new().map_err(|e| format!("{name} couldn't start: no folder for it ({e})"))?;
         let cwd = folder.path().to_str().ok_or_else(|| format!("{name} couldn't start: the temporary folder's path isn't text"))?.to_string();
         let env = agent_env(std::env::vars_os(), &self.spec.env);
@@ -210,7 +265,7 @@ impl Acp {
         }
         let agent = agent_info(&init);
         let methods = auth_methods(&init);
-        let new_session = json!({"cwd": cwd, "mcpServers": self.mcp_servers()});
+        let new_session = json!({"cwd": cwd, "mcpServers": mcp_servers});
         let mut signed_in = false;
         loop {
             let id = process.request("session/new", new_session.clone())?;
@@ -422,6 +477,12 @@ impl Acp {
 impl Backend for Acp {
     fn info(&self) -> BackendInfo {
         BackendInfo { id: self.spec.id.clone(), label: self.spec.label.clone(), author: self.spec.author.clone(), in_process_tools: false }
+    }
+
+    fn begin(&mut self, seat: &Seat) -> Result<(), String> {
+        // The agent itself starts with the first turn, which Stop can interrupt.
+        self.seat = Some(seat.clone());
+        Ok(())
     }
 
     fn turn(&mut self, turn: &Turn, ctx: &mut TurnCtx<'_>) -> Result<StopReason, String> {

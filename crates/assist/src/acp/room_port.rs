@@ -1,0 +1,452 @@
+//! The shared document's room on a loopback port of its own ([`RoomPort`]), which only invites'
+//! keys open: the built-in assistant's agents reach their copies of the document through it
+//! (WordCraft's MCP server, `wordcraft-cli mcp --connect`), whether or not the window runs its
+//! control channel.
+//!
+//! It speaks the control channel's protocol (`docs/control-protocol.md`): one JSON request per
+//! line, one reply per line. A connection's first request must carry the key of an invite to
+//! the document the window shares (top-level `key`, or `auth`'s); from then on the holder's own
+//! copy answers it ([`hosted::call`]), and later requests carry the same key or none. The
+//! window's own key opens nothing here: the port doesn't know it, and no key file names it, so
+//! an MCP server that went looking for a key would find none that works.
+
+use std::io::{BufReader, Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+use wordcraft_engine::room::{Lobby, Replica, hosted};
+use wordcraft_mcp::server::{BoundedLine, read_bounded_line};
+
+/// Longest request line; a longer one is refused and the connection closed.
+pub const MAX_REQUEST_LINE: usize = 1 << 20;
+
+/// A connection that sends no request with an invite's key in this time is closed.
+pub const FIRST_REQUEST: Duration = Duration::from_secs(30);
+
+/// Most connections served at once; more are refused.
+pub const MAX_CONNECTIONS: usize = 64;
+
+/// The room's own port, listening on `127.0.0.1` (a port the system picks) for the room the
+/// lobby opens. The lobby says where it is ([`Lobby::addr`]) while it listens. Dropping it
+/// closes the port, unless it was kept open ([`RoomPort::keep_open`]).
+pub struct RoomPort {
+    addr: SocketAddr,
+    lobby: Lobby,
+    open: Arc<AtomicBool>,
+    kept: bool,
+}
+
+impl RoomPort {
+    /// Listen for `lobby`'s room, and say where in the lobby.
+    pub fn open(lobby: &Lobby) -> std::io::Result<RoomPort> {
+        RoomPort::open_with(lobby, FIRST_REQUEST)
+    }
+
+    fn open_with(lobby: &Lobby, first: Duration) -> std::io::Result<RoomPort> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let addr = listener.local_addr()?;
+        let open = Arc::new(AtomicBool::new(true));
+        let (room, listening) = (lobby.clone(), open.clone());
+        std::thread::Builder::new().name("room port".into()).spawn(move || accept(&listener, &room, &listening, first))?;
+        lobby.set_addr(Some(addr));
+        log::info!("the shared document's room listens on {addr} (invites' keys only)");
+        Ok(RoomPort { addr, lobby: lobby.clone(), open, kept: false })
+    }
+
+    /// Where it listens.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Keep the port open until the process ends (the app's window), whatever becomes of this
+    /// handle.
+    pub fn keep_open(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for RoomPort {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        self.open.store(false, Ordering::SeqCst);
+        if self.lobby.addr() == Some(self.addr) {
+            self.lobby.set_addr(None);
+        }
+        // Wake the listener, which then sees it's closed.
+        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(500));
+    }
+}
+
+/// Counts a connection while it's served.
+struct Live(Arc<AtomicUsize>);
+
+impl Live {
+    fn new(count: &Arc<AtomicUsize>) -> Live {
+        count.fetch_add(1, Ordering::SeqCst);
+        Live(count.clone())
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The listener's thread: a thread for each connection, until the port closes.
+fn accept(listener: &TcpListener, lobby: &Lobby, open: &AtomicBool, first: Duration) {
+    let live = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        if !open.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                // Out of file descriptors, say: wait a little rather than spin.
+                log::debug!("room port: {e}");
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
+        if live.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+            let _ = writeln!(stream, "{}", json!({"ok": false, "error": "too many connections"}));
+            continue;
+        }
+        let counted = Live::new(&live);
+        let lobby = lobby.clone();
+        let spawned = std::thread::Builder::new().name("room port connection".into()).spawn(move || {
+            let _counted = counted;
+            serve(stream, &lobby, first);
+        });
+        if let Err(e) = spawned {
+            log::warn!("room port: no thread for a connection: {e}");
+        }
+    }
+}
+
+/// The read side of a connection, with an overall deadline while it has one: each read waits
+/// only for the time left, so blank lines or a slow drip of bytes can't extend it.
+struct Deadline {
+    stream: TcpStream,
+    until: Option<Instant>,
+}
+
+impl Read for Deadline {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(until) = self.until {
+            let left = until.checked_duration_since(Instant::now()).filter(|l| !l.is_zero()).ok_or(std::io::ErrorKind::TimedOut)?;
+            self.stream.set_read_timeout(Some(left))?;
+        }
+        self.stream.read(buf)
+    }
+}
+
+/// A request: its id, method and params, and the key it carries (top-level `key`, or `auth`'s
+/// `params.key`; for other methods `params.key` is an ordinary parameter).
+struct Request {
+    id: Value,
+    method: String,
+    params: Value,
+    key: Option<String>,
+}
+
+/// The next request; `None` when the connection ends: at its end, after a read error, or after
+/// a line that is too long, isn't UTF-8 or isn't JSON (answered first).
+fn next_request(reader: &mut BufReader<Deadline>, out: &mut TcpStream) -> Option<Request> {
+    loop {
+        let line = match read_bounded_line(reader, MAX_REQUEST_LINE) {
+            Ok(BoundedLine::Line(line)) => line,
+            Ok(BoundedLine::TooLong) => {
+                let _ = writeln!(out, "{}", json!({"ok": false, "error": "line too long"}));
+                return None;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                let _ = writeln!(out, "{}", json!({"ok": false, "error": "not UTF-8"}));
+                return None;
+            }
+            Ok(BoundedLine::Eof) | Err(_) => return None,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let message = match serde_json::from_str::<Value>(&line) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = writeln!(out, "{}", json!({"ok": false, "error": format!("bad JSON: {e}; closing the connection")}));
+                return None;
+            }
+        };
+        let id = message.get("id").cloned().unwrap_or(Value::Null);
+        let method = message.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
+        let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+        let key = message
+            .get("key")
+            .and_then(Value::as_str)
+            .or_else(|| if method == "auth" { params.get("key").and_then(Value::as_str) } else { None })
+            .map(str::to_string);
+        return Some(Request { id, method, params, key });
+    }
+}
+
+/// Write reply `v` to request `id`; whether the connection is still there.
+fn send(out: &mut TcpStream, id: &Value, mut v: Value) -> bool {
+    if let Some(o) = v.as_object_mut() {
+        o.insert("id".into(), id.clone());
+    }
+    writeln!(out, "{v}").is_ok()
+}
+
+/// Whether `given` is `key`, compared in a time that doesn't depend on where they differ. An
+/// empty key is never one.
+fn same_key(given: &str, key: &str) -> bool {
+    let (a, b) = (given.as_bytes(), key.as_bytes());
+    !b.is_empty() && a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// A connection: its first request must carry an invite's key, whose holder's copy answers
+/// the rest.
+fn serve(stream: TcpStream, lobby: &Lobby, first: Duration) {
+    let _ = stream.set_nodelay(true);
+    let Ok(read) = stream.try_clone() else { return };
+    let mut out = stream;
+    let mut reader = BufReader::new(Deadline { stream: read, until: Some(Instant::now() + first) });
+    let Some(request) = next_request(&mut reader, &mut out) else { return };
+    let key = request.key.clone().unwrap_or_default();
+    let copy = match lobby.join_with(&key) {
+        Ok(copy) if !key.is_empty() => copy,
+        _ => {
+            let _ = send(&mut out, &request.id, json!({"ok": false, "error": "unauthorized"}));
+            return;
+        }
+    };
+    let deadline = reader.get_mut();
+    deadline.until = None;
+    let _ = deadline.stream.set_read_timeout(None);
+    serve_copy(&mut reader, &mut out, copy, &key, request);
+}
+
+/// The rest of a connection whose first request, `first`, carried invite `key`: `copy`, its
+/// holder's own copy of the shared document, answers each request (`auth` just says yes).
+/// Every request carries that key or none. The connection ends when the copy is out of the
+/// room (the invite was taken back, or sharing stopped).
+fn serve_copy(reader: &mut BufReader<Deadline>, out: &mut TcpStream, mut copy: Replica, key: &str, first: Request) {
+    let mut next = Some(first);
+    while let Some(request) = next.take().or_else(|| next_request(reader, out)) {
+        if request.key.as_deref().is_some_and(|k| !same_key(k, key)) {
+            let _ = send(out, &request.id, json!({"ok": false, "error": "unauthorized"}));
+            return;
+        }
+        if let Some(why) = hosted::ended(&copy) {
+            let _ = send(out, &request.id, json!({"ok": false, "error": why}));
+            return;
+        }
+        let reply = match request.method.as_str() {
+            "auth" => json!({"ok": true, "result": {}}),
+            method => match hosted::call(&mut copy, method, &request.params) {
+                Ok(v) => json!({"ok": true, "result": v}),
+                Err(e) => json!({"ok": false, "error": e}),
+            },
+        };
+        if !send(out, &request.id, reply) {
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+    use wordcraft_doc::{Document, StoryRef};
+    use wordcraft_engine::Session;
+    use wordcraft_engine::room::{Lobby, Replica, Role, Room};
+
+    use super::RoomPort;
+
+    /// A window sharing "one two three" through `lobby`.
+    fn share(lobby: &Lobby) -> (Session, Arc<Room>, Replica) {
+        let mut session = Session::new(Document::from_text("one two three"));
+        session.author = "Minoru".into();
+        let (room, own) = Room::host(&mut session, "Minoru").unwrap();
+        lobby.open(room.clone());
+        (session, room, own)
+    }
+
+    struct Conn(BufReader<TcpStream>, TcpStream);
+
+    impl Conn {
+        fn open(port: &RoomPort) -> Conn {
+            let s = TcpStream::connect(port.addr()).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            Conn(BufReader::new(s.try_clone().unwrap()), s)
+        }
+
+        fn send(&mut self, line: &str) {
+            let _ = self.1.write_all(line.as_bytes()).and_then(|()| self.1.write_all(b"\n"));
+        }
+
+        fn recv(&mut self) -> Value {
+            let mut line = String::new();
+            self.0.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line:?}"))
+        }
+
+        fn call(&mut self, line: &str) -> Value {
+            self.send(line);
+            self.recv()
+        }
+
+        /// Whether the server closed the connection.
+        fn closed(&mut self) -> bool {
+            let mut line = String::new();
+            matches!(self.0.read_line(&mut line), Ok(0) | Err(_))
+        }
+    }
+
+    #[test]
+    fn an_invites_key_gets_its_holder_a_copy_whose_edits_are_tracked_in_their_name() {
+        let lobby = Lobby::default();
+        let port = RoomPort::open(&lobby).unwrap();
+        assert_eq!(lobby.addr(), Some(port.addr()));
+        assert!(port.addr().ip().is_loopback());
+        let (mut session, room, mut own) = share(&lobby);
+        let key = room.invite("Claude Code", Role::Suggester).unwrap();
+        let mut c = Conn::open(&port);
+        let line = |id: u32, method: &str, params: Value| json!({"id": id, "key": key, "method": method, "params": params}).to_string();
+        let reply = c.call(&line(1, "select.text", json!({"text": "two"})));
+        assert_eq!((reply["id"].clone(), reply["ok"].clone()), (json!(1), json!(true)), "{reply}");
+        let reply = c.call(&json!({"id": 2, "method": "text.insert", "params": {"text": "2"}}).to_string());
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        // The window takes the room's change in: a tracked change in the agent's name.
+        for _ in 0..500 {
+            let _ = own.lend(&mut session, Replica::sync);
+            if session.doc.revisions.iter().any(|r| r.author == "Claude Code") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(session.doc.revisions.iter().any(|r| r.author == "Claude Code"), "no tracked change in the agent's name");
+        assert!(session.doc.final_text(StoryRef::Body).contains("one 2 three"));
+        // `auth` with the same key says yes; another key is refused, and the connection closed.
+        assert_eq!(c.call(&json!({"id": 3, "method": "auth", "key": key}).to_string())["ok"], json!(true));
+        let reply = c.call(&json!({"id": 4, "key": "0".repeat(32), "method": "document.inspect"}).to_string());
+        assert_eq!((reply["id"].clone(), reply["error"].clone()), (json!(4), json!("unauthorized")));
+        assert!(c.closed());
+        // A copy reaches no file.
+        let mut c = Conn::open(&port);
+        let reply = c.call(&line(5, "file.saveAs", json!({"path": std::env::temp_dir().join("wordcraft-room-port.docx")})));
+        assert_eq!(reply["ok"], json!(false), "{reply}");
+    }
+
+    #[test]
+    fn keys_that_arent_invites_open_nothing() {
+        let lobby = Lobby::default();
+        let port = RoomPort::open(&lobby).unwrap();
+        // Nothing shared: no key works.
+        let mut c = Conn::open(&port);
+        assert_eq!(c.call(&json!({"id": 1, "key": "k", "method": "document.inspect"}).to_string())["error"], json!("unauthorized"));
+        assert!(c.closed());
+        let (_session, room, _own) = share(&lobby);
+        let key = room.invite("Codex", Role::Editor).unwrap();
+        for line in [
+            json!({"id": 1, "method": "document.inspect"}).to_string(),
+            json!({"id": 1, "key": "", "method": "document.inspect"}).to_string(),
+            json!({"id": 1, "key": key.to_uppercase() + "x", "method": "document.inspect"}).to_string(),
+            json!({"id": 1, "method": "auth", "params": {"nokey": key}}).to_string(),
+            json!({"id": 1, "method": "document.inspect", "params": {"key": key}}).to_string(),
+        ] {
+            let mut c = Conn::open(&port);
+            assert_eq!(c.call(&line)["error"], json!("unauthorized"), "{line}");
+            assert!(c.closed(), "{line}");
+        }
+        // `auth` carries the key in its params; later requests may leave it out.
+        let mut c = Conn::open(&port);
+        assert_eq!(c.call(&json!({"id": 1, "method": "auth", "params": {"key": key}}).to_string())["ok"], json!(true));
+        assert_eq!(c.call(&json!({"id": 2, "method": "room.participants"}).to_string())["result"]["you"]["name"], json!("Codex"));
+    }
+
+    #[test]
+    fn junk_is_answered_and_the_connection_closed() {
+        let lobby = Lobby::default();
+        let port = RoomPort::open(&lobby).unwrap();
+        let (_session, room, _own) = share(&lobby);
+        let key = room.invite("Pi", Role::Viewer).unwrap();
+        let mut c = Conn::open(&port);
+        assert!(c.call("GET / HTTP/1.1")["error"].as_str().unwrap().starts_with("bad JSON"));
+        assert!(c.closed());
+        let mut c = Conn::open(&port);
+        c.send(&"x".repeat(super::MAX_REQUEST_LINE + 10));
+        assert_eq!(c.recv()["error"], json!("line too long"));
+        assert!(c.closed());
+        let mut c = Conn::open(&port);
+        let _ = c.1.write_all(b"\xff\xfe\n");
+        assert_eq!(c.recv()["error"], json!("not UTF-8"));
+        assert!(c.closed());
+        // After all that, the invite still works.
+        let mut c = Conn::open(&port);
+        assert_eq!(c.call(&json!({"id": 9, "key": key, "method": "document.inspect"}).to_string())["ok"], json!(true));
+    }
+
+    #[test]
+    fn a_silent_connection_is_closed_and_blank_lines_dont_keep_it() {
+        let lobby = Lobby::default();
+        let port = RoomPort::open_with(&lobby, Duration::from_millis(300)).unwrap();
+        let mut c = Conn::open(&port);
+        c.send("");
+        c.send("");
+        assert!(c.closed());
+    }
+
+    #[test]
+    fn taking_the_invite_back_or_stopping_sharing_ends_the_connection() {
+        let lobby = Lobby::default();
+        let port = RoomPort::open(&lobby).unwrap();
+        let (_session, room, _own) = share(&lobby);
+        let key = room.invite("Claude Code", Role::Suggester).unwrap();
+        let mut c = Conn::open(&port);
+        assert_eq!(c.call(&json!({"id": 1, "key": key, "method": "document.inspect"}).to_string())["ok"], json!(true));
+        assert!(room.revoke(&key));
+        let reply = c.call(&json!({"id": 2, "method": "document.inspect"}).to_string());
+        assert_eq!(reply["ok"], json!(false), "{reply}");
+        assert!(c.closed());
+        // The key opens nothing any more.
+        let mut c = Conn::open(&port);
+        assert_eq!(c.call(&json!({"id": 3, "key": key, "method": "document.inspect"}).to_string())["error"], json!("unauthorized"));
+        // Sharing stops.
+        let key = room.invite("Codex", Role::Suggester).unwrap();
+        let mut c = Conn::open(&port);
+        assert_eq!(c.call(&json!({"id": 4, "key": key, "method": "document.inspect"}).to_string())["ok"], json!(true));
+        lobby.close();
+        assert_eq!(c.call(&json!({"id": 5, "method": "document.inspect"}).to_string())["ok"], json!(false));
+        assert!(c.closed());
+    }
+
+    #[test]
+    fn dropping_the_port_closes_it_unless_it_was_kept_open() {
+        let lobby = Lobby::default();
+        let port = RoomPort::open(&lobby).unwrap();
+        let addr = port.addr();
+        drop(port);
+        assert_eq!(lobby.addr(), None);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            assert!(std::time::Instant::now() < deadline, "the port still listens");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let port = RoomPort::open(&lobby).unwrap();
+        let addr = port.addr();
+        port.keep_open();
+        assert_eq!(lobby.addr(), Some(addr));
+        assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok());
+    }
+}

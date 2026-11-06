@@ -38,6 +38,7 @@
 //!
 //! Next in milestone A1: presence.
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -348,13 +349,25 @@ impl Room {
 
 /// Where those with a key find the room the process shares, if it shares one: the app's
 /// window opens it when it shares its document, and its control channel lets participants in
-/// through it ([`Lobby::join_with`]). Clones are the same lobby.
+/// through it ([`Lobby::join_with`]), as does the room's own port, whose address the lobby
+/// keeps ([`Lobby::addr`]). Clones are the same lobby.
 #[derive(Clone, Default)]
-pub struct Lobby(Arc<Mutex<Option<Arc<Room>>>>);
+pub struct Lobby(Arc<Mutex<Option<Arc<Room>>>>, Arc<Mutex<Option<SocketAddr>>>);
 
 impl Lobby {
     fn slot(&self) -> MutexGuard<'_, Option<Arc<Room>>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Where participants with a key reach the lobby on this computer: the room's own port
+    /// (`127.0.0.1`, which only invites' keys open), if the process listens for them.
+    pub fn addr(&self) -> Option<SocketAddr> {
+        *self.1.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Say where participants reach the lobby ([`Lobby::addr`]); `None` once nothing listens.
+    pub fn set_addr(&self, addr: Option<SocketAddr>) {
+        *self.1.lock().unwrap_or_else(PoisonError::into_inner) = addr;
     }
 
     /// Let participants with a key into `room` (in place of the room before, which closes).

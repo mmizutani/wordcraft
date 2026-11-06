@@ -94,16 +94,31 @@ pub enum Step {
     /// had (`session`), its `WORDCRAFT_*` environment (`env`), the prompt's text blocks
     /// (`prompt`) and its process id (`pid`).
     Report,
-    /// Call `tool` with `args` on the first MCP server `session/new` gave, the way an agent
-    /// does (its command, args and env), and say the result's text: "mcp: <text>", or
-    /// "mcp error: <why>".
-    Mcp { tool: String, args: Value },
+    /// Make `calls` on the first MCP server `session/new` gave, started the way an agent starts
+    /// it (its command, args and env), and say each result on a line of its own: "<tool>: ok
+    /// <text>" or "<tool>: error <why>" (and "mcp: error <why>" when there's no server).
+    Mcp { calls: Vec<Call> },
     /// End the turn with stop reason `reason` now.
     Stop { reason: String },
     /// Answer the prompt with error `code` and `message`.
     Fail { code: i64, message: String },
     /// Wait `ms` milliseconds (at most a minute).
     Sleep { ms: u64 },
+}
+
+/// One MCP tool call ([`Step::Mcp`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Call {
+    pub tool: String,
+    #[serde(default)]
+    pub args: Value,
+}
+
+impl Call {
+    /// Call `tool` with `args`.
+    pub fn new(tool: &str, args: Value) -> Call {
+        Call { tool: tool.into(), args }
+    }
 }
 
 /// Be the agent `script` says, on stdin and stdout, until stdin ends: the exit code.
@@ -317,9 +332,9 @@ impl Agent<'_> {
                     say(&format!("{method}: {said}"));
                 }
                 Step::Report => say(&self.report().to_string()),
-                Step::Mcp { tool, args } => match self.mcp(&tool, &args) {
-                    Ok(text) => say(&format!("mcp: {text}")),
-                    Err(why) => say(&format!("mcp error: {why}")),
+                Step::Mcp { calls } => match self.mcp(&calls) {
+                    Ok(said) => say(&said),
+                    Err(why) => say(&format!("mcp: error {why}\n")),
                 },
                 Step::Stop { reason } => {
                     reply(id, json!({"stopReason": reason}));
@@ -357,8 +372,8 @@ impl Agent<'_> {
         })
     }
 
-    /// Call `tool` on the first MCP server of the session, as an agent does: the result's text.
-    fn mcp(&self, tool: &str, args: &Value) -> Result<String, String> {
+    /// Make `calls` on the first MCP server of the session, as an agent does: what each gave.
+    fn mcp(&self, calls: &[Call]) -> Result<String, String> {
         let server = self.session.get("mcpServers").and_then(Value::as_array).and_then(|s| s.first()).ok_or("the session has no MCP server")?;
         let command = server.get("command").and_then(Value::as_str).ok_or("the MCP server has no command")?;
         let argv: Vec<&str> = server.get("args").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
@@ -370,7 +385,7 @@ impl Agent<'_> {
             }
         }
         let mut child = cmd.spawn().map_err(|e| format!("the MCP server didn't start: {e}"))?;
-        let result = talk_mcp(&mut child, tool, args);
+        let result = talk_mcp(&mut child, calls);
         drop(child.stdin.take());
         let until = Instant::now() + Duration::from_secs(5);
         while matches!(child.try_wait(), Ok(None)) && Instant::now() < until {
@@ -382,8 +397,8 @@ impl Agent<'_> {
     }
 }
 
-/// MCP over `child`'s stdin and stdout: initialize, then call `tool`.
-fn talk_mcp(child: &mut Child, tool: &str, args: &Value) -> Result<String, String> {
+/// MCP over `child`'s stdin and stdout: initialize, then make `calls`, saying what each gave.
+fn talk_mcp(child: &mut Child, calls: &[Call]) -> Result<String, String> {
     let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else { return Err("no pipes to the MCP server".into()) };
     let (tx, lines) = channel::<Value>();
     std::thread::Builder::new()
@@ -420,11 +435,21 @@ fn talk_mcp(child: &mut Child, tool: &str, args: &Value) -> Result<String, Strin
     let init = json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fake-agent", "version": "1.0"}});
     answer(&mut stdin, 1, "initialize", init)?;
     write_line(&mut stdin, &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))?;
-    let result = answer(&mut stdin, 2, "tools/call", json!({"name": tool, "arguments": args}))?;
-    let content = result.get("content").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-    let text: Vec<&str> = content.iter().filter_map(|c| c.get("text").and_then(Value::as_str)).collect();
-    let text = text.join("\n");
-    if result.get("isError").and_then(Value::as_bool).unwrap_or(false) { Err(text) } else { Ok(text) }
+    let mut said = String::new();
+    for (id, call) in (2_i64..).zip(calls) {
+        let (outcome, text) = match answer(&mut stdin, id, "tools/call", json!({"name": call.tool, "arguments": call.args})) {
+            Ok(result) => {
+                let content = result.get("content").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+                let text: Vec<&str> = content.iter().filter_map(|c| c.get("text").and_then(Value::as_str)).collect();
+                let failed = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+                (if failed { "error" } else { "ok" }, text.join(" "))
+            }
+            Err(why) => ("error", why),
+        };
+        let text: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).take(2000).collect();
+        said.push_str(&format!("{}: {outcome} {text}\n", call.tool));
+    }
+    Ok(said)
 }
 
 fn write_line(to: &mut impl Write, message: &Value) -> Result<(), String> {

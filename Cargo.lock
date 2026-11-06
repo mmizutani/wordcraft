@@ -6821,6 +6821,7 @@ dependencies = [
  "winit",
  "winresource",
  "wl-clipboard-rs",
+ "wordcraft-assist",
  "wordcraft-control-key",
  "wordcraft-doc",
  "wordcraft-engine",
@@ -6855,6 +6856,7 @@ version = "0.15.1"
 dependencies = [
  "serde_json",
  "sys-locale",
+ "wordcraft-assist",
  "wordcraft-doc",
  "wordcraft-engine",
  "wordcraft-mcp",

@@ -11,7 +11,7 @@ use wordcraft_engine::room::{Replica, Room};
 
 use super::fake_agent::{SCRIPT_VAR, Script, Step};
 use super::{
-    Acp, AgentSpec, Launch, NOT_NOW, START_ROW, agent_env, agent_info, auth_methods, content_text, permission_option, plan_entry, stop_reason,
+    Acp, AgentSpec, Launch, NOT_NOW, Reach, START_ROW, agent_env, agent_info, auth_methods, content_text, permission_option, plan_entry, stop_reason,
     tool_detail,
 };
 use crate::backend::MAX_LABEL;
@@ -226,6 +226,35 @@ fn the_agent_runs_in_an_empty_folder_of_its_own_with_no_wordcraft_variables_and_
         }
     }
     let _ = pid;
+}
+
+/// A key in WordCraft's own environment, as when the app was started with
+/// `WORDCRAFT_CONTROL_KEY` set: this test runs itself again with one, and that run checks the
+/// agent sees none of it, in its environment or in `session/new`.
+#[test]
+fn a_key_in_wordcrafts_environment_never_reaches_the_agent() {
+    const WINDOW_KEY: &str = "the-windows-own-key-0123456789abcdef";
+    const TEST: &str = "acp::tests::a_key_in_wordcrafts_environment_never_reaches_the_agent";
+    if std::env::var("WORDCRAFT_CONTROL_KEY").as_deref() == Ok(WINDOW_KEY) {
+        let mut spec = spec(&turns(vec![vec![Step::Report]]));
+        let room = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9));
+        spec.reach = Reach::Mcp { cli: std::env::current_exe().unwrap(), room };
+        let mut c = Chat::new(spec, PermissionPolicy::Reject);
+        c.ask("Report");
+        assert!(!c.answer().contains(WINDOW_KEY), "{}", c.answer());
+        let report = c.report();
+        assert_eq!(report["env"], json!({}));
+        assert_eq!(report["session"]["mcpServers"][0]["env"], json!([{"name": "WORDCRAFT_CONTROL_KEY", "value": c.a.key()}]));
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture", "--test-threads", "1", "-q"])
+        .env("WORDCRAFT_CONTROL_KEY", WINDOW_KEY)
+        .env("WORDCRAFT_CONTROL_ADDR", "127.0.0.1:7981")
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && said.contains("1 passed"), "{said}");
 }
 
 #[test]

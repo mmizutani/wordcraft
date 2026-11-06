@@ -13,6 +13,8 @@ workspace = true
 [dependencies]
 wordcraft-doc = { workspace = true }
 wordcraft-engine = { workspace = true }
+# The shared document's own port for the assistant's agents (`acp::RoomPort`).
+wordcraft-assist = { workspace = true }
 wordcraft-proof = { workspace = true }
 # Fonts the user added (#582) load from the settings folder at start-up.
 wordcraft-fonts = { workspace = true }
