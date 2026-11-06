@@ -127,6 +127,25 @@ debug = false
 opt-level = 1
 debug = "line-tables-only"
 
+# Build speed (#44): the crates edited most and compiled last are unoptimised, so an edit there
+# rebuilds in about half the time (one function changed in the UI: 44 s to 12 s for the test
+# build). Their tests stay fast because the code they spend their time in (layout, shaping, the
+# document model, the readers and writers) keeps opt-level 1 above. Release builds are unchanged.
+[profile.dev.package.wordcraft-engine]
+opt-level = 0
+[profile.dev.package.wordcraft-ui-egui]
+opt-level = 0
+[profile.dev.package.wordcraft-mcp]
+opt-level = 0
+[profile.dev.package.wordcraft-zotero]
+opt-level = 0
+[profile.dev.package.wordcraft]
+opt-level = 0
+[profile.dev.package.wordcraft-cli]
+opt-level = 0
+[profile.dev.package.wordcraft-web]
+opt-level = 0
+
 [profile.release]
 opt-level = 3
 lto = "thin"
