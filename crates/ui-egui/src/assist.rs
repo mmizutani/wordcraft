@@ -417,7 +417,9 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     };
     let selection = doc.anchor_at(&anchor).zip(doc.anchor_at(&focus));
     // The person is asked what the agent asks in their own turns; a program's turn is answered
-    // per the setting.
+    // per the setting, told to the conversation before the turn is sent: its first request may
+    // come before this command returns, and must not find a setting from before.
+    sync_unattended(app);
     let policy = if app.assist.by_person { PermissionPolicy::Ask } else { unattended(app) };
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
     a.ask_with_policy(prompt, Some(context), selection, policy).map_err(|e| e.to_string())?;
