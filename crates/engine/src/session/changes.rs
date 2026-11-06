@@ -66,6 +66,11 @@ impl ChangeLog {
     /// The changes after version `since`, oldest first, each with the version it made. An error
     /// when `since` is ahead of the document, or older than the changes it keeps.
     pub fn since(&self, since: u64) -> Result<Vec<(u64, Arc<ChangeSet>)>, String> {
+        Ok(self.borrowed_since(since)?.cloned().collect())
+    }
+
+    /// Read entries without cloning them, so a bounded caller can check before materialization.
+    pub(crate) fn borrowed_since(&self, since: u64) -> Result<impl Iterator<Item = &(u64, Arc<ChangeSet>)>, String> {
         if since > self.version {
             return Err(format!("version {since} is ahead of the document, which is at version {}", self.version));
         }
@@ -76,7 +81,7 @@ impl ChangeLog {
                 oldest.saturating_add(1)
             ));
         }
-        Ok(self.recent.iter().filter(|(v, _)| *v > since).cloned().collect())
+        Ok(self.recent.iter().filter(move |(v, _)| *v > since))
     }
 }
 

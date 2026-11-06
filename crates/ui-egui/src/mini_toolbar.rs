@@ -27,6 +27,8 @@ const SPACING: f32 = 1.0;
 /// arrow, two allocations), a group divider and the size box.
 const BTN_W: f32 = 24.0;
 const SPLIT_W: f32 = 24.0 + SPACING + 11.0;
+/// A small menu button with no label: its icon and drop-down marker (the Assistant menu).
+const MENU_W: f32 = 24.0 + 10.0;
 const SEP_W: f32 = 9.0;
 const COMBO_SIZE_W: f32 = 52.0;
 /// Gap between the size box and the grow/shrink buttons.
@@ -34,9 +36,9 @@ const GAP: f32 = 3.0;
 /// Row 2, like Word's: B I U S | highlight, font colour | the four alignments. Fourteen
 /// allocations, so thirteen gaps; the two inside the split buttons are counted in `SPLIT_W`.
 const ROW2_W: f32 = 8.0 * BTN_W + 2.0 * SPLIT_W + 2.0 * SEP_W + 11.0 * SPACING;
-/// Row 1: font, size, grow, shrink. The font box takes what row 2 leaves, so both rows end
-/// together and the box starts at the bar's left edge.
-const COMBO_FONT_W: f32 = ROW2_W - (COMBO_SIZE_W + GAP + 2.0 * BTN_W + 3.0 * SPACING);
+/// Row 1: font, size, grow, shrink, and the assistant's writing actions (#18). The font box
+/// takes what row 2 leaves, so both rows end together and the box starts at the bar's left edge.
+const COMBO_FONT_W: f32 = ROW2_W - (COMBO_SIZE_W + GAP + 2.0 * BTN_W + MENU_W + 4.0 * SPACING);
 
 /// The bar's size: fixed, so it never jitters as the selection changes, and wide enough for every
 /// control of both rows (#535: one row of a fixed width cut off everything after Align Left).
@@ -288,6 +290,10 @@ fn content(app: &mut WordApp, ui: &mut egui::Ui, t: &Tokens) {
         ui.add_space(GAP);
         widgets::small(ui, app, "grow", None, "Increase Font Size", crate::widgets::ButtonAction::new("format.growFont", json!({}), false));
         widgets::small(ui, app, "shrink", None, "Decrease Font Size", crate::widgets::ButtonAction::new("format.shrinkFont", json!({}), false));
+        // The assistant's writing actions on the selection (#18), greyed out with no assistant.
+        widgets::menu_button(ui, app, widgets::MenuButtonOptions::new("assistant", None, "Assistant", false, "assist.draft"), |ui, app| {
+            crate::assist::action_items(ui, app)
+        });
     });
 
     row(ui, app, &|ui, app| {

@@ -154,9 +154,9 @@ pub(crate) const COMMENT_ROWS: usize = 10;
 /// The height a text field's frame and padding add to its text, in points.
 const FIELD_FRAME: f32 = 4.0;
 
-/// A comment or reply field at most [`COMMENT_ROWS`] lines tall. Longer text scrolls inside it,
+/// A multiline field at most [`COMMENT_ROWS`] lines tall. Longer text scrolls inside it,
 /// and the field keeps its caret in view.
-fn capped_field(ui: &mut Ui, scroll_id: egui::Id, font: Option<&egui::FontId>, edit: egui::TextEdit<'_>) -> egui::Response {
+pub(super) fn capped_field(ui: &mut Ui, scroll_id: egui::Id, font: Option<&egui::FontId>, edit: egui::TextEdit<'_>) -> egui::Response {
     let font = font.cloned().unwrap_or_else(|| egui::FontSelection::Default.resolve(ui.style()));
     let row = ui.fonts_mut(|f| f.row_height(&font));
     let max = row * COMMENT_ROWS as f32 + FIELD_FRAME;

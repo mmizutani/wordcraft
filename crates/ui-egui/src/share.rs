@@ -74,7 +74,7 @@ impl WordApp {
     /// Share the active document under `name` (the author name when `None`): the window joins
     /// its room as the owner, and participants with a key it hands out ([`room_method`],
     /// `room.invite`) join through the lobby.
-    fn share_document(&mut self, name: Option<&str>) -> Result<Value, String> {
+    pub(crate) fn share_document(&mut self, name: Option<&str>) -> Result<Value, String> {
         if !self.has_document() {
             return Err("no document is open to share".into());
         }
@@ -118,6 +118,19 @@ impl WordApp {
     /// Whether the document the window shows is the one it shares.
     pub(crate) fn shows_shared_document(&self) -> bool {
         self.share.as_ref().is_some_and(|s| s.copy.document() == self.session.document_id())
+    }
+
+    /// The room of the document the window shares, if it shares one: the assistant joins it
+    /// (#15).
+    pub(crate) fn shared_room(&self) -> Option<Arc<Room>> {
+        self.share.as_ref().map(|s| s.room.clone())
+    }
+
+    /// Whether the window has every change the room took and the room every change the window
+    /// sent (tests wait for it).
+    #[cfg(test)]
+    pub(crate) fn share_settled(&self) -> bool {
+        self.share.as_ref().is_none_or(|s| !s.copy.has_unconfirmed() && s.copy.received() == s.room.version())
     }
 
     /// Whether the window shares a document, which one, its version, who the window is in it and

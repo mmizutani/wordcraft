@@ -26,7 +26,10 @@ impl WordApp {
     /// Creates the app: adopts the system locale, then initializes the document session, UI state,
     /// services, printing, canvas, dialogs, previews, control and screenshot state, font and theme
     /// tracking.
-    pub fn new(session: Session, services: Services) -> Self {
+    pub fn new(mut session: Session, services: Services) -> Self {
+        // The assistant's commands work in a window (#15), once an assistant is set up
+        // (`crate::assist::tick` keeps this up to date).
+        session.assistant.window = true;
         // Numeral › System follows the system locale, found here rather than in layout.
         if let Some(tag) = sys_locale::get_locale() {
             wordcraft_engine::set_system_locale(&tag);
@@ -107,6 +110,7 @@ impl WordApp {
             control_rx: None,
             lobby: Default::default(),
             share: None,
+            assist: Default::default(),
             shots: crate::control::Shots::default(),
             capture_epoch: 0,
             surface_geometry: None,
@@ -324,6 +328,7 @@ impl WordApp {
         self.drain_control(ctx);
         // What others changed in the shared document, before it's drawn.
         self.sync_share(ctx);
+        crate::assist::tick(self);
         // The active window's own work; with native windows each window does it again as it
         // draws, for itself.
         self.window_work(ctx);

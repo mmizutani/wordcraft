@@ -17,6 +17,7 @@ use wordcraft_engine::StylesPaneDock;
 use crate::WordApp;
 use crate::theme::{Tokens, regular, semibold};
 
+mod assistant;
 mod comments;
 mod host;
 mod inspector;
@@ -62,6 +63,8 @@ pub enum Pane {
     RestrictEditing,
     Proofing,
     Comments,
+    /// Home › Assistant: a conversation with the built-in assistant (#15).
+    Assistant,
 }
 
 impl Pane {
@@ -78,6 +81,7 @@ impl Pane {
             Self::RestrictEditing => "Restrict Editing",
             Self::Proofing => "Proofing",
             Self::Comments => "Comments",
+            Self::Assistant => "Assistant",
         }
     }
 
@@ -94,6 +98,7 @@ impl Pane {
             Self::RestrictEditing => (Edge::End, 270.0),
             Self::Proofing => (Edge::End, 400.0),
             Self::Comments => (Edge::End, 290.0),
+            Self::Assistant => (Edge::End, 320.0),
         };
         PaneState::docked(edge, width)
     }
@@ -112,10 +117,11 @@ impl Pane {
             Self::RestrictEditing => "restrictEditing",
             Self::Proofing => "proofing",
             Self::Comments => "comments",
+            Self::Assistant => "assistant",
         }
     }
 
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::SmartArtText,
         Self::Navigation,
         Self::Clipboard,
@@ -127,6 +133,7 @@ impl Pane {
         Self::RestrictEditing,
         Self::Proofing,
         Self::Comments,
+        Self::Assistant,
     ];
 
     fn from_key(key: &str) -> Option<Self> {
@@ -145,6 +152,7 @@ impl Pane {
             Self::AltText => Some("view.altTextPane"),
             Self::FormatShape => Some("view.formatShapePane"),
             Self::Comments => Some("view.commentsPane"),
+            Self::Assistant => Some("assist.pane"),
             Self::RestrictEditing | Self::Proofing => None,
         }
     }
@@ -171,6 +179,7 @@ impl PaneContent<Pane> for Content<'_> {
             Pane::RestrictEditing => crate::dialogs_review::restrict_pane(app, ui),
             Pane::Proofing => crate::proofing_pane::show(app, ui),
             Pane::Comments => comments(app, ui),
+            Pane::Assistant => assistant::assistant(app, ui),
         })
     }
 

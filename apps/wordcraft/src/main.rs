@@ -309,6 +309,8 @@ fn services(file_dialog: file_dialogs::Hook, ctx: &egui::Context) -> Services {
         make_default_app: default_apps::hook(),
         // Personal templates live in `Templates` in the settings folder (#2852), made on first save.
         templates_dir: wordcraft_control_key::settings_dir().map(|d| d.join("Templates")),
+        // What the assistant's sign-ins and agent set-ups keep (#15).
+        settings_dir: wordcraft_control_key::settings_dir(),
         animations_enabled: Some(animations::hook(ctx)),
         clipboard_text: Some(Box::new(clipboard::text)),
         clipboard_html: Some(Box::new(clipboard::html)),
@@ -555,13 +557,20 @@ fn main() -> eframe::Result {
             let mut key_file = None;
             // Where participants with a key find the document the window shares.
             let lobby = wordcraft_engine::room::Lobby::default();
+            // The room's own port, which only invites' keys open: the assistant's agents reach
+            // the shared document through it, with or without the control channel.
+            match wordcraft_assist::acp::RoomPort::open(&lobby) {
+                Ok(port) => port.keep_open(),
+                Err(e) => log::warn!("no port for the shared document's room, so agents can't reach it: {e}"),
+            }
             if let Some(port) = control_port
                 && let Some((rx, file)) =
                     control_server::start(port, cc.egui_ctx.clone(), wordcraft_control_key::settings_dir().as_deref(), lobby.clone())
             {
-                app = app.with_control(rx).with_lobby(lobby);
+                app = app.with_control(rx);
                 key_file = file;
             }
+            app = app.with_lobby(lobby);
             // Nothing to open (no files, no sample, no control channel driving the editor): start
             // on File › Home, as Word does (#766), unless the Start screen option is off. Files
             // macOS hands over later open on top of it and close it (`apple_events`).

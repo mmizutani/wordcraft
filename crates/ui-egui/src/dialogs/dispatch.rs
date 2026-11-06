@@ -1575,7 +1575,7 @@ fn match_fields_dialog(ui: &mut Ui, d: &mut Dialog) -> bool {
 
 /// Commands Search leaves out: they need a parameter it can't give (which Language pack), and
 /// File › Options › Language does them with the list in front of the person.
-const NOT_IN_SEARCH: [&str; 2] = ["proof.installPack", "proof.removePack"];
+const NOT_IN_SEARCH: [&str; 4] = ["proof.installPack", "proof.removePack", "assist.backend", "assist.defaultRole"];
 
 fn check_errors_dialog(ui: &mut Ui, d: &mut Dialog) -> bool {
     let Dialog::CheckErrors { unknown, records } = d else {

@@ -137,6 +137,12 @@ web build has no packs.
 A click or key sent with `click`/`key` on Add a language…, Install or Refresh never turns
 downloading on either: only the person's own click does; the app shows why instead.
 
+The assistant's consent is kept the same way. With `--connect`, `execute` reads File › Options ›
+Assistant › Allow what agents ask when no one can answer (`assist.allowUnattended`) and can turn
+it off, never on. `click` and `key` never turn it on, never answer the Assistant pane's permission
+or sign-in questions, and a prompt they send from the pane is a program's, not the person's: its
+agent's requests are answered per that setting, refused unless the person allowed them.
+
 Installing reads the pinned index of craft-i18n's language-packs-2 release (75 languages). For
 testing packs before they are released, set `CRAFT_LANGUAGE_PACK_INDEX` to another index (a URL or a path
 to an `index.json`) when starting WordCraft or `wordcraft-cli`. That index isn't pinned, so the

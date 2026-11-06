@@ -40,7 +40,7 @@ use doc_state::{TypedWord, Undo, doc_bib_style};
 use ime_state::ImeCaretState;
 pub use locale::set_system_locale;
 pub(crate) use locale::system_locale;
-pub use prefs::Prefs;
+pub use prefs::{AssistantPrefs, Prefs};
 pub use query::blank_document;
 pub(crate) use shared::Steps;
 pub use snapshot_types::EditSnapshot;
@@ -92,6 +92,9 @@ pub struct Session {
     /// document's Track Changes setting, and a command that changes more than the role lets
     /// them is undone and refused. `None` outside a room.
     pub role: Option<crate::room::Role>,
+    /// What the window's assistant can do now (`assist.*`, #15), which the window keeps up to
+    /// date; a session without a window has none.
+    pub assistant: crate::cmd::assist::AssistantStatus,
     /// Initials for comments (File › Options › General); empty = the name's initials.
     pub initials: String,
     /// Format painter: copied formatting waiting to be applied (and whether it stays on).

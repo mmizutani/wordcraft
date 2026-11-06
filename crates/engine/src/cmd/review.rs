@@ -15,7 +15,8 @@ mod proofing;
 
 pub(crate) use changes::reject_all;
 pub use changes::{
-    DELETION_TEXT_CHARS, DeletionBalloon, deletion_balloons, format_changes, has_deletions, has_format_changes, move_changes, tracking_json,
+    DELETION_TEXT_CHARS, DeletionBalloon, changes_by, deletion_balloons, format_changes, has_deletions, has_format_changes, move_changes,
+    tracking_json,
 };
 use changes::{list_changes, nav_change, resolve_all_then, resolve_sel_then, tracking_options};
 pub(crate) use comments::comment_at_caret;
@@ -51,9 +52,9 @@ pub fn specs() -> Vec<CommandSpec> {
         .params(r#"{"value"?: bool (omit to toggle)}"#)
         .key("Mod+Shift+E"),
         CommandSpec::new("review.acceptAll", "Accept All Changes", "Review › Changes", |s, v| resolve_all_then(s, v, true))
-            .params(r#"{"stopTracking"?: bool (also turn Track Changes off)}"#),
+            .params(r#"{"stopTracking"?: bool (also turn Track Changes off), "author"?: string (only this reviewer's changes)}"#),
         CommandSpec::new("review.rejectAll", "Reject All Changes", "Review › Changes", |s, v| resolve_all_then(s, v, false))
-            .params(r#"{"stopTracking"?: bool (also turn Track Changes off)}"#),
+            .params(r#"{"stopTracking"?: bool (also turn Track Changes off), "author"?: string (only this reviewer's changes)}"#),
         CommandSpec::new("review.accept", "Accept", "Review › Changes", |s, v| resolve_sel_then(s, v, true))
             .params(r#"{"next"?: bool (then select the next change)}"#),
         CommandSpec::new("review.reject", "Reject", "Review › Changes", |s, v| resolve_sel_then(s, v, false))

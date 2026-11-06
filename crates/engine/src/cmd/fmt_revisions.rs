@@ -328,15 +328,39 @@ pub fn resolve_para(p: &mut ParaProps, accept: bool) {
     }
 }
 
-/// Accept or reject every table, row, cell and section change in `blocks` (paragraph changes
-/// are resolved with their text).
-pub fn resolve_containers(blocks: &mut Blocks, accept: bool, depth: usize) {
+/// Which tracked changes Accept All or Reject All resolves: every one, or only those of some
+/// revisions (one reviewer's, for Accept All from one assistant).
+#[derive(Clone, Copy, Debug)]
+pub enum Which<'a> {
+    All,
+    Revisions(&'a std::collections::BTreeSet<u32>),
+}
+
+impl Which<'_> {
+    /// Whether the change of revision `rev` (none: no change) is resolved.
+    pub fn has(self, rev: Option<u32>) -> bool {
+        match (self, rev) {
+            (_, None) => false,
+            (Which::All, Some(_)) => true,
+            (Which::Revisions(set), Some(r)) => set.contains(&r),
+        }
+    }
+
+    /// Whether the formatting change `ch` is resolved.
+    pub fn has_change<T>(self, ch: Option<&PropChange<T>>) -> bool {
+        self.has(ch.map(|c| c.rev))
+    }
+}
+
+/// Accept or reject the table, row, cell and section changes in `blocks` that `which` names
+/// (paragraph changes are resolved with their text).
+pub fn resolve_containers(blocks: &mut Blocks, accept: bool, which: Which, depth: usize) {
     if depth > MAX_DEPTH {
         return;
     }
     for b in blocks.iter_mut() {
         let needs = match &**b {
-            Block::Para(p) => p.section.as_ref().is_some_and(|s| s.fmt_change.is_some()),
+            Block::Para(p) => which.has_change(p.section.as_ref().and_then(|s| s.fmt_change.as_deref())),
             Block::Table(_) => true,
         };
         if !needs {
@@ -350,12 +374,18 @@ pub fn resolve_containers(blocks: &mut Blocks, accept: bool, depth: usize) {
                 }
             }
             Block::Table(t) => {
-                resolve_table(t, accept);
+                if which.has_change(t.props.fmt_change.as_deref()) {
+                    resolve_table(t, accept);
+                }
                 for r in &mut t.rows {
-                    resolve_row(r, accept);
+                    if which.has_change(r.props.fmt_change.as_deref()) {
+                        resolve_row(r, accept);
+                    }
                     for c in &mut r.cells {
-                        resolve_cell(c, accept);
-                        resolve_containers(&mut c.blocks, accept, depth + 1);
+                        if which.has_change(c.props.fmt_change.as_deref()) {
+                            resolve_cell(c, accept);
+                        }
+                        resolve_containers(&mut c.blocks, accept, which, depth + 1);
                     }
                 }
             }

@@ -107,6 +107,7 @@ pub use dialogs::dialogs_templates;
 pub use file_dialogs::{FileDialogAnswer, FileDialogRequest, open_filters};
 
 mod app;
+mod assist;
 mod clock;
 mod services;
 mod state;
@@ -284,6 +285,9 @@ pub struct UiState {
     pub update_fields_before_print: bool,
     /// The custom dictionary (File › Options › Proofing, Add to Dictionary), kept between runs.
     pub dictionary: Vec<String>,
+    /// The assistant new conversations use (`assist.backend`, #15): an id the window offers;
+    /// empty, or one no longer offered, picks the first one ready.
+    pub assistant: String,
 }
 
 /// The ribbon tab the app opens on, and the one it falls back to when the tab that was showing
@@ -359,6 +363,7 @@ impl Default for UiState {
             print_backgrounds: false,
             update_fields_before_print: false,
             dictionary: Vec::new(),
+            assistant: String::new(),
         }
     }
 }
@@ -510,6 +515,9 @@ pub struct WordApp {
     lobby: wordcraft_engine::room::Lobby,
     /// The document this window shares, if it shares one ([`share`]).
     share: Option<share::Share>,
+    /// The built-in assistant: its conversation, the assistants offered, the prompt being
+    /// typed ([`assist`], #15).
+    pub(crate) assist: assist::AssistState,
     /// Admitted `ui.screenshot` requests: count/byte budgets, retries and completion slots.
     shots: control::Shots,
     /// Monotonic geometry epoch; any size/DPI/zoom/surface/document change increments it,

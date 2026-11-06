@@ -34,8 +34,9 @@ pub const COMMANDS_URI: &str = "wordcraft://commands";
 /// Longest request line accepted on stdin.
 pub const MAX_REQUEST_LINE: usize = 1 << 20;
 
-/// One bounded line read.
-pub(crate) enum BoundedLine {
+/// One bounded line read ([`read_bounded_line`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundedLine {
     Eof,
     Line(String),
     /// The line exceeded the limit; the rest of it has been discarded.
@@ -43,8 +44,10 @@ pub(crate) enum BoundedLine {
 }
 
 /// Read one line of at most `max` bytes (excluding the newline) without buffering more than
-/// `max + 1` bytes; an over-long line is skipped up to its newline.
-pub(crate) fn read_bounded_line(reader: &mut impl BufRead, max: usize) -> std::io::Result<BoundedLine> {
+/// `max + 1` bytes; an over-long line is skipped up to its newline. A line that isn't UTF-8 is
+/// an [`std::io::ErrorKind::InvalidData`] error, after which the next line can be read. The
+/// built-in assistant reads its ACP agents' lines with it too.
+pub fn read_bounded_line(reader: &mut impl BufRead, max: usize) -> std::io::Result<BoundedLine> {
     let mut buf = Vec::new();
     reader.by_ref().take(max as u64 + 1).read_until(b'\n', &mut buf)?;
     if buf.is_empty() {

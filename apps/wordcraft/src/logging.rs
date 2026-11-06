@@ -11,7 +11,10 @@
 //! Levels: `info` for WordCraft's own crates, `warn` for everything else (wgpu and naga are
 //! chatty). `RUST_LOG` replaces that with env_logger-style directives: `debug`,
 //! `warn,wordcraft_docx=trace`, `wgpu_core=info`. A directive ending in `*` matches every target
-//! that starts with it (`wordcraft*=debug`).
+//! that starts with it (`wordcraft*=debug`). The HTTP client's targets ([`WIRE_TARGETS`]) never
+//! log past `debug`, whatever `RUST_LOG` says: at `trace` they write the raw bytes of each
+//! request and answer, sign-in tokens included. The file is only its owner's (mode 0600 on
+//! Unix).
 //!
 //! Records logged before the settings directory is known are kept (up to [`MAX_PENDING`]) and
 //! written once the file is attached. Writing never panics: a file that can't be created or
@@ -39,6 +42,10 @@ pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_PENDING: usize = 512;
 /// The built-in filter when `RUST_LOG` is unset or empty.
 pub const DEFAULT_FILTER: &str = "warn,wordcraft*=info";
+/// Targets that log at `debug` at most, whatever the filter says: ureq-proto's `trace` records
+/// are each HTTP request's and answer's raw bytes (a bearer token, the token endpoint's
+/// answers), and ureq's `trace` shows addresses and headers it otherwise hides.
+pub const WIRE_TARGETS: [&str; 2] = ["ureq_proto", "ureq"];
 
 /// Per-target level filter parsed from env_logger-style directives.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,9 +77,16 @@ impl Filter {
         f
     }
 
-    /// The level that applies to `target` (the most specific matching directive wins).
+    /// The level that applies to `target` (the most specific matching directive wins), at
+    /// most `debug` for the [`WIRE_TARGETS`].
     pub fn level_for(&self, target: &str) -> LevelFilter {
-        self.directives.iter().filter(|(name, _)| matches(name, target)).max_by_key(|(name, _)| name.len()).map_or(self.default, |(_, level)| *level)
+        let level = self
+            .directives
+            .iter()
+            .filter(|(name, _)| matches(name, target))
+            .max_by_key(|(name, _)| name.len())
+            .map_or(self.default, |(_, level)| *level);
+        if WIRE_TARGETS.iter().any(|wire| matches(wire, target)) { level.min(LevelFilter::Debug) } else { level }
     }
 
     /// The most verbose level any target can reach (for `log::set_max_level`).
@@ -132,7 +146,8 @@ fn numbered(dir: &Path, n: usize) -> PathBuf {
 }
 
 /// Shift the previous logs up one (`.log` → `.1.log` → … → `.<KEEP>.log`, the oldest dropped)
-/// and create a fresh, empty log file in `dir` (created if missing).
+/// and create a fresh, empty log file in `dir` (created if missing), only its owner's (mode
+/// 0600 on Unix).
 pub fn rotate(dir: &Path) -> std::io::Result<(PathBuf, File)> {
     std::fs::create_dir_all(dir)?;
     for n in (1..=KEEP).rev() {
@@ -142,7 +157,11 @@ pub fn rotate(dir: &Path) -> std::io::Result<(PathBuf, File)> {
         }
     }
     let path = numbered(dir, 0);
-    let file = File::create(&path)?;
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+    let file = open.open(&path)?;
     Ok((path, file))
 }
 

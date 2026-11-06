@@ -74,7 +74,7 @@ fn host_of(addr: &str) -> &str {
 /// Whether `addr` (`HOST:PORT`, as given to `--connect`) names the app's own address:
 /// 127.0.0.1 or `localhost`. Other loopback addresses (127.0.0.2, ::1) don't count: the app never
 /// listens there, so whatever does is not the app. Other host names are not resolved.
-fn is_app_addr(addr: &str) -> bool {
+pub fn is_app_addr(addr: &str) -> bool {
     let app = |ip: IpAddr| ip.to_canonical() == APP_IP;
     if let Ok(sa) = addr.parse::<SocketAddr>() {
         return app(sa.ip());
@@ -108,6 +108,13 @@ impl Remote {
     /// Connect to `addr` (`127.0.0.1:7981`), failing fast when nothing is listening.
     pub fn connect(addr: &str) -> std::io::Result<Self> {
         Self::connect_with(addr, Box::new(find_key))
+    }
+
+    /// Connect with an invite's key, without consulting the environment or the app's key file.
+    /// The same loopback checks as [`Remote::connect`] keep it on WordCraft's address.
+    pub fn connect_with_key(addr: &str, key: &str) -> std::io::Result<Self> {
+        let key = key.to_string();
+        Self::connect_with(addr, Box::new(move |_| Ok(key.clone())))
     }
 
     fn connect_with(addr: &str, find_key: KeyFinder) -> std::io::Result<Self> {

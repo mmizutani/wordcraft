@@ -44,6 +44,13 @@ impl WordApp {
             self.dialog = dialogs::Dialog::open(name, self);
             return Ok(json!({"pending": name}));
         }
+        if ((id == "assist.draft" && params.get("about").is_none()) || (id == "assist.ask" && params.get("prompt").is_none()))
+            && widgets::enabled(self, id)
+        {
+            self.run("assist.pane", json!({"value": true}))?;
+            self.assist.draft = id == "assist.draft";
+            return Ok(json!({"pending": "assistant"}));
+        }
         // What agents changed in a shared document since the last frame counts as unsaved.
         if discards_document(id, &params) {
             self.catch_up_share();
@@ -209,6 +216,9 @@ impl WordApp {
             None if self.ime_origin => self.session.run_ime(id, &params).map_err(|e| e.to_string()),
             None => self.session.run(id, &params).map_err(|e| e.to_string()),
         };
+        // The assistant's commands checked their params and asked the window: it does what they
+        // ask now, and answers for them ([`crate::assist`]).
+        let r = crate::assist::after_command(self, id, r);
         if self.session.ime_body_epoch() != body_epoch {
             self.canvas.ime_interrupted_preedit |= composing_before;
             // The body (or the whole document) was replaced under the same id — setText, a
@@ -319,7 +329,14 @@ impl WordApp {
         }
         let retry = (id == "file.open").then(|| params.clone());
         let retry_path = retry.clone();
+        // The person asked for it: a turn of the assistant's it starts asks them its agent's
+        // permission requests ([`crate::assist`]). A click or key the control channel made
+        // (MCP's `click` and `key`) is a program's, not theirs. The origin is restored on every
+        // return.
+        let person = !self.ctx.as_ref().map_or(self.synthetic_pending, |ctx| self.input_from_control(ctx));
+        let by_person = std::mem::replace(&mut self.assist.by_person, person);
         let r = self.execute(id, params);
+        self.assist.by_person = by_person;
         if let (Err(e), Some(params)) = (&r, retry)
             && wordcraft_engine::io::needs_password(e)
         {
@@ -424,6 +441,13 @@ impl WordApp {
             let app_wide = req.get("interfaceTheme").is_some() || req.get("toggle").and_then(Value::as_str) == Some("interfaceTheme");
             if app_wide || req.get("close").is_some() || !self.queue_for_window(document, req) {
                 self.handle_request_for(document, req);
+            }
+            return;
+        }
+        // The assistant's, from a command `execute` didn't run (it answers those itself).
+        if req.get("assist").is_some() {
+            if let Err(e) = crate::assist::handle(self, req) {
+                self.status(e);
             }
             return;
         }
@@ -1042,6 +1066,9 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "ui.caretAnimation"
             | "ui.startScreen"
             | "ui.checkForUpdates"
+            | "assist.backend"
+            | "assist.defaultRole"
+            | "assist.allowUnattended"
     ) || id.starts_with("help.")
 }
 
