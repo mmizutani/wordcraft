@@ -1,6 +1,8 @@
 //! The ACP backend against the scripted fake agent, which is this test executable run again
 //! ([`fake_agent`]).
 
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,8 +13,8 @@ use wordcraft_engine::room::{Replica, Room};
 
 use super::fake_agent::{SCRIPT_VAR, Script, Step};
 use super::{
-    Acp, AgentSpec, Launch, NOT_NOW, Reach, START_ROW, agent_env, agent_info, auth_methods, content_text, permission_option, plan_entry, stop_reason,
-    tool_detail,
+    Acp, AgentSpec, Launch, NOT_NOW, Reach, START_ROW, agent_env, agent_info, auth_methods, content_text, permission_option, plan_entry, shell_word,
+    stop_reason, tool_detail,
 };
 use crate::backend::MAX_LABEL;
 use crate::{Answer, Assistant, Entry, Options, PermissionKind, PermissionPolicy, PlanStatus, Priority, StopReason, ToolStatus};
@@ -376,15 +378,11 @@ fn a_key_in_wordcrafts_environment_never_reaches_the_agent() {
     const WINDOW_KEY: &str = "the-windows-own-key-0123456789abcdef";
     const TEST: &str = "acp::tests::a_key_in_wordcrafts_environment_never_reaches_the_agent";
     if std::env::var("WORDCRAFT_CONTROL_KEY").as_deref() == Ok(WINDOW_KEY) {
-        let mut spec = spec(&turns(vec![vec![Step::Report]]));
         let room = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9));
-        spec.reach = Reach::Mcp { cli: std::env::current_exe().unwrap(), room };
-        let mut c = Chat::new(spec, PermissionPolicy::Reject);
-        c.ask("Report");
-        assert!(!c.answer().contains(WINDOW_KEY), "{}", c.answer());
-        let report = c.report();
-        assert_eq!(report["env"], json!({}));
-        assert_eq!(report["session"]["mcpServers"][0]["env"], json!([{"name": "WORDCRAFT_CONTROL_KEY", "value": c.a.key()}]));
+        let cli = std::env::current_exe().unwrap();
+        for reach in [Reach::Mcp { cli: cli.clone(), room }, Reach::Shell { cli, room }] {
+            only_the_invites_key_reaches(reach, WINDOW_KEY);
+        }
         return;
     }
     let out = std::process::Command::new(std::env::current_exe().unwrap())
@@ -395,6 +393,50 @@ fn a_key_in_wordcrafts_environment_never_reaches_the_agent() {
         .unwrap();
     let said = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success() && said.contains("1 passed"), "{said}");
+}
+
+/// An agent reaching the document by `reach`, started by a WordCraft with `window_key` in its
+/// environment and a key in the agent's own settings: the only key it gets is its invite's, in
+/// its MCP server's environment, and in its own for an agent with a shell.
+fn only_the_invites_key_reaches(reach: Reach, window_key: &str) {
+    let shell = matches!(reach, Reach::Shell { .. });
+    let mut spec = spec(&turns(vec![vec![Step::Report]]));
+    spec.env.push(("WORDCRAFT_CONTROL_KEY".into(), "a-key-from-the-settings".into()));
+    spec.reach = reach;
+    let mut c = Chat::new(spec, PermissionPolicy::Reject);
+    c.ask("Report");
+    let answer = c.answer();
+    assert!(!answer.contains(window_key) && !answer.contains("a-key-from-the-settings"), "{answer}");
+    let report = c.report();
+    let key = c.a.key().to_string();
+    let env = if shell { json!({"WORDCRAFT_CONTROL_KEY": key, "WORDCRAFT_CONTROL_ADDR": "127.0.0.1:9"}) } else { json!({}) };
+    assert_eq!(report["env"], env);
+    assert_eq!(report["session"]["mcpServers"][0]["env"], json!([{"name": "WORDCRAFT_CONTROL_KEY", "value": key}]));
+    let note = report["prompt"][0].as_str().unwrap();
+    assert_eq!(note.contains("call document.inspect"), shell, "{note}");
+}
+
+#[test]
+fn an_agent_with_a_shell_gets_its_key_and_the_room_in_its_environment_and_the_note_says_how() {
+    let room = SocketAddr::from((Ipv4Addr::LOCALHOST, 4567));
+    let cli = std::env::temp_dir().join("Word Craft").join("wordcraft-cli");
+    let shell = Reach::Shell { cli: cli.clone(), room };
+    let env = shell.env("k").unwrap();
+    assert_eq!(env, [("WORDCRAFT_CONTROL_KEY".to_string(), "k".to_string()), ("WORDCRAFT_CONTROL_ADDR".to_string(), "127.0.0.1:4567".to_string())]);
+    assert_eq!(shell.mcp_servers("k").unwrap().len(), 1, "the MCP server too, for an adapter that passes it on");
+    let note = shell.note().unwrap();
+    let word = shell_word(&cli.to_string_lossy());
+    assert!(word.starts_with('\'') && note.contains(&format!("{word} call document.inspect")), "{note}");
+    let mcp = Reach::Mcp { cli: cli.clone(), room };
+    assert!(mcp.env("k").unwrap().is_empty() && mcp.note().is_none());
+    assert!(Reach::Nothing.env("k").unwrap().is_empty() && Reach::Nothing.mcp_servers("k").unwrap().is_empty());
+    // No key goes anywhere but 127.0.0.1, or to a program that isn't an absolute path.
+    let elsewhere = Reach::Shell { cli, room: SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 4567)) };
+    assert!(elsewhere.env("k").is_err() && elsewhere.mcp_servers("k").is_err());
+    assert!(Reach::Shell { cli: PathBuf::from("wordcraft-cli"), room }.env("k").is_err());
+    assert_eq!(shell_word("/usr/bin/wordcraft-cli"), "/usr/bin/wordcraft-cli");
+    assert_eq!(shell_word("/it's/cli"), "'/it'\\''s/cli'");
+    assert_eq!(shell_word(""), "''");
 }
 
 #[test]

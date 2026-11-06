@@ -2,6 +2,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod automation_args;
+mod call;
 mod script;
 
 use std::ffi::{OsStr, OsString};
@@ -51,6 +52,14 @@ USAGE:
                                               export, merge output…) to DIR, links followed; a root left
                                               out grants none of its access. They apply to the headless
                                               server and are an error with --connect.
+  wordcraft-cli call <method> [<params> | -] [--connect HOST:PORT]
+                                              send one request to the running app, or to a shared
+                                              document's room, and print its result as JSON
+                                              (docs/control-protocol.md). params is a JSON object;
+                                              - reads it from stdin. The address is --connect's or
+                                              WORDCRAFT_CONTROL_ADDR's, 127.0.0.1 or localhost only;
+                                              the key is WORDCRAFT_CONTROL_KEY, or the app's key
+                                              file for that port
   wordcraft-cli zotero <command> <file> [--cmd 'id={json}' …] [--save OUT] [--trace] [--port P]
                                               run a Zotero command on a document (Zotero must be
                                               running): addEditCitation, addEditBibliography,
@@ -71,7 +80,7 @@ same output on every machine.
 ";
 
 /// The subcommands, in `USAGE` order; `--help` or `-h` after any of them prints `USAGE` (#968).
-const SUBCOMMANDS: &[&str] = &["convert", "info", "text", "inspect", "render", "run", "commands", "parity", "mcp", "zotero"];
+const SUBCOMMANDS: &[&str] = &["convert", "info", "text", "inspect", "render", "run", "commands", "parity", "mcp", "call", "zotero"];
 
 fn wants_help(cmd: &str, rest: &[String]) -> bool {
     SUBCOMMANDS.contains(&cmd) && rest.iter().any(|a| a == "--help" || a == "-h")
@@ -654,6 +663,7 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
             // A client that closes our stdout has hung up: `serve` returns BrokenPipe and we end cleanly.
             Ok(server.serve(stdin.lock(), std::io::stdout())?)
         }
+        "call" => call::call(&rest, std::env::var(call::ADDR_VAR).ok(), std::io::stdin().lock()),
         "zotero" => {
             validate_options("zotero", &rest, ZOTERO_OPTIONS)?;
             let paths = positionals(&rest, ZOTERO_OPTIONS);

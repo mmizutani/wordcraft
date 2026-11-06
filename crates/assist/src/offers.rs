@@ -8,7 +8,7 @@
 //!
 //! On the desktop the picker lists ChatGPT first ([`crate::chatgpt`]), then, for a host that
 //! gives agents a way to the document (`wordcraft-cli`, the room's port), the ACP agents
-//! ([`crate::acp::presets`]: Claude Code, Codex, a custom one), each ready, or with what to
+//! ([`crate::acp::presets`]: Claude Code, Codex, Pi, a custom one), each ready, or with what to
 //! install or set up first, and the fake last. The web build offers no backend but the fake:
 //! the ones that sign in or start agent processes are desktop only.
 
@@ -142,7 +142,7 @@ mod tests {
         let room = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9));
         let host = Host { room: Some(room), cli: Some(std::env::temp_dir().join("wordcraft-cli")), fake: true, ..Host::default() };
         let ids: Vec<String> = offers(&host).into_iter().map(|o| o.id).collect();
-        assert_eq!(ids, ["chatgpt", "acp:claude-code", "acp:codex", "acp:custom", "fake"]);
+        assert_eq!(ids, ["chatgpt", "acp:claude-code", "acp:codex", "acp:pi", "acp:custom", "fake"]);
         // Without a way to the document, no agent.
         let ids: Vec<String> = offers(&Host { fake: true, ..Host::default() }).into_iter().map(|o| o.id).collect();
         assert_eq!(ids, ["chatgpt", "fake"]);

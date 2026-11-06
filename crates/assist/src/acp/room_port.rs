@@ -6,14 +6,17 @@
 //! It speaks the control channel's protocol (`docs/control-protocol.md`): one JSON request per
 //! line, one reply per line. A connection's first request must carry the key of an invite to
 //! the document the window shares (top-level `key`, or `auth`'s); from then on the holder's own
-//! copy answers it ([`hosted::call`]), and later requests carry the same key or none. The
-//! window's own key opens nothing here: the port doesn't know it, and no key file names it, so
-//! an MCP server that went looking for a key would find none that works.
+//! copy answers it ([`hosted::call`]), and later requests carry the same key or none. Every
+//! connection with the same key works on the same copy ([`Seats`]), so an agent that connects
+//! for each request (`wordcraft-cli call` in its shell) finds what it selected still selected,
+//! and stays one participant. The window's own key opens nothing here: the port doesn't know it,
+//! and no key file names it, so an MCP server that went looking for a key would find none that
+//! works.
 
 use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -29,6 +32,12 @@ pub const FIRST_REQUEST: Duration = Duration::from_secs(30);
 /// Most connections served at once; more are refused.
 pub const MAX_CONNECTIONS: usize = 64;
 
+/// Most copies the port holds at once ([`Seats`]).
+pub const MAX_SEATS: usize = 64;
+
+/// How often the port lets go of the copies whose holders are out of the room.
+const SWEEP: Duration = Duration::from_secs(2);
+
 /// The room's own port, listening on `127.0.0.1` (a port the system picks) for the room the
 /// lobby opens. The lobby says where it is ([`Lobby::addr`]) while it listens. Dropping it
 /// closes the port, unless it was kept open ([`RoomPort::keep_open`]).
@@ -36,6 +45,7 @@ pub struct RoomPort {
     addr: SocketAddr,
     lobby: Lobby,
     open: Arc<AtomicBool>,
+    seats: Seats,
     kept: bool,
 }
 
@@ -49,11 +59,20 @@ impl RoomPort {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let addr = listener.local_addr()?;
         let open = Arc::new(AtomicBool::new(true));
-        let (room, listening) = (lobby.clone(), open.clone());
-        std::thread::Builder::new().name("room port".into()).spawn(move || accept(&listener, &room, &listening, first))?;
+        let seats = Seats::default();
+        let (room, listening, held) = (lobby.clone(), open.clone(), seats.clone());
+        std::thread::Builder::new().name("room port".into()).spawn(move || accept(&listener, &room, &held, &listening, first))?;
+        let (listening, held_too) = (open.clone(), seats.clone());
+        std::thread::Builder::new().name("room port seats".into()).spawn(move || {
+            while listening.load(Ordering::SeqCst) {
+                std::thread::sleep(SWEEP);
+                seats.sweep();
+            }
+            seats.list().clear();
+        })?;
         lobby.set_addr(Some(addr));
         log::info!("the shared document's room listens on {addr} (invites' keys only)");
-        Ok(RoomPort { addr, lobby: lobby.clone(), open, kept: false })
+        Ok(RoomPort { addr, lobby: lobby.clone(), open, seats: held_too, kept: false })
     }
 
     /// Where it listens.
@@ -77,6 +96,8 @@ impl Drop for RoomPort {
         if self.lobby.addr() == Some(self.addr) {
             self.lobby.set_addr(None);
         }
+        // Its copies leave the room; a connection still served keeps its own till it ends.
+        self.seats.list().clear();
         // Wake the listener, which then sees it's closed.
         let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(500));
     }
@@ -98,8 +119,71 @@ impl Drop for Live {
     }
 }
 
+/// The copies of the shared document the port holds, one for each invite key that opened it:
+/// every connection with that key works on the same copy, one request at a time, so what one
+/// request selects the next one finds selected, and a holder who connects for each request
+/// (`wordcraft-cli call`) stays one participant rather than joining the room again each time.
+/// A copy is let go once its holder is out of the room (the invite was taken back, or sharing
+/// stopped), and when the port closes.
+#[derive(Clone, Default)]
+struct Seats(Arc<Mutex<Vec<Seat>>>);
+
+/// The copy the port holds for one invite key.
+struct Seat {
+    key: String,
+    copy: Arc<Mutex<Replica>>,
+    used: Instant,
+}
+
+impl Seats {
+    fn list(&self) -> MutexGuard<'_, Vec<Seat>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The copy for invite `key`: the one the port holds, or a new one, joined with the key.
+    /// `None` when the key opens nothing.
+    fn take(&self, lobby: &Lobby, key: &str) -> Option<Arc<Mutex<Replica>>> {
+        if key.is_empty() {
+            return None;
+        }
+        let mut seats = self.list();
+        sweep(&mut seats);
+        // Every seat is compared, so how long it takes says nothing about the key.
+        let found = seats.iter_mut().fold(None, |found, seat| if same_key(key, &seat.key) { Some(seat) } else { found });
+        if let Some(seat) = found {
+            seat.used = Instant::now();
+            return Some(seat.copy.clone());
+        }
+        let copy = Arc::new(Mutex::new(lobby.join_with(key).ok()?));
+        if seats.len() >= MAX_SEATS {
+            // The one used longest ago goes; a connection that has it keeps it till it ends.
+            let oldest = seats.iter().enumerate().min_by_key(|(_, seat)| seat.used).map(|(i, _)| i);
+            if let Some(i) = oldest {
+                seats.swap_remove(i);
+            }
+        }
+        seats.push(Seat { key: key.to_string(), copy: copy.clone(), used: Instant::now() });
+        Some(copy)
+    }
+
+    /// Let go of the copies whose holders are out of the room.
+    fn sweep(&self) {
+        sweep(&mut self.list());
+    }
+}
+
+/// Let go of the copies in `seats` whose holders are out of the room, and of any a request
+/// broke; a copy busy with a request stays.
+fn sweep(seats: &mut Vec<Seat>) {
+    seats.retain(|seat| match seat.copy.try_lock() {
+        Ok(copy) => hosted::ended(&copy).is_none(),
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Poisoned(_)) => false,
+    });
+}
+
 /// The listener's thread: a thread for each connection, until the port closes.
-fn accept(listener: &TcpListener, lobby: &Lobby, open: &AtomicBool, first: Duration) {
+fn accept(listener: &TcpListener, lobby: &Lobby, seats: &Seats, open: &AtomicBool, first: Duration) {
     let live = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         if !open.load(Ordering::SeqCst) {
@@ -119,10 +203,10 @@ fn accept(listener: &TcpListener, lobby: &Lobby, open: &AtomicBool, first: Durat
             continue;
         }
         let counted = Live::new(&live);
-        let lobby = lobby.clone();
+        let (lobby, seats) = (lobby.clone(), seats.clone());
         let spawned = std::thread::Builder::new().name("room port connection".into()).spawn(move || {
             let _counted = counted;
-            serve(stream, &lobby, first);
+            serve(stream, &lobby, &seats, first);
         });
         if let Err(e) = spawned {
             log::warn!("room port: no thread for a connection: {e}");
@@ -253,19 +337,16 @@ fn same_key(given: &str, key: &str) -> bool {
 
 /// A connection: its first request must carry an invite's key, whose holder's copy answers
 /// the rest.
-fn serve(stream: TcpStream, lobby: &Lobby, first: Duration) {
+fn serve(stream: TcpStream, lobby: &Lobby, seats: &Seats, first: Duration) {
     let _ = stream.set_nodelay(true);
     let Ok(read) = stream.try_clone() else { return };
     let mut out = stream;
     let mut reader = BufReader::new(Deadline { stream: read, until: Some(Instant::now() + first), participant: None });
     let Some(request) = next_request(&mut reader, &mut out) else { return };
     let key = request.key.clone().unwrap_or_default();
-    let copy = match lobby.join_with(&key) {
-        Ok(copy) if !key.is_empty() => copy,
-        _ => {
-            let _ = send(&mut out, &request.id, json!({"ok": false, "error": "unauthorized"}));
-            return;
-        }
+    let Some(copy) = seats.take(lobby, &key) else {
+        let _ = send(&mut out, &request.id, json!({"ok": false, "error": "unauthorized"}));
+        return;
     };
     let deadline = reader.get_mut();
     deadline.until = None;
@@ -274,26 +355,36 @@ fn serve(stream: TcpStream, lobby: &Lobby, first: Duration) {
 }
 
 /// The rest of a connection whose first request, `first`, carried invite `key`: `copy`, its
-/// holder's own copy of the shared document, answers each request (`auth` just says yes).
-/// Every request carries that key or none. The connection ends when the copy is out of the
-/// room (the invite was taken back, or sharing stopped).
-fn serve_copy(reader: &mut BufReader<Deadline>, out: &mut TcpStream, mut copy: Replica, key: &str, first: Request) {
+/// holder's copy of the shared document, answers each request (`auth` just says yes). Every
+/// request carries that key or none. The connection ends when the copy is out of the room (the
+/// invite was taken back, or sharing stopped).
+fn serve_copy(reader: &mut BufReader<Deadline>, out: &mut TcpStream, copy: Arc<Mutex<Replica>>, key: &str, first: Request) {
     let mut next = Some(first);
     while let Some(request) = next.take().or_else(|| next_request(reader, out)) {
         if request.key.as_deref().is_some_and(|k| !same_key(k, key)) {
             let _ = send(out, &request.id, json!({"ok": false, "error": "unauthorized"}));
             return;
         }
-        if let Some(why) = hosted::ended(&copy) {
-            let _ = send(out, &request.id, json!({"ok": false, "error": why}));
-            return;
-        }
-        let reply = match request.method.as_str() {
-            "auth" => json!({"ok": true, "result": {}}),
-            method => match hosted::call(&mut copy, method, &request.params) {
-                Ok(v) => json!({"ok": true, "result": v}),
-                Err(e) => json!({"ok": false, "error": e}),
+        let answered = match copy.lock() {
+            // Another connection's request broke the copy: the next connection gets a new one.
+            Err(_) => Err("the copy of the shared document broke: connect again".to_string()),
+            Ok(mut copy) => match hosted::ended(&copy) {
+                Some(why) => Err(why),
+                None => Ok(match request.method.as_str() {
+                    "auth" => json!({"ok": true, "result": {}}),
+                    method => match hosted::call(&mut copy, method, &request.params) {
+                        Ok(v) => json!({"ok": true, "result": v}),
+                        Err(e) => json!({"ok": false, "error": e}),
+                    },
+                }),
             },
+        };
+        let reply = match answered {
+            Ok(reply) => reply,
+            Err(why) => {
+                let _ = send(out, &request.id, json!({"ok": false, "error": why}));
+                return;
+            }
         };
         if !send(out, &request.id, reply) {
             return;
@@ -388,6 +479,55 @@ mod tests {
         let mut c = Conn::open(&port);
         let reply = c.call(&line(5, "file.saveAs", json!({"path": std::env::temp_dir().join("wordcraft-room-port.docx")})));
         assert_eq!(reply["ok"], json!(false), "{reply}");
+    }
+
+    /// `wordcraft-cli call` connects for each request: what one selects the next one finds
+    /// selected, and the holder stays one participant.
+    #[test]
+    fn every_connection_with_a_key_works_on_the_same_copy() {
+        let lobby = Lobby::default();
+        let port = RoomPort::open(&lobby).unwrap();
+        let (mut session, room, mut own) = share(&lobby);
+        let key = room.invite("Pi", Role::Suggester).unwrap();
+        let call = |id: u32, method: &str, params: Value| {
+            let mut c = Conn::open(&port);
+            c.call(&json!({"id": id, "key": key, "method": method, "params": params}).to_string())
+        };
+        assert_eq!(call(1, "select.text", json!({"text": "two"}))["ok"], json!(true));
+        assert_eq!(call(2, "text.insert", json!({"text": "2", "raw": true}))["ok"], json!(true));
+        for _ in 0..500 {
+            let _ = own.lend(&mut session, Replica::sync);
+            if session.doc.final_text(StoryRef::Body) == "one 2 three" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(session.doc.final_text(StoryRef::Body), "one 2 three");
+        let pis = |room: &Room| room.participants().iter().filter(|p| p.name == "Pi").count();
+        assert_eq!(pis(&room), 1);
+        // A connection that stays (an MCP server) and one per request share it too.
+        let mut stays = Conn::open(&port);
+        assert_eq!(stays.call(&json!({"id": 3, "key": key, "method": "select.text", "params": {"text": "three"}}).to_string())["ok"], json!(true));
+        let reply = call(4, "document.inspect", json!({}));
+        assert!(reply["result"].to_string().contains("three"), "{reply}");
+        assert_eq!(pis(&room), 1);
+        // Taken back: out of the room, and the key opens nothing.
+        assert!(room.revoke(&key));
+        assert_eq!(pis(&room), 0);
+        assert_eq!(call(5, "document.inspect", json!({}))["error"], json!("unauthorized"));
+    }
+
+    #[test]
+    fn the_port_holds_a_bounded_number_of_copies() {
+        let lobby = Lobby::default();
+        let port = RoomPort::open(&lobby).unwrap();
+        let (_session, room, _own) = share(&lobby);
+        let keys: Vec<String> = (0..=super::MAX_SEATS).map(|i| room.invite(&format!("Agent {i}"), Role::Viewer).unwrap()).collect();
+        for key in keys.iter().chain(keys.first()) {
+            let mut c = Conn::open(&port);
+            assert_eq!(c.call(&json!({"id": 1, "key": key, "method": "room.participants"}).to_string())["ok"], json!(true));
+        }
+        assert!(port.seats.list().len() <= super::MAX_SEATS);
     }
 
     #[test]

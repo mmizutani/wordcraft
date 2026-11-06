@@ -98,6 +98,16 @@ pub enum Step {
     /// it (its command, args and env), and say each result on a line of its own: "<tool>: ok
     /// <text>" or "<tool>: error <why>" (and "mcp: error <why>" when there's no server).
     Mcp { calls: Vec<Call> },
+    /// Run `program` with `args` (and `input` on its standard input) as an agent's shell tool
+    /// runs a command, in the agent's folder and with its environment, and say what came of it:
+    /// "run: ok <stdout>", "run: exit <code> <stderr>" or "run: error <why>".
+    Run {
+        program: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        input: Option<String>,
+    },
     /// End the turn with stop reason `reason` now.
     Stop { reason: String },
     /// Answer the prompt with error `code` and `message`.
@@ -336,6 +346,7 @@ impl Agent<'_> {
                     Ok(said) => say(&said),
                     Err(why) => say(&format!("mcp: error {why}\n")),
                 },
+                Step::Run { program, args, input } => say(&format!("{}\n", run_program(&program, &args, input.as_deref()))),
                 Step::Stop { reason } => {
                     reply(id, json!({"stopReason": reason}));
                     return None;
@@ -394,6 +405,60 @@ impl Agent<'_> {
         let _ = child.kill();
         let _ = child.wait();
         result
+    }
+}
+
+/// Most bytes of a program's output [`Step::Run`] reads, from each of its stdout and stderr.
+const MAX_OUTPUT: u64 = 1 << 20;
+
+/// How long a program [`Step::Run`] runs may take.
+const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Run `program` with `args`, `input` on its stdin: what came of it, for [`Step::Run`].
+fn run_program(program: &str, args: &[String], input: Option<&str>) -> String {
+    use std::io::Read;
+    let child = Command::new(program).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => return format!("run: error {e}"),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        // On a thread of its own, so a program that doesn't read its input can't hold this one
+        // up; it ends the input when it's written.
+        let input = input.unwrap_or_default().to_string();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(input.as_bytes());
+        });
+    }
+    let read = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(pipe) = pipe {
+                let _ = pipe.take(MAX_OUTPUT).read_to_end(&mut bytes);
+            }
+            String::from_utf8_lossy(&bytes).trim().to_string()
+        })
+    };
+    let out = read(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err = read(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let until = Instant::now() + RUN_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err("it didn't end in time".to_string());
+            }
+            Err(e) => break Err(e.to_string()),
+        }
+    };
+    let (out, err) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
+    match status {
+        Ok(s) if s.success() => format!("run: ok {out}"),
+        Ok(s) => format!("run: exit {} {err}", s.code().map_or_else(|| "by signal".to_string(), |c| c.to_string())),
+        Err(why) => format!("run: error {why}"),
     }
 }
 

@@ -1,4 +1,4 @@
-//! The ACP agents WordCraft knows ([`PRESETS`]: Claude Code, Codex) and the person's own
+//! The ACP agents WordCraft knows ([`PRESETS`]: Claude Code, Codex, Pi) and the person's own
 //! ([`CUSTOM_ID`]), as the assistant pane offers them: found on `PATH` (or run through `npx`),
 //! with the command, arguments and environment the person set up for them in the agents'
 //! settings file ([`AgentSettings`]). Built-in npx fallback asks a person before downloading
@@ -39,6 +39,16 @@ const MAX_ITEMS: usize = 64;
 /// Longest command, argument, name or value kept.
 const MAX_TEXT: usize = 32 << 10;
 
+/// What an agent reaches the document through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    /// WordCraft's MCP server, which `session/new` gives it ([`Reach::Mcp`]).
+    Mcp,
+    /// Its own shell and `wordcraft-cli call`, since its adapter doesn't pass MCP servers on
+    /// ([`Reach::Shell`]).
+    Shell,
+}
+
 /// An ACP agent WordCraft knows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Preset {
@@ -52,10 +62,14 @@ pub struct Preset {
     pub program: &'static str,
     /// The npm package `npx -y` runs when the program isn't installed.
     pub package: Option<&'static str>,
+    /// Programs the adapter runs, which must be on `PATH` too.
+    pub needs: &'static [&'static str],
     /// What to install when neither is there.
     pub install: &'static str,
     /// How to sign in when the agent needs it and offers no way WordCraft can run.
     pub sign_in: &'static str,
+    /// How it reaches the document.
+    pub via: Via,
 }
 
 /// Claude Code, through its ACP adapter (`@agentclientprotocol/claude-agent-acp`, which wraps
@@ -66,8 +80,10 @@ pub const CLAUDE_CODE: Preset = Preset {
     label: "Claude Code",
     program: "claude-agent-acp",
     package: Some("@agentclientprotocol/claude-agent-acp"),
+    needs: &[],
     install: "install Claude Code's ACP adapter (`npm install -g @agentclientprotocol/claude-agent-acp`), or Node.js so WordCraft can run it with npx",
     sign_in: "run `claude` in a terminal and sign in, then try again",
+    via: Via::Mcp,
 };
 
 /// Codex, through its ACP adapter (`@agentclientprotocol/codex-acp`), with the person's
@@ -78,12 +94,29 @@ pub const CODEX: Preset = Preset {
     label: "Codex",
     program: "codex-acp",
     package: Some("@agentclientprotocol/codex-acp"),
+    needs: &[],
     install: "install Codex's ACP adapter (`npm install -g @agentclientprotocol/codex-acp`), or Node.js so WordCraft can run it with npx",
     sign_in: "run `codex login` in a terminal, or give Codex an API key (CODEX_API_KEY or OPENAI_API_KEY in its environment), then try again",
+    via: Via::Mcp,
+};
+
+/// Pi, through its ACP adapter (`pi-acp`, which runs `pi --mode rpc`), with the model
+/// providers the person signed Pi in to. The adapter doesn't pass MCP servers on, so Pi reaches
+/// the document with its own shell tool and `wordcraft-cli call` ([`Via::Shell`]).
+pub const PI: Preset = Preset {
+    id: "acp:pi",
+    key: "pi",
+    label: "Pi",
+    program: "pi-acp",
+    package: Some("pi-acp"),
+    needs: &["pi"],
+    install: "install Pi (`npm install -g @earendil-works/pi-coding-agent`) and its ACP adapter (`npm install -g pi-acp`, or WordCraft runs it with npx)",
+    sign_in: "run `pi` in a terminal and sign in, then try again",
+    via: Via::Shell,
 };
 
 /// The agents WordCraft knows, in the picker's order.
-pub const PRESETS: [Preset; 2] = [CLAUDE_CODE, CODEX];
+pub const PRESETS: [Preset; 3] = [CLAUDE_CODE, CODEX, PI];
 
 /// What the person set up for one agent: in place of a preset's own command and arguments, its
 /// environment, and for the custom agent its name.
@@ -106,7 +139,7 @@ pub struct AgentPrefs {
 }
 
 /// The agents' settings: what the person set up for each, by its key (`claude-code`, `codex`,
-/// `custom`), in [`SETTINGS_FILE`].
+/// `pi`, `custom`), in [`SETTINGS_FILE`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSettings {
@@ -246,6 +279,9 @@ fn launch(preset: Option<&Preset>, prefs: &AgentPrefs, path: Option<&OsStr>) -> 
     let Some(preset) = preset else {
         return Err(Readiness::Unavailable { why: "no custom agent is set up: give its command in File › Options › Assistant".into() });
     };
+    if preset.needs.iter().any(|p| find_program(p, path).is_none()) {
+        return Err(Readiness::Install { how: preset.install.to_string() });
+    }
     if let Some(program) = find_program(preset.program, path) {
         return Ok((Launch::new(program, Vec::<OsString>::new()), None));
     }
@@ -257,15 +293,18 @@ fn launch(preset: Option<&Preset>, prefs: &AgentPrefs, path: Option<&OsStr>) -> 
     Err(Readiness::Install { how: preset.install.to_string() })
 }
 
-/// What reaching the document needs of the host: WordCraft's command line tool and the room's
-/// port.
-fn reach(host: &Host) -> Result<Reach, Readiness> {
+/// What reaching the document `via` needs of the host: WordCraft's command line tool and the
+/// room's port.
+fn reach(host: &Host, via: Via) -> Result<Reach, Readiness> {
     let cli = host.cli.clone().filter(|c| c.is_absolute()).ok_or_else(|| Readiness::Unavailable {
         why: "WordCraft's command line tool (wordcraft-cli), which agents reach the document through, wasn't found next to WordCraft".into(),
     })?;
     let room: SocketAddr =
         host.room.ok_or_else(|| Readiness::Unavailable { why: "the shared document has no port for agents to reach it (see the log)".into() })?;
-    Ok(Reach::Mcp { cli, room })
+    Ok(match via {
+        Via::Mcp => Reach::Mcp { cli, room },
+        Via::Shell => Reach::Shell { cli, room },
+    })
 }
 
 /// The agents' settings on `host`.
@@ -318,7 +357,7 @@ fn spec_with(id: &str, host: &Host, settings: &AgentSettings, path: Option<&OsSt
     let configured_path = prefs.env.iter().find(|(name, _)| if cfg!(windows) { name.eq_ignore_ascii_case("PATH") } else { name.as_str() == "PATH" });
     let path = effective_path(configured_path.map(|(_, value)| OsStr::new(value)).or(path), extra);
     let (launch, setup) = launch(preset, &prefs, path.as_deref())?;
-    let reach = reach(host)?;
+    let reach = reach(host, preset.map_or(Via::Mcp, |p| p.via))?;
     let name = match preset {
         Some(p) => p.label.to_string(),
         None if prefs.name.is_empty() => "Custom agent".to_string(),
@@ -330,12 +369,9 @@ fn spec_with(id: &str, host: &Host, settings: &AgentSettings, path: Option<&OsSt
     spec.path = path;
     spec.reach = reach;
     spec.sign_in = preset.map_or_else(|| format!("sign in with {name} itself, then try again"), |p| p.sign_in.to_string());
-    // WordCraft's own control key and address come from WordCraft only, never from settings.
-    spec.env = prefs
-        .env
-        .into_iter()
-        .filter(|(k, _)| !["WORDCRAFT_CONTROL_KEY", "WORDCRAFT_CONTROL_ADDR"].contains(&k.to_ascii_uppercase().as_str()))
-        .collect();
+    // WordCraft's own control key and address come from WordCraft only (a seat's, for an
+    // agent that reaches the document through its shell), never from settings.
+    spec.env = prefs.env.into_iter().filter(|(k, _)| ![super::KEY_VAR, super::ADDR_VAR].contains(&k.to_ascii_uppercase().as_str())).collect();
     Ok(spec)
 }
 
@@ -606,12 +642,12 @@ mod tests {
         let empty = OsString::new();
         let offers = offers_on(&host, Some(&empty));
         let ids: Vec<&str> = offers.iter().map(|o| o.id.as_str()).collect();
-        assert_eq!(ids, ["acp:claude-code", "acp:codex", CUSTOM_ID]);
-        for o in &offers[..2] {
+        assert_eq!(ids, ["acp:claude-code", "acp:codex", "acp:pi", CUSTOM_ID]);
+        for o in &offers[..3] {
             assert!(matches!(&o.readiness, Readiness::Install { how } if how.contains("install")), "{o:?}");
         }
         assert!(matches!(&offers[0].readiness, Readiness::Install { how } if how.contains("@agentclientprotocol/claude-agent-acp")));
-        assert!(matches!(&offers[2].readiness, Readiness::Unavailable { why } if why.contains("Options › Assistant")), "{:?}", offers[2]);
+        assert!(matches!(&offers[3].readiness, Readiness::Unavailable { why } if why.contains("Options › Assistant")), "{:?}", offers[3]);
         let e = make_on("acp:codex", &host, Some(&empty)).err().unwrap();
         assert!(e.contains("codex-acp"), "{e}");
         assert!(make_on("acp:nope", &host, Some(&empty)).is_err());
@@ -637,8 +673,16 @@ mod tests {
         assert_eq!((spec.launch.program.clone(), spec.launch.args.len()), (adapter, 0));
         assert_eq!((spec.id.as_str(), spec.label.as_str(), spec.author.as_str()), ("acp:claude-code", "Claude Code", "Claude Code"));
         assert_eq!(spec.reach, Reach::Mcp { cli: dir.join("wordcraft-cli"), room: SocketAddr::from((Ipv4Addr::LOCALHOST, 4567)) });
+        // Pi's adapter runs `pi`, which npx doesn't bring: Pi is offered once it's there too, and
+        // reaches the document through its shell.
+        let pi = spec_for("acp:pi", &host, Some(&path));
+        assert!(matches!(&pi, Err(Readiness::Install { how }) if how.contains("@earendil-works/pi-coding-agent")), "{:?}", pi.map(|s| s.id));
+        program(&bin, "pi");
+        let spec = spec_for("acp:pi", &host, Some(&path)).unwrap();
+        assert_eq!(spec.launch.args, [OsString::from("-y"), OsString::from("pi-acp")]);
+        assert_eq!(spec.reach, Reach::Shell { cli: dir.join("wordcraft-cli"), room: SocketAddr::from((Ipv4Addr::LOCALHOST, 4567)) });
         let offers = offers_on(&host, Some(&path));
-        assert!(offers[..2].iter().all(|o| o.readiness == Readiness::Ready), "{offers:?}");
+        assert!(offers[..3].iter().all(|o| o.readiness == Readiness::Ready), "{offers:?}");
         // No wordcraft-cli or no room's port: nothing can reach the document.
         let no_cli = Host { cli: None, ..host.clone() };
         assert!(matches!(spec_for("acp:claude-code", &no_cli, Some(&path)), Err(Readiness::Unavailable { why }) if why.contains("wordcraft-cli")));

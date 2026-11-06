@@ -236,3 +236,60 @@ fn the_fake_agent_runs_end_to_end_as_the_custom_agent() {
     a.end();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// #25: Pi's adapter passes no MCP server on, so Pi reaches the document with its own shell
+/// and `wordcraft-cli call`, with its invite's key and the room's address in its environment.
+/// The fake agent, set up as Pi's command in the agents' settings, does just that.
+#[test]
+fn pi_edits_through_wordcraft_cli_call_in_its_shell_with_its_invites_key() {
+    let mut w = Window::new();
+    let dir = std::env::temp_dir().join(format!("wordcraft-acp-pi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cli = env!("CARGO_BIN_EXE_wordcraft-cli").to_string();
+    let run = |args: &[&str], input: Option<&str>| Step::Run {
+        program: cli.clone(),
+        args: args.iter().map(|a| a.to_string()).collect(),
+        input: input.map(str::to_string),
+    };
+    let edit = vec![
+        run(&["call", "select.text", r#"{"text": "two"}"#], None),
+        run(&["call", "text.insert", "-"], Some(r#"{"text": "2", "raw": true}"#)),
+        run(&["call", "file.saveAs", r#"{"path": "/tmp/stolen.docx"}"#], None),
+    ];
+    let script = Script { turns: vec![vec![Step::Report], edit], ..Script::default() };
+    let mut settings = AgentSettings::default();
+    let pi = AgentPrefs {
+        command: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+        args: AS_AGENT.map(String::from).to_vec(),
+        env: [(SCRIPT_VAR.to_string(), serde_json::to_string(&script).unwrap()), ("WORDCRAFT_CONTROL_KEY".to_string(), "not-from-here".to_string())]
+            .into(),
+        ..AgentPrefs::default()
+    };
+    settings.agents.insert("pi".into(), pi);
+    settings.save(&dir).unwrap();
+    let host = Host { settings: Some(dir.clone()), room: Some(w.port.addr()), cli: Some(PathBuf::from(&cli)), fake: false };
+    let backend = wordcraft_assist::offers::make("acp:pi", &host).unwrap();
+    assert_eq!(backend.info().author, "Pi");
+    let mut a = Assistant::start(&w.room, backend, Options { document: "Notes".into(), ..Options::default() }).unwrap();
+
+    // Its environment has the invite's key and the room's address, and the note says how to use
+    // them.
+    let report: Value = serde_json::from_str(&ask(&mut a, "Report")).unwrap();
+    assert_eq!(report["env"], json!({"WORDCRAFT_CONTROL_KEY": a.key(), "WORDCRAFT_CONTROL_ADDR": w.port.addr().to_string()}));
+    let note = report["prompt"][0].as_str().unwrap();
+    assert!(note.contains(cli.as_str()) && note.contains(" call document.inspect"), "{note}");
+
+    let answer = ask(&mut a, "Write two as a digit");
+    // Each run's line; a reply printed as JSON goes on over lines of its own.
+    let lines: Vec<&str> = answer.lines().filter(|l| l.starts_with("run: ")).collect();
+    assert_eq!(lines.len(), 3, "{answer}");
+    assert!(lines[0].starts_with("run: ok") && lines[1].starts_with("run: ok"), "{answer}");
+    assert!(lines[2].starts_with("run: exit 1") && lines[2].contains("aren't part of a shared document"), "{}", lines[2]);
+    w.settle();
+    assert_eq!(w.accepted(), "one 2 three");
+    assert!(w.authors().iter().all(|a| a == "Pi") && !w.authors().is_empty(), "{:?}", w.authors());
+    let key = a.key().to_string();
+    a.end();
+    assert_eq!(request(&w.port, &key, "document.inspect")["error"], json!("unauthorized"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

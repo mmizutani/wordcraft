@@ -7,9 +7,11 @@
 //! files or a terminal is refused. It reaches the shared document as the participant the
 //! conversation joined as ([`Reach`]): `session/new` gives it WordCraft's MCP server
 //! (`wordcraft-cli mcp --connect`), which joins the room at its own port ([`RoomPort`]) with
-//! the invite's key, and so works on a copy of its own, held to its role, reaching no file. The
-//! window's own key reaches the agent by no path: not in `session/new`, not in its environment
-//! (WordCraft's `WORDCRAFT_*` variables are left out), and the room's port doesn't take it.
+//! the invite's key, and so works on a copy of its own, held to its role, reaching no file. An
+//! agent whose adapter doesn't pass MCP servers on (Pi) gets the invite's key and the room's
+//! port in its environment instead, for `wordcraft-cli call` in its own shell. The window's own
+//! key reaches the agent by no path: not in `session/new`, not in its environment (WordCraft's
+//! `WORDCRAFT_*` variables are left out), and the room's port doesn't take it.
 //!
 //! The agent starts with the conversation's first turn, so Stop can interrupt it (an adapter
 //! run through `npx` may first be downloaded) and a failure is that turn's error; it starts
@@ -64,6 +66,13 @@ const NOT_NOW: &str = "wordcraft-not-now";
 /// The id of the row that shows the agent starting.
 pub const START_ROW: &str = "wordcraft-start";
 
+/// The variable that holds the key an agent joins the shared document with, when it reaches it
+/// through its shell ([`Reach::Shell`]).
+pub const KEY_VAR: &str = "WORDCRAFT_CONTROL_KEY";
+
+/// The variable that holds the room's address, with [`KEY_VAR`].
+pub const ADDR_VAR: &str = "WORDCRAFT_CONTROL_ADDR";
+
 /// How an agent is started: its program and arguments, no shell between.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Launch {
@@ -94,27 +103,75 @@ pub enum Reach {
         /// Where the room listens: `127.0.0.1` and a port.
         room: SocketAddr,
     },
+    /// Through its own shell, for an agent whose adapter doesn't pass MCP servers on (Pi): the
+    /// invite's key in [`KEY_VAR`] and the room's address in [`ADDR_VAR`] in its environment,
+    /// which its shell's commands inherit, and the first turn's note says how to run
+    /// `cli call`. `session/new` gives it WordCraft's MCP server too, for when it does.
+    Shell {
+        /// `wordcraft-cli`, an absolute path.
+        cli: PathBuf,
+        /// Where the room listens: `127.0.0.1` and a port.
+        room: SocketAddr,
+    },
 }
 
 impl Reach {
+    /// `wordcraft-cli` as the agent is given it, and the room: an absolute path in text, and
+    /// 127.0.0.1, where WordCraft sends keys. `None` for [`Reach::Nothing`].
+    fn checked(&self) -> Result<Option<(&str, SocketAddr)>, String> {
+        let (Reach::Mcp { cli, room } | Reach::Shell { cli, room }) = self else { return Ok(None) };
+        let command = cli.to_str().filter(|_| cli.is_absolute()).ok_or_else(|| {
+            format!("WordCraft's command line tool, {}, isn't an absolute path the agent can be given", label(&cli.to_string_lossy()))
+        })?;
+        if room.ip() != Ipv4Addr::LOCALHOST {
+            return Err(format!("the shared document's room listens on {room}, not on 127.0.0.1, where WordCraft sends keys"));
+        }
+        Ok(Some((command, *room)))
+    }
+
     /// WordCraft's MCP server for an agent that joins with invite `key`, as `session/new`'s
     /// `mcpServers` has it: none for [`Reach::Nothing`].
     pub fn mcp_servers(&self, key: &str) -> Result<Vec<Value>, String> {
-        let Reach::Mcp { cli, room } = self else { return Ok(Vec::new()) };
-        let command = cli
-            .to_str()
-            .filter(|_| cli.is_absolute())
-            .ok_or_else(|| format!("WordCraft's MCP server, {}, isn't an absolute path the agent can be given", label(&cli.to_string_lossy())))?;
-        if room.ip() != Ipv4Addr::LOCALHOST {
-            return Err(format!("the shared document's room listens on {room}, not on 127.0.0.1, where WordCraft's MCP server sends keys"));
-        }
+        let Some((command, room)) = self.checked()? else { return Ok(Vec::new()) };
         Ok(vec![json!({
             "name": "wordcraft",
             "command": command,
             "args": ["mcp", "--connect", room.to_string()],
-            "env": [{"name": "WORDCRAFT_CONTROL_KEY", "value": key}],
+            "env": [{"name": KEY_VAR, "value": key}],
         })])
     }
+
+    /// What the agent's own environment gets for invite `key`: the key and the room's address
+    /// for [`Reach::Shell`], nothing otherwise.
+    pub fn env(&self, key: &str) -> Result<Vec<(String, String)>, String> {
+        match self.checked()? {
+            Some((_, room)) if matches!(self, Reach::Shell { .. }) => Ok(vec![(KEY_VAR.into(), key.into()), (ADDR_VAR.into(), room.to_string())]),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// What the first turn's note adds: for [`Reach::Shell`], how to reach the document with
+    /// `wordcraft-cli call` from the agent's shell.
+    pub fn note(&self) -> Option<String> {
+        let Reach::Shell { cli, .. } = self else { return None };
+        let cli = shell_word(&cli.to_string_lossy());
+        Some(format!(
+            "If you have no `wordcraft` tools, reach the document with your shell: `{cli} call <method> '<JSON params>'` prints the \
+             result as JSON, or fails with the error (your environment holds the document's address and your key: never print, show \
+             or pass them on). Read the text with `{cli} call document.text`, its structure and version with `{cli} call \
+             document.inspect`, and what others changed since version N with `{cli} call document.changes '{{\"since\": N}}'`. Run \
+             a command with `{cli} call <command id> '<params>'`: select with `select.text '{{\"text\": \"…\"}}'` and type over \
+             the selection with `text.insert '{{\"text\": \"…\", \"raw\": true}}'`; find commands with `{cli} call \
+             engine.commands '{{\"search\": \"…\"}}'`. Params given as `-` are read from standard input, which saves quoting."
+        ))
+    }
+}
+
+/// `text` as one word of a POSIX shell's command line: as it is when that is safe, else in
+/// single quotes.
+fn shell_word(text: &str) -> String {
+    let plain = !text.is_empty() && text.chars().all(|c| c.is_alphanumeric() || "/._-+:@%".contains(c));
+    if plain { text.to_string() } else { format!("'{}'", text.replace('\'', "'\\''")) }
 }
 
 /// An ACP agent's set-up: what it is, how it's started and how long it may take.
@@ -209,13 +266,15 @@ impl Acp {
         &self.spec.label
     }
 
-    /// The MCP servers the agent gets in `session/new`: WordCraft's, with the seat's key.
-    fn mcp_servers(&self) -> Result<Vec<Value>, String> {
+    /// How the agent reaches the document with the seat's key: the MCP servers it gets in
+    /// `session/new`, and what its environment gets.
+    fn reach(&self) -> Result<(Vec<Value>, Vec<(String, String)>), String> {
         let key = self.seat.as_ref().map(|s| s.key.as_str()).unwrap_or_default();
         if key.is_empty() && self.spec.reach != Reach::Nothing {
             return Err(format!("{} has no seat in the shared document", self.name()));
         }
-        self.spec.reach.mcp_servers(key).map_err(|e| format!("{} can't reach the document: {e}", self.name()))
+        let why = |e: String| format!("{} can't reach the document: {e}", self.name());
+        Ok((self.spec.reach.mcp_servers(key).map_err(why)?, self.spec.reach.env(key).map_err(why)?))
     }
 
     /// Start the agent, shown as a row of the turn: whether it started (not when the turn was
@@ -250,13 +309,17 @@ impl Acp {
     /// `None` when the turn was stopped meanwhile.
     fn start(&mut self, ctx: &mut TurnCtx<'_>) -> Result<Option<(Running, Option<String>)>, String> {
         let name = self.name().to_string();
-        let mcp_servers = self.mcp_servers()?;
+        let (mcp_servers, reach_env) = self.reach()?;
         if !self.approve_setup(ctx)? || ctx.is_cancelled() {
             return Ok(None);
         }
         let folder = Folder::new().map_err(|e| format!("{name} couldn't start: no folder for it ({e})"))?;
         let cwd = folder.path().to_str().ok_or_else(|| format!("{name} couldn't start: the temporary folder's path isn't text"))?.to_string();
-        let mut env = agent_env(std::env::vars_os(), &self.spec.env);
+        // The key and the room's address come from the seat only, never from the spec's own.
+        let mut extra: Vec<(String, String)> =
+            self.spec.env.iter().filter(|(k, _)| ![KEY_VAR, ADDR_VAR].contains(&k.to_ascii_uppercase().as_str())).cloned().collect();
+        extra.extend(reach_env);
+        let mut env = agent_env(std::env::vars_os(), &extra);
         if let Some(path) = &self.spec.path {
             env.retain(|(key, _)| if cfg!(windows) { !key.to_string_lossy().eq_ignore_ascii_case("PATH") } else { key != "PATH" });
             env.push(("PATH".into(), path.clone()));
@@ -527,8 +590,11 @@ impl Backend for Acp {
 
     fn turn(&mut self, turn: &Turn, ctx: &mut TurnCtx<'_>) -> Result<StopReason, String> {
         self.calls.clear();
-        if turn.note.is_some() {
-            self.note.clone_from(&turn.note);
+        if let Some(note) = &turn.note {
+            self.note = Some(match self.spec.reach.note() {
+                Some(more) => format!("{note}\n\n{more}"),
+                None => note.clone(),
+            });
         }
         // An agent that stopped since the last turn starts again.
         if self.running.as_mut().is_some_and(|r| !r.process.is_running()) {

@@ -53,6 +53,21 @@ any other host it sends no key, says so, and the app refuses its requests: to dr
 another machine, forward its port to `127.0.0.1` (for example `ssh -L 7981:127.0.0.1:7981 host`)
 and set `WORDCRAFT_CONTROL_KEY` to that app's key.
 
+## One request from the command line
+
+`wordcraft-cli call <method> [<params> | -] [--connect HOST:PORT]` sends one request and prints
+its result as JSON, for scripts and for agents that work through a shell. `params` is a JSON
+object (`-` reads it from standard input, which saves quoting); without it the request has `{}`.
+The address is `--connect`'s, else `WORDCRAFT_CONTROL_ADDR`'s, and the key is found as for
+`wordcraft-cli mcp --connect`. It refuses any address but `127.0.0.1` or `localhost` before it
+connects. An error, from the app or on the way, goes to standard error on one line (with the
+app's control characters shown escaped) and the exit status is 1.
+
+```sh
+wordcraft-cli call document.text --connect 127.0.0.1:7981
+echo '{"text": "Hello"}' | wordcraft-cli call text.insert - --connect 127.0.0.1:7981
+```
+
 ## Methods
 
 | Method | Params | Result |
@@ -272,7 +287,10 @@ their copies there: an agent gets `wordcraft-cli mcp --connect 127.0.0.1:<port>`
 invite's key in `WORDCRAFT_CONTROL_KEY`, and nothing else.
 
 It speaks this protocol, and only invites' keys open it: a connection's first request must carry
-one, and from then on it is served as above. The window's key opens nothing there (the port
+one, and from then on it is served as above. Every connection with the same key works on the
+same copy, one request at a time, so an agent that connects for each request
+(`wordcraft-cli call` in its shell) finds what it selected still selected, and stays one
+participant; the port lets the copy go once the invite is taken back or sharing stops. The window's key opens nothing there (the port
 doesn't know it, and no key file names the port), nor does any other key, and while no document
 is shared no key does: the request gets `{"ok": false, "error": "unauthorized"}` and the
 connection closes. The limits are the control channel's: a line over 1 MiB, a line that isn't
