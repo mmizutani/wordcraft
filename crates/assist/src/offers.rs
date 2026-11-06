@@ -60,6 +60,8 @@ pub struct Offer {
 /// The backends the host can offer, in the picker's order.
 pub fn offers(host: &Host) -> Vec<Offer> {
     let mut all = Vec::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    all.push(crate::chatgpt::offer(host));
     if host.fake {
         let info = crate::backend::Backend::info(&Fake::new());
         all.push(Offer { id: info.id, label: info.label, readiness: Readiness::Ready });
@@ -105,15 +107,16 @@ mod tests {
 
     #[test]
     fn the_fake_is_offered_only_when_asked_for_and_unknown_ids_say_what_there_is() {
-        assert!(offers(&Host::default()).is_empty());
-        assert!(refused("fake", &Host::default()).contains("no assistant is available"));
+        assert!(offers(&Host::default()).iter().all(|o| o.id != "fake"));
+        let e = refused("fake", &Host::default());
+        assert!(e.contains("no assistant is available") || e.contains("no such assistant"), "{e}");
         let host = Host { fake: true, ..Host::default() };
         let all = offers(&host);
-        assert_eq!(all.len(), 1);
-        assert_eq!((all[0].id.as_str(), &all[0].readiness), ("fake", &Readiness::Ready));
+        let fake = all.iter().find(|o| o.id == "fake").unwrap();
+        assert_eq!(fake.readiness, Readiness::Ready);
         assert_eq!(make(" fake ", &host).unwrap().info().author, "Test Assistant");
         let e = refused("acp:nope\u{0}\u{7}", &host);
-        assert!(e.contains("there are fake") && !e.contains('\u{0}'), "{e}");
+        assert!(e.contains("there are") && e.contains("fake") && !e.contains('\u{0}'), "{e}");
         assert!(refused(&"x".repeat(100_000), &host).len() < 200);
     }
 }

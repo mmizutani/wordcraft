@@ -26,6 +26,9 @@
 
 mod assistant;
 pub mod backend;
+/// Sign in with ChatGPT and the ChatGPT backend: desktop only (HTTPS and a loopback port).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod chatgpt;
 pub mod context;
 mod fake;
 pub mod offers;
