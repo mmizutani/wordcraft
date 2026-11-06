@@ -50,6 +50,8 @@ const ANSWERING: &str = "the assistant is still answering: stop it first";
 const NOT_ANSWERING: &str = "the assistant isn't answering";
 /// Why an action on the selected text waits.
 const SELECT_FIRST: &str = "select the text first";
+/// Why the assistant cannot use a block selection.
+const CONTINUOUS_SELECTION: &str = "select one continuous range of text before asking the assistant";
 
 /// Longest tone `assist.rewrite` takes, in characters.
 const MAX_TONE_CHARS: usize = 40;
@@ -112,7 +114,7 @@ fn in_window(s: &Session) -> Option<&'static str> {
 }
 
 /// A prompt or a writing action can start a turn: a window with an assistant set up and not
-/// answering.
+/// answering, with a selection the assistant's copy can represent.
 pub fn can_ask(s: &Session) -> Option<&'static str> {
     if !s.assistant.window {
         Some(NO_WINDOW)
@@ -120,6 +122,9 @@ pub fn can_ask(s: &Session) -> Option<&'static str> {
         Some(NOT_SET_UP)
     } else if s.assistant.busy {
         Some(ANSWERING)
+    } else if s.column_segments().is_some() {
+        // shortcut: block segments need context and selection transport before assistant turns can use them.
+        Some(CONTINUOUS_SELECTION)
     } else {
         None
     }

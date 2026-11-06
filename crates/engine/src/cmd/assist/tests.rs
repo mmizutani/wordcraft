@@ -266,6 +266,50 @@ fn actions_on_the_selection_need_one_and_an_assistant() {
 }
 
 #[test]
+fn block_selections_cannot_start_assistant_turns_or_send_their_bounding_range() {
+    use wordcraft_doc::{Pos, StoryRef};
+    let mut s = Session::new(Document::from_text("abc\nabc"));
+    s.assistant = AssistantStatus { window: true, ready: true, busy: false };
+    s.run("select.column", &json!({"anchor": Pos::body(0, 1), "focus": Pos::body(1, 2)})).unwrap();
+    assert_eq!(s.selected_text(), "b\nb");
+    assert_eq!(s.column_segments().unwrap().len(), 2);
+    let selection = s.sel.clone();
+    let turns = [
+        ("assist.rewrite", json!({})),
+        ("assist.shorten", json!({})),
+        ("assist.expand", json!({})),
+        ("assist.proofread", json!({})),
+        ("assist.ask", json!({"prompt": "Rewrite this"})),
+        ("assist.draft", json!({"about": "a line"})),
+        ("assist.summarize", json!({"insert": true})),
+    ];
+    for (id, params) in &turns {
+        let why = disabled(s.run(id, params));
+        assert!(why.contains("continuous range"), "{id}: {why}");
+        assert_eq!(s.why_disabled(id), Some("select one continuous range of text before asking the assistant"));
+    }
+    assert!(requests(&mut s).is_empty(), "the window must not receive a lossy selection");
+    assert_eq!(s.sel, selection);
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "abc\nabc");
+    assert!(!s.can_undo());
+    for id in ["assist.pane", "assist.backend"] {
+        assert_eq!(s.why_disabled(id), None, "{id}");
+    }
+    s.assistant.busy = true;
+    assert_eq!(s.why_disabled("assist.cancel"), None);
+    s.assistant.busy = false;
+    // Leave column selection and select the same endpoints as a continuous range.
+    s.run("caret.docStart", &json!({})).unwrap();
+    s.run("select.range", &json!({"anchor": Pos::body(0, 1), "focus": Pos::body(1, 2)})).unwrap();
+    assert!(s.column_segments().is_none());
+    for (id, params) in &turns {
+        assert_eq!(s.why_disabled(id), None, "{id}");
+        assert!(s.run(id, params).is_ok(), "{id}");
+    }
+    assert_eq!(requests(&mut s).len(), turns.len());
+}
+
+#[test]
 fn bad_action_params_are_refused_and_nothing_is_asked() {
     let mut s = selected("two");
     for (id, bad) in [
