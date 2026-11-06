@@ -19,11 +19,15 @@
 //! - [`Context`]: the selection, the paragraphs around it and the outline, as text, held to hard
 //!   caps on a document of any size.
 //! - [`offers`]: the backends the pane offers on this host, and how one is made by its id.
+//! - `acp` (desktop only): ACP agents (Claude Code, Codex, Pi…) as backends, each a process
+//!   WordCraft starts and speaks the Agent Client Protocol with.
 //!
-//! The crate has no network and starts no process, so it builds for the web; the backends that
-//! need either are added for the desktop app only.
+//! The crate builds for the web: the backends that start processes or reach the network are
+//! desktop only.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod acp;
 mod assistant;
 pub mod backend;
 /// Sign in with ChatGPT and the ChatGPT backend: desktop only (HTTPS and a loopback port).

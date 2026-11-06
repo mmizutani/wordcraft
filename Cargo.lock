@@ -6825,6 +6825,7 @@ dependencies = [
  "base64 0.23.1",
  "getrandom 0.3.4",
  "log",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "sha2 0.11.1",

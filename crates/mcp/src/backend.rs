@@ -74,7 +74,7 @@ fn host_of(addr: &str) -> &str {
 /// Whether `addr` (`HOST:PORT`, as given to `--connect`) names the app's own address:
 /// 127.0.0.1 or `localhost`. Other loopback addresses (127.0.0.2, ::1) don't count: the app never
 /// listens there, so whatever does is not the app. Other host names are not resolved.
-fn is_app_addr(addr: &str) -> bool {
+pub fn is_app_addr(addr: &str) -> bool {
     let app = |ip: IpAddr| ip.to_canonical() == APP_IP;
     if let Ok(sa) = addr.parse::<SocketAddr>() {
         return app(sa.ip());
