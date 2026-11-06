@@ -1,7 +1,5 @@
 //! A small HTTP/1.1 server on 127.0.0.1 for the tests: the sign-in's and the API's endpoints,
 //! scripted by each test. Every connection gets one answer and is closed.
-// The streaming parts are for the backend's tests, which come with it.
-#![allow(dead_code)]
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -19,7 +17,6 @@ pub(crate) struct Request {
     pub(crate) method: String,
     /// The path, without the query.
     pub(crate) path: String,
-    pub(crate) query: String,
     /// Header names in lower case.
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
@@ -228,7 +225,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut lines = head.split("\r\n");
     let mut first = lines.next()?.split(' ');
     let (method, target) = (first.next()?.to_string(), first.next()?.to_string());
-    let (path, query) = target.split_once('?').map_or((target.clone(), String::new()), |(p, q)| (p.to_string(), q.to_string()));
+    let path = target.split_once('?').map_or(target.as_str(), |(p, _)| p).to_string();
     let headers: Vec<(String, String)> =
         lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
     let length = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse::<usize>().ok()).unwrap_or(0);
@@ -240,5 +237,5 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
         }
         body.extend_from_slice(&chunk[..n]);
     }
-    Some(Request { method, path, query, headers, body })
+    Some(Request { method, path, headers, body })
 }

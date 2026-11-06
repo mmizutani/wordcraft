@@ -1011,6 +1011,10 @@ fn the_models_list_keeps_listed_models_in_order_and_the_choice_is_kept() {
     assert_eq!(chosen_model(folder.path()).as_deref(), Some("gpt-test-mini"));
     choose_model(folder.path(), None).unwrap();
     assert_eq!(chosen_model(folder.path()), None);
+    // A hand-edited file with junk for a model: none chosen.
+    let client = store::client(folder.path()).unwrap();
+    store::save_client(folder.path(), &store::Client { model: Some("two words\n".into()), ..client }).unwrap();
+    assert_eq!(chosen_model(folder.path()), None);
     assert_eq!(store::client(folder.path()).unwrap().client_id.as_deref(), Some("oaiapp_issued-1"), "the client id stays");
 }
 

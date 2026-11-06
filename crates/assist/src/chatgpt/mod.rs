@@ -9,6 +9,8 @@
 //! - [`account`]: who is signed in, read from the file (no network).
 //! - [`SignOut`]: deletes the credentials and revokes their refresh token.
 //! - [`models`], [`choose_model`]: the models the account may use, and the one chosen.
+//! - [`ChatGpt`]: the backend. It calls the Responses API, streamed, with WordCraft's tools as
+//!   function tools that run in this process.
 //!
 //! Tokens never reach the document, the window's state, the control channel or the log, and
 //! error text shown to the person has them taken out. Everything that comes from the network
@@ -17,13 +19,16 @@
 //! Desktop only: the web build has no loopback port to sign in with.
 
 mod auth;
+mod backend;
 mod http;
+mod sse;
 mod store;
 
 pub use auth::{
     AuthError, CALLBACK_PATH, DEFAULT_PORT, Model, PLAN_SCOPE, SCOPES, SIGN_IN_WAIT, SignIn, SignInOptions, SignOut, SignedOut, choose_model,
     chosen_model, models, models_with, sign_out, sign_out_with,
 };
+pub use backend::{ChatGpt, MAX_ROUNDS};
 pub use store::{Account, CLIENT_FILE, CREDENTIALS_FILE, account};
 
 use std::path::Path;
@@ -122,6 +127,8 @@ pub(crate) fn offer(host: &Host) -> Offer {
     Offer { id: ID.into(), label: AUTHOR.into(), readiness: readiness(host.settings.as_deref()) }
 }
 
+#[cfg(test)]
+mod backend_tests;
 #[cfg(test)]
 mod fake_server;
 #[cfg(test)]

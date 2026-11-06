@@ -90,6 +90,11 @@ pub fn make(id: &str, host: &Host) -> Result<Box<dyn Backend>, String> {
     }
     match id {
         FAKE_ID => Ok(Box::new(Fake::new())),
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::chatgpt::ID => match &host.settings {
+            Some(settings) => Ok(Box::new(crate::chatgpt::ChatGpt::new(settings))),
+            None => Err(format!("{}: WordCraft has no settings folder to keep a sign-in in", offer.label)),
+        },
         _ => Err(format!("{}: can't be started", offer.label)),
     }
 }
