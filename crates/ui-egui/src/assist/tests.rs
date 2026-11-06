@@ -1203,3 +1203,95 @@ fn on_the_web_the_window_never_asks_for_the_fake() {
     assert!(!super::host(&a).fake);
     assert!(wordcraft_assist::offers::offers_in(&super::host(&a), super::desktop(&a)).is_empty());
 }
+
+/// #27: the window never waits for an assistant. The pane's assistant holds its turn after its
+/// edit, another assistant in the shared document holds its own, and the person types into the
+/// page with the keyboard meanwhile, every frame timed; the pane's Stop and the other's don't
+/// wait either. Each edit is in, in its author's name; the pane accepts its assistant's, Review
+/// rejects the other's, and the person's typing stays.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_window_never_waits_for_its_assistants() {
+    use std::time::Instant;
+
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::{Assistant, Options};
+    use wordcraft_engine::cmd::review::changes_by;
+
+    /// A frame that waited for an assistant would take as long as it holds (until it's stopped).
+    const BUDGET: Duration = Duration::from_secs(1);
+    let mut app = window("one two three");
+    let pane = vec![Step::tool("select_text", json!({"text": "two"})), Step::tool("type_text", json!({"text": "2"})), Step::Hold];
+    app.assist_with(Box::new(Fake::named("Pane Assistant").then(pane)));
+    let mut h = harness(app);
+    h.state_mut().execute("assist.ask", json!({"prompt": "Use digits"})).unwrap();
+    let room = h.state().shared_room().unwrap();
+    let steps = vec![Step::tool("execute", json!({"command": "caret.docEnd"})), Step::tool("type_text", json!({"text": " four"})), Step::Hold];
+    let mut other = Assistant::start(&room, Box::new(Fake::named("Other Assistant").then(steps)), Options::default()).unwrap();
+    other.ask("Count on", None).unwrap();
+    // The page has the keyboard, the caret at the start.
+    h.state_mut().execute("caret.docStart", json!({})).unwrap();
+    h.state_mut().canvas.want_focus = true;
+    h.run_steps(2);
+
+    let mut keys = "Zero, ".chars().peekable();
+    let mut frames = 0usize;
+    let mut frame = |h: &mut egui_kittest::Harness<'static, WordApp>, other: &mut Assistant| {
+        if frames.is_multiple_of(4)
+            && let Some(key) = keys.next()
+        {
+            h.event(egui::Event::Text(key.to_string()));
+        }
+        let started = Instant::now();
+        h.step();
+        other.poll();
+        assert!(started.elapsed() < BUDGET, "frame {frames} took {:?}: the window waited", started.elapsed());
+        frames += 1;
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // Frames, at least two seconds of them, until both assistants made their edits and hold, and
+    // the person typed everything.
+    let held_from = Instant::now();
+    let deadline = held_from + Duration::from_secs(60);
+    loop {
+        frame(&mut h, &mut other);
+        let s = &h.state().session;
+        let edited = changes_by(s, "Pane Assistant") >= 2 && changes_by(s, "Other Assistant") >= 1;
+        if edited && held_from.elapsed() >= Duration::from_secs(2) && s.doc.plain_text(StoryRef::Body).starts_with("Zero, ") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the edits never came in");
+    }
+    assert!(h.state().conversation().is_some_and(|c| c.is_busy()) && other.is_busy(), "both hold their turns");
+    // Stop in the pane, then the other's Stop: frames go on, and both turns end.
+    h.get_by_label("Stop").click();
+    let started = Instant::now();
+    other.cancel();
+    assert!(started.elapsed() < BUDGET);
+    while h.state().conversation().is_some_and(|c| c.is_busy()) || other.is_busy() || !h.state().share_settled() {
+        frame(&mut h, &mut other);
+        assert!(Instant::now() < deadline, "the turns never ended");
+    }
+    let stopped = |a: &Assistant| a.transcript().entries().any(|e| matches!(e, Entry::Stopped { stop: StopReason::Cancelled }));
+    assert!(stopped(h.state().conversation().unwrap()) && stopped(&other));
+    assert_eq!(accepted(h.state()), "Zero, one 2 three four");
+    assert_eq!(changes_by(&h.state().session, "Minoru"), 0, "the person's typing isn't tracked");
+    assert_eq!(h.state().session.doc, room.document().1);
+
+    // The pane's Accept all takes its assistant's changes; Review's Reject All by author the
+    // other's.
+    h.get_by_label("Accept all").click();
+    h.run_steps(3);
+    h.state_mut().execute("review.rejectAll", json!({"author": "Other Assistant"})).unwrap();
+    while !h.state().share_settled() {
+        frame(&mut h, &mut other);
+        assert!(Instant::now() < deadline, "the window never caught up");
+    }
+    let s = &h.state().session;
+    assert_eq!(s.doc.final_text(StoryRef::Body), "Zero, one 2 three");
+    assert_eq!((changes_by(s, "Pane Assistant"), changes_by(s, "Other Assistant")), (0, 0));
+    assert_eq!(s.doc, room.document().1);
+    let started = Instant::now();
+    other.end();
+    assert!(started.elapsed() < BUDGET);
+}
