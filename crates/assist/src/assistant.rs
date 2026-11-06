@@ -13,15 +13,15 @@
 //! ([`Assistant::ask`]), reads what came back each frame ([`Assistant::poll`]), and never waits.
 
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel, sync_channel};
 use std::time::{Duration, Instant};
 
 use wordcraft_engine::AssistantPrefs;
 use wordcraft_engine::room::{Role, Room, RoomError};
 
 use crate::backend::{
-    Answer, Backend, BackendInfo, Cancel, Event, Events, NoTools, PermissionPolicy, PermissionRequest, Permissions, Seat, ToolHost, Turn, TurnCtx,
-    Waker,
+    Answer, Backend, BackendInfo, Cancel, Event, Events, MAX_QUEUED_EVENTS, NoTools, PermissionPolicy, PermissionRequest, Permissions, Seat,
+    StopReason, ToolHost, Turn, TurnCtx, Waker,
 };
 use crate::tools::CopyTools;
 use crate::transcript::{Entry, Transcript};
@@ -31,9 +31,6 @@ pub const MAX_EVENTS_PER_POLL: usize = 512;
 
 /// Most bytes of a prompt; more is refused.
 pub const MAX_PROMPT: usize = 64 << 10;
-
-/// Most names tried when the backend's author name is taken in the room ("ChatGPT (2)"…).
-const MAX_NAME_TRIES: u32 = 64;
 
 /// Why a conversation didn't start or take a prompt.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -120,7 +117,7 @@ impl Assistant {
         let (name, key) = invite(room, &info.author, role)?;
         let seat = Seat { name, role, key, document: options.document.clone() };
         let (jobs_tx, jobs_rx) = channel();
-        let (events_tx, events_rx) = channel();
+        let (events_tx, events_rx) = sync_channel(MAX_QUEUED_EVENTS);
         let events = Events::new(events_tx, options.wake.clone());
         let cancel = Cancel::default();
         let permissions = Permissions::default();
@@ -303,17 +300,17 @@ impl Assistant {
         log::info!("assistant {} ({:?}) left the shared document", self.info.id, self.seat.name);
     }
 
-    /// Wait until the turn that is running ended or `timeout` has passed, taking its events
-    /// ([`Assistant::poll`]): whether it ended. For tests and runs with no window; the window
-    /// polls each frame instead.
+    /// Wait until the turn that is running ended or `timeout` has passed (any timeout, however
+    /// long), taking its events ([`Assistant::poll`]): whether it ended. For tests and runs with
+    /// no window; the window polls each frame instead.
     pub fn wait_idle(&mut self, timeout: Duration) -> bool {
-        let until = Instant::now() + timeout;
+        let until = Instant::now().checked_add(timeout);
         loop {
             self.poll();
             if !self.busy {
                 return true;
             }
-            if Instant::now() >= until {
+            if until.is_some_and(|until| Instant::now() >= until) {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -333,25 +330,15 @@ impl Drop for Assistant {
     }
 }
 
-/// An invite for an assistant called `author` with `role`: under `author` when the room hasn't
-/// had a participant or invite of that name, else the first of "author (2)", "author (3)"… it
-/// hasn't. The name it got, and the key.
+/// An invite for an assistant called `author` (or "Assistant") with `role`: under `author` when
+/// the room hasn't had a participant or invite of that name, else the first of "author (2)",
+/// "author (3)"… it hasn't ([`Room::invite_numbered`]). The name it got, and the key.
 fn invite(room: &Room, author: &str, role: Role) -> Result<(String, String), AssistError> {
     let author = match author.trim() {
         "" => "Assistant",
         a => a,
     };
-    let mut last = RoomError::Name(format!("{author} is someone's name in this document already"));
-    for n in 1..=MAX_NAME_TRIES {
-        let name = if n == 1 { author.to_string() } else { format!("{author} ({n})") };
-        match room.invite(&name, role) {
-            Ok(key) => return Ok((name, key)),
-            // Taken (or not a name a participant may have): try the next number.
-            Err(e @ RoomError::Name(_)) => last = e,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Err(last.into())
+    Ok(room.invite_numbered(author, role)?)
 }
 
 /// The conversation's thread: its backend, its seat, and where its jobs come from and its events
@@ -371,7 +358,7 @@ impl Work {
     fn run(mut self) {
         let mut tools: Box<dyn ToolHost> = if self.backend.info().in_process_tools {
             match CopyTools::join(&self.room, &self.seat.key) {
-                Ok(t) => Box::new(t),
+                Ok(t) => Box::new(t.stopped_by(self.cancel.clone())),
                 Err(e) => {
                     self.fail_turns(&format!("the assistant couldn't join the shared document: {e}"));
                     return;
@@ -401,11 +388,14 @@ impl Work {
             };
             let backend = &mut self.backend;
             let ended = guarded(|| backend.turn(&turn, &mut ctx));
-            let event = match ended {
-                Ok(stop) => Event::Done { stop },
-                Err(message) => Event::Error { message },
+            let stop = match ended {
+                Ok(stop) => stop,
+                Err(message) => {
+                    self.events.send(Event::Error { message });
+                    StopReason::EndTurn
+                }
             };
-            self.events.send(event);
+            self.events.send(Event::Done { stop });
         }
         self.end_backend();
     }
@@ -424,6 +414,7 @@ impl Work {
         log::warn!("assistant: {why}");
         while let Ok(Job::Turn(_)) = self.jobs.recv() {
             self.events.send(Event::Error { message: why.to_string() });
+            self.events.send(Event::Done { stop: StopReason::EndTurn });
         }
     }
 }
@@ -432,9 +423,10 @@ impl Work {
 fn guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(r) => r,
-        Err(p) => {
-            let why = p.downcast_ref::<&str>().map(|s| (*s).to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
-            log::error!("assistant: the backend panicked: {why}");
+        Err(_) => {
+            // The panic's own message may quote the person's text: the app's panic hook has
+            // logged it already, with that text taken out.
+            log::error!("assistant: the backend panicked");
             Err("the assistant stopped unexpectedly".into())
         }
     }

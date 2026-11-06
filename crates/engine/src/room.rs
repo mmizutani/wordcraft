@@ -285,6 +285,13 @@ impl Room {
         self.hub().invite(name, role)
     }
 
+    /// [`Room::invite`] under `name`, or under the first of "name (2)", "name (3)"… that no
+    /// invite or participant has had ([`Hub::invite_numbered`]): the name it got, and the key.
+    /// For a participant that comes again and again, like each conversation with an assistant.
+    pub fn invite_numbered(&self, name: &str, role: Role) -> Result<(String, String), RoomError> {
+        self.hub().invite_numbered(name, role)
+    }
+
     /// Take back the invite with `key`: no one joins with it any more, and the copies that
     /// joined with it are out of the room (the hub accepts no change of theirs, and a hosted
     /// copy stops answering). Whether there was one.

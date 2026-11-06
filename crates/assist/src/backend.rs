@@ -6,7 +6,7 @@
 //! [`TurnCtx`] when it runs the model loop in WordCraft, and returns why the turn stopped. The
 //! window never waits for it: it reads the events each frame.
 
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -277,9 +277,12 @@ pub enum Event {
 }
 
 impl Event {
-    /// Whether the event ends its turn.
+    /// Whether the event ends its turn: only [`Event::Done`], which the conversation sends when
+    /// the backend's turn returns (after an [`Event::Error`] when it failed). A backend's own
+    /// `Done` never reaches the conversation ([`TurnCtx::emit`]), and an `Error` it sends during
+    /// a turn is shown without ending it.
     pub fn ends_turn(&self) -> bool {
-        matches!(self, Event::Done { .. } | Event::Error { .. })
+        matches!(self, Event::Done { .. })
     }
 
     /// The event held to the pane's limits: text cut at [`MAX_EVENT_TEXT`] bytes, labels at
@@ -310,6 +313,8 @@ pub fn cut(mut text: String, max: usize) -> String {
             end -= 1;
         }
         text.truncate(end);
+        // What was cut off is given back, not kept behind the shorter text.
+        text.shrink_to_fit();
     }
     text
 }
@@ -433,25 +438,43 @@ impl Cancel {
 /// Called when an event is sent: the window asks to be drawn again.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
+/// Most events waiting for the window ([`crate::Assistant::poll`]): a backend that sends more
+/// waits until the window takes some, so a chatty one, or a window that draws no frames while
+/// it is minimized, can't pile them up.
+pub const MAX_QUEUED_EVENTS: usize = 1024;
+
 /// Where a conversation's events go: to the conversation ([`crate::Assistant::poll`]), which
 /// the window reads each frame. Clones send to the same place.
 #[derive(Clone)]
 pub struct Events {
-    tx: Sender<Event>,
+    tx: SyncSender<Event>,
     wake: Option<Waker>,
 }
 
 impl Events {
-    pub(crate) fn new(tx: Sender<Event>, wake: Option<Waker>) -> Events {
+    pub(crate) fn new(tx: SyncSender<Event>, wake: Option<Waker>) -> Events {
         Events { tx, wake }
     }
 
-    /// Send `event`, held to the pane's limits ([`Event::bounded`]), and wake the window.
+    /// Send `event`, held to the pane's limits ([`Event::bounded`]), and wake the window. Waits
+    /// while [`MAX_QUEUED_EVENTS`] are waiting for it.
     pub fn send(&self, event: Event) {
-        // Nobody reads any more once the conversation is gone: the event goes nowhere.
-        let _ = self.tx.send(event.bounded());
-        if let Some(wake) = &self.wake {
-            wake();
+        let wake = || {
+            if let Some(wake) = &self.wake {
+                wake();
+            }
+        };
+        match self.tx.try_send(event.bounded()) {
+            Ok(()) => wake(),
+            Err(TrySendError::Full(event)) => {
+                // The window is behind: wake it to make room, and wait for it.
+                wake();
+                if self.tx.send(event).is_ok() {
+                    wake();
+                }
+            }
+            // Nobody reads any more once the conversation is gone: the event goes nowhere.
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 }
@@ -551,8 +574,13 @@ pub struct TurnCtx<'a> {
 }
 
 impl TurnCtx<'_> {
-    /// Send `event` to the conversation.
+    /// Send `event` to the conversation. [`Event::Done`] is the conversation's own, sent when
+    /// [`Backend::turn`] returns: a backend's is dropped (return the stop reason instead).
     pub fn emit(&self, event: Event) {
+        if matches!(event, Event::Done { .. }) {
+            log::debug!("assistant: a backend sent its own Done, which was dropped");
+            return;
+        }
         self.events.send(event);
     }
 
@@ -640,7 +668,8 @@ impl TurnCtx<'_> {
             }
         };
         if self.policy != PermissionPolicy::Ask {
-            log::info!("assistant: permission request {:?} answered {answer:?} by the {:?} policy", request.title, self.policy);
+            // The request's title is the agent's text, which may quote the document: not logged.
+            log::info!("assistant: permission request {id} answered {answer:?} by the {:?} policy", self.policy);
             self.emit(Event::Permission(request));
         }
         self.emit(Event::Answered { id, answer: answer.clone() });

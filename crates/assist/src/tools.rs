@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use wordcraft_engine::room::{Replica, Room, RoomError, hosted};
 use wordcraft_mcp::tools::{ToolResult, call_tool, tool_definitions};
 
-use crate::backend::{ToolHost, ToolOutput, ToolSpec, cut};
+use crate::backend::{Cancel, ToolHost, ToolOutput, ToolSpec, cut};
 
 /// The MCP tools an assistant's model gets: those that read and edit one document. Not the
 /// ones that open, save or switch documents, drive the window or share the document.
@@ -49,12 +49,20 @@ pub fn specs() -> &'static [ToolSpec] {
 /// The assistant's copy of the shared document, which its model's tool calls work on.
 pub struct CopyTools {
     copy: Replica,
+    /// The turn's stop flag, which a `batch` checks between its commands.
+    cancel: Option<Cancel>,
 }
 
 impl CopyTools {
     /// Join `room` with the invite `key` handed out for the assistant: a copy of its own.
     pub fn join(room: &Arc<Room>, key: &str) -> Result<CopyTools, RoomError> {
-        Ok(CopyTools { copy: room.join_with(key)? })
+        Ok(CopyTools { copy: room.join_with(key)?, cancel: None })
+    }
+
+    /// The same tools, with a `batch` that stops between its commands once `cancel` is set.
+    pub fn stopped_by(mut self, cancel: Cancel) -> CopyTools {
+        self.cancel = Some(cancel);
+        self
     }
 
     /// The copy.
@@ -98,18 +106,92 @@ impl ToolHost for CopyTools {
             Value::Null => json!({}),
             _ => return ToolOutput::error("the arguments must be an object"),
         };
-        if name == "batch" && args.get("commands").and_then(Value::as_array).is_some_and(|c| c.len() > MAX_BATCH) {
-            return ToolOutput::error(format!("`commands`: at most {MAX_BATCH} in one batch"));
-        }
         let sent = self.copy.stats().sent;
-        let result = call_tool(&mut Hosted(&mut self.copy), name, &args);
+        let out = if name == "batch" {
+            self.batch(&args)
+        } else {
+            let result = call_tool(&mut Hosted(&mut self.copy), name, &args);
+            output(&result)
+        };
         let changed = self.copy.stats().sent > sent;
-        output(&result, changed.then(|| self.copy.received()))
+        ToolOutput { version: changed.then(|| self.copy.received()), ..out }
     }
 }
 
+impl CopyTools {
+    /// The MCP server's `batch`, one command at a time: it stops at the first error (unless
+    /// `keepGoing`) and once the turn is stopped, and holds what it gives back to about
+    /// [`MAX_OUTPUT`] as it goes, so a batch of big results never piles up in memory. Every
+    /// command gets an entry; the results get what the entries leave of the budget, in order.
+    fn batch(&mut self, args: &Value) -> ToolOutput {
+        /// The most an entry without its result takes, with its command id cut to 48 characters.
+        const ENTRY: usize = 80;
+        let Some(commands) = args.get("commands").and_then(Value::as_array) else {
+            return ToolOutput::error("`commands`: a list of {\"command\": id, \"params\": {…}}");
+        };
+        if commands.len() > MAX_BATCH {
+            return ToolOutput::error(format!("`commands`: at most {MAX_BATCH} in one batch"));
+        }
+        let keep_going = args.get("keepGoing").and_then(Value::as_bool).unwrap_or(false);
+        let mut room = MAX_OUTPUT.saturating_sub(ENTRY.saturating_mul(commands.len().saturating_add(1)));
+        let mut out = Vec::new();
+        let mut ok = true;
+        for c in commands {
+            if self.cancel.as_ref().is_some_and(Cancel::is_set) {
+                out.push(json!({"stopped": "the person stopped this turn: the commands from here on didn't run"}));
+                ok = false;
+                break;
+            }
+            let id = c.get("command").and_then(Value::as_str).unwrap_or_default();
+            let params = c.get("params").cloned().unwrap_or_else(|| json!({}));
+            let result = call_tool(&mut Hosted(&mut self.copy), "execute", &json!({"command": id, "params": params}));
+            let detail = fitted(output(&result).text, room);
+            room = room.saturating_sub(detail.as_ref().map_or(0, |d| d.to_string().len()));
+            let shown: String = crate::backend::label(id).chars().take(48).collect();
+            let mut entry = json!({"command": shown, "ok": !result.is_error});
+            if let (Some(d), Some(e)) = (detail, entry.as_object_mut()) {
+                e.insert(if result.is_error { "error" } else { "result" }.into(), d);
+            }
+            out.push(entry);
+            // As the MCP server's `batch`: an error stops it and fails the call, unless it keeps
+            // going, when each command's entry says how it went.
+            if result.is_error && !keep_going {
+                ok = false;
+                break;
+            }
+        }
+        ToolOutput { ok, text: Value::Array(out).to_string(), version: None }
+    }
+}
+
+/// A command's result for a batch entry, in at most `room` bytes as JSON: as it is when it
+/// fits, else cut as text, else none.
+fn fitted(text: String, room: usize) -> Option<Value> {
+    if room < 256 {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
+    if value.to_string().len() <= room {
+        return Some(value);
+    }
+    let text = match value {
+        Value::String(s) => s,
+        other => other.to_string(),
+    };
+    // Escaping can lengthen the text: halve the cut until it fits.
+    let mut keep = room.saturating_sub(16);
+    while keep >= 64 {
+        let cut_text = Value::String(cut(text.clone(), keep) + "…[cut]");
+        if cut_text.to_string().len() <= room {
+            return Some(cut_text);
+        }
+        keep /= 2;
+    }
+    None
+}
+
 /// A tool result as the model gets it: its text, at most [`MAX_OUTPUT`] bytes.
-fn output(result: &ToolResult, version: Option<u64>) -> ToolOutput {
+fn output(result: &ToolResult) -> ToolOutput {
     let mut text = String::new();
     for c in &result.content {
         match c.get("type").and_then(Value::as_str) {
@@ -126,7 +208,7 @@ fn output(result: &ToolResult, version: Option<u64>) -> ToolOutput {
             total.saturating_sub(text.len())
         ));
     }
-    ToolOutput { ok: !result.is_error, text, version }
+    ToolOutput { ok: !result.is_error, text, version: None }
 }
 
 /// What a call does, for its row in the pane: the tool, and the command it runs.

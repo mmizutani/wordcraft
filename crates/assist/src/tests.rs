@@ -433,6 +433,110 @@ fn hostile_permission_requests_and_events_are_held_to_the_pane_s_limits() {
 }
 
 #[test]
+fn a_room_never_runs_out_of_names_for_its_conversations() {
+    let w = Window::new("one two three");
+    for n in 1..=70 {
+        let mut a = w.start(Fake::new(), Options::default());
+        let expected = if n == 1 { "Test Assistant".to_string() } else { format!("Test Assistant ({n})") };
+        assert_eq!(a.name(), expected);
+        // Its copy joins, so the name stays taken once it ends.
+        ask(&mut a, "hello");
+        a.end();
+    }
+}
+
+#[test]
+fn a_backend_can_t_end_its_turn_early_and_its_errors_don_t_end_it_either() {
+    let w = Window::new("x");
+    let steps = vec![
+        Step::Emit(Event::Done { stop: StopReason::EndTurn }),
+        Step::Emit(Event::Error { message: "rate limited: trying again".into() }),
+        Step::Hold,
+        Step::say("never said"),
+    ];
+    let mut a = w.start(Fake::new().then(steps), Options::default());
+    a.ask("go", None).unwrap();
+    for _ in 0..2000 {
+        a.poll();
+        if a.transcript().entries().any(|e| matches!(e, Entry::Error { .. })) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(a.transcript().entries().any(|e| matches!(e, Entry::Error { message } if message.contains("trying again"))));
+    // The turn still runs: Stop works, and a second prompt is refused meanwhile.
+    std::thread::sleep(Duration::from_millis(50));
+    a.poll();
+    assert!(a.is_busy(), "a backend's own Done or Error doesn't end the turn");
+    assert!(matches!(a.ask("again", None), Err(AssistError::Busy)));
+    a.cancel();
+    assert!(a.wait_idle(WAIT));
+    assert!(a.transcript().entries().any(|e| matches!(e, Entry::Stopped { stop: StopReason::Cancelled })));
+    assert!(!a.transcript().entries().any(|e| matches!(e, Entry::Answer { text } if text.contains("never"))));
+}
+
+#[test]
+fn a_chatty_backend_waits_for_the_window_instead_of_piling_up_events() {
+    let w = Window::new("x");
+    let steps: Vec<Step> = (0..3 * crate::backend::MAX_QUEUED_EVENTS).map(|_| Step::say("x")).collect();
+    let mut a = w.start(Fake::new().then(steps), Options::default());
+    ask(&mut a, "talk");
+    assert_eq!(a.transcript().last_answer().map(|t| t.len()), Some(3 * crate::backend::MAX_QUEUED_EVENTS));
+    // What a backend sends is cut without keeping the cut-off memory.
+    let cut = crate::backend::cut("x".repeat(1 << 20), 10);
+    assert!(cut.capacity() < 1024, "{}", cut.capacity());
+    // Waiting takes any timeout.
+    a.ask("again", None).unwrap();
+    assert!(a.wait_idle(Duration::MAX));
+}
+
+#[test]
+fn a_batch_stops_once_the_turn_is_stopped_and_holds_its_output_to_the_budget() {
+    let mut w = Window::new("one two three");
+    let key = w.room.invite("Batcher", Role::Editor).unwrap();
+    let cancel = crate::Cancel::default();
+    let mut tools = CopyTools::join(&w.room, &key).unwrap().stopped_by(cancel.clone());
+    let three = json!({"commands": [
+        {"command": "caret.docEnd"},
+        {"command": "text.insert", "params": {"text": " four"}},
+        {"command": "text.insert", "params": {"text": " five"}},
+    ]});
+    // Stopped: none of its commands runs.
+    cancel.set();
+    let out = tools.call("batch", &three);
+    assert!(!out.ok && out.text.contains("stopped"), "{}", out.text);
+    assert_eq!(w.room.version(), 0);
+    cancel.clear();
+    let out = tools.call("batch", &three);
+    assert!(out.ok, "{}", out.text);
+    assert!(out.version.is_some());
+    w.settle();
+    assert_eq!(w.text(), "one two three four five");
+    // An error stops it unless it keeps going, as the MCP server's batch does.
+    let failing = json!({"commands": [{"command": "nope.nope"}, {"command": "caret.docStart"}]});
+    let out = tools.call("batch", &failing);
+    assert!(!out.ok);
+    assert_eq!(serde_json::from_str::<Value>(&out.text).unwrap().as_array().map(Vec::len), Some(1));
+    let out = tools.call("batch", &json!({"commands": failing["commands"], "keepGoing": true}));
+    assert!(out.ok);
+    assert_eq!(serde_json::from_str::<Value>(&out.text).unwrap().as_array().map(Vec::len), Some(2));
+    // 256 big results: the output stays near the budget, every command is still accounted for.
+    let mut s = Session::new(wordcraft_engine::sample::sample_document());
+    let (room, _own) = Room::host(&mut s, "Minoru").unwrap();
+    let key = room.invite("Batcher", Role::Editor).unwrap();
+    let mut tools = CopyTools::join(&room, &key).unwrap();
+    let inspect: Vec<Value> = (0..crate::tools::MAX_BATCH).map(|_| json!({"command": "document.inspect", "params": {"text": true}})).collect();
+    let out = tools.call("batch", &json!({"commands": inspect}));
+    assert!(out.ok, "{}", &out.text[..out.text.len().min(300)]);
+    assert!(out.text.len() <= MAX_OUTPUT + 1024, "{} bytes", out.text.len());
+    let entries = serde_json::from_str::<Value>(&out.text).unwrap();
+    let entries = entries.as_array().unwrap();
+    assert_eq!(entries.len(), crate::tools::MAX_BATCH);
+    assert!(entries.iter().all(|e| e["ok"] == true));
+    assert!(entries.last().unwrap().get("result").is_none(), "the budget was spent before the last one");
+}
+
+#[test]
 fn labels_and_answers_can_t_be_made_to_read_as_something_else() {
     use crate::backend::{label, shown};
     // An option a backend names "Allow" with a right-to-left override shows as what it is.
