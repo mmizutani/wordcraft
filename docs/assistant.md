@@ -89,10 +89,15 @@ WordCraft in ChatGPT's settings.
 The sign-in is kept in `chatgpt-credentials.json` in the settings folder, which only you may
 read (mode 0600 on Unix), never in a document, a recovery copy or the log. Signing in and out
 are yours alone: `assist.chatgpt.signIn`, `assist.chatgpt.cancelSignIn` and
-`assist.chatgpt.signOut` run from the buttons, Search, the Quick Access Toolbar or a key of
-yours, and from a script or an agent (the control channel, MCP) they are an error, as is a click
-or key the control channel made. The address the browser opens may carry your last sign-in as a
-hint, so no command's answer holds it.
+`assist.chatgpt.signOut` run from the buttons or Search. From a script or an agent (the control
+channel, MCP, also addressed to another document) they are an error, as is a click or key the
+control channel made and a step of a macro, whoever wrote it; and they take no key and go on no
+ribbon or Quick Access Toolbar, so no one can arrange for a key you press or a button you click
+to sign you in or out. The address the browser
+opens may carry your last sign-in as a hint, so no command's answer holds it, and the log leaves
+out the browser opener's command line. Cancel stops a sign-in unless it is already finishing
+what the browser sent: then you are signed in, and the page says so at once; until it has, Sign
+Out and a new sign-in ask you to try again in a moment.
 
 ### Setting up an agent
 

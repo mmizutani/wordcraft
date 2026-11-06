@@ -13,8 +13,10 @@
 //! `warn,wordcraft_docx=trace`, `wgpu_core=info`. A directive ending in `*` matches every target
 //! that starts with it (`wordcraft*=debug`). The HTTP client's targets ([`WIRE_TARGETS`]) never
 //! log past `debug`, whatever `RUST_LOG` says: at `trace` they write the raw bytes of each
-//! request and answer, sign-in tokens included. The file is only its owner's (mode 0600 on
-//! Unix).
+//! request and answer, sign-in tokens included. The browser opener's ([`URL_TARGETS`]) never log
+//! past `info`: its `debug` and `trace` records are the command line that opens the browser,
+//! address included, and the ChatGPT sign-in's address can carry the last sign-in's id token and
+//! email as hints. The file is only its owner's (mode 0600 on Unix).
 //!
 //! Records logged before the settings directory is known are kept (up to [`MAX_PENDING`]) and
 //! written once the file is attached. Writing never panics: a file that can't be created or
@@ -46,6 +48,10 @@ pub const DEFAULT_FILTER: &str = "warn,wordcraft*=info";
 /// are each HTTP request's and answer's raw bytes (a bearer token, the token endpoint's
 /// answers), and ureq's `trace` shows addresses and headers it otherwise hides.
 pub const WIRE_TARGETS: [&str; 2] = ["ureq_proto", "ureq"];
+/// Targets that log at `info` at most, whatever the filter says: webbrowser's `debug` record
+/// (Linux, the BSDs) and `trace` one (macOS) hold the address it opens, and Sign in with
+/// ChatGPT's address may carry the last sign-in's id token and email (#19).
+pub const URL_TARGETS: [&str; 1] = ["webbrowser"];
 
 /// Per-target level filter parsed from env_logger-style directives.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,7 +84,7 @@ impl Filter {
     }
 
     /// The level that applies to `target` (the most specific matching directive wins), at
-    /// most `debug` for the [`WIRE_TARGETS`].
+    /// most `debug` for the [`WIRE_TARGETS`] and `info` for the [`URL_TARGETS`].
     pub fn level_for(&self, target: &str) -> LevelFilter {
         let level = self
             .directives
@@ -86,7 +92,13 @@ impl Filter {
             .filter(|(name, _)| matches(name, target))
             .max_by_key(|(name, _)| name.len())
             .map_or(self.default, |(_, level)| *level);
-        if WIRE_TARGETS.iter().any(|wire| matches(wire, target)) { level.min(LevelFilter::Debug) } else { level }
+        if WIRE_TARGETS.iter().any(|wire| matches(wire, target)) {
+            level.min(LevelFilter::Debug)
+        } else if URL_TARGETS.iter().any(|t| matches(t, target)) {
+            level.min(LevelFilter::Info)
+        } else {
+            level
+        }
     }
 
     /// The most verbose level any target can reach (for `log::set_max_level`).

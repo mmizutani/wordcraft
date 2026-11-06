@@ -161,6 +161,7 @@ Table rows and cells inside `mc:AlternateContent` use the same selected-branch p
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-06 | trivial | #25: signing in to ChatGPT from File › Options › Account and the Assistant pane (Continue with ChatGPT, Waiting for your browser… with Open the Browser Again and Cancel, the signed-in account, Sign In Again when plan usage wasn't allowed, Sign Out), the person's alone: no key, no macro step, no other document's request (#19); hours unchanged |
 | 2026-11-06 | trivial | #25: the web app has the Assistant pane and its commands but no assistant (the backends sign in or start agents, desktop only); the pane and the greyed-out buttons say it needs the desktop app, and docs/assistant.md says what would unblock the web (#26); hours unchanged |
 | 2026-11-06 | trivial | #25: File › Options › Assistant › Agents sets up Claude Code, Codex, Pi and a custom agent: command, arguments and masked environment, saved to the agents' settings file, with what to install when one is missing (#24); hours unchanged |
 | 2026-11-06 | trivial | #25: the Assistant pane's tool rows open to the change they made, the plan is a checklist, and an agent's permission requests ask the person in their turns and are answered per `assist.allowUnattended` (off by default) in a script's (#23); hours unchanged |

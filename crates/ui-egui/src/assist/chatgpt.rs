@@ -5,14 +5,20 @@
 //! ([`wordcraft_assist::chatgpt::SignIn`]): it listens on `127.0.0.1` for the browser's answer,
 //! and the window opens the browser at its address. Every frame [`tick`] asks whether it is
 //! done, never waiting for it, and once it is, ChatGPT is offered ready without a restart.
-//! Cancel (`assist.chatgpt.cancelSignIn`) stops it; Sign Out (`assist.chatgpt.signOut`) deletes
-//! the sign-in and asks ChatGPT to end it, on a thread of its own.
+//! Cancel (`assist.chatgpt.cancelSignIn`) stops it, unless the browser's answer is already being
+//! finished: then the sign-in is kept and shows as soon as it is saved. Sign Out
+//! (`assist.chatgpt.signOut`) deletes the sign-in and asks ChatGPT to end it, on a thread of its
+//! own.
 //!
-//! Signing in and out are the person's alone, as turning on downloading is: from a script or an
-//! agent (`WordApp::execute`: the control channel, MCP, macros) they are an error, and so is a
-//! click or key the control channel made (MCP's `click` and `key`). The address the browser
-//! opens may hold the last sign-in's id token as a hint, so it reaches neither a command's answer
-//! nor the log, and the tokens stay in the settings folder: nothing here holds one.
+//! Signing in and out are the person's alone, as turning on downloading is: the person runs them
+//! from their buttons or Search ([`WordApp::run`]). From a script or an agent
+//! (`WordApp::execute`: the control channel, MCP) they are an error, and so is a click or key the
+//! control channel made (MCP's `click` and `key`), a step of a macro (someone else may have
+//! written it) and a request addressed to another document; and they take no key and go on no
+//! ribbon or Quick Access Toolbar ([`wordcraft_engine::cmd::assist::person_only`]). The address the browser opens may hold the
+//! last sign-in's id token as a hint, so it reaches neither a command's answer nor the log (the
+//! desktop app's logger keeps the browser opener's command lines out), and the tokens stay in the
+//! settings folder: nothing here holds one.
 
 use serde_json::{Value, json};
 use wordcraft_engine::cmd::assist::ChatGptStatus;
@@ -26,6 +32,10 @@ pub(crate) const YOURS: &str =
 /// Why there is no sign-in without a settings folder.
 #[cfg(not(target_arch = "wasm32"))]
 const NO_FOLDER: &str = "WordCraft has no settings folder here to keep a sign-in in";
+
+/// Why a sign-out, or a new sign-in, waits for a cancelled sign-in.
+#[cfg(not(target_arch = "wasm32"))]
+const FINISHING: &str = "the ChatGPT sign-in you cancelled is still finishing: try again in a moment";
 
 /// Seconds between two readings of who is signed in (another WordCraft may sign in or out).
 #[cfg(not(target_arch = "wasm32"))]
@@ -61,6 +71,11 @@ pub(crate) struct ChatGptState {
     /// The sign-in waiting for the browser, if one is.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) sign_in: Option<wordcraft_assist::chatgpt::SignIn>,
+    /// A sign-in the person cancelled that may still be finishing the browser's answer: how it
+    /// ends is still taken, so a sign-in saved anyway shows at once rather than at the next
+    /// re-read.
+    #[cfg(not(target_arch = "wasm32"))]
+    cancelled: Option<wordcraft_assist::chatgpt::SignIn>,
     /// The sign-out under way, if one is.
     #[cfg(not(target_arch = "wasm32"))]
     sign_out: Option<wordcraft_assist::chatgpt::SignOut>,
@@ -87,6 +102,8 @@ impl Default for ChatGptState {
             #[cfg(not(target_arch = "wasm32"))]
             sign_in: None,
             #[cfg(not(target_arch = "wasm32"))]
+            cancelled: None,
+            #[cfg(not(target_arch = "wasm32"))]
             sign_out: None,
             #[cfg(not(target_arch = "wasm32"))]
             account: None,
@@ -100,9 +117,11 @@ impl Default for ChatGptState {
 }
 
 /// Whether the command running now is the person's own: one they ran ([`WordApp::run`]: a
-/// button, a menu, Search, a key), and not with a click or key the control channel made.
+/// button or Search), not with a click or key the control channel made (`WordApp::run` doesn't
+/// count those as theirs). Macro steps, keys, ribbon and toolbar buttons and requests addressed
+/// to another document never reach here ([`wordcraft_engine::cmd::assist::person_only`]).
 fn the_person_asked(app: &WordApp) -> bool {
-    app.assist.by_person && !app.ctx.as_ref().is_some_and(|ctx| app.input_from_control(ctx))
+    app.assist.by_person
 }
 
 /// Who is signed in, as the window last read it.
@@ -154,6 +173,11 @@ pub(crate) fn sign_in(app: &mut WordApp) -> Result<Value, String> {
             app.canvas.open_url = Some(waiting.url().to_string());
             return Ok(json!({"signingIn": true}));
         }
+        // A cancelled sign-in may still save what the browser sent: a new one now would race it,
+        // and cancelling that one too would lose track of the first.
+        if s.cancelled.is_some() {
+            return Err(FINISHING.into());
+        }
         // Signed in without plan usage, or it was declined: ChatGPT asks about it again.
         let consent = s.declined || s.account.as_ref().is_some_and(|a| !a.plan_usage);
         let options = SignInOptions { endpoints: s.endpoints.clone(), port: s.port, wait: SIGN_IN_WAIT, consent };
@@ -182,14 +206,18 @@ pub(crate) fn cancel(app: &mut WordApp) -> Result<Value, String> {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        // Dropping it stops it: its port closes once its thread sees that.
-        let cancelled = app.assist.chatgpt.sign_in.take().is_some_and(|s| {
-            s.cancel();
-            true
-        });
-        if cancelled {
-            app.assist.chatgpt.notice = None;
-        }
+        // It stops, and its port closes, unless it is already finishing the browser's answer:
+        // [`tick`] still takes how it ends, so a sign-in kept that way shows at once.
+        let s = &mut app.assist.chatgpt;
+        let cancelled = match s.sign_in.take() {
+            Some(waiting) => {
+                waiting.cancel();
+                s.cancelled = Some(waiting);
+                s.notice = None;
+                true
+            }
+            None => false,
+        };
         Ok(json!({"cancelled": cancelled}))
     }
     #[cfg(target_arch = "wasm32")]
@@ -213,6 +241,11 @@ pub(crate) fn sign_out(app: &mut WordApp) -> Result<Value, String> {
         }
         if s.sign_in.is_some() {
             return Err("a ChatGPT sign-in is waiting for your browser: cancel it first".into());
+        }
+        // A cancelled sign-in may still save what the browser sent: signing out now could be
+        // undone by it a moment later.
+        if s.cancelled.is_some() {
+            return Err(FINISHING.into());
         }
         match wordcraft_assist::chatgpt::SignOut::start(&settings, s.endpoints.clone()) {
             Ok(started) => {
@@ -258,6 +291,17 @@ pub(crate) fn tick(app: &mut WordApp) -> bool {
                 }
             }
         }
+        // A cancelled sign-in that was finishing the browser's answer: kept if it got that far.
+        if let Some(ended) = s.cancelled.as_mut().and_then(|w| w.poll().cloned()) {
+            s.cancelled = None;
+            if let Ok(account) = ended {
+                changed = true;
+                s.account = Some(account);
+                s.read_at = Some(now);
+                s.declined = false;
+                s.notice = Some(Notice::SignedIn);
+            }
+        }
         if let Some(ended) = s.sign_out.as_mut().and_then(|w| w.poll().cloned()) {
             s.sign_out = None;
             changed = true;
@@ -274,12 +318,17 @@ pub(crate) fn tick(app: &mut WordApp) -> bool {
         let stale = s.read_at.is_none_or(|at| now - at > READ_EVERY * 1000.0);
         if stale && s.sign_out.is_none() {
             let read = settings.as_deref().and_then(wordcraft_assist::chatgpt::account);
-            changed |= s.read_at.is_some() && read != s.account;
+            if read != s.account {
+                changed |= s.read_at.is_some();
+                // Signed in or out elsewhere (another WordCraft, or ChatGPT ended the sign-in):
+                // what the last sign-in or sign-out said no longer describes who is signed in.
+                s.notice = None;
+            }
             s.account = read;
             s.read_at = Some(now);
         }
         // Frames keep coming while the browser has the sign-in, so its end shows at once.
-        if (s.sign_in.is_some() || s.sign_out.is_some())
+        if (s.sign_in.is_some() || s.cancelled.is_some() || s.sign_out.is_some())
             && let Some(ctx) = &app.ctx
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(LOOK_EVERY_MS));

@@ -23,7 +23,8 @@
 //! in, `assist.chatgpt.cancelSignIn` stops a sign-in that waits for it, and
 //! `assist.chatgpt.signOut` revokes and deletes the sign-in (File › Options › Account, and the
 //! Assistant pane's Continue with ChatGPT). They are the person's alone: the window refuses them
-//! from a script or an agent ([`AssistantStatus::chatgpt`] says where the sign-in stands).
+//! from a script or an agent ([`AssistantStatus::chatgpt`] says where the sign-in stands), and
+//! they take no key, go on no ribbon or toolbar and run as no macro's step ([`person_only`]).
 //!
 //! A writing action is a prompt of ours ([`prompts`]) asked like any other, so its edits are the
 //! assistant's: tracked changes in its name while it is a suggester. The window gives the
@@ -137,14 +138,14 @@ pub fn specs() -> Vec<CommandSpec> {
             s.push_ui_request(json!({"assist": "chatgptSignIn"}));
             Ok(json!({"signingIn": true}))
         })
-        .params(r#"{} → your browser opens to sign in with your ChatGPT account (Plus or Pro), and the assistant can use ChatGPT once you have; while that sign-in waits, it opens again. Yours alone: from a script or an agent (control channel, MCP) it is an error"#)
+        .params(r#"{} → your browser opens to sign in with your ChatGPT account (Plus or Pro), and the assistant can use ChatGPT once you have; while that sign-in waits, it opens again. Yours alone: from a script or an agent (control channel, MCP), as a macro's step or from a key it is an error, and it takes no key and goes on no ribbon or toolbar"#)
         .when(can_sign_in)
         .pure(),
         CommandSpec::new("assist.chatgpt.cancelSignIn", "Cancel Signing In with ChatGPT", "File › Options › Account", |s, _| {
             s.push_ui_request(json!({"assist": "chatgptCancel"}));
             Ok(json!({"cancelled": true}))
         })
-        .params(r#"{} → the sign-in waiting for your browser stops. Yours alone, as signing in is"#)
+        .params(r#"{} → the sign-in waiting for your browser stops (unless it is already finishing what the browser sent: then you are signed in). Yours alone, as signing in is"#)
         .when(signing_in)
         .pure(),
         CommandSpec::new("assist.chatgpt.signOut", "Sign Out of ChatGPT", "File › Options › Account", |s, _| {
@@ -197,6 +198,15 @@ pub fn can_ask(s: &Session) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Whether command `id` is the person's alone, run from its own button (or Search), never by
+/// someone else's arrangement: signing in to ChatGPT or out of it (#19). It takes no key and goes
+/// on no ribbon or Quick Access Toolbar (an agent could put it where the person presses or clicks
+/// for something else: [`crate::RibbonLayout`]), and the window refuses it as a macro's step
+/// (anyone may have written the macro) and addressed to another document.
+pub fn person_only(id: &str) -> bool {
+    id.starts_with("assist.chatgpt.")
 }
 
 /// The ChatGPT sign-in is the window's, on the desktop.

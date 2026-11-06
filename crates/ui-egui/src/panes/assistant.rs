@@ -112,7 +112,9 @@ fn picker(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     if let Some(o) = &current {
         let text = match &o.readiness {
             Readiness::Ready => return,
-            Readiness::SignIn { how } => fmt(tl!("Sign in: {how}"), &[("how", how)]),
+            // A backend's sign-in hint already says what to do ("Sign in with …"), with the
+            // button for it right under it for ChatGPT (#19): no "Sign in:" before it.
+            Readiness::SignIn { how } => how.clone(),
             Readiness::Install { how } => fmt(tl!("Install: {how}"), &[("how", how)]),
             Readiness::Unavailable { why } => fmt(tl!("Unavailable: {why}"), &[("why", why)]),
         };

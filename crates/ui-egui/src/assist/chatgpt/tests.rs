@@ -15,7 +15,7 @@ use wordcraft_assist::Readiness;
 use wordcraft_assist::chatgpt::{CREDENTIALS_FILE, Endpoints, ID, SCOPES};
 use wordcraft_engine::cmd::assist::ChatGptStatus;
 
-use super::{Notice, YOURS, status};
+use super::{FINISHING, Notice, YOURS, status};
 use crate::{Services, WordApp};
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -53,6 +53,8 @@ struct Script {
     scope: Mutex<Option<String>>,
     /// The paths asked for, in order.
     asked: Mutex<Vec<String>>,
+    /// The token endpoint waits while this is set (a code exchange that takes a while).
+    hold_token: AtomicBool,
 }
 
 /// The fake sign-in server: the token, discovery and revocation endpoints.
@@ -154,6 +156,9 @@ fn serve() -> Server {
             n += 1;
             match (method.as_str(), path.as_str()) {
                 ("POST", "/oauth/token") => {
+                    while script2.hold_token.load(Ordering::Relaxed) && !stop2.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
                     let client = field(&body, "client_id").unwrap_or_default();
                     let mut claims = json!({
                         "iss": "https://auth.openai.com", "aud": [client], "sub": "user-123", "exp": now() + 3600, "iat": now(),
@@ -209,15 +214,32 @@ fn until(a: &mut WordApp, what: &str, done: impl Fn(&WordApp) -> bool) {
 fn browser_returns(a: &WordApp, server: &Server) {
     let url = a.canvas.open_url.clone().expect("the browser was opened");
     *server.script.nonce.lock().unwrap() = param(&url, "nonce").unwrap();
+    browser_answers(a, "code=the-code&client_id=oaiapp_issued-1");
+}
+
+/// The browser comes back to the sign-in's port with `query` (its `state` added); the page it
+/// shows.
+fn browser_answers(a: &WordApp, query: &str) -> String {
+    let (redirect, state) = callback(a);
+    answer_at(&redirect, &format!("{query}&state={state}"))
+}
+
+/// Where the sign-in waits for the browser, and the state it expects.
+fn callback(a: &WordApp) -> (String, String) {
+    let url = a.canvas.open_url.clone().expect("the browser was opened");
     let state = param(&url, "state").unwrap();
-    let redirect = a.assist.chatgpt.sign_in.as_ref().unwrap().redirect_uri().to_string();
+    (a.assist.chatgpt.sign_in.as_ref().unwrap().redirect_uri().to_string(), state)
+}
+
+/// The browser asks `redirect` with `query`: the page it shows.
+fn answer_at(redirect: &str, query: &str) -> String {
     let (host, path) = redirect.strip_prefix("http://").unwrap().split_once('/').unwrap();
     let mut s = TcpStream::connect(host).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let query = format!("code=the-code&client_id=oaiapp_issued-1&state={state}");
     s.write_all(format!("GET /{path}?{query} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes()).unwrap();
     let mut page = Vec::new();
     let _ = s.read_to_end(&mut page);
+    String::from_utf8_lossy(&page).to_string()
 }
 
 fn chatgpt_offer(a: &WordApp) -> Readiness {
@@ -445,4 +467,234 @@ fn the_web_app_has_no_sign_in() {
     use egui_kittest::kittest::Queryable;
     assert!(h.query_by_label_contains("takes the WordCraft desktop app").is_some());
     assert!(h.query_by_label("Continue with ChatGPT").is_none());
+}
+
+/// A macro an agent wrote signs nobody in or out when the person runs it, and an agent can't give
+/// Sign Out a key the person would press (#19): both are someone else's arrangement.
+#[test]
+fn a_macro_or_a_key_an_agent_set_up_signs_nobody_in_or_out() {
+    let (folder, server) = (Folder::new(), serve());
+    let mut a = window(&folder, &server);
+    // Signed out: a sign-in step opens no browser.
+    a.execute("tools.macros", json!({"define": {"name": "Start", "steps": [{"command": "assist.chatgpt.signIn"}]}})).unwrap();
+    let _ = a.run("tools.macros", json!({"run": "Start"}));
+    assert!(a.assist.chatgpt.sign_in.is_none() && a.canvas.open_url.is_none(), "a macro step started a sign-in");
+    sign_in(&mut a, &server);
+    // An agent (engine.execute: control channel, MCP) writes a macro and tries to bind a key.
+    a.execute("tools.macros", json!({"define": {"name": "Tidy headings", "steps": [{"command": "assist.chatgpt.signOut"}]}})).unwrap();
+    assert!(a.execute("tools.customizeKeyboard", json!({"assign": {"command": "assist.chatgpt.signOut", "key": "Mod+S"}})).is_err());
+    // The person runs the macro from View › Macros.
+    let _ = a.run("tools.macros", json!({"run": "Tidy headings"}));
+    for _ in 0..20 {
+        crate::assist::tick(&mut a);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(status(&a), ChatGptStatus::SignedIn, "a macro step started a sign-out");
+    assert!(folder.path().join(CREDENTIALS_FILE).exists(), "the sign-in is kept");
+    assert!(!server.script.asked.lock().unwrap().iter().any(|p| p == "/oauth/revoke"), "nothing was revoked");
+    // The person's own Sign Out still works.
+    a.run("assist.chatgpt.signOut", json!({})).unwrap();
+    until(&mut a, "signed out", |a| status(a) == ChatGptStatus::SignedOut);
+}
+
+/// Cancel while the browser's answer is being finished (the code is exchanged): the sign-in
+/// that gets saved anyway shows at once, not only at the next re-read.
+#[test]
+fn cancel_while_the_code_is_exchanged_shows_the_sign_in_it_kept() {
+    let (folder, server) = (Folder::new(), serve());
+    let mut a = window(&folder, &server);
+    // No re-read of the settings folder: only the attempt's own end can show the account.
+    a.assist.chatgpt.read_at = Some(f64::INFINITY);
+    a.run("assist.chatgpt.signIn", json!({})).unwrap();
+    server.script.hold_token.store(true, Ordering::Relaxed);
+    let url = a.canvas.open_url.clone().unwrap();
+    *server.script.nonce.lock().unwrap() = param(&url, "nonce").unwrap();
+    let (redirect, state) = callback(&a);
+    let browser = std::thread::spawn(move || answer_at(&redirect, &format!("code=the-code&client_id=oaiapp_issued-1&state={state}")));
+    let end = Instant::now() + WAIT;
+    while !server.script.asked.lock().unwrap().iter().any(|p| p == "/oauth/token") {
+        assert!(Instant::now() < end, "the code was never exchanged");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    crate::assist::tick(&mut a);
+    assert_eq!(status(&a), ChatGptStatus::SigningIn, "the window still waits for the browser");
+    // The person cancels now; the exchange finishes anyway and keeps the sign-in.
+    assert_eq!(a.run("assist.chatgpt.cancelSignIn", json!({})).unwrap(), json!({"cancelled": true}));
+    assert_eq!(a.run("assist.chatgpt.signIn", json!({})).unwrap_err(), FINISHING);
+    assert!(a.assist.chatgpt.sign_in.is_none());
+    server.script.hold_token.store(false, Ordering::Relaxed);
+    let _page = browser.join().unwrap();
+    until(&mut a, "the kept sign-in shows", |a| status(a) == ChatGptStatus::SignedIn);
+    assert!(folder.path().join(CREDENTIALS_FILE).exists());
+    assert_eq!(super::account(&a).map(|x| x.email.as_str()), Some("writer@example.com"));
+    assert_eq!(a.assist.chatgpt.notice, Some(Notice::SignedIn));
+    assert_eq!(chatgpt_offer(&a), Readiness::Ready);
+    assert!(a.assist.chatgpt.cancelled.is_none());
+}
+
+/// Signed in, the person signs in again and cancels while the code is exchanged: until that
+/// sign-in has saved what the browser sent, Sign Out and a new sign-in wait (either would race
+/// it: a sign-out it undoes, or a second sign-in whose Cancel loses track of it); then the kept
+/// sign-in shows, and Sign Out works.
+#[test]
+fn a_cancelled_sign_in_still_finishing_holds_back_sign_out_and_a_new_sign_in() {
+    let (folder, server) = (Folder::new(), serve());
+    let mut a = window(&folder, &server);
+    sign_in(&mut a, &server);
+    a.assist.chatgpt.read_at = Some(f64::INFINITY);
+    let tokens = |server: &Server| server.script.asked.lock().unwrap().iter().filter(|p| *p == "/oauth/token").count();
+    let before = tokens(&server);
+    a.canvas.open_url = None;
+    a.run("assist.chatgpt.signIn", json!({})).unwrap();
+    server.script.hold_token.store(true, Ordering::Relaxed);
+    let url = a.canvas.open_url.clone().unwrap();
+    *server.script.nonce.lock().unwrap() = param(&url, "nonce").unwrap();
+    let (redirect, state) = callback(&a);
+    let browser = std::thread::spawn(move || answer_at(&redirect, &format!("code=the-code&client_id=oaiapp_issued-1&state={state}")));
+    let end = Instant::now() + WAIT;
+    while tokens(&server) == before {
+        assert!(Instant::now() < end, "the code was never exchanged");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(a.run("assist.chatgpt.cancelSignIn", json!({})).unwrap(), json!({"cancelled": true}));
+    assert_eq!(status(&a), ChatGptStatus::SignedIn, "still signed in as before");
+    assert_eq!(a.run("assist.chatgpt.signOut", json!({})).unwrap_err(), FINISHING);
+    assert!(a.assist.chatgpt.sign_out.is_none());
+    assert_eq!(a.run("assist.chatgpt.signIn", json!({})).unwrap_err(), FINISHING);
+    assert!(a.assist.chatgpt.sign_in.is_none());
+    server.script.hold_token.store(false, Ordering::Relaxed);
+    let _page = browser.join().unwrap();
+    until(&mut a, "the kept sign-in shows", |a| a.assist.chatgpt.cancelled.is_none());
+    assert_eq!(a.assist.chatgpt.notice, Some(Notice::SignedIn));
+    assert!(folder.path().join(CREDENTIALS_FILE).exists());
+    assert_eq!(a.run("assist.chatgpt.signOut", json!({})).unwrap(), json!({"signingOut": true}));
+    until(&mut a, "signed out", |a| status(a) == ChatGptStatus::SignedOut);
+    assert!(!folder.path().join(CREDENTIALS_FILE).exists());
+}
+
+/// An agent can't put signing in or out on the Quick Access Toolbar, where the person's Alt, 1
+/// (or a click) would run it as theirs; one an older settings file put there shows no button, so
+/// Alt, 1 runs nothing.
+#[test]
+fn an_agent_puts_no_sign_in_or_out_on_the_quick_access_toolbar() {
+    let (folder, server) = (Folder::new(), serve());
+    let mut a = window(&folder, &server);
+    sign_in(&mut a, &server);
+    let e = a.execute("tools.customizeRibbon", json!({"qatAdd": "assist.chatgpt.signOut"})).unwrap_err();
+    assert!(e.contains("only you run it"), "{e}");
+    a.execute("tools.customizeRibbon", json!({"layout": {"qat": ["assist.chatgpt.signOut", "file.save"]}})).unwrap();
+    assert_eq!(a.session.ribbon.qat(), ["file.save"]);
+    a.session.ribbon.qat = Some(vec!["assist.chatgpt.signOut".into()]);
+    crate::keytips::activate(&mut a);
+    crate::keytips::handle_key(&mut a, egui::Key::Num1);
+    crate::assist::tick(&mut a);
+    assert!(a.assist.chatgpt.sign_out.is_none(), "the person's Alt, 1 signed them out");
+    assert_eq!(status(&a), ChatGptStatus::SignedIn);
+    assert!(folder.path().join(CREDENTIALS_FILE).exists());
+}
+
+/// A sign-in that ends elsewhere (another WordCraft signs out, or ChatGPT ends it) drops the
+/// last "You're signed in" notice: the page doesn't say so under Continue with ChatGPT.
+#[test]
+fn a_sign_in_ended_elsewhere_drops_the_last_notice() {
+    let (folder, server) = (Folder::new(), serve());
+    let mut a = window(&folder, &server);
+    sign_in(&mut a, &server);
+    assert_eq!(a.assist.chatgpt.notice, Some(Notice::SignedIn));
+    std::fs::remove_file(folder.path().join(CREDENTIALS_FILE)).unwrap();
+    // Ten seconds pass: the next frame reads the settings folder again.
+    a.assist.chatgpt.read_at = Some(crate::clock::now_ms() - 11_000.0);
+    crate::assist::tick(&mut a);
+    assert_eq!(status(&a), ChatGptStatus::SignedOut);
+    assert_eq!(a.assist.chatgpt.notice, None);
+    a.run("file.options", json!({"pane": "account"})).unwrap();
+    let h = harness(a);
+    use egui_kittest::kittest::Queryable;
+    assert!(h.query_by_label("Continue with ChatGPT").is_some());
+    assert!(h.query_by_label_contains("You're signed in to ChatGPT").is_none());
+}
+
+/// And the reverse: a sign-in elsewhere drops the "signed out" notice under Signed in as ….
+#[test]
+fn a_sign_in_elsewhere_drops_the_signed_out_notice() {
+    let (folder, server) = (Folder::new(), serve());
+    let mut a = window(&folder, &server);
+    sign_in(&mut a, &server);
+    let kept = std::fs::read(folder.path().join(CREDENTIALS_FILE)).unwrap();
+    a.run("assist.chatgpt.signOut", json!({})).unwrap();
+    until(&mut a, "signed out", |a| status(a) == ChatGptStatus::SignedOut);
+    assert!(matches!(a.assist.chatgpt.notice, Some(Notice::SignedOut { .. })));
+    // Another WordCraft signs in: the credentials file is back.
+    std::fs::write(folder.path().join(CREDENTIALS_FILE), &kept).unwrap();
+    a.assist.chatgpt.read_at = Some(crate::clock::now_ms() - 11_000.0);
+    crate::assist::tick(&mut a);
+    assert_eq!(status(&a), ChatGptStatus::SignedIn);
+    assert_eq!(a.assist.chatgpt.notice, None, "no 'signed out' line under Signed in as …");
+}
+
+/// File › Options › Account signed in with plan usage: who, the usage link, and the person's own
+/// Sign Out click, which deletes the sign-in and revokes it.
+#[test]
+fn the_account_page_shows_who_is_signed_in_and_its_sign_out_button_works() {
+    let (folder, server) = (Folder::new(), serve());
+    let mut a = window(&folder, &server);
+    sign_in(&mut a, &server);
+    a.run("file.options", json!({"pane": "account"})).unwrap();
+    let mut h = harness(a);
+    use egui_kittest::kittest::Queryable;
+    assert!(h.query_by_label("Signed in as A Writer (writer@example.com)").is_some());
+    assert!(h.query_by_label("See your plan's usage").is_some());
+    assert!(h.query_by_label_contains("plan usage isn't allowed").is_none());
+    assert!(h.query_by_label("Sign In Again").is_none());
+    h.get_by_label("Sign Out").click();
+    let end = Instant::now() + WAIT;
+    while status(h.state()) != ChatGptStatus::SignedOut {
+        assert!(Instant::now() < end, "the Sign Out button never signed out");
+        h.run_steps(1);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!folder.path().join(CREDENTIALS_FILE).exists());
+    assert_eq!(h.state().assist.chatgpt.notice, Some(Notice::SignedOut { revoked: true }));
+    assert!(server.script.asked.lock().unwrap().iter().any(|p| p == "/oauth/revoke"));
+}
+
+/// Declining plan usage in the browser says why, and the next sign-in asks for consent again.
+/// (Only WordCraft's client id, which the first sign-in registers, can be asked that: a first
+/// sign-in shows ChatGPT's consent anyway.)
+#[test]
+fn a_declined_sign_in_asks_for_consent_the_next_time() {
+    let (folder, server) = (Folder::new(), serve());
+    let mut a = window(&folder, &server);
+    // Signed in once, so WordCraft has its client id, and signed out: its client id stays.
+    sign_in(&mut a, &server);
+    a.run("assist.chatgpt.signOut", json!({})).unwrap();
+    until(&mut a, "signed out", |a| status(a) == ChatGptStatus::SignedOut);
+    a.canvas.open_url = None;
+    a.run("assist.chatgpt.signIn", json!({})).unwrap();
+    assert!(param(a.canvas.open_url.as_deref().unwrap(), "prompt").is_none());
+    browser_answers(&a, "error=access_denied&error_description=The+user+declined");
+    until(&mut a, "the decline ended the sign-in", |a| a.assist.chatgpt.sign_in.is_none());
+    assert_eq!(status(&a), ChatGptStatus::SignedOut);
+    assert_eq!(a.assist.chatgpt.notice, Some(Notice::SignInFailed(wordcraft_assist::chatgpt::AuthError::Denied.to_string())));
+    assert!(!folder.path().join(CREDENTIALS_FILE).exists());
+    a.canvas.open_url = None;
+    a.run("assist.chatgpt.signIn", json!({})).unwrap();
+    let url = a.canvas.open_url.clone().unwrap();
+    assert_eq!(param(&url, "prompt").as_deref(), Some("consent"), "{url}");
+    a.run("assist.chatgpt.cancelSignIn", json!({})).unwrap();
+}
+
+/// The pane, while ChatGPT waits for a sign-in, says what to do once, with the button under it:
+/// not "Sign in: Sign in with …".
+#[test]
+fn the_pane_says_how_to_sign_in_once() {
+    let (folder, server) = (Folder::new(), serve());
+    let mut a = window(&folder, &server);
+    a.run("assist.backend", json!({"id": ID})).unwrap();
+    a.run("assist.pane", json!({"value": true})).unwrap();
+    let h = harness(a);
+    use egui_kittest::kittest::Queryable;
+    assert!(h.query_by_label("Sign in with a ChatGPT Plus or Pro account in Options › Account.").is_some());
+    assert!(h.query_by_label_contains("Sign in: ").is_none());
+    assert!(h.query_by_label("Continue with ChatGPT").is_some());
 }

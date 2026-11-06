@@ -444,9 +444,16 @@ impl WordApp {
             }
             return;
         }
-        // The assistant's, from a command `execute` didn't run (it answers those itself).
-        if req.get("assist").is_some() {
-            if let Err(e) = crate::assist::handle(self, req) {
+        // The assistant's, from a command `execute` didn't run (it answers those itself): a step
+        // of another command, such as a macro. Signing in to ChatGPT or out of it is never one:
+        // anyone may have written the macro the person runs (#19).
+        if let Some(what) = req.get("assist") {
+            let r = if what.as_str().is_some_and(|w| w.starts_with("chatgpt")) {
+                Err(crate::assist::chatgpt::YOURS.to_string())
+            } else {
+                crate::assist::handle(self, req)
+            };
+            if let Err(e) = r {
                 self.status(e);
             }
             return;

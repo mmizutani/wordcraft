@@ -147,6 +147,11 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
             if id.starts_with("ui.") {
                 return err(format!("`{id}` works on the window: make the document active first (view.switchWindows {{\"id\": {doc}}})"));
             }
+            // Signing in to ChatGPT or out of it is the person's alone (#19): addressed to a
+            // document it is an error, as through `WordApp::execute`, and nothing is queued.
+            if wordcraft_engine::cmd::assist::person_only(id) {
+                return err(crate::assist::chatgpt::YOURS);
+            }
             // Close, with the same guard as the window's: unsaved changes need `force`.
             if id == "file.close" {
                 let force = params.get("force").and_then(Value::as_bool) == Some(true);
