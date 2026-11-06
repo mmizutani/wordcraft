@@ -26,7 +26,7 @@ use wordcraft_assist::{Assistant, Entry, Options, StopReason, ToolStatus};
 use wordcraft_doc::{Document, StoryRef};
 use wordcraft_engine::Session;
 use wordcraft_engine::cmd::review::changes_by;
-use wordcraft_engine::room::{Lobby, Replica, Room};
+use wordcraft_engine::room::{Lobby, Replica, Role, Room};
 
 use crate::acp::AS_AGENT;
 
@@ -108,10 +108,10 @@ impl Window {
     /// One frame of the window: what the room took since the last frame comes in, the next key
     /// of the person's typing when one is due goes out, and each conversation's events are
     /// taken, as the app's frame does. Timed: nothing in it may wait for an assistant.
-    fn frame(&mut self, chats: [&mut Assistant; 2]) {
+    fn frame(&mut self, chats: &mut [&mut Assistant]) {
         let started = Instant::now();
         let key = if self.frames.is_multiple_of(KEY_EVERY) { self.typing.pop_front() } else { None };
-        let theirs = self.session.doc.revisions.len();
+        let theirs = self.theirs();
         self.own
             .lend(&mut self.session, |c| {
                 c.sync();
@@ -121,7 +121,7 @@ impl Window {
                 }
             })
             .unwrap();
-        for a in chats {
+        for a in chats.iter_mut() {
             a.poll();
         }
         let took = started.elapsed();
@@ -129,12 +129,19 @@ impl Window {
         if key.is_some() {
             self.keys_at.push(self.frames);
         }
-        // The assistants are suggesters: their changes come in as tracked changes.
-        if self.session.doc.revisions.len() != theirs {
+        if self.theirs() != theirs {
             self.theirs_at.push(self.frames);
         }
         self.frames += 1;
         std::thread::sleep(FRAME_GAP);
+    }
+
+    /// What shows that a change of another participant's came in: how many of theirs the
+    /// window's copy made, and the document's revision records (a copy that reads the whole
+    /// document again counts none of the changes in it). Not the records alone: an author's later
+    /// changes in the same second reuse its record and add none.
+    fn theirs(&self) -> (u64, usize) {
+        (self.own.stats().received, self.session.doc.revisions.len())
     }
 
     /// Whether the window has every change the room took, and the room every change the window
@@ -203,7 +210,7 @@ impl Editors {
     }
 
     fn frame(&mut self) {
-        self.window.frame([&mut self.chatgpt, &mut self.agent]);
+        self.window.frame(&mut [&mut self.chatgpt, &mut self.agent]);
     }
 
     /// Frames until `done` holds (at most [`WAIT`]).
@@ -516,6 +523,55 @@ fn killing_the_agent_mid_turn_leaves_chatgpt_and_the_person_working() {
     assert_eq!(error(&e.agent), None);
     assert_eq!(agent_read(&answer(&e.agent)), e.window.text());
     e.end();
+}
+
+#[test]
+fn stopping_the_agent_mid_turn_never_makes_the_window_wait() {
+    // ChatGPT isn't asked here. The agent sleeps without reading what WordCraft sends, as an
+    // agent slow to stop does: it says it stopped only once it wakes, seconds after the Stop
+    // (and before its cancel_timeout, 10 s, so it isn't killed).
+    let openai = OpenAi::start(vec![]);
+    let sleep = u64::try_from((HELD * 2).as_millis()).unwrap();
+    let slow = vec![Step::Say { text: "Thinking it over.".into() }, Step::Sleep { ms: sleep }, hours()];
+    let mut e = Editors::new(&openai, &script(&[(ADD_SECTION, slow)]));
+    e.ask_agent(ADD_SECTION);
+    e.window.type_slowly(TYPED);
+    e.until("the agent to start sleeping", |e| answer(&e.agent).ends_with("Thinking it over."));
+    // The window's Stop returns at once, though the agent won't answer for seconds.
+    timed("Stop", || e.agent.cancel());
+    // Frames go on, each within its budget, while the agent is still stopping: a Stop that
+    // waited for it would have taken at least this long.
+    e.for_a_while(HELD / 2);
+    assert!(e.agent.is_busy(), "the agent is slow to stop, so Stop returned before its turn ended");
+    e.until("the agent's turn to end", |e| !e.agent.is_busy());
+    assert_eq!(stopped(&e.agent), Some(StopReason::Cancelled));
+    assert_eq!(error(&e.agent), None);
+    e.settle();
+    // Nothing the agent would have done after Stop is in; the person's typing is.
+    assert_eq!(e.window.accepted(), format!("The studio opens at nine.{TYPED}\n{OLD}\nVisitors are welcome."));
+    assert!(e.window.authors().is_empty(), "{:?}", e.window.authors());
+    assert!(e.window.same_as_the_hub());
+    e.end();
+}
+
+/// Each change another participant makes is a frame their change came in at, a later one in the
+/// same second too, which reuses its author's revision record and adds none.
+#[test]
+fn the_window_sees_each_change_of_theirs_even_in_the_same_second() {
+    let mut w = Window::new();
+    let mut helper = w.room.join("Helper", Role::Suggester).unwrap();
+    helper.run("caret.docEnd", &json!({})).unwrap();
+    helper.run("text.insert", &json!({"text": " One."})).unwrap();
+    helper.send();
+    w.frame(&mut []);
+    let records = w.session.doc.revisions.len();
+    // Microseconds later: the same author, kind and (almost always) second, so the same record.
+    helper.run("text.insert", &json!({"text": " Two."})).unwrap();
+    // Its first change comes back first: a copy sends its next one only then.
+    helper.sync();
+    w.frame(&mut []);
+    assert_eq!(w.theirs_at, [0, 1], "revision records {records} -> {}", w.session.doc.revisions.len());
+    assert!(w.text().ends_with("Visitors are welcome. One. Two."), "{}", w.text());
 }
 
 /// Kill process `pid` at once, as the system does to a program it ends.

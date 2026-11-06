@@ -1215,19 +1215,45 @@ fn the_window_never_waits_for_its_assistants() {
     use std::time::Instant;
 
     use egui_kittest::kittest::Queryable;
-    use wordcraft_assist::{Assistant, Options};
+    use wordcraft_assist::{Assistant, Backend, BackendInfo, Options, Seat, Turn, TurnCtx};
     use wordcraft_engine::cmd::review::changes_by;
 
-    /// A frame that waited for an assistant would take as long as it holds (until it's stopped).
+    /// A frame that waited for an assistant would take as long as it holds (until it's stopped),
+    /// or as long as it takes to stop.
     const BUDGET: Duration = Duration::from_secs(1);
+    /// How long each assistant takes to stop: well over a frame's budget.
+    const STOPPING: Duration = Duration::from_secs(3);
+
+    /// An assistant slow to stop, as an agent in the middle of a tool call is: its fake's turn,
+    /// then, once stopped, [`STOPPING`] more before the turn ends.
+    struct SlowToStop(Fake);
+
+    impl Backend for SlowToStop {
+        fn info(&self) -> BackendInfo {
+            self.0.info()
+        }
+
+        fn begin(&mut self, seat: &Seat) -> Result<(), String> {
+            self.0.begin(seat)
+        }
+
+        fn turn(&mut self, turn: &Turn, ctx: &mut TurnCtx<'_>) -> Result<StopReason, String> {
+            let stop = self.0.turn(turn, ctx);
+            if ctx.is_cancelled() {
+                std::thread::sleep(STOPPING);
+            }
+            stop
+        }
+    }
+
     let mut app = window("one two three");
     let pane = vec![Step::tool("select_text", json!({"text": "two"})), Step::tool("type_text", json!({"text": "2"})), Step::Hold];
-    app.assist_with(Box::new(Fake::named("Pane Assistant").then(pane)));
+    app.assist_with(Box::new(SlowToStop(Fake::named("Pane Assistant").then(pane))));
     let mut h = harness(app);
     h.state_mut().execute("assist.ask", json!({"prompt": "Use digits"})).unwrap();
     let room = h.state().shared_room().unwrap();
     let steps = vec![Step::tool("execute", json!({"command": "caret.docEnd"})), Step::tool("type_text", json!({"text": " four"})), Step::Hold];
-    let mut other = Assistant::start(&room, Box::new(Fake::named("Other Assistant").then(steps)), Options::default()).unwrap();
+    let mut other = Assistant::start(&room, Box::new(SlowToStop(Fake::named("Other Assistant").then(steps))), Options::default()).unwrap();
     other.ask("Count on", None).unwrap();
     // The page has the keyboard, the caret at the start.
     h.state_mut().execute("caret.docStart", json!({})).unwrap();
@@ -1263,7 +1289,9 @@ fn the_window_never_waits_for_its_assistants() {
         assert!(Instant::now() < deadline, "the edits never came in");
     }
     assert!(h.state().conversation().is_some_and(|c| c.is_busy()) && other.is_busy(), "both hold their turns");
-    // Stop in the pane, then the other's Stop: frames go on, and both turns end.
+    // Stop in the pane, then the other's Stop: neither waits for its assistant, which takes
+    // seconds to stop; frames go on meanwhile, and both turns end.
+    let stopped_at = Instant::now();
     h.get_by_label("Stop").click();
     let started = Instant::now();
     other.cancel();
@@ -1272,6 +1300,7 @@ fn the_window_never_waits_for_its_assistants() {
         frame(&mut h, &mut other);
         assert!(Instant::now() < deadline, "the turns never ended");
     }
+    assert!(stopped_at.elapsed() >= STOPPING, "the turns ended {:?} after Stop", stopped_at.elapsed());
     let stopped = |a: &Assistant| a.transcript().entries().any(|e| matches!(e, Entry::Stopped { stop: StopReason::Cancelled }));
     assert!(stopped(h.state().conversation().unwrap()) && stopped(&other));
     assert_eq!(accepted(h.state()), "Zero, one 2 three four");
