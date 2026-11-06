@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use wordcraft_mcp::Backend as _;
 
 use crate::backend::{
     Answer, Backend, BackendInfo, Event, MAX_OPTIONS, MAX_PLAN, PermissionKind, PermissionOption, PermissionPolicy, PermissionRequest, PlanEntry,
@@ -603,6 +604,13 @@ impl Backend for Acp {
         let fresh = self.running.is_none();
         if fresh && !self.start_shown(ctx)? {
             return Ok(StopReason::Cancelled);
+        }
+        if let Some((anchor, focus)) = turn.selection
+            && let Some((_, room)) = self.spec.reach.checked()?
+        {
+            let seat = self.seat.as_ref().ok_or("the assistant has no seat in the shared document")?;
+            let mut remote = wordcraft_mcp::Remote::connect_with_key(&room.to_string(), &seat.key).map_err(|e| e.to_string())?;
+            remote.call("select.range", json!({"anchor": anchor, "focus": focus}))?;
         }
         // A new session gets the note, which the agent's model reads first.
         let note = if fresh { self.note.as_deref() } else { None };

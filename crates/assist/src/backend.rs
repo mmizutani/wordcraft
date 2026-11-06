@@ -85,6 +85,9 @@ pub struct Turn {
     /// The note the conversation's first turn carries: which document, the assistant's role,
     /// whether its edits are tracked, and how to read and follow the document ([`crate::note`]).
     pub note: Option<String>,
+    /// The person's selection, by stable paragraph id: the backend selects it in its document
+    /// copy before the turn. `None` leaves that copy's selection where it is.
+    pub selection: Option<(Anchor, Anchor)>,
 }
 
 /// Why a turn stopped (ACP's stop reasons, which the ChatGPT backend maps its own to).

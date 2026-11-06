@@ -152,10 +152,7 @@ impl ToolHost for CopyTools {
     fn select(&mut self, anchor: Anchor, focus: Anchor) -> bool {
         // What the hub took since, the person's edits among it, first.
         self.copy.receive();
-        let doc = &self.copy.session().doc;
-        let (Some(a), Some(f)) = (doc.pos_of(anchor, None), doc.pos_of(focus, None)) else { return false };
-        let range = json!({"anchor": wordcraft_engine::cmd::pos_json(&a), "focus": wordcraft_engine::cmd::pos_json(&f)});
-        self.copy.run("select.range", &range).is_ok()
+        self.copy.run("select.range", &json!({"anchor": anchor, "focus": focus})).is_ok()
     }
 }
 

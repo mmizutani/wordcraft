@@ -148,6 +148,27 @@ fn an_agents_edit_through_wordcrafts_mcp_server_is_a_tracked_change_in_its_name(
 }
 
 #[test]
+fn each_turn_selects_the_persons_range_in_the_agents_mcp_copy() {
+    let mut w = Window::new();
+    let type_text = |text: &str| vec![Step::Mcp { calls: vec![Call::new("type_text", json!({"text": text}))] }];
+    let script = Script { turns: vec![type_text("2"), type_text("3")], ..Script::default() };
+    let mut a = w.start(&script, None);
+    for (selected, expected) in [("two", "one 2 three"), ("three", "one 2 3")] {
+        w.own.lend(&mut w.session, |c| c.run("select.text", &json!({"text": selected}))).unwrap().unwrap();
+        let anchor = w.session.doc.anchor_at(&w.session.sel.anchor).unwrap();
+        let focus = w.session.doc.anchor_at(&w.session.sel.focus).unwrap();
+        a.ask_at("Rewrite the selected text", None, Some((anchor, focus))).unwrap();
+        assert!(a.wait_idle(WAIT), "the turn didn't end");
+        let answer = a.transcript().last_answer().unwrap_or_default();
+        assert!(answer.contains("type_text: ok"), "{answer}");
+        w.settle();
+        assert_eq!(w.accepted(), expected);
+    }
+    assert!(w.authors().iter().all(|author| author == "Fake Agent"));
+    a.end();
+}
+
+#[test]
 fn with_the_setting_at_editor_the_agents_edit_is_untracked() {
     let mut w = Window::new();
     let mut a = w.start(&Script { turns: vec![rewrite_two()], ..Script::default() }, Some(Role::Editor));

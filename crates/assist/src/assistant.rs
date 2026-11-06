@@ -87,8 +87,7 @@ pub struct Options {
 
 /// What the conversation's thread is asked to do.
 enum Job {
-    /// A turn, and the selection the assistant's copy takes before it ([`Assistant::ask_at`]).
-    Turn(Turn, Option<(Anchor, Anchor)>),
+    Turn(Turn),
     End,
 }
 
@@ -207,9 +206,8 @@ impl Assistant {
     /// first (the person's selection in the window, from anchor to focus, as
     /// [`wordcraft_doc::Document::anchor_at`] gives them there), so the turn works on what the
     /// person selected. The copy finds the paragraphs by id, which edits it hasn't had yet don't
-    /// change; one it can't find leaves its own selection. A backend with no copy of its own in
-    /// WordCraft (an agent that joins through the MCP server) reads the selection from the
-    /// context instead.
+    /// change. An ACP backend selects in the same room-port copy its agent's MCP or shell
+    /// calls use, and fails the turn if the selection can no longer be found.
     pub fn ask_at(&mut self, prompt: &str, context: Option<String>, selection: Option<(Anchor, Anchor)>) -> Result<(), AssistError> {
         if self.ended {
             return Err(AssistError::Ended);
@@ -225,11 +223,11 @@ impl Assistant {
             return Err(AssistError::Prompt(format!("the prompt is longer than {} KB", MAX_PROMPT >> 10)));
         }
         let note = self.first.then(|| crate::note(&self.seat, self.info.in_process_tools));
-        let turn = Turn { prompt: prompt.to_string(), context, note };
+        let turn = Turn { prompt: prompt.to_string(), context, note, selection };
         // Cleared before the turn is sent: a Stop from now on ends this turn, even one the
         // thread hasn't started yet.
         self.cancel.clear();
-        if self.jobs.send(Job::Turn(turn, selection)).is_err() {
+        if self.jobs.send(Job::Turn(turn)).is_err() {
             self.ended = true;
             return Err(AssistError::Ended);
         }
@@ -393,14 +391,14 @@ impl Work {
             return;
         }
         while let Ok(job) = self.jobs.recv() {
-            let (turn, selection) = match job {
-                Job::Turn(t, selection) => (t, selection),
+            let turn = match job {
+                Job::Turn(t) => t,
                 Job::End => break,
             };
             // The person's selection, in the assistant's copy: WordCraft's own step, not a call
             // of the model's, so the pane doesn't show it. A copy that can't find it (its
             // paragraph is gone) keeps its own.
-            if let Some((anchor, focus)) = selection {
+            if let Some((anchor, focus)) = turn.selection {
                 let _ = tools.select(anchor, focus);
             }
             let mut ctx = TurnCtx {
@@ -437,7 +435,7 @@ impl Work {
     /// Answer every turn with `why` until the conversation ends: it can't run any.
     fn fail_turns(&self, why: &str) {
         log::warn!("assistant: {why}");
-        while let Ok(Job::Turn(..)) = self.jobs.recv() {
+        while let Ok(Job::Turn(_)) = self.jobs.recv() {
             self.events.send(Event::Error { message: why.to_string() });
             self.events.send(Event::Done { stop: StopReason::EndTurn });
         }

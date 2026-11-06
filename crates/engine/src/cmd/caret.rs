@@ -1,6 +1,7 @@
 //! Caret movement and selection.
 
 use serde_json::Value;
+use wordcraft_doc::change::Anchor;
 use wordcraft_doc::{Pos, StoryRef};
 use wordcraft_layout::ViewMode;
 
@@ -52,7 +53,9 @@ pub fn specs() -> Vec<CommandSpec> {
             .params(r#"{"pos": Pos, "extend"?: bool} | {"page": n, "x": pt, "y": pt}"#)
             .pure(),
         CommandSpec::new("select.all", "Select All", "Home › Editing › Select", select_all).key("Mod+A").pure(),
-        CommandSpec::new("select.range", "Select Range", "Navigation", select_range).params(r#"{"anchor": Pos, "focus": Pos}"#).pure(),
+        CommandSpec::new("select.range", "Select Range", "Navigation", select_range)
+            .params(r#"{"anchor": Pos | {"block": hex id, "off": byte offset}, "focus": same} (stable block ids follow moved paragraphs)"#)
+            .pure(),
         CommandSpec::new("select.word", "Select Word", "Navigation", select_word).pure(),
         CommandSpec::new("select.sentence", "Select Sentence", "Navigation", select_sentence).pure(),
         CommandSpec::new("select.paragraph", "Select Paragraph", "Navigation", select_paragraph).pure(),
@@ -329,8 +332,14 @@ fn select_all(s: &mut Session, v: &Value) -> CmdResult {
 }
 
 fn select_range(s: &mut Session, v: &Value) -> CmdResult {
-    let a = v.get("anchor").and_then(parse_pos).ok_or_else(|| CmdError::Params("bad `anchor`".into()))?;
-    let b = v.get("focus").and_then(parse_pos).ok_or_else(|| CmdError::Params("bad `focus`".into()))?;
+    let pos = |v: &Value| {
+        parse_pos(v).or_else(|| {
+            let anchor = serde_json::from_value::<Anchor>(v.clone()).ok()?;
+            s.doc.pos_of(anchor, None)
+        })
+    };
+    let a = v.get("anchor").and_then(pos).ok_or_else(|| CmdError::Params("bad `anchor`".into()))?;
+    let b = v.get("focus").and_then(pos).ok_or_else(|| CmdError::Params("bad `focus`".into()))?;
     s.sel = Selection { anchor: s.doc.clamp(&a), focus: s.doc.clamp(&b) };
     sel_result(s)
 }
@@ -492,4 +501,47 @@ fn select_text(s: &mut Session, v: &Value) -> CmdResult {
     }
     let _ = StoryRef::Body;
     Err(CmdError::Failed(format!("`{needle}` not found")))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use wordcraft_doc::change::Anchor;
+    use wordcraft_doc::{BlockId, Document, Pos};
+
+    use crate::Session;
+
+    #[test]
+    fn select_range_keeps_pos_endpoints_and_clamping() {
+        let mut s = Session::new(Document::from_text("one two\nthree"));
+        s.run("select.range", &json!({"anchor": {"block": 0, "off": 1}, "focus": Pos::body(1, 999)})).unwrap();
+        assert_eq!((&s.sel.anchor, &s.sel.focus), (&Pos::body(0, 1), &Pos::body(1, 5)));
+    }
+
+    #[test]
+    fn select_range_finds_stable_anchors_after_paragraphs_move() {
+        let mut s = Session::new(Document::from_text("one\ntwo"));
+        let anchor = s.doc.anchor_at(&Pos::body(1, 0)).unwrap();
+        let focus = s.doc.anchor_at(&Pos::body(1, 3)).unwrap();
+        s.doc.body.swap(0, 1);
+        s.run("select.range", &json!({"anchor": anchor, "focus": focus})).unwrap();
+        assert_eq!((&s.sel.anchor, &s.sel.focus), (&Pos::body(0, 0), &Pos::body(0, 3)));
+    }
+
+    #[test]
+    fn select_range_checks_both_stable_anchors_before_changing_selection() {
+        let mut s = Session::new(Document::from_text("one two"));
+        s.run("select.text", &json!({"text": "two"})).unwrap();
+        let before = (s.sel.anchor.clone(), s.sel.focus.clone());
+        let valid = s.doc.anchor_at(&Pos::body(0, 0)).unwrap();
+        let missing = Anchor { block: BlockId::UNSET, off: 0 };
+        for params in [
+            json!({"anchor": missing, "focus": valid}),
+            json!({"anchor": valid, "focus": missing}),
+            json!({"anchor": valid, "focus": {"block": "not-a-block-id", "off": 0}}),
+        ] {
+            assert!(s.run("select.range", &params).is_err(), "{params}");
+            assert_eq!((&s.sel.anchor, &s.sel.focus), (&before.0, &before.1));
+        }
+    }
 }

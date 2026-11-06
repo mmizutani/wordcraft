@@ -110,6 +110,13 @@ impl Remote {
         Self::connect_with(addr, Box::new(find_key))
     }
 
+    /// Connect with an invite's key, without consulting the environment or the app's key file.
+    /// The same loopback checks as [`Remote::connect`] keep it on WordCraft's address.
+    pub fn connect_with_key(addr: &str, key: &str) -> std::io::Result<Self> {
+        let key = key.to_string();
+        Self::connect_with(addr, Box::new(move |_| Ok(key.clone())))
+    }
+
     fn connect_with(addr: &str, find_key: KeyFinder) -> std::io::Result<Self> {
         let mut r = Self { addr: addr.to_string(), conn: None, next_id: 1, connected: false, send_key: false, key: None, find_key };
         r.reconnect()?;
