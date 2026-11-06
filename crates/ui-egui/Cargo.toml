@@ -44,6 +44,12 @@ zbus = "=5.19.0"
 
 # Comment times in the user's own time zone (`local_time.rs`); the web app asks the browser.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Feature unification (build speed, #44): the dev-dependencies of `cargo test --workspace` turn on
+# these features, so the normal build turns them on too. Then `cargo build` and `cargo test` share
+# one build of every workspace library instead of compiling each twice. They add no code: the
+# features are already on in every test build. Check with `cargo xtask unified`.
+# (craft-update's tempfile uses getrandom 0.4; proptest's rand turns on `std` and `sys_rng`.)
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["std", "sys_rng"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 craft-update = { workspace = true }
 
@@ -53,9 +59,6 @@ js-sys = "0.3"
 
 [dev-dependencies]
 cfb = { workspace = true }
-# Producer tests simulate a globally exhausted IME revision allocator through the engine's
-# explicit test-support feature; production builds of this crate never enable it.
-wordcraft-engine = { workspace = true, features = ["test-support"] }
 # kittest's own dev-dependencies do not propagate their font features. Declare the fonts the
 # interface tests lay out explicitly: default faces plus monochrome emoji fallbacks.
 egui = { workspace = true, features = ["default_fonts", "monochrome_emoji_fonts"] }

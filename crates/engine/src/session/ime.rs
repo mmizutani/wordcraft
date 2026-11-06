@@ -23,8 +23,8 @@ impl Session {
     ///
     /// This only ever makes receipt classification fail closed. It exists so front-end producer
     /// tests can exercise the real `ime_stamp` path instead of hand-building an `Unavailable`
-    /// stamp; production builds do not compile it.
-    #[cfg(any(test, feature = "test-support"))]
+    /// stamp. Always compiled (a feature only tests turned on made `cargo build` and `cargo test`
+    /// compile the engine and everything above it twice); nothing outside tests calls it.
     #[doc(hidden)]
     pub fn exhaust_ime_state_revision(&mut self) {
         self.ime_state_exhausted = true;
@@ -51,7 +51,6 @@ impl Session {
     /// Test support can pin exhaustion for this session so a front-end producer test sees the
     /// real `ime_stamp`/receipt path fail closed.
     pub(super) fn reset_ime_state_revision(&mut self) {
-        #[cfg(any(test, feature = "test-support"))]
         if self.ime_state_exhausted {
             self.ime_state_revision = None;
             return;

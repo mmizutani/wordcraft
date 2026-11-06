@@ -37,5 +37,4 @@ js-sys = "0.3"
 getrandom = { workspace = true, features = ["wasm_js"] }
 
 [dev-dependencies]
-wordcraft-doc = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }

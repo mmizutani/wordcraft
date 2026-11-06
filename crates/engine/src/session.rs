@@ -155,9 +155,8 @@ pub struct Session {
     /// The current command's explicit IME effect classification.
     ime_edit_outcome: ImeEditOutcome,
     /// Simulation of a globally exhausted IME revision allocator for front-end producer tests.
-    /// Only [`Self::exhaust_ime_state_revision`] sets it; production builds do not compile it,
-    /// and it only makes receipt classification fail closed.
-    #[cfg(any(test, feature = "test-support"))]
+    /// Only [`Self::exhaust_ime_state_revision`] sets it (tests only), and it only makes receipt
+    /// classification fail closed.
     ime_state_exhausted: bool,
     /// A successful non-IME command changed document state since the last IME observation. It is
     /// drained before publishing a receipt and at observation time; it is never cleared by a later

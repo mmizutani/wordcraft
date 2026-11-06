@@ -77,9 +77,11 @@ pub fn check(bytes: &[u8], max_entries: u64) -> Result<(), String> {
 /// A package of one empty stored file, `a`, whose central directory lists it `entries` times (at
 /// most as many as fit in 64 MiB) under a ZIP64 end record that declares them all: `zip` 3.0.0
 /// parses and keeps every one of them before its caller can count them. Regression input for the
-/// readers' tests: built only for tests, this crate's and (through the `test-support` feature,
-/// which they turn on as a dev-dependency) the readers', never into the app.
-#[cfg(any(test, feature = "test-support"))]
+/// readers' tests (this crate's and theirs). Always compiled, so test builds of the readers use
+/// the same `wordcraft-doc` as normal builds (a feature only tests turned on made `cargo build` and
+/// `cargo test` compile every crate above this one twice); nothing in the app calls it, so the
+/// linker drops it.
+#[doc(hidden)]
 pub fn zip64_entry_count_sample(entries: u64) -> Vec<u8> {
     // Local file header (APPNOTE.TXT §4.3.7): version 10, stored, no data, name "a".
     let mut f = b"PK\x03\x04".to_vec();
