@@ -453,6 +453,28 @@ fn delayed_restore_lands_in_the_document_that_asked_for_it() {
     assert_eq!(s.documents().len(), 2);
 }
 
+/// A restore asked for in an untouched blank document that is shared before the copy loads
+/// opens beside it: the room's document stays, and so does sharing.
+#[test]
+fn delayed_restore_opens_beside_a_document_shared_meanwhile() {
+    let t = Temp::new();
+    let mut s = session(&t.0);
+    s.run("text.insert", &json!({"text": "Saved draft"})).unwrap();
+    save_now(&mut s);
+    drop(s);
+    let mut s = session(&t.0);
+    let blank = s.document_id();
+    let id = s.recovery_documents()[0].id.clone();
+    s.run("file.recover", &json!({"restore": id})).unwrap();
+    let (room, _own) = crate::room::Room::host(&mut s, "Minoru").unwrap();
+    settle(&mut s);
+    assert!(s.recovery_error().is_none(), "{:?}", s.recovery_error());
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "Saved draft");
+    assert_ne!(s.document_id(), blank, "the copy opens beside the shared document");
+    assert!(s.is_open(blank));
+    assert!(!room.is_closed());
+}
+
 #[test]
 fn opening_protected_file_and_password_save_never_leave_plaintext_copies() {
     let t = Temp::new();

@@ -194,15 +194,18 @@ impl WordApp {
         if self.quit_requested {
             return true;
         }
-        // Nothing to save, also with no document open in this window (#1129) and none elsewhere.
-        if !self.has_unsaved_documents() {
+        // What agents changed in a shared document since the last frame is unsaved work too.
+        self.catch_up_share();
+        // Nothing to save, also with no document open in this window (#1129) and none elsewhere;
+        // sharing stops first, and a change the room took meanwhile is asked about.
+        if !self.has_unsaved_documents() && !self.stop_sharing_to_quit() {
             return true;
         }
         // A comment draft the document refuses is an unsaved change: the prompt can drop it.
         if self.has_document() {
             let _ = panes::flush_comment_drafts(self);
         }
-        if !self.has_unsaved_documents() {
+        if !self.has_unsaved_documents() && !self.stop_sharing_to_quit() {
             return true;
         }
         // Each document with unsaved work is shown and asked about in turn; Cancel stops.

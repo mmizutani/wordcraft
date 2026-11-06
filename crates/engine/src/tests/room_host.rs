@@ -296,9 +296,9 @@ fn a_participant_with_a_key_is_answered_by_a_copy_of_their_own() {
     assert!(call(&mut reader, "document.inspect", json!({})).is_ok());
 }
 
-#[test]
-fn an_edit_whose_text_went_meanwhile_is_reported_lost() {
-    // "one two", with a text box holding "box".
+/// A shared "one two" with a text box holding "box", whose agent typed in the box `edits` times;
+/// before that got to the hub, the person typed over the whole body, which takes the box away.
+fn typed_in_a_box_that_went(edits: usize) -> (Session, Replica, Arc<Room>, Replica) {
     let mut win = Session::new(Document::from_text("one two"));
     win.author = "Minoru".into();
     run_in(&mut win, "caret.docEnd");
@@ -309,20 +309,136 @@ fn an_edit_whose_text_went_meanwhile_is_reported_lost() {
     let (room, mut own) = Room::host(&mut win, "Minoru").unwrap();
     let key = room.invite("Writer", Role::Editor).unwrap();
     let mut agent = room.join_with(&key).unwrap();
-    // The agent types in the text box, and before that gets to the hub the person types over
-    // the whole body, which takes the box away.
+    // Run in the copy and not sent yet, as an edit is that others' changes kept sending back.
     agent.run("caret.set", &json!({"pos": in_box})).unwrap();
-    agent.run("text.insert", &json!({"text": " more"})).unwrap();
+    for _ in 0..edits {
+        agent.run("text.insert", &json!({"text": " more"})).unwrap();
+    }
     in_window(&mut own, &mut win, "select.all", json!({}));
     in_window(&mut own, &mut win, "text.insert", json!({"text": "gone"}));
-    // The agent's next request says its typing couldn't be made again.
+    (win, own, room, agent)
+}
+
+#[test]
+fn an_edit_whose_text_went_meanwhile_is_reported_lost() {
+    let (mut win, mut own, room, mut agent) = typed_in_a_box_that_went(1);
+    // The agent's next request says its typing couldn't be made again, and the command it
+    // asked for doesn't run, so the error is about the earlier edit alone.
     let r = execute(&mut agent, "caret.docEnd", json!({}));
     assert_eq!(agent.stats().lost, 1);
     let why = r.unwrap_err();
     assert!(why.contains("couldn't be made again (text.insert)"), "{why}");
+    assert!(why.contains("caret.docEnd didn't run"), "{why}");
+    execute(&mut agent, "caret.docEnd", json!({})).unwrap();
     settle_all(&mut own, &mut win, std::slice::from_mut(&mut agent));
     window_is_hub(&win, &room);
     assert_eq!(win.doc.plain_text(StoryRef::Body), "gone");
+}
+
+#[test]
+fn a_request_that_only_reads_says_when_an_earlier_edit_was_lost() {
+    for method in ["document.inspect", "engine.commands", "ui.render", "room.participants"] {
+        let (_win, _own, _room, mut agent) = typed_in_a_box_that_went(1);
+        let params = if method == "ui.render" { json!({"scale": 0.25}) } else { json!({}) };
+        // Bringing in what the person changed gives the agent's typing up: the request says so,
+        // and answers nothing else.
+        let why = call(&mut agent, method, params.clone()).unwrap_err();
+        assert!(why.contains("couldn't be made again (text.insert)") && why.contains(&format!("{method} didn't run")), "{method}: {why}");
+        assert_eq!(agent.stats().lost, 1);
+        // Said once: asked again, it answers.
+        call(&mut agent, method, params).unwrap();
+    }
+    // Several are counted.
+    let (_win, _own, _room, mut agent) = typed_in_a_box_that_went(3);
+    let why = call(&mut agent, "document.inspect", json!({})).unwrap_err();
+    assert!(why.contains("couldn't be made again (text.insert)") && why.contains("(3 edits in all)"), "{why}");
+    assert_eq!(agent.stats().lost, 3);
+}
+
+#[test]
+fn every_request_first_sends_what_an_earlier_command_left() {
+    let (mut win, _, _) = window();
+    let (room, _own) = Room::host(&mut win, "Minoru").unwrap();
+    let key = room.invite("Agent", Role::Editor).unwrap();
+    let mut agent = room.join_with(&key).unwrap();
+    agent.run("caret.docEnd", &json!({})).unwrap();
+    for method in ["document.inspect", "engine.commands", "ui.render", "room.participants", "engine.execute"] {
+        // An edit the hub hasn't taken yet, as others' changes sending it back leave one.
+        agent.run("text.insert", &json!({"text": "!"})).unwrap();
+        assert!(agent.has_unconfirmed());
+        let params = match method {
+            "ui.render" => json!({"scale": 0.25}),
+            "engine.execute" => json!({"command": "caret.docEnd"}),
+            _ => json!({}),
+        };
+        call(&mut agent, method, params).unwrap();
+        assert!(!agent.has_unconfirmed(), "{method} left an edit unsent");
+    }
+    let (version, hub) = room.document();
+    assert_eq!(hub.plain_text(StoryRef::Body), "one two three!!!!!");
+    assert_eq!(agent.received(), version);
+}
+
+#[test]
+fn an_edit_the_hub_keeps_refusing_is_given_up_with_a_reason() {
+    let (mut win, _, _) = window();
+    let (room, _own) = Room::host(&mut win, "Minoru").unwrap();
+    let key = room.invite("Agent", Role::Editor).unwrap();
+    let mut agent = room.join_with(&key).unwrap();
+    agent.run("text.insert", &json!({"text": "x"})).unwrap();
+    // Out of the room, the agent's sends are refused: each time the copy reads the document again
+    // and makes the edit again, until it gives up, saying which command it was.
+    assert!(room.revoke(&key));
+    for _ in 0..10 {
+        agent.send();
+    }
+    assert_eq!(agent.stats().lost, 1);
+    assert!(!agent.has_unconfirmed());
+    let why = agent.last_lost();
+    assert!(why.contains("couldn't be made again (text.insert): the shared document kept sending it back"), "{why}");
+    assert_eq!(agent.session().status, why);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_file_opened_over_a_shared_blank_document_opens_beside_it() {
+    let dir = std::env::temp_dir().join(format!("wordcraft-open-over-shared-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("other.txt");
+    std::fs::write(&file, "Other").unwrap();
+    let mut win = Session::new(Document::new());
+    assert!(win.is_untouched_blank());
+    let (room, _own) = Room::host(&mut win, "Minoru").unwrap();
+    let shared = win.document_id();
+    assert!(!win.is_untouched_blank(), "a shared document counts as used");
+    win.run("file.open", &json!({"path": file.to_string_lossy()})).unwrap();
+    assert!(win.is_open(shared), "the shared document is still open");
+    assert_ne!(win.document_id(), shared);
+    assert_eq!(win.doc.plain_text(StoryRef::Body), "Other");
+    // Once its room closes, a blank document is an untouched one again.
+    room.close();
+    win.activate(shared).unwrap();
+    assert!(win.is_untouched_blank());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_long_macro_is_all_in_the_hub_before_the_reply() {
+    let (mut win, _, _) = window();
+    let (room, _own) = Room::host(&mut win, "Minoru").unwrap();
+    let key = room.invite("Agent", Role::Owner).unwrap();
+    let mut agent = room.join_with(&key).unwrap();
+    // More steps than four of the hub's batches: the reply comes once it has every one.
+    let n = 4 * crate::room::MAX_BATCH + 100;
+    let steps: Vec<Value> = (0..n).map(|_| json!({"command": "text.insert", "params": {"text": "x"}})).collect();
+    execute(&mut agent, "tools.macros", json!({"define": {"name": "many", "steps": steps}})).unwrap();
+    execute(&mut agent, "caret.docEnd", json!({})).unwrap();
+    let ran = execute(&mut agent, "tools.macros", json!({"run": "many"})).unwrap();
+    assert_eq!(ran["steps"], n);
+    assert!(!agent.has_unconfirmed(), "{} changes the hub hasn't taken", agent.unconfirmed());
+    let (version, hub) = room.document();
+    assert_eq!(hub.plain_text(StoryRef::Body), format!("one two three{}", "x".repeat(n)));
+    assert_eq!(agent.received(), version);
 }
 
 #[test]

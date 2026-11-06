@@ -495,6 +495,8 @@ pub struct Replica {
     /// The next unit's serial.
     serials: u64,
     stats: Stats,
+    /// Why the copy last gave up an edit it couldn't make again ([`Replica::last_lost`]).
+    last_lost: String,
     /// Whether its session is one the room's own process keeps, lent to it for each step
     /// ([`Replica::lend`]): the app's window's, which has other documents open beside the
     /// room's. The copy never closes them.
@@ -528,6 +530,7 @@ impl Replica {
             seen,
             serials: 0,
             stats: Stats::default(),
+            last_lost: String::new(),
             lent: false,
             reborn: BTreeMap::new(),
             repeat: Vec::new(),
@@ -571,21 +574,17 @@ impl Replica {
     }
 
     /// [`Replica::lend`], with the room's document the session's active one while `f` runs when
-    /// the session shows another of its documents: to catch up on the room's before the window
-    /// stops sharing it or closes it, whichever document it shows. The one it showed is shown
-    /// again after. `None`, running nothing, when the copy isn't one made for a session, or the
-    /// room's document isn't open in `session`.
+    /// the session shows another of its documents: so the window keeps the room's document up
+    /// to date, and catches up on it before it stops sharing it or closes it, whichever document
+    /// it shows. The one it showed is shown again after. `None`, running nothing, when the copy
+    /// isn't one made for a session, or the room's document isn't open in `session`.
     pub fn lend_document<R>(&mut self, session: &mut Session, f: impl FnOnce(&mut Replica) -> R) -> Option<R> {
-        let shown = session.document_id();
-        if shown == self.document {
-            return self.lend(session, f);
-        }
-        if !self.lent || session.switch_document(self.document).is_err() {
+        if !self.lent {
             return None;
         }
-        let r = self.lend(session, f);
-        let _ = session.switch_document(shown);
-        r
+        // As for any work on a document the window doesn't show: the input method, which works
+        // on the shown one, isn't told of the change ([`Session::with_document`]).
+        session.with_document(self.document, |s| self.lend(s, f)).ok().flatten()
     }
 
     /// The session's id for the room's document.
@@ -624,9 +623,21 @@ impl Replica {
         !self.pending.is_empty()
     }
 
+    /// How many of the copy's changes the hub hasn't accepted, or accepted and not sent back
+    /// yet: one for each change a command made (each of a macro's steps makes its own).
+    pub fn unconfirmed(&self) -> usize {
+        self.pending.len()
+    }
+
     /// What the copy did since it joined.
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    /// Why the copy last gave up an edit it couldn't make again, naming the command (as the
+    /// session's status says right then); empty when it never gave one up.
+    pub fn last_lost(&self) -> &str {
+        &self.last_lost
     }
 
     /// Run command `id` in the copy ([`Session::run`]): what it changes is in the copy at once,
@@ -1001,19 +1012,22 @@ impl Replica {
                 let after_cut = cut;
                 cut |= moves;
                 let tries = if read_again { tries.saturating_add(1) } else { tries };
-                let Some((id, mut params)) = command.filter(|_| tries <= MAX_TRIES) else {
-                    self.stats.lost = self.stats.lost.saturating_add(1);
-                    gone(&mut renamed, &comments);
-                    self.lost_blocks(&blocks);
-                    went_on = None;
-                    continue;
+                let (id, mut params) = match command {
+                    Some(command) if tries <= MAX_TRIES => command,
+                    other => {
+                        match &other {
+                            Some((id, _)) => self.give_up(Some(id.as_str()), "the shared document kept sending it back"),
+                            None => self.give_up(None, "it wasn't made by a command, so it can't be made again"),
+                        }
+                        gone(&mut renamed, &comments);
+                        self.lost_blocks(&blocks);
+                        went_on = None;
+                        continue;
+                    }
                 };
                 // A comment an edit before it made, named by the id it had then.
                 if !rename_comment(&id, &mut params, &renamed) {
-                    self.stats.lost = self.stats.lost.saturating_add(1);
-                    self.session.status = format!(
-                        "An edit made at the same time as another participant's couldn't be made again ({id}): the comment it was made on is gone"
-                    );
+                    self.give_up(Some(&id), "the comment it was made on is gone");
                     gone(&mut renamed, &comments);
                     self.lost_blocks(&blocks);
                     went_on = None;
@@ -1034,12 +1048,9 @@ impl Replica {
                 // An edit whose selection or places are gone (another participant took their text
                 // or the text box they were in away) isn't made anywhere else.
                 if !self.made_at(reselect, before, &around, &places, &mut params, through) {
-                    self.stats.lost = self.stats.lost.saturating_add(1);
+                    self.give_up(Some(&id), "the text it was made in is gone");
                     gone(&mut renamed, &comments);
                     self.lost_blocks(&blocks);
-                    self.session.status = format!(
-                        "An edit made at the same time as another participant's couldn't be made again ({id}): the text it was made in is gone"
-                    );
                     went_on = None;
                     continue;
                 }
@@ -1083,10 +1094,9 @@ impl Replica {
                         }
                     }
                     Err(e) => {
-                        self.stats.lost = self.stats.lost.saturating_add(1);
+                        self.give_up(Some(&id), &e.to_string());
                         gone(&mut renamed, &comments);
                         self.lost_blocks(&blocks);
-                        self.session.status = format!("An edit made at the same time as another participant's couldn't be made again ({id}): {e}");
                         went_on = None;
                     }
                 }
@@ -1127,6 +1137,16 @@ impl Replica {
         self.session.math = math_now.and_then(|(a, m)| Some(crate::MathEdit { at: self.find(a, through)?, ..m }));
         self.session.also_selected.clear();
         self.reborn.clear();
+    }
+
+    /// Give up an edit that couldn't be made again, made by command `id` (none for a change made
+    /// outside a command), because of `why`: it counts as lost, and the session's status and
+    /// [`Replica::last_lost`] say so.
+    fn give_up(&mut self, id: Option<&str>, why: &str) {
+        self.stats.lost = self.stats.lost.saturating_add(1);
+        let command = id.map(|id| format!(" ({id})")).unwrap_or_default();
+        self.last_lost = format!("An edit made at the same time as another participant's couldn't be made again{command}: {why}");
+        self.session.status = self.last_lost.clone();
     }
 
     /// Blocks dropped edits made that weren't made again: places in them are gone.

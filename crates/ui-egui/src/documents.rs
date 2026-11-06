@@ -164,9 +164,14 @@ impl WordApp {
 
     /// Quitting: show the next document with unsaved work and ask Save / Don't Save / Cancel
     /// about it (its answer goes on with [`WordApp::close_document`]'s `quit`). With none left,
-    /// the app quits.
+    /// sharing stops, and the app quits unless the room took a change meanwhile, which is
+    /// asked about too.
     pub(crate) fn ask_before_quit(&mut self) -> Value {
-        let Some(&next) = self.unsaved_documents().first() else {
+        let mut unsaved = self.unsaved_documents();
+        if unsaved.is_empty() && self.stop_sharing_to_quit() {
+            unsaved = self.unsaved_documents();
+        }
+        let Some(&next) = unsaved.first() else {
             self.quit_requested = true;
             return json!({"quit": true});
         };

@@ -123,6 +123,9 @@ impl WordApp {
         if id == "file.close" {
             return self.close_document(&params);
         }
+        if id == "file.closeDocument" {
+            self.stop_sharing_to_close_document(self.session.document_id(), &params);
+        }
         if id == "file.autosave" {
             return self.set_autosave(&params);
         }

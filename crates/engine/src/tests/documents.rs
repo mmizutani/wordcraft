@@ -346,3 +346,54 @@ fn input_method_joins_stay_with_their_window() {
     assert_eq!(text(&s).trim(), "Hello", "B's typing is its own undo step");
     drop(a);
 }
+
+#[test]
+fn work_on_another_document_leaves_the_input_method_of_the_shown_one_alone() {
+    let mut s = s();
+    let shown = s.document_id();
+    let other = s.add_document(wordcraft_doc::Document::from_text("Other"));
+    s.activate(shown).unwrap();
+    run(&mut s, "text.insert", json!({"text": "Shown"}));
+    // The input method hasn't looked since the command: what it was told stays, a visit to another
+    // document between.
+    s.with_document(other, |s| s.run("text.insert", &json!({"text": "!"}))).unwrap().unwrap();
+    assert!(s.take_pending_ime_application_change(), "the shown document's own change is still to be told");
+    // It has looked since: a change in another document is nothing it composes in.
+    let revision = s.ime_state_revision();
+    s.with_document(other, |s| s.run("text.insert", &json!({"text": "?"}))).unwrap().unwrap();
+    assert!(!s.take_pending_ime_application_change());
+    assert_eq!(s.ime_state_revision(), revision);
+    assert_eq!(s.with_document(other, |s| text(s)).unwrap(), "!?Other");
+    // A change in the shown document is.
+    run(&mut s, "text.insert", json!({"text": "."}));
+    assert!(s.take_pending_ime_application_change());
+    assert_eq!(text(&s), "Shown.");
+}
+
+/// Work addressed to another document can still change the shown one: a macro's step can switch
+/// to it. The input method is told, and the changed document doesn't get the revision it saw.
+#[test]
+fn work_on_another_document_that_changes_the_shown_one_tells_the_input_method() {
+    let mut s = s();
+    let shown = s.document_id();
+    run(&mut s, "text.insert", json!({"text": "Shown"}));
+    let other = s.add_document(wordcraft_doc::Document::from_text("Other"));
+    s.activate(shown).unwrap();
+    let steps = json!([{"command": "view.switchWindows", "params": {"id": shown}}, {"command": "para.alignCenter"}]);
+    run(&mut s, "tools.macros", json!({"define": {"name": "centre", "steps": steps}}));
+    s.take_pending_ime_application_change();
+    let revision = s.ime_state_revision();
+    s.with_document(other, |s| s.run("tools.macros", &json!({"run": "centre"}))).unwrap().unwrap();
+    assert_eq!(s.document_id(), shown);
+    let first = s.doc.body.iter().find_map(|b| b.as_para()).map(|p| p.props.align);
+    assert_eq!(first, Some(Some(wordcraft_doc::props::Align::Center)));
+    assert!(s.take_pending_ime_application_change(), "the shown document changed");
+    assert_ne!(s.ime_state_revision(), revision);
+    // A visit that only switches to the shown document changes nothing the input method saw.
+    run(&mut s, "tools.macros", json!({"define": {"name": "back", "steps": [{"command": "view.switchWindows", "params": {"id": shown}}]}}));
+    s.take_pending_ime_application_change();
+    let revision = s.ime_state_revision();
+    s.with_document(other, |s| s.run("tools.macros", &json!({"run": "back"}))).unwrap().unwrap();
+    assert!(!s.take_pending_ime_application_change());
+    assert_eq!(s.ime_state_revision(), revision);
+}

@@ -10,9 +10,9 @@ use super::{Replica, Role};
 use crate::file_access::AutomationRoots;
 use crate::scope::Scope;
 
-/// Most times [`call`] sends a command's edit to the hub: the hub sends one back when it
-/// clashes with another participant's change accepted meanwhile, and the copy makes it again
-/// after that change.
+/// Most sends in a row of a command's edits that the hub takes none of before [`call`] answers
+/// that it hasn't taken them yet: the hub sends edits back when they clash with another
+/// participant's change accepted meanwhile, and the copy makes them again after that change.
 const MAX_SENDS: usize = 4;
 
 /// Why `copy` doesn't answer any more, if it doesn't: the room closed, or its participant is
@@ -27,14 +27,19 @@ pub fn ended(copy: &Replica) -> Option<String> {
 }
 
 /// Answer control-channel method `method`, with `params`, for `copy`, the hosted copy of a
-/// participant who joined with a key. Each first gets what others changed since:
+/// participant who joined with a key. Each first sends the participant's edits the hub hasn't
+/// taken yet, which an earlier command left when others' changes kept sending them back, and
+/// gets what others changed since: when one of those edits couldn't be made again, the request
+/// answers that, naming its command, and does nothing else.
 ///
 /// - `engine.execute` (or `command`): run `command` with `params` in the copy
 ///   ([`Replica::run`]: held to the participant's role) and send what it changed to the hub,
-///   until the hub accepted it. The command's result; an error when the hub sent an edit of
-///   the participant's back and it couldn't be made again after another participant's change,
-///   which took its text away (the error names the command; a hosted copy has no edit the hub
-///   didn't take before a request, unless the hub kept sending it back).
+///   until the hub accepted all of it (a long macro's changes go in several batches). The
+///   command's result; an error when the hub sent an edit of the participant's back and it
+///   couldn't be made again after another participant's change, which took its text away (the
+///   error names the command), or when others' changes kept sending its edits back and the hub
+///   hasn't taken them yet (they stay in the copy and go first with the participant's next
+///   request; a command doesn't run while the hub still hasn't taken edits an earlier one left).
 /// - `document.inspect`: the document as the copy has it.
 /// - `engine.commands`: every command, as MCP lists them, `enabled` when the participant may run
 ///   it now.
@@ -75,11 +80,11 @@ fn answer(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, Str
             if let Some(o) = args.as_object_mut() {
                 o.remove("doc");
             }
-            copy.receive();
+            catch_up(copy, method, false)?;
             copy.run("document.inspect", &args).map_err(|e| e.to_string())
         }
         "engine.commands" => {
-            copy.receive();
+            catch_up(copy, method, false)?;
             let search = params.get("search").and_then(Value::as_str).unwrap_or("").to_lowercase();
             let registry = copy.session().registry.clone();
             let commands = registry
@@ -106,14 +111,14 @@ fn answer(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, Str
             if params.get("path").is_some_and(|p| !p.is_null()) {
                 return Err("`path`: a participant's copy writes no files; without one, the page comes back as base64 `png`".into());
             }
-            copy.receive();
+            catch_up(copy, method, false)?;
             let page = params.get("page").and_then(Value::as_u64).unwrap_or(1);
             let scale = params.get("scale").and_then(Value::as_f64).map_or(2.0, |v| v as f32);
             copy.session().page_png(page, scale)
         }
         "ui.parity" => Ok(crate::catalog::parity(&copy.session().registry)),
         "room.participants" => {
-            copy.receive();
+            catch_up(copy, method, false)?;
             Ok(json!({"you": copy.participant(), "participants": copy.room().participants(), "version": copy.received()}))
         }
         "room.share" | "room.invite" | "room.revoke" | "room.stop" => {
@@ -127,24 +132,91 @@ fn answer(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, Str
 }
 
 /// Run command `id` with `params` in the copy ([`Replica::run`]: held to the participant's
-/// role), and send what it changed to the hub until the hub took it, making it again after the
-/// changes the hub sends it back for (at most [`MAX_SENDS`] times). The command's result, or an
-/// error when the hub sent the edit back and another participant's change took its text away.
+/// role), once the hub took the edits an earlier command left ([`catch_up`]), and send what it
+/// changed to the hub until the hub took all of it ([`send_all`]). The command's result; an error
+/// when the hub sent the edit back and another participant's change took its text away, or when
+/// the hub hasn't taken all of it.
 fn execute(copy: &mut Replica, id: &str, params: &Value) -> Result<Value, String> {
+    catch_up(copy, id, true)?;
     let lost = copy.stats().lost;
-    copy.receive();
     let result = copy.run(id, params).map_err(|e| e.to_string());
-    for _ in 0..MAX_SENDS {
-        if !copy.has_unconfirmed() {
-            break;
-        }
+    send_all(copy)?;
+    // Edits it couldn't make again, or the hub hasn't taken: this command's, as an earlier
+    // command left none.
+    let left = copy.unconfirmed();
+    let not_taken = (left > 0).then(|| {
+        format!(
+            "{id} ran, but the shared document hasn't taken {left} of your changes yet: other participants' changes sent them back {MAX_SENDS} times in a row. {STAY}"
+        )
+    });
+    let notes: Vec<String> = [lost_since(copy, lost), not_taken].into_iter().flatten().collect();
+    match result {
+        Ok(_) if !notes.is_empty() => Err(notes.join(". ")),
+        Err(e) if !notes.is_empty() => Err(format!("{e}. {}", notes.join(". "))),
+        r => r,
+    }
+}
+
+/// What the errors about changes the hub hasn't taken yet say happens to them.
+const STAY: &str = "They stay in your copy and go first with your next request (disconnecting drops them)";
+
+/// Before request `what` (a method, or a command when `command`): send the participant's edits
+/// the hub hasn't taken yet, which an earlier command left when others' changes kept sending them
+/// back, and get what others changed since ([`send_all`]). An error, and `what` isn't done, when
+/// one of those edits couldn't be made again (another participant's change took its text away),
+/// or when the participant is out of the room; before a command, also when the hub still hasn't
+/// taken them, so what a command answers is about its own edits.
+fn catch_up(copy: &mut Replica, what: &str, command: bool) -> Result<(), String> {
+    let lost = copy.stats().lost;
+    send_all(copy)?;
+    if let Some(why) = lost_since(copy, lost) {
+        return Err(format!("{why}. That was an earlier edit of yours, so {what} didn't run: send it again"));
+    }
+    let left = copy.unconfirmed();
+    if command && left > 0 {
+        return Err(format!(
+            "the shared document still hasn't taken {left} of your changes from before: other participants' changes sent them back {MAX_SENDS} times in a row, so {what} didn't run. {STAY}"
+        ));
+    }
+    Ok(())
+}
+
+/// Get what others changed since, and send the copy's edits the hub hasn't taken until it took
+/// all of them: up to [`super::MAX_BATCH`] changes at a time, so a long macro's go in several
+/// sends, and made again after the changes the hub sends them back for. It stops after
+/// [`MAX_SENDS`] sends in a row that the hub took none of, and with an error when the
+/// participant is out of the room ([`ended`]).
+fn send_all(copy: &mut Replica) -> Result<(), String> {
+    copy.receive();
+    // A send counts as taken when it leaves fewer changes than ever before, so this ends.
+    let mut fewest = copy.unconfirmed();
+    let mut idle = 0;
+    while copy.has_unconfirmed() && idle < MAX_SENDS {
         copy.send();
         copy.receive();
+        if let Some(why) = ended(copy) {
+            return Err(why);
+        }
+        let left = copy.unconfirmed();
+        if left < fewest {
+            fewest = left;
+            idle = 0;
+        } else {
+            idle += 1;
+        }
     }
-    if result.is_ok() && copy.stats().lost > lost {
-        return Err(copy.session().status.clone());
+    Ok(())
+}
+
+/// Why the copy gave up edits since it had given up `lost` (the last one's reason, naming its
+/// command), and how many when more than one; `None` when it gave up none.
+fn lost_since(copy: &Replica, lost: u64) -> Option<String> {
+    let n = copy.stats().lost.saturating_sub(lost);
+    match n {
+        0 => None,
+        1 => Some(copy.last_lost().to_string()),
+        n => Some(format!("{} ({n} edits in all)", copy.last_lost())),
     }
-    result
 }
 
 /// Refuse a `doc` other than the copy's document.

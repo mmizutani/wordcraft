@@ -256,6 +256,10 @@ pub struct Session {
     order: Vec<u64>,
     /// Untitled documents made so far, for the next one's name (`Document3`).
     untitled_count: u32,
+    /// The open document a room shares, by id, and that room ([`crate::room::Room::host`]):
+    /// while the room is open, the document counts as used, so File › Open opens beside it
+    /// instead of in its place.
+    room: Option<(u64, std::sync::Weak<crate::room::Room>)>,
 }
 
 impl Session {

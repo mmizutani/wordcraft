@@ -222,10 +222,19 @@ With the window's key:
 | `room.participants` | — | `{"shared": false}`, or what `room.share` answers |
 | `room.stop` | — | stops sharing: the room closes and every participant's connection ends; the window keeps the document as it is, with every change the room took, whether it shows that document or another. `{"stopped": bool}` |
 
-Closing the shared document's window stops sharing too. A close sees every change the room took
-until then: an agent's edit since the window's last frame is unsaved work, so `file.close`
-without `force` is refused for it, and the person's Close asks to save. One document is shared
-at a time.
+The window keeps the shared document up to date while it shows another one: every frame brings
+in what the others changed, and every control request first gets what the room took since the
+last frame, so a request addressed to the shared document (`doc`) reads, renders, saves and
+exports it as the room has it. Commands addressed to it go through the window's copy, as the
+window's own do while it shows the document.
+
+Closing the shared document stops sharing too, however it closes (`file.close`, with `doc` or
+without, or `file.closeDocument`), and so does quitting the app: once nothing is left unsaved,
+the room closes before the app does (`app.quit`, which quits without asking, closes it first
+too). A close or a quit sees every change the room took until then: an agent's edit since the
+window's last frame is unsaved work, so a close without `force` is refused for it, and the
+person's Close or quit asks to save it. A shared document is never replaced by a file opened in
+its place, even a blank one: `file.open` opens beside it. One document is shared at a time.
 Undo and Redo (`edit.undo`, `edit.redo`, `edit.undoTo`) take back the steps of whoever runs
 them, the window's or a participant's own, and leave others' changes in. When another
 participant changed what the step changed since (the same characters, blocks, part or document
@@ -241,15 +250,19 @@ the same key or none. The copy answers:
 
 | Method | Params | Result |
 |---|---|---|
-| `engine.execute` | `command`, `params` | runs the command in the copy, held to the participant's role, and sends what it changed to the room until the room took it. The command's result; an error when the room sent the edit back and it couldn't be made again because another participant's change took its text away (the error names the command) |
+| `engine.execute` | `command`, `params` | runs the command in the copy, held to the participant's role, and sends what it changed to the room until the room took all of it (up to 1,024 changes at a time, so a long macro's go in several). The command's result; an error when the room sent the edit back and it couldn't be made again because another participant's change took its text away (the error names the command), or when others' changes sent its changes back four times in a row and the room hasn't taken them yet (they stay in the copy and go first with the next request; closing the connection drops them) |
 | `document.inspect` | `text?` | the document as the copy has it, with what others changed |
 | `engine.commands` | `search?` | every command, as for the window; `enabled` says whether this participant may run it now |
 | `ui.render` | `page?`, `scale?` | a page of the document as base64 `png`, as for the window; a copy writes no files, so `path` is refused |
 | `ui.parity` | — | as for the window |
 | `room.participants` | — | `{"you", "participants", "version"}`: the caller, everyone in the room, and the version of the document the copy has |
 
-Any other method name is a command id, as for the window. Each request first brings in what
-others changed since. `doc` may name the shared document only. Commands that work on files,
+Any other method name is a command id, as for the window. Each request first sends the
+participant's changes the room hasn't taken yet, if an earlier command left some, and brings in
+what others changed since. When one of those changes couldn't be made again, the request fails
+with the error that says so (naming its command) and does nothing else, so it can be sent
+again; a command also doesn't run while the room still hasn't taken them. `doc` may name the
+shared document only. Commands that work on files,
 other documents or windows (`file.*`, `view.switchWindows`, `ui.*`), the window's methods
 (`ui.click`, `ui.screenshot`…, `app.quit`) and the room's other methods (which are the owner's)
 are refused. Their commands reach none of the computer's files, whatever their role: a document

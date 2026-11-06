@@ -193,7 +193,8 @@ impl Room {
     /// itself (the app's window, with its other documents): a room holding it at version 0,
     /// which `name` joins as its owner with a copy that works on `session` itself, lent to it
     /// for each step ([`Replica::lend`]). Blocks without an id get one first, in `session`
-    /// too. Refused when the name can't be a participant's.
+    /// too. While the room is open, the document counts as used, so a file opened in `session`
+    /// opens beside it, never in its place. Refused when the name can't be a participant's.
     pub fn host(session: &mut Session, name: &str) -> Result<(Arc<Room>, Replica), RoomError> {
         // What changed outside a command is the session's own, before the room has it.
         session.record_outside_changes();
@@ -204,6 +205,8 @@ impl Room {
         }
         let doc = hub.document().clone();
         let room = Room::with_registry(hub, session.registry.clone());
+        // A shared document is never replaced by one opened in its place.
+        session.shared_through(&room);
         // The copy's own session stands in while the window's isn't lent to it.
         let stand_in = Session::with_registry(Document::new(), room.registry.clone());
         let copy = Replica::lent_by(room.clone(), who, session, stand_in, doc);
