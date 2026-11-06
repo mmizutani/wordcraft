@@ -8,6 +8,7 @@ mod ico;
 mod layers;
 mod parity;
 mod stats;
+mod unified;
 mod version;
 mod visual_diff;
 
@@ -20,6 +21,8 @@ usage: cargo xtask <command>
 commands:
   assets          check that every icon/image/font/asset is attributed in ATTRIBUTION.md
   layers          enforce the crate dependency layering (plan/architecture.md §3)
+  unified         check that `cargo build` and `cargo test` build the workspace with the same
+                  features, so they share one build of each crate (#44)
   wasm            cargo check --target wasm32-unknown-unknown for the wasm-safe crates (one call)
   test            workspace tests (cargo nextest when installed, else cargo test), the interface
                   audit with its missing-translation report, then doctests
@@ -28,7 +31,7 @@ commands:
   language        the build embeds English Language data plus only what CRAFT_PROOF_EMBED names (`en`: English
                   only), or by default the carry-over locales (de, pl, pt, it, ru) until Language packs ship
   ci              fmt --check, clippy -D warnings, test, i18n-report, language, doctest, assets,
-                  layers, wasm
+                  layers, unified, wasm
                   (stops at first failure)
   corpus [--download]
                   show where test corpora live; --download fetches PngSuite into corpus/pngsuite
@@ -47,6 +50,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("assets") => assets::run(&root()),
         Some("layers") => cmd_layers(),
+        Some("unified") => unified::run(),
         Some("wasm") => cmd_wasm(),
         Some("test") => cmd_test().and_then(|()| cmd_i18n_report()).and_then(|()| cmd_doctest()),
         Some("i18n-report") => cmd_i18n_report(),
@@ -243,6 +247,7 @@ fn cmd_ci() -> Result<(), String> {
         ("doctest", Box::new(cmd_doctest)),
         ("assets", Box::new(|| assets::run(&root()))),
         ("layers", Box::new(cmd_layers)),
+        ("unified", Box::new(unified::run)),
         ("wasm", Box::new(cmd_wasm)),
     ];
     let mut done = Vec::new();

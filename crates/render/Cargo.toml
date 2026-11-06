@@ -16,6 +16,12 @@ wordcraft-layout = { workspace = true }
 wordcraft-metafile = { workspace = true }
 vello_cpu = { workspace = true }
 image = { workspace = true }
+# Feature unification (build speed, #44): the dev-dependencies of `cargo test --workspace` turn on
+# these features, so the normal build turns them on too. Then `cargo build` and `cargo test` share
+# one build of every workspace library instead of compiling each twice. They add no code: the
+# features are already on in every test build. Check with `cargo xtask unified`.
+# (`default` is `std`, which vello's own dependency already enables; hayro's adds the name.)
+fearless_simd = { version = "0.4", features = ["default"] }
 log = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

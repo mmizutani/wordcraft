@@ -6909,6 +6909,7 @@ dependencies = [
  "proptest",
  "regex",
  "regex-automata",
+ "regex-syntax",
  "same-file",
  "serde",
  "serde_json",
@@ -7040,6 +7041,7 @@ dependencies = [
 name = "wordcraft-render"
 version = "0.15.1"
 dependencies = [
+ "fearless_simd 0.4.1",
  "image",
  "log",
  "vello_cpu",
@@ -7064,6 +7066,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "egui_kittest",
+ "getrandom 0.4.3",
  "image",
  "js-sys",
  "log",
