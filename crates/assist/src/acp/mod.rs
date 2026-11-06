@@ -610,13 +610,53 @@ fn stop_reason(s: Option<&str>) -> StopReason {
     }
 }
 
-/// A new empty folder of an agent's own under the system's temporary folder (on Unix only its
-/// owner may enter it), removed with everything in it at the end.
+#[cfg(unix)]
+fn check_trusted_ancestors(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = rustix::process::geteuid().as_raw();
+    for parent in path.ancestors() {
+        let metadata = std::fs::metadata(parent)?;
+        if !metadata.is_dir() || metadata.mode() & 0o022 != 0 || (metadata.uid() != uid && metadata.uid() != 0) {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the agent's folder must have private, trusted ancestors"));
+        }
+    }
+    Ok(())
+}
+
+/// A new empty folder of an agent's own, removed with everything in it at the end.
+/// Unix uses a private cache ancestry so ancestor configuration cannot come from other users.
 struct Folder(Option<PathBuf>);
 
 impl Folder {
     fn new() -> std::io::Result<Folder> {
+        #[cfg(unix)]
+        let base = {
+            let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).ok_or_else(|| std::io::Error::other("no home folder for the agent"))?;
+            let cache = if cfg!(target_os = "macos") { "Library/Caches/WordCraft/agents" } else { ".cache/wordcraft/agents" };
+            PathBuf::from(home).join(cache)
+        };
+        #[cfg(not(unix))]
         let base = std::env::temp_dir();
+        Self::in_base(&base)
+    }
+
+    #[cfg(unix)]
+    fn private_base(base: &Path) -> std::io::Result<PathBuf> {
+        use std::os::unix::fs::DirBuilderExt;
+        if !base.is_absolute() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "the agent's cache folder must be absolute"));
+        }
+        let parent = base.ancestors().find(|p| p.exists()).ok_or_else(|| std::io::Error::other("no existing parent for the agent's folder"))?;
+        check_trusted_ancestors(&parent.canonicalize()?)?;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(base)?;
+        let base = base.canonicalize()?;
+        check_trusted_ancestors(&base)?;
+        Ok(base)
+    }
+
+    fn in_base(base: &Path) -> std::io::Result<Folder> {
+        #[cfg(unix)]
+        let base = Self::private_base(base)?;
         let mut last = std::io::Error::other("no name was free");
         for _ in 0..16 {
             let mut bytes = [0u8; 12];

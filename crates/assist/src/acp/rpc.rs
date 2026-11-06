@@ -26,9 +26,8 @@ pub const MAX_LINE: usize = 4 << 20;
 /// Most bytes of an agent's stderr kept for error messages.
 pub const STDERR_TAIL: usize = 8 << 10;
 
-/// Messages from the agent waiting for the conversation to read them; the reader waits when
-/// there are this many.
-const QUEUE: usize = 256;
+/// At most 16 MiB of raw lines wait for the conversation; JSON expands only in `next`.
+const QUEUE: usize = 4;
 
 /// Lines waiting to be written to the agent; one more is refused (the agent isn't reading).
 const OUTBOX: usize = 64;
@@ -47,6 +46,13 @@ pub enum Incoming {
     /// A line that was skipped, and why.
     Junk(&'static str),
     /// Its stdout closed: the agent exited, or closed it.
+    Closed,
+}
+
+/// Bounded wire data, kept unparsed while the conversation is busy.
+enum Queued {
+    Line(String),
+    Junk(&'static str),
     Closed,
 }
 
@@ -115,7 +121,7 @@ pub struct Process {
     child: Child,
     /// Lines for the writer thread; `None` once WordCraft closed the agent's stdin.
     outbox: Option<SyncSender<String>>,
-    incoming: Receiver<Incoming>,
+    incoming: Receiver<Queued>,
     stderr: Arc<Mutex<Tail>>,
     next_id: i64,
     /// Whether its stdout closed.
@@ -131,6 +137,9 @@ impl Process {
     pub fn spawn(launch: &Launch, cwd: &Path, env: Vec<(OsString, OsString)>) -> std::io::Result<Process> {
         let mut command = Command::new(&launch.program);
         command.args(&launch.args).current_dir(cwd).env_clear().envs(env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(windows)]
+        // The desktop app must not open a console window for each agent.
+        std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000);
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let mut child = command.spawn()?;
@@ -194,11 +203,20 @@ impl Process {
             return Some(Incoming::Closed);
         }
         match self.incoming.recv_timeout(timeout) {
-            Ok(Incoming::Closed) | Err(RecvTimeoutError::Disconnected) => {
+            Ok(Queued::Closed) | Err(RecvTimeoutError::Disconnected) => {
                 self.closed = true;
                 Some(Incoming::Closed)
             }
-            Ok(i) => Some(i),
+            Ok(Queued::Junk(why)) => Some(Incoming::Junk(why)),
+            Ok(Queued::Line(line)) => Some(match serde_json::from_str::<Value>(&line) {
+                Ok(Value::Object(m)) => Incoming::Message(m),
+                Ok(_) => Incoming::Junk("a line that isn't a JSON object"),
+                Err(_) => Incoming::Junk("a line that isn't JSON"),
+            }),
+            Err(RecvTimeoutError::Timeout) if self.exit_status().is_some() => {
+                self.closed = true;
+                Some(Incoming::Closed)
+            }
             Err(RecvTimeoutError::Timeout) => None,
         }
     }
@@ -293,26 +311,22 @@ fn spawn_thread(name: &str, f: impl FnOnce() + Send + 'static) -> std::io::Resul
 }
 
 /// The stdout thread: each line to `tx`, until the stream ends or nobody reads any more.
-fn read_stdout(stdout: impl Read, tx: &SyncSender<Incoming>) {
+fn read_stdout(stdout: impl Read, tx: &SyncSender<Queued>) {
     let mut reader = BufReader::with_capacity(64 << 10, stdout);
     loop {
         let incoming = match read_bounded_line(&mut reader, MAX_LINE) {
             Ok(BoundedLine::Eof) => break,
-            Ok(BoundedLine::TooLong) => Incoming::Junk("a line longer than WordCraft reads"),
+            Ok(BoundedLine::TooLong) => Queued::Junk("a line longer than WordCraft reads"),
             Ok(BoundedLine::Line(line)) if line.trim().is_empty() => continue,
-            Ok(BoundedLine::Line(line)) => match serde_json::from_str::<Value>(&line) {
-                Ok(Value::Object(m)) => Incoming::Message(m),
-                Ok(_) => Incoming::Junk("a line that isn't a JSON object"),
-                Err(_) => Incoming::Junk("a line that isn't JSON"),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Incoming::Junk("a line that isn't UTF-8"),
+            Ok(BoundedLine::Line(line)) => Queued::Line(line),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Queued::Junk("a line that isn't UTF-8"),
             Err(_) => break,
         };
         if tx.send(incoming).is_err() {
             return;
         }
     }
-    let _ = tx.send(Incoming::Closed);
+    let _ = tx.send(Queued::Closed);
 }
 
 /// The stderr thread: keep its tail.
@@ -397,6 +411,51 @@ mod tests {
             let _ = rustix::process::kill_process(worker, rustix::process::Signal::KILL);
             assert!(closed, "the launcher's descendant kept stdout open (on EOF: {on_eof})");
         }
+    }
+
+    #[cfg(all(unix, not(target_os = "openbsd")))]
+    #[test]
+    fn an_exited_launcher_is_detected_while_its_worker_holds_stdout_open() {
+        use super::{Incoming, Process};
+        use crate::acp::Launch;
+        use std::time::Duration;
+        let launch = Launch::new("/bin/sh", ["-c", "sleep 30 & printf '{\"worker\":%s}\\n' \"$!\"; exit 0"]);
+        let mut process = Process::spawn(&launch, &std::env::temp_dir(), vec![("PATH".into(), "/bin:/usr/bin".into())]).unwrap();
+        assert!(matches!(process.next(Duration::from_secs(5)), Some(Incoming::Message(_))));
+        let observed = process.next(Duration::from_secs(1));
+        process.stop(Duration::ZERO);
+        assert!(matches!(observed, Some(Incoming::Closed)), "an exited leader still looked idle");
+    }
+
+    #[test]
+    fn a_stalled_consumer_bounds_stdout_before_json_expansion() {
+        use std::io::{Cursor, Read};
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+        struct Meter<R> {
+            input: R,
+            bytes: usize,
+            over: std::sync::mpsc::Sender<()>,
+        }
+        impl<R: Read> Read for Meter<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.input.read(buf)?;
+                self.bytes += n;
+                if self.bytes > 6 * (64 << 10) {
+                    let _ = self.over.send(());
+                }
+                Ok(n)
+            }
+        }
+        let line = format!("{{\"a\":[{}0]}}\n", "0,".repeat(32_000));
+        let (over, progress) = std::sync::mpsc::channel();
+        let (tx, rx) = sync_channel(super::QUEUE);
+        let reader = Meter { input: Cursor::new(line.repeat(12)), bytes: 0, over };
+        let worker = std::thread::spawn(move || super::read_stdout(reader, &tx));
+        let exceeded = progress.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(rx);
+        worker.join().unwrap();
+        assert!(!exceeded, "stdout read beyond the bounded raw queue while its consumer was paused");
     }
 
     #[test]

@@ -172,12 +172,32 @@ fn the_prompt_carries_the_note_then_the_context_then_the_prompt() {
     assert_eq!(c.report()["prompt"], json!(["And this"]));
 }
 
+#[cfg(unix)]
+#[test]
+fn an_agent_folder_rejects_a_world_writable_parent() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::env::temp_dir().join(format!("wordcraft-unsafe-agent-parent-{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let folder = super::Folder::in_base(&base);
+    let refused = folder.is_err();
+    drop(folder);
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(refused, "the agent could inherit configuration from a world-writable ancestor");
+}
+
 #[test]
 fn the_agent_runs_in_an_empty_folder_of_its_own_with_no_wordcraft_variables_and_ends_with_the_conversation() {
     let mut c = Chat::with(&turns(vec![vec![Step::Report]]));
     c.ask("Report");
     let report = c.report();
     let cwd = std::path::PathBuf::from(report["cwd"].as_str().unwrap());
+    #[cfg(unix)]
+    for ancestor in cwd.ancestors() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(ancestor).unwrap().permissions().mode() & 0o022, 0, "unsafe agent ancestor: {}", ancestor.display());
+    }
+    #[cfg(not(unix))]
     assert!(cwd.starts_with(std::env::temp_dir().canonicalize().unwrap()) || cwd.starts_with(std::env::temp_dir()), "{cwd:?}");
     assert!(cwd.file_name().unwrap().to_string_lossy().starts_with("wordcraft-agent-"), "{cwd:?}");
     assert_eq!(report["cwdEmpty"], json!(true));
