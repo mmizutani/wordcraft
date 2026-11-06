@@ -65,7 +65,7 @@ pub fn role_for(setting: Role, choice: Option<Role>) -> Result<Role, AssistError
             Err(AssistError::Role("an assistant can't be an owner: owners change the application's settings and share the document".into()))
         }
         Some(role) => Ok(role),
-        None => Ok(AssistantPrefs { default_role: setting }.default_role()),
+        None => Ok(AssistantPrefs { default_role: setting, ..AssistantPrefs::default() }.default_role()),
     }
 }
 
@@ -79,7 +79,8 @@ pub struct Options {
     /// The shared document's title, for the note on the first turn.
     pub document: String,
     /// How the agent's permission requests are answered: [`PermissionPolicy::Ask`] in the
-    /// window; rejected, unless a setting allows, when nobody is there to ask.
+    /// window; rejected, unless a setting allows, when nobody is there to ask. A turn may be
+    /// answered its own way ([`Assistant::ask_with_policy`]).
     pub permissions: PermissionPolicy,
     /// Called when events arrive: the window asks to be drawn again.
     pub wake: Option<Waker>,
@@ -87,7 +88,9 @@ pub struct Options {
 
 /// What the conversation's thread is asked to do.
 enum Job {
-    Turn(Turn),
+    /// A turn, and how its permission requests are answered when not as the conversation's
+    /// ([`Assistant::ask_with_policy`]).
+    Turn(Turn, Option<PermissionPolicy>),
     End,
 }
 
@@ -209,6 +212,30 @@ impl Assistant {
     /// change. An ACP backend selects in the same room-port copy its agent's MCP or shell
     /// calls use, and fails the turn if the selection can no longer be found.
     pub fn ask_at(&mut self, prompt: &str, context: Option<String>, selection: Option<(Anchor, Anchor)>) -> Result<(), AssistError> {
+        self.turn(prompt, context, selection, None)
+    }
+
+    /// [`Assistant::ask_at`], with this turn's permission requests answered per `policy` in
+    /// place of the conversation's ([`Options::permissions`]): the window asks the person
+    /// ([`PermissionPolicy::Ask`]) in the turns they asked for, and answers per their setting
+    /// in those a program asked for (the control channel, MCP), which no one is there to answer.
+    pub fn ask_with_policy(
+        &mut self,
+        prompt: &str,
+        context: Option<String>,
+        selection: Option<(Anchor, Anchor)>,
+        policy: PermissionPolicy,
+    ) -> Result<(), AssistError> {
+        self.turn(prompt, context, selection, Some(policy))
+    }
+
+    fn turn(
+        &mut self,
+        prompt: &str,
+        context: Option<String>,
+        selection: Option<(Anchor, Anchor)>,
+        policy: Option<PermissionPolicy>,
+    ) -> Result<(), AssistError> {
         if self.ended {
             return Err(AssistError::Ended);
         }
@@ -227,7 +254,7 @@ impl Assistant {
         // Cleared before the turn is sent: a Stop from now on ends this turn, even one the
         // thread hasn't started yet.
         self.cancel.clear();
-        if self.jobs.send(Job::Turn(turn)).is_err() {
+        if self.jobs.send(Job::Turn(turn, policy)).is_err() {
             self.ended = true;
             return Err(AssistError::Ended);
         }
@@ -391,8 +418,8 @@ impl Work {
             return;
         }
         while let Ok(job) = self.jobs.recv() {
-            let turn = match job {
-                Job::Turn(t) => t,
+            let (turn, policy) = match job {
+                Job::Turn(t, policy) => (t, policy.unwrap_or(self.policy)),
                 Job::End => break,
             };
             // The person's selection, in the assistant's copy: WordCraft's own step, not a call
@@ -401,14 +428,8 @@ impl Work {
             if let Some((anchor, focus)) = turn.selection {
                 let _ = tools.select(anchor, focus);
             }
-            let mut ctx = TurnCtx {
-                tools: tools.as_mut(),
-                events: &self.events,
-                cancel: &self.cancel,
-                permissions: &self.permissions,
-                policy: self.policy,
-                calls: 0,
-            };
+            let mut ctx =
+                TurnCtx { tools: tools.as_mut(), events: &self.events, cancel: &self.cancel, permissions: &self.permissions, policy, calls: 0 };
             let backend = &mut self.backend;
             let ended = guarded(|| backend.turn(&turn, &mut ctx));
             let stop = match ended {
@@ -435,7 +456,7 @@ impl Work {
     /// Answer every turn with `why` until the conversation ends: it can't run any.
     fn fail_turns(&self, why: &str) {
         log::warn!("assistant: {why}");
-        while let Ok(Job::Turn(_)) = self.jobs.recv() {
+        while let Ok(Job::Turn(..)) = self.jobs.recv() {
             self.events.send(Event::Error { message: why.to_string() });
             self.events.send(Event::Done { stop: StopReason::EndTurn });
         }

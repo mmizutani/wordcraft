@@ -705,7 +705,9 @@ fn agents(ui: &mut Ui) {
 }
 
 /// The built-in assistant (#15): the role assistants join a shared document with
-/// (`assist.defaultRole`); a conversation may choose its own in the Assistant pane.
+/// (`assist.defaultRole`); a conversation may choose its own in the Assistant pane. And whether
+/// an agent goes ahead when it asks permission in a turn no one can answer
+/// (`assist.allowUnattended`, off by default, #23).
 fn assistant(app: &mut WordApp, ui: &mut Ui) {
     use crate::assist::{role_label, role_note};
     use wordcraft_engine::AssistantPrefs;
@@ -726,6 +728,16 @@ fn assistant(app: &mut WordApp, ui: &mut Ui) {
     note(
         ui,
         "An assistant works in the document like a person you share it with: its role says what it may do. Each conversation in the Assistant pane may choose another.",
+    );
+    ui.add_space(8.0);
+    // What an agent asks when no one is there to answer (#23): refused unless allowed.
+    let mut allow = app.session.prefs.assistant.allow_unattended;
+    if ui.checkbox(&mut allow, tl!("Allow what agents ask when no one can answer")).changed() {
+        let _ = app.run("assist.allowUnattended", json!({"value": allow}));
+    }
+    note(
+        ui,
+        "When you ask, the Assistant pane asks you before an agent goes ahead. A script or another app that asks the assistant (the control channel, MCP) has no one to ask: its agent's requests are refused unless this is on. Each answer is logged.",
     );
 }
 

@@ -3,15 +3,17 @@
 //! At the top, the assistant new conversations use (whether it is ready, and if not what to do)
 //! and who it is in the document: its name and role, which the person can change for the
 //! conversation. Then the conversation: the prompts, the answers, thoughts folded away, a row per
-//! tool call with how it went, the plan, permission requests with their options while they wait,
-//! errors, and why a turn stopped. At the bottom, Accept all and Reject all of this assistant's
+//! tool call folded to how it went (open: what it said, and the way to the change it made, #23),
+//! the plan as a checklist, permission requests with their options while they wait, errors, and
+//! why a turn stopped, said plainly. At the bottom, Accept all and Reject all of this assistant's
 //! changes, the writing actions (#18), and the prompt box with Send and Stop; Draft turns the box
 //! into what to write at the caret. Everything it does goes through the `assist.*` and `review.*`
-//! commands.
+//! commands, but for the answer to a permission request: that is the person's click alone, which
+//! no script can give for them.
 
 use egui::{Color32, RichText, Stroke, Ui, vec2};
 use serde_json::json;
-use wordcraft_assist::{Answer, Entry, PlanStatus, Readiness, ToolStatus};
+use wordcraft_assist::{Answer, Entry, PermissionRequest, PlanStatus, Readiness, StopReason, ToolCall, ToolStatus};
 use wordcraft_engine::AssistantPrefs;
 use wordcraft_engine::room::Role;
 
@@ -187,28 +189,15 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
                 .default_open(false)
                 .show(ui, |ui| wrapped(ui, RichText::new(text).small().color(t.text_dim)));
         }
-        Entry::Tool(call) => {
-            ui.horizontal_top(|ui| {
-                let mark = match call.status {
-                    ToolStatus::Pending => Mark::Waiting,
-                    ToolStatus::InProgress => Mark::Running,
-                    ToolStatus::Completed => Mark::Done,
-                    ToolStatus::Failed => Mark::Failed,
-                };
-                mark.paint(ui, t);
-                ui.vertical(|ui| {
-                    wrapped(ui, RichText::new(&call.title).font(regular(12.0)).color(t.text));
-                    // Why a call failed, or what it said, unless that is data for the model (the
-                    // start of a JSON result says nothing in a compact log).
-                    let failed = call.status == ToolStatus::Failed;
-                    if !call.detail.is_empty() && (failed || !call.detail.trim_start().starts_with(['{', '['])) {
-                        wrapped(ui, RichText::new(&call.detail).small().color(if failed { t.red } else { t.text_dim }));
-                    }
-                });
-            });
-        }
+        Entry::Tool(call) => tool_row(app, ui, t, i, call),
         Entry::Plan { entries } => {
-            ui.label(RichText::new(tl!("Plan")).font(semibold(12.0)));
+            // A checklist: what is done, under way and to come.
+            let done = entries.iter().filter(|p| p.status == PlanStatus::Completed).count();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(tl!("Plan")).font(semibold(12.0)));
+                let count = fmt(tl!("{done} of {all} done"), &[("done", &done.to_string()), ("all", &entries.len().to_string())]);
+                ui.label(RichText::new(count).small().color(t.text_dim));
+            });
             for p in entries {
                 ui.horizontal_top(|ui| {
                     let mark = match p.status {
@@ -217,48 +206,112 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
                         PlanStatus::Completed => Mark::Done,
                     };
                     mark.paint(ui, t);
-                    wrapped(ui, RichText::new(&p.content).color(t.text));
+                    let color = if p.status == PlanStatus::Completed { t.text_dim } else { t.text };
+                    wrapped(ui, RichText::new(&p.content).color(color));
                 });
             }
         }
-        Entry::Permission { request, answer } => {
-            egui::Frame::NONE.stroke(Stroke::new(1.0, t.border_strong)).corner_radius(6).inner_margin(6).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                wrapped(ui, RichText::new(&request.title).font(semibold(12.0)).color(t.text));
-                match answer {
-                    None if waiting == Some(request.id) => {
-                        ui.horizontal_wrapped(|ui| {
-                            for o in &request.options {
-                                if ui.button(&o.name).clicked() {
-                                    if app.input_from_control(ui.ctx()) {
-                                        app.assist.notice = Some(tl!("Only you can answer the assistant: click it yourself.").to_string());
-                                    } else if let Some(a) = app.conversation_mut() {
-                                        a.answer(request.id, Answer::Selected { option: o.id.clone() });
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    None => wrapped(ui, RichText::new(tl!("No answer")).small().color(t.text_dim)),
-                    Some(Answer::Selected { option }) => {
-                        let name = request.options.iter().find(|o| &o.id == option).map_or(option.as_str(), |o| o.name.as_str());
-                        wrapped(ui, RichText::new(fmt(tl!("Answered: {option}"), &[("option", name)])).small().color(t.text_dim));
-                    }
-                    Some(Answer::Cancelled) => wrapped(ui, RichText::new(tl!("No answer")).small().color(t.text_dim)),
-                }
-            });
-        }
+        Entry::Permission { request, answer } => permission(app, ui, t, request, answer.as_ref(), waiting == Some(request.id)),
         Entry::Model { name } => {
             ui.label(RichText::new(fmt(tl!("Model: {name}"), &[("name", name)])).small().color(t.text_dim));
         }
         Entry::Stopped { stop } => {
             if let Some(says) = stop.says() {
-                ui.label(RichText::new(tl!(says)).small().italics().color(t.text_dim));
+                // Stopped by the person reads as a note; any other stop is news to them.
+                let color = if *stop == StopReason::Cancelled { t.text_dim } else { t.orange };
+                wrapped(ui, RichText::new(tl!(says)).small().italics().color(color));
             }
         }
         // A failed turn says why; the turn itself ends with its own event.
         Entry::Error { message } => wrapped(ui, RichText::new(message).color(t.red)),
     }
+}
+
+/// A tool call's row: how it stands and its title, folded; open, its kind, how it went, what it
+/// said, and for a call of WordCraft's tools that changed the document, the way to that change.
+fn tool_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, call: &ToolCall) {
+    let (mark, status) = match call.status {
+        ToolStatus::Pending => (Mark::Waiting, "Waiting"),
+        ToolStatus::InProgress => (Mark::Running, "Running"),
+        ToolStatus::Completed => (Mark::Done, "Done"),
+        ToolStatus::Failed => (Mark::Failed, "Failed"),
+    };
+    let failed = call.status == ToolStatus::Failed;
+    let id = ui.make_persistent_id(("assistant_tool", i, call.id.as_str()));
+    let mut toggled = false;
+    let row = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+    let mut header = row.show_header(ui, |ui| {
+        mark.paint(ui, t);
+        // The title opens the row too, as the arrow does.
+        let title = egui::Label::new(RichText::new(&call.title).font(regular(12.0)).color(t.text)).truncate().sense(egui::Sense::click());
+        toggled = ui.add(title).on_hover_text(&call.title).clicked();
+    });
+    if toggled {
+        header.toggle();
+    }
+    header.body(|ui| {
+        let kind = match call.kind.as_str() {
+            "read" => tl!("Read"),
+            "edit" => tl!("Edit"),
+            "delete" => tl!("Delete"),
+            "move" => tl!("Move"),
+            "search" => tl!("Search"),
+            "execute" => tl!("Run"),
+            "think" => tl!("Think"),
+            "fetch" => tl!("Fetch"),
+            _ => tl!("Other"),
+        };
+        let line = fmt(tl!("{kind} · {status}"), &[("kind", kind), ("status", tl!(status))]);
+        ui.label(RichText::new(line).small().color(if failed { t.red } else { t.text_dim }));
+        // Why a call failed, or what it said, unless that is data for the model (the start of a
+        // JSON result says nothing here).
+        if !call.detail.is_empty() && (failed || !call.detail.trim_start().starts_with(['{', '['])) {
+            wrapped(ui, RichText::new(&call.detail).small().color(if failed { t.red } else { t.text_dim }));
+        }
+        if let Some(version) = call.version
+            && ui.link(RichText::new(tl!("Show the change")).small()).on_hover_text(tl!("Select what this call changed, with Review open")).clicked()
+        {
+            let _ = app.run("assist.showChange", json!({"version": version}));
+        }
+    });
+}
+
+/// A permission request: what the agent asks, and while the turn waits, its answers as buttons
+/// (an agent's long names cut, whole on hover); once answered, the answer.
+fn permission(app: &mut WordApp, ui: &mut Ui, t: &Tokens, request: &PermissionRequest, answer: Option<&Answer>, waiting: bool) {
+    let stroke = if waiting { Stroke::new(1.5, t.accent) } else { Stroke::new(1.0, t.border_strong) };
+    egui::Frame::NONE.stroke(stroke).corner_radius(6).inner_margin(6).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let name = app.conversation().map(|a| a.name().to_string()).unwrap_or_default();
+        ui.label(RichText::new(fmt(tl!("{name} asks permission"), &[("name", &name)])).small().color(t.text_dim));
+        wrapped(ui, RichText::new(&request.title).font(semibold(12.0)).color(t.text));
+        match answer {
+            None if waiting && request.options.is_empty() => {
+                wrapped(ui, RichText::new(tl!("It offers no answer to choose: Stop ends the turn.")).small().color(t.orange));
+            }
+            None if waiting => {
+                ui.horizontal_wrapped(|ui| {
+                    for o in &request.options {
+                        let b = ui.add(egui::Button::new(&o.name).truncate()).on_hover_text(&o.name);
+                        if b.clicked() {
+                            // Only the person answers: a click or key the control channel made
+                            // (MCP's `click` and `key`) leaves the question waiting.
+                            if app.input_from_control(ui.ctx()) {
+                                app.assist.notice = Some(tl!("Only you can answer the assistant: click it yourself.").to_string());
+                            } else if let Some(a) = app.conversation_mut() {
+                                a.answer(request.id, Answer::Selected { option: o.id.clone() });
+                            }
+                        }
+                    }
+                });
+            }
+            None | Some(Answer::Cancelled) => wrapped(ui, RichText::new(tl!("No answer")).small().color(t.text_dim)),
+            Some(Answer::Selected { option }) => {
+                let chosen = request.options.iter().find(|o| &o.id == option).map_or(option.as_str(), |o| o.name.as_str());
+                wrapped(ui, RichText::new(fmt(tl!("Answered: {option}"), &[("option", chosen)])).small().color(t.text_dim));
+            }
+        }
+    });
 }
 
 /// How a tool call or a plan entry stands, drawn: an open ring (waiting), a dot (running), a

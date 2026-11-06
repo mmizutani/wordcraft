@@ -482,3 +482,27 @@ fn length_units_follow_the_interface_language() {
     h.run_steps(4);
     assert_eq!(length(72.0), "25,4 mm", "English keeps the English names");
 }
+
+/// File › Options › Assistant (#23): the checkbox is the `assist.allowUnattended` setting, off
+/// until the person turns it on.
+#[test]
+fn assistant_unattended_requests_are_refused_until_allowed() {
+    let mut a = app();
+    a.run("file.options", json!({"pane": "assistant"})).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    assert!(!h.state().session.prefs.assistant.allow_unattended);
+    h.get_by_label("Allow what agents ask when no one can answer").click();
+    h.run_steps(4);
+    assert!(h.state().session.prefs.assistant.allow_unattended, "the checkbox allows them");
+    h.get_by_label("Allow what agents ask when no one can answer").click();
+    h.run_steps(4);
+    assert!(!h.state().session.prefs.assistant.allow_unattended, "and refuses them again");
+}

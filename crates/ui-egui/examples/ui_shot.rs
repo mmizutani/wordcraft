@@ -14,8 +14,11 @@
 //! folder rather than the person's, or in `"storeDir"` given on the same line (with
 //! `CRAFT_LANGUAGE_PACK_INDEX` for a local pack index). `{"assistScript": [[step, …], …]}` has the
 //! next assistant conversation use the scripted assistant, one list of steps per turn: `{"say":
-//! text}`, `{"think": text}`, `{"tool": name, "args": {…}}`, `{"plan": [text, …]}` or `{"ask":
-//! title}` (a permission request).
+//! text}`, `{"think": text}`, `{"tool": name, "args": {…}}`, `{"plan": [text, …]}` (an entry
+//! may be `{"content": text, "status": "completed|in_progress|pending"}`) or `{"ask": title}` (a
+//! permission request: the pane asks it when the prompt came from the pane itself, e.g. typed
+//! with `ui.text` and sent with `ui.key` Enter, and answers it per `assist.allowUnattended` when
+//! it came from `engine.execute`).
 
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{ControlRequest, Services, WordApp};
@@ -127,9 +130,21 @@ fn scripted_assistant(turns: &[serde_json::Value]) -> Result<wordcraft_assist::F
         } else if let Some(name) = s.get("tool") {
             Step::tool(&text(name), s.get("args").cloned().unwrap_or_default())
         } else if let Some(entries) = s.get("plan").and_then(|v| v.as_array()) {
-            let status = |i: usize| if i == 0 { PlanStatus::Completed } else { PlanStatus::Pending };
+            // An entry is its text (the first done, the rest to come) or `{"content", "status"}`.
+            let status = |i: usize, e: &serde_json::Value| match e.get("status").and_then(|s| s.as_str()) {
+                Some("completed") => PlanStatus::Completed,
+                Some("in_progress") => PlanStatus::InProgress,
+                Some(_) => PlanStatus::Pending,
+                None if i == 0 => PlanStatus::Completed,
+                None => PlanStatus::Pending,
+            };
+            let content = |e: &serde_json::Value| e.get("content").map_or_else(|| text(e), text);
             Step::Plan(
-                entries.iter().enumerate().map(|(i, e)| PlanEntry { content: text(e), priority: Priority::Medium, status: status(i) }).collect(),
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| PlanEntry { content: content(e), priority: Priority::Medium, status: status(i, e) })
+                    .collect(),
             )
         } else if let Some(t) = s.get("ask") {
             Step::Ask(text(t))

@@ -43,7 +43,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use wordcraft_doc::{ChangeSet, Document};
+use wordcraft_doc::change::{Anchor, Mapped};
+use wordcraft_doc::{ChangeSet, Document, Pos, StoryRef};
 
 use crate::scope::Scope;
 use crate::{Registry, Session};
@@ -267,6 +268,51 @@ impl Room {
         (hub.version(), hub.document().clone())
     }
 
+    /// Where the change that made version `version` is in the latest version, as anchors moved
+    /// past the changes accepted after it: from the start of the first text it put in or
+    /// changed to the end of the last ([`touched`]), in the body when it changed text there,
+    /// else in the story it changed first; where it only took text out, the place that text
+    /// was. `None` when the hub no longer keeps that change, or none of the text it changed is
+    /// there any more (or it changed none: styles or settings alone). What shows a
+    /// participant's change, such as the one an assistant's tool call made.
+    pub fn where_changed(&self, version: u64) -> Option<(Anchor, Anchor)> {
+        let (changes, doc) = {
+            let hub = self.hub();
+            (hub.since(version.checked_sub(1)?).ok()?, hub.document().clone())
+        };
+        let (made, after) = changes.split_first()?;
+        if made.version != version {
+            return None;
+        }
+        let mut anchors = touched(&made.change);
+        // A change across many paragraphs is shown by the first and the last it touched: each
+        // place is looked for in the whole document.
+        if anchors.len() > MOST_PLACES {
+            anchors.drain(MOST_PLACES / 2..anchors.len().saturating_sub(MOST_PLACES / 2));
+        }
+        let places: Vec<Pos> = anchors
+            .into_iter()
+            .filter_map(|a| {
+                let mut m = Mapped::At(a);
+                for later in after {
+                    let a = match m {
+                        Mapped::At(a) => a,
+                        Mapped::Before(block) => Anchor { block, off: 0 },
+                        Mapped::After(block) => Anchor { block, off: usize::MAX },
+                        Mapped::Gone => return None,
+                    };
+                    m = later.change.map(a);
+                }
+                doc.place(m, None)
+            })
+            .collect();
+        let story = if places.iter().any(|p| p.story == StoryRef::Body) { StoryRef::Body } else { places.first()?.story };
+        let mut there = places.iter().filter(|p| p.story == story);
+        let first = there.next()?;
+        let (start, end) = there.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p)));
+        Some((doc.anchor_at(start)?, doc.anchor_at(end)?))
+    }
+
     /// Join the room as a new participant called `name` (the author of their comments and
     /// tracked changes) with `role`, and a copy of the document as of its latest version. For
     /// the room's own process: anyone else joins with a key ([`Room::join_with`]).
@@ -402,4 +448,31 @@ impl std::fmt::Debug for Lobby {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Lobby").field("open", &self.room().is_some()).finish()
     }
+}
+
+/// Most places of a change [`Room::where_changed`] looks for.
+const MOST_PLACES: usize = 256;
+
+/// The places change `cs` put in or changed text, as anchors in the document right after it:
+/// the ends of the characters it put in each paragraph it edited in place (the whole paragraph
+/// when only its properties changed), the start of the first and the end of the last of each run
+/// of blocks it put in, and where it only took blocks out, the block after them (or before them,
+/// at the end of their list). Parts it added or removed whole, and fields, have no place.
+fn touched(cs: &ChangeSet) -> Vec<Anchor> {
+    let mut out = Vec::new();
+    for e in &cs.edits {
+        let (from, to) = e.chars.as_ref().map_or((0, usize::MAX), |c| (c.at, c.at.saturating_add(c.inserted.text.len())));
+        out.extend([Anchor { block: e.id, off: from }, Anchor { block: e.id, off: to }]);
+    }
+    for s in &cs.splices {
+        match (s.inserted.first(), s.inserted.last()) {
+            (Some(first), Some(last)) => out.extend([Anchor { block: first.0.id(), off: 0 }, Anchor { block: last.0.id(), off: usize::MAX }]),
+            _ => match (s.before, s.after) {
+                (Some(block), _) => out.push(Anchor { block, off: 0 }),
+                (None, Some(block)) => out.push(Anchor { block, off: usize::MAX }),
+                (None, None) => {}
+            },
+        }
+    }
+    out
 }

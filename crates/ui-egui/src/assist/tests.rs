@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use wordcraft_assist::{Entry, Fake, Step, StopReason};
+use wordcraft_assist::{Answer, Entry, Fake, Step, StopReason};
 use wordcraft_doc::{Document, StoryRef};
 use wordcraft_engine::Session;
 
@@ -586,4 +586,252 @@ fn control_clicks_cannot_answer_an_assistant_permission() {
     }
     settle(h.state_mut());
     assert!(matches!(seen.lock().unwrap().answers.as_slice(), [wordcraft_assist::Answer::Selected { option }] if option == "allow"));
+}
+
+/// The window in a harness wide enough for the whole Home tab, after a few frames.
+#[cfg(not(target_arch = "wasm32"))]
+fn harness(app: WordApp) -> egui_kittest::Harness<'static, WordApp> {
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(2560.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        app,
+    );
+    h.run_steps(4);
+    h
+}
+
+/// Frames until `done` holds, while the assistant's thread works.
+#[cfg(not(target_arch = "wasm32"))]
+fn until(h: &mut egui_kittest::Harness<'static, WordApp>, done: impl Fn(&WordApp) -> bool) {
+    for _ in 0..4000 {
+        if done(h.state()) {
+            h.run_steps(2);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        h.run_steps(1);
+    }
+    panic!("the window never gets there");
+}
+
+fn waiting(a: &WordApp) -> bool {
+    a.conversation().is_some_and(|c| c.pending_permission().is_some())
+}
+
+fn idle(a: &WordApp) -> bool {
+    !a.conversation().is_some_and(|c| c.is_busy()) && a.share_settled()
+}
+
+fn answers(seen: &std::sync::Arc<std::sync::Mutex<wordcraft_assist::Seen>>) -> Vec<Answer> {
+    seen.lock().unwrap().answers.clone()
+}
+
+fn picked(option: &str) -> Answer {
+    Answer::Selected { option: option.into() }
+}
+
+/// The person's prompt: the agent's permission request shows in the pane (which opens for it)
+/// with its answers, and the one they click reaches the agent; Stop answers a waiting request
+/// cancelled.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_pane_asks_the_person_and_their_choice_reaches_the_agent() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = window("one two three");
+    let fake =
+        Fake::new().then(vec![Step::Ask("Delete the old notes".into()), Step::say("Deleted.")]).then(vec![Step::Ask("Rename the file".into())]);
+    let seen = fake.seen();
+    app.assist_with(Box::new(fake));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Tidy up"})).unwrap();
+    // Closed meanwhile, it opens again to ask.
+    h.state_mut().session.view.assistant_pane = false;
+    until(&mut h, waiting);
+    assert!(h.state().session.view.assistant_pane, "the pane opens to ask");
+    assert!(h.query_by_label("Delete the old notes").is_some());
+    assert!(h.query_by_label("Test Assistant asks permission").is_some());
+    h.get_by_label("Allow once").click();
+    h.run_steps(1);
+    until(&mut h, idle);
+    assert_eq!(answers(&seen), [picked("allow")]);
+    assert!(h.query_by_label("Answered: Allow once").is_some());
+    assert!(h.query_by_label("Allow once").is_none(), "answered, the buttons go");
+    // Stop while the next one waits: it is answered cancelled.
+    h.state_mut().run("assist.ask", json!({"prompt": "And rename it"})).unwrap();
+    until(&mut h, waiting);
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+    until(&mut h, idle);
+    assert_eq!(answers(&seen), [picked("allow"), Answer::Cancelled]);
+    let c = h.state().conversation().unwrap();
+    assert!(
+        c.transcript()
+            .entries()
+            .any(|e| matches!(e, Entry::Permission { request, answer: Some(Answer::Cancelled) } if request.title == "Rename the file"))
+    );
+    assert!(h.query_by_label("Stopped.").is_some());
+}
+
+/// A turn a program asked for (the control channel, MCP) never asks anyone: it answers per the
+/// setting, refusing unless the person allowed it. The person's own prompt in the same
+/// conversation still asks them.
+#[test]
+fn a_program_s_turn_answers_per_the_setting() {
+    let mut a = window("one two three");
+    let fake = Fake::new()
+        .then(vec![Step::Ask("Edit the heading".into())])
+        .then(vec![Step::Ask("Edit the heading".into())])
+        .then(vec![Step::Ask("Edit the title".into())]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Go", None);
+    assert_eq!(answers(&seen), [picked("reject")]);
+    let refused = |a: &WordApp, option: &str| {
+        a.conversation()
+            .unwrap()
+            .transcript()
+            .entries()
+            .filter(|e| matches!(e, Entry::Permission { answer: Some(Answer::Selected { option: o }), .. } if o == option))
+            .count()
+    };
+    assert_eq!(refused(&a, "reject"), 1, "the conversation says how it was answered");
+    assert_eq!(a.execute("assist.allowUnattended", json!({"value": true})).unwrap(), json!({"value": true}));
+    ask(&mut a, "Again", None);
+    assert_eq!(answers(&seen), [picked("reject"), picked("allow")]);
+    // The person asks: the pane waits for them.
+    a.run("assist.ask", json!({"prompt": "Mine"})).unwrap();
+    let ctx = egui::Context::default();
+    let mut request = None;
+    for _ in 0..4000 {
+        a.sync_share(&ctx);
+        super::tick(&mut a);
+        request = a.conversation().and_then(|c| c.pending_permission()).cloned();
+        if request.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let request = request.expect("the person is asked");
+    assert_eq!(request.title, "Edit the title");
+    assert!(a.conversation_mut().unwrap().answer(request.id, picked("reject")));
+    settle(&mut a);
+    assert_eq!(answers(&seen), [picked("reject"), picked("allow"), picked("reject")]);
+    assert!(!a.assist.by_person, "the person's command is over");
+}
+
+/// What an agent offers is held to the pane's limits: no option (Stop ends the turn), thousands
+/// (the first 16), huge or hostile names and titles; the pane draws each without a panic, and
+/// the person's pick reaches the agent.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn hostile_option_lists_are_capped_in_the_pane() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::{PermissionKind, PermissionOption};
+    let option = |id: &str, name: String| PermissionOption { id: id.into(), name, kind: PermissionKind::AllowOnce };
+    let thousands = (0..5000).map(|n| option(&format!("o{n}"), format!("Option {n}"))).collect();
+    let huge = vec![
+        option("big", "y".repeat(1 << 20)),
+        option(&"z".repeat(1 << 16), "Too long an id".into()),
+        option("rtl", "\u{202e}Go ahead\u{0}".into()),
+    ];
+    let mut app = window("one");
+    let fake = Fake::new()
+        .then(vec![Step::AskWith { title: "Nothing to pick".into(), options: vec![] }])
+        .then(vec![Step::AskWith { title: "x".repeat(1 << 20), options: thousands }])
+        .then(vec![Step::AskWith { title: "Huge".into(), options: huge }]);
+    let seen = fake.seen();
+    app.assist_with(Box::new(fake));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "none"})).unwrap();
+    until(&mut h, waiting);
+    assert!(h.query_by_label("It offers no answer to choose: Stop ends the turn.").is_some());
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+    until(&mut h, idle);
+    h.state_mut().run("assist.ask", json!({"prompt": "thousands"})).unwrap();
+    until(&mut h, waiting);
+    assert!(h.query_by_label("Option 15").is_some() && h.query_by_label("Option 16").is_none(), "the first 16");
+    h.get_by_label("Option 3").click();
+    h.run_steps(1);
+    until(&mut h, idle);
+    h.state_mut().run("assist.ask", json!({"prompt": "huge"})).unwrap();
+    until(&mut h, waiting);
+    assert!(h.query_by_label("Too long an id").is_none(), "an option whose id is too long is dropped");
+    h.get_by_label("Go ahead").click();
+    h.run_steps(1);
+    until(&mut h, idle);
+    assert_eq!(answers(&seen), [Answer::Cancelled, picked("o3"), picked("rtl")]);
+}
+
+/// A tool call's row is folded to its title; open, it says how the call went, and for a call
+/// that changed the document, Show the change selects that change with Review open. The plan
+/// is a checklist that counts what is done.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_tool_row_opens_to_the_change_it_made() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::{PlanEntry, PlanStatus, Priority};
+    let entry = |content: &str, status| PlanEntry { content: content.into(), priority: Priority::Medium, status };
+    let plan = Step::Plan(vec![
+        entry("Find “two”", PlanStatus::Completed),
+        entry("Use a digit", PlanStatus::InProgress),
+        entry("Say so", PlanStatus::Pending),
+    ]);
+    let mut app = window("one two three");
+    app.assist_with(Box::new(Fake::new().then([vec![plan], rewrite_two()].concat())));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Use digits"})).unwrap();
+    until(&mut h, idle);
+    assert!(h.query_by_label("1 of 3 done").is_some());
+    assert!(h.query_by_label("Use a digit").is_some());
+    assert!(h.query_by_label("type_text").is_some(), "the call's title");
+    assert!(h.query_by_label("Show the change").is_none(), "folded");
+    assert!(h.query_by_label("Edit · Done").is_none(), "folded");
+    h.get_by_label("type_text").click();
+    h.run_steps(4);
+    assert!(h.query_by_label("Edit · Done").is_some());
+    h.get_by_label("Show the change").click();
+    h.run_steps(2);
+    let a = h.state();
+    assert_eq!(a.ui.tab, "Review");
+    let (start, end) = a.session.sel.ordered();
+    let para = a.session.doc.body.first().and_then(|b| b.as_para()).unwrap();
+    assert_eq!(para.text.get(start.off..end.off), Some("2two"), "the tracked deletion and the insertion");
+    // The call that only selected text changed nothing: it has no change to show.
+    h.get_by_label("select_text").click();
+    h.run_steps(4);
+    assert_eq!(h.query_all_by_label("Show the change").count(), 1);
+}
+
+/// `assist.showChange` from a script: the version a tool call made, selected; a version the
+/// room doesn't have says so, and without a shared document there is nothing to show.
+#[test]
+fn show_change_selects_what_a_tool_call_changed() {
+    let mut a = window("one two three");
+    assert!(a.execute("assist.showChange", json!({"version": 1})).unwrap_err().contains("isn't the one shown"));
+    a.assist_with(Box::new(Fake::new().then(rewrite_two())));
+    ask(&mut a, "Use digits", None);
+    let versions: Vec<u64> = a
+        .conversation()
+        .unwrap()
+        .transcript()
+        .entries()
+        .filter_map(|e| match e {
+            Entry::Tool(call) => call.version,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(versions.len(), 1, "only type_text changed the document");
+    let r = a.execute("assist.showChange", json!({"version": versions[0]})).unwrap();
+    assert_eq!(r, json!({"version": versions[0], "shown": true}));
+    let (start, end) = a.session.sel.ordered();
+    assert_eq!(a.session.doc.body.first().and_then(|b| b.as_para()).and_then(|p| p.text.get(start.off..end.off)), Some("2two"));
+    assert!(a.assist.notice.is_none());
+    let e = a.execute("assist.showChange", json!({"version": 9999})).unwrap_err();
+    assert!(e.contains("isn't in the document"), "{e}");
+    assert_eq!(a.assist.notice.as_deref(), Some(e.as_str()), "the pane says why");
+    for bad in [json!({"version": 0}), json!({"version": "1"}), json!({})] {
+        assert!(a.execute("assist.showChange", bad).is_err());
+    }
 }

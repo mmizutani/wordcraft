@@ -31,6 +31,9 @@ pub enum Step {
     /// Ask permission for this, offering allow once and reject once; the answer is kept
     /// ([`Fake::answers`]).
     Ask(String),
+    /// Ask permission for `title`, offering `options` as they are (to test what the pane does
+    /// with an agent's odd lists); the answer is kept.
+    AskWith { title: String, options: Vec<PermissionOption> },
     /// Wait until the turn is stopped (at most [`HOLD`]).
     Hold,
     /// Fail the turn with this.
@@ -138,6 +141,10 @@ impl Backend for Fake {
                     let options = [("allow", "Allow once", PermissionKind::AllowOnce), ("reject", "Reject", PermissionKind::RejectOnce)]
                         .map(|(id, name, kind)| PermissionOption { id: id.into(), name: name.into(), kind });
                     let answer = ctx.ask(PermissionRequest::bounded(&title, options));
+                    self.see(|s| s.answers.push(answer));
+                }
+                Step::AskWith { title, options } => {
+                    let answer = ctx.ask(PermissionRequest { id: 0, title, options });
                     self.see(|s| s.answers.push(answer));
                 }
                 Step::Hold => {

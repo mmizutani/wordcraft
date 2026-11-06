@@ -1465,3 +1465,86 @@ fn a_tracked_paste_made_again_still_moves_what_was_cut() {
     smooth(&copies);
     same_everywhere(&copies).unwrap();
 }
+
+/// A change is found again by the version it made, where its text is now: past the changes made
+/// after it, in its paragraph or across the paragraphs it put in, or where it took text out; a
+/// version the hub no longer keeps, or never had, finds nothing.
+#[test]
+fn a_change_is_found_by_the_version_it_made() {
+    let room = Room::new(Document::from_text("one two three\nfour\nfive"));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    run(&mut a, "review.trackChanges", json!({"value": true}));
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "text.insert", json!({"text": "2"}));
+    a.send();
+    let replaced = room.version();
+    // Ben types before it, and after it in the same paragraph.
+    b.receive();
+    run(&mut b, "caret.docStart", json!({}));
+    run(&mut b, "text.insert", json!({"text": "zero "}));
+    run(&mut b, "caret.set", json!({"pos": Pos::body(0, "zero one 2two three".len())}));
+    run(&mut b, "text.insert", json!({"text": " and on"}));
+    b.send();
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    let [a, mut b] = copies;
+    let (_, doc) = room.document();
+    let found = |v: u64| room.where_changed(v).map(|(s, e)| (doc.pos_of(s, None).unwrap(), doc.pos_of(e, None).unwrap()));
+    // The "2" put in and the tracked deletion of "two", still together after "zero one ".
+    let (start, end) = found(replaced).unwrap();
+    let para = doc.body[0].as_para().unwrap();
+    assert_eq!(&para.text[start.off..end.off], "2two", "{start:?} {end:?} in {:?}", para.text);
+    // Paragraphs put in: from the start of the first to the end of the last.
+    run(&mut b, "caret.set", json!({"pos": Pos::body(1, 4)}));
+    run(&mut b, "text.insert", json!({"text": "\nsix\nseven", "paragraphs": true}));
+    b.send();
+    let split = room.version();
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    let [mut a, b] = copies;
+    let (_, doc) = room.document();
+    let found = |v: u64| room.where_changed(v).map(|(s, e)| (doc.pos_of(s, None).unwrap(), doc.pos_of(e, None).unwrap()));
+    let (start, end) = found(split).unwrap();
+    assert_eq!(start.story, StoryRef::Body);
+    assert!(start.path <= Pos::body(2, 0).path && end.path == Pos::body(3, 0).path && end.off == 5, "{start:?} {end:?}");
+    // Text taken out (untracked): the place it was.
+    run(&mut a, "review.trackChanges", json!({"value": false}));
+    a.receive();
+    run(&mut a, "select.range", json!({"anchor": Pos::body(4, 0), "focus": Pos::body(4, 4)}));
+    run(&mut a, "text.delete", json!({}));
+    a.send();
+    let deleted = room.version();
+    let (_, doc) = room.document();
+    let (start, end) = room.where_changed(deleted).map(|(s, e)| (doc.pos_of(s, None).unwrap(), doc.pos_of(e, None).unwrap())).unwrap();
+    assert_eq!((start.path.clone(), start.off), (Pos::body(4, 0).path, 0), "{start:?}");
+    assert!(start <= end);
+    // Versions the hub doesn't have.
+    assert!(room.where_changed(0).is_none());
+    assert!(room.where_changed(room.version() + 1).is_none());
+    assert!(room.where_changed(u64::MAX).is_none());
+    drop((a, b));
+    // Nor one it no longer keeps.
+    let small = Room::with_hub(Hub::new(Document::from_text("one")).keeping(1));
+    let mut c = join(&small, "Cy");
+    for word in [" two", " three"] {
+        run(&mut c, "caret.docEnd", json!({}));
+        run(&mut c, "text.insert", json!({"text": word}));
+        for _ in 0..10 {
+            c.sync();
+        }
+    }
+    assert_eq!(small.version(), 2);
+    assert!(small.where_changed(1).is_none(), "no longer kept");
+    assert!(small.where_changed(2).is_some());
+    // A change across hundreds of paragraphs: from the first to the last.
+    let text: Vec<String> = (0..400).map(|n| format!("Line {n}")).collect();
+    let big = Room::new(Document::from_text(&text.join("\n")));
+    let mut d = join(&big, "Di");
+    run(&mut d, "select.all", json!({}));
+    run(&mut d, "format.bold", json!({}));
+    d.send();
+    let (_, doc) = big.document();
+    let (start, end) = big.where_changed(big.version()).map(|(s, e)| (doc.pos_of(s, None).unwrap(), doc.pos_of(e, None).unwrap())).unwrap();
+    assert_eq!((start, end), (Pos::body(0, 0), Pos::body(399, "Line 399".len())));
+}

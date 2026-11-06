@@ -10,8 +10,14 @@
 //! ask. A session without a window (the MCP server, `wordcraft-cli run`) has none: there only the
 //! pane toggle and the setting do anything.
 //!
-//! The setting `assist.defaultRole` is the person's (`Prefs::assistant`): the role assistants
-//! join a shared document with, never owner.
+//! The settings are the person's (`Prefs::assistant`): `assist.defaultRole`, the role
+//! assistants join a shared document with, never owner; and `assist.allowUnattended`, whether an
+//! assistant goes ahead when its agent asks permission in a turn a program asked for, which no
+//! one is there to answer (refused unless the person allows it). In the person's own turns the
+//! Assistant pane asks them.
+//!
+//! `assist.showChange` selects what one of the assistant's tool calls changed, by the version of
+//! the shared document it made.
 //!
 //! A writing action is a prompt of ours ([`prompts`]) asked like any other, so its edits are the
 //! assistant's: tracked changes in its name while it is a suggester. The window gives the
@@ -84,6 +90,13 @@ pub fn specs() -> Vec<CommandSpec> {
             .pure(),
         CommandSpec::new("assist.defaultRole", "Assistants Join As", "File › Options › Assistant", default_role)
             .params(r#"{"value"?: "viewer|commenter|suggester|editor" (omit to read it; never owner)}"#)
+            .pure(),
+        CommandSpec::new("assist.allowUnattended", "Allow Requests No One Can Answer", "File › Options › Assistant", allow_unattended)
+            .params(r#"{"value"?: bool (omit to read it)} → whether an assistant goes ahead when its agent asks permission in a turn a program asked for (control channel, MCP), which no one is there to answer; false (the default): the request is refused, and the answer logged"#)
+            .pure(),
+        CommandSpec::new("assist.showChange", "Show the Change", "Home › Assistant", show_change)
+            .params(r#"{"version": number (a tool call's: the shared document's version once its change was in)} → the text that change put in or changed is selected, and the Review tab opens"#)
+            .when(in_window)
             .pure(),
         CommandSpec::new("assist.draft", "Draft with the Assistant", "Home › Assistant", draft)
             .params(r#"{"about": string (what to write)} → the assistant writes it at the caret (after the selection, if there is one)"#)
@@ -259,6 +272,29 @@ fn default_role(s: &mut Session, v: &Value) -> CmdResult {
         Some(_) => return Err(CmdError::Params("`value`: viewer, commenter, suggester or editor".into())),
     }
     Ok(json!({"value": s.prefs.assistant.default_role().name()}))
+}
+
+/// Whether an assistant goes ahead when its agent asks permission in a turn no one can answer
+/// (File › Options › Assistant).
+fn allow_unattended(s: &mut Session, v: &Value) -> CmdResult {
+    match v.get("value") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(b)) => s.prefs.assistant.allow_unattended = *b,
+        Some(_) => return Err(CmdError::Params("`value` must be true or false".into())),
+    }
+    Ok(json!({"value": s.prefs.assistant.allow_unattended}))
+}
+
+/// Show the change an assistant's tool call made: the window selects it in the shared document.
+fn show_change(s: &mut Session, v: &Value) -> CmdResult {
+    let version = match v.get("version") {
+        Some(Value::Number(n)) => n.as_u64().filter(|v| *v > 0),
+        None | Some(Value::Null) => return Err(CmdError::Params("missing `version`: a tool call's, as the conversation gives it".into())),
+        Some(_) => None,
+    };
+    let version = version.ok_or_else(|| CmdError::Params("`version`: a tool call's, a whole number from 1".into()))?;
+    s.push_ui_request(json!({"assist": "show", "version": version}));
+    Ok(json!({"version": version}))
 }
 
 /// What the writing actions ask the assistant (#18): our own words, in one place. The window

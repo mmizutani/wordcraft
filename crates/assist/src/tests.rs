@@ -436,6 +436,74 @@ fn permission_requests_follow_the_policy_and_wait_for_the_person() {
     assert!(PERMISSION_TIMEOUT >= Duration::from_secs(60));
 }
 
+/// A turn answers its permission requests its own way when asked to: the window's person is
+/// asked in their turns, and a program's turn in the same conversation is answered per the
+/// setting, without a prompt.
+#[test]
+fn a_turn_answers_requests_its_own_way() {
+    let w = Window::new("x");
+    let fake = Fake::new().then(vec![Step::Ask("Edit".into())]).then(vec![Step::Ask("Edit again".into())]).then(vec![Step::Ask("Once more".into())]);
+    let seen = fake.seen();
+    let mut a = w.start(fake, Options { permissions: PermissionPolicy::Reject, ..Options::default() });
+    // The person's turn: the pane asks.
+    a.ask_with_policy("go", None, None, PermissionPolicy::Ask).unwrap();
+    let request = wait_for_request(&mut a);
+    assert_eq!(request.title, "Edit");
+    assert!(a.answer(request.id, Answer::Selected { option: "allow".into() }));
+    assert!(a.wait_idle(WAIT));
+    // A program's turn, allowed by the setting, and one with the conversation's: no prompt.
+    a.ask_with_policy("go on", None, None, PermissionPolicy::Allow).unwrap();
+    assert!(a.wait_idle(WAIT));
+    ask(&mut a, "and on");
+    let answers = seen.lock().unwrap().answers.clone();
+    assert_eq!(
+        answers,
+        [Answer::Selected { option: "allow".into() }, Answer::Selected { option: "allow".into() }, Answer::Selected { option: "reject".into() }]
+    );
+    assert!(a.pending_permission().is_none());
+}
+
+/// Hostile option lists reach the pane held to its limits: none, thousands, huge names and ids,
+/// and options without an id; nothing panics, and a request with no option to pick is answered
+/// cancelled on Stop.
+#[test]
+fn hostile_option_lists_are_capped() {
+    let option = |id: String, name: String| PermissionOption { id, name, kind: PermissionKind::AllowOnce };
+    let thousands: Vec<PermissionOption> = (0..5000).map(|n| option(format!("o{n}"), format!("Option {n}"))).collect();
+    let huge = vec![
+        option("big".into(), "x".repeat(1 << 20)),
+        option("y".repeat(1 << 16), "Too long an id".into()),
+        option(String::new(), "No id".into()),
+        option("rtl".into(), "\u{202e}evil\u{0}".into()),
+    ];
+    let w = Window::new("x");
+    let fake = Fake::new()
+        .then(vec![Step::AskWith { title: "Nothing to pick".into(), options: vec![] }])
+        .then(vec![Step::AskWith { title: "t".repeat(1 << 20), options: thousands }])
+        .then(vec![Step::AskWith { title: "Huge".into(), options: huge }]);
+    let seen = fake.seen();
+    let mut a = w.start(fake, Options { permissions: PermissionPolicy::Ask, ..Options::default() });
+    a.ask("none", None).unwrap();
+    let request = wait_for_request(&mut a);
+    assert!(request.options.is_empty());
+    a.cancel();
+    assert!(a.wait_idle(WAIT));
+    a.ask("thousands", None).unwrap();
+    let request = wait_for_request(&mut a);
+    assert_eq!(request.options.len(), MAX_OPTIONS);
+    assert!(request.title.chars().count() <= MAX_LABEL);
+    assert!(a.answer(request.id, Answer::Selected { option: "o3".into() }));
+    assert!(a.wait_idle(WAIT));
+    a.ask("huge", None).unwrap();
+    let request = wait_for_request(&mut a);
+    let ids: Vec<&str> = request.options.iter().map(|o| o.id.as_str()).collect();
+    assert_eq!(ids, ["big", "rtl"], "options without an id, or with one too long, are dropped");
+    assert!(request.options.iter().all(|o| o.name.chars().count() <= MAX_LABEL && !o.name.contains('\u{202e}') && !o.name.contains('\u{0}')));
+    a.cancel();
+    assert!(a.wait_idle(WAIT));
+    assert_eq!(seen.lock().unwrap().answers, [Answer::Cancelled, Answer::Selected { option: "o3".into() }, Answer::Cancelled]);
+}
+
 fn wait_for_request(a: &mut Assistant) -> PermissionRequest {
     for _ in 0..5000 {
         a.poll();

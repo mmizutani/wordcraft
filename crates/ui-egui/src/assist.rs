@@ -11,6 +11,12 @@
 //!
 //! The writing actions (#18) are prompts like any other; [`action_items`] lists them for the
 //! mini toolbar's Assistant menu and the right-click menu, and the pane has them as buttons.
+//!
+//! When an agent asks permission (#23), the pane asks the person in the turns they asked for
+//! (the pane, a menu, a shortcut: [`WordApp::run`]). A turn a program asked for (the control
+//! channel, MCP) has no one to ask: it answers per the person's setting
+//! (`assist.allowUnattended`), refusing unless they allowed it, and the answer is logged. A tool
+//! call's row links to the change it made in the shared document (`assist.showChange`).
 
 use std::sync::Arc;
 
@@ -46,8 +52,14 @@ pub(crate) struct AssistState {
     /// Frames left in which the prompt box takes the keyboard: a few, as the click that opened
     /// the pane hands the keyboard back to the page.
     pub(crate) focus_prompt: u8,
-    /// Why the last prompt didn't start, for the pane.
+    /// Why the last prompt didn't start, or a change couldn't be shown, for the pane.
     pub(crate) notice: Option<String>,
+    /// The command running now is the person's ([`WordApp::run`]: the pane, a menu, a
+    /// shortcut), not a program's: a turn it asks for asks them its agent's permission requests.
+    pub(crate) by_person: bool,
+    /// The permission request the pane last opened for: it opens once for each, so the person
+    /// sees what the turn waits for, and stays closed if they close it.
+    opened_for: Option<u64>,
     /// How many changes the conversation's assistant has in the document, and for which
     /// (document, revision, name): Accept all and Reject all are greyed out without any.
     pub(crate) changes_by: Option<((u64, u64, String), usize)>,
@@ -136,6 +148,13 @@ pub(crate) fn tick(app: &mut WordApp) {
             c.assistant.end();
         }
     }
+    // A permission request waits for the person: the pane opens to ask them.
+    if let Some(id) = app.conversation().and_then(Assistant::pending_permission).map(|r| r.id)
+        && app.assist.opened_for != Some(id)
+    {
+        app.assist.opened_for = Some(id);
+        app.session.view.assistant_pane = true;
+    }
     let stale = match app.assist.offers_at {
         None => true,
         Some(at) => app.session.view.assistant_pane && crate::clock::now_ms() - at > OFFERS_EVERY * 1000.0,
@@ -198,6 +217,7 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
             Ok(json!({"switched": switched}))
         }
         "backend" => backend(app, req.get("id").and_then(Value::as_str)),
+        "show" => show_change(app, req.get("version").and_then(Value::as_u64).unwrap_or(0)),
         other => Err(format!("`{}`: not an assistant request", other.chars().take(40).collect::<String>())),
     };
     app.session.assistant = status(app);
@@ -219,6 +239,35 @@ fn backend(app: &mut WordApp, id: Option<&str>) -> Result<Value, String> {
         app.ui.assistant = id.to_string();
     }
     Ok(json!({"chosen": chosen(app).map(|o| o.id.clone()), "offers": app.assist.offers}))
+}
+
+/// Select what the change that made `version` of the shared document put in or changed, as the
+/// document is now, and open the Review tab, where Accept and Reject act on the selection.
+fn show_change(app: &mut WordApp, version: u64) -> Result<Value, String> {
+    let r = show_change_inner(app, version);
+    app.assist.notice = r.as_ref().err().cloned();
+    r
+}
+
+fn show_change_inner(app: &mut WordApp, version: u64) -> Result<Value, String> {
+    let room = app.shared_room().filter(|_| app.shows_shared_document()).ok_or("the document the assistant changed isn't the one shown")?;
+    // What the room took since the last frame, the change among it.
+    app.catch_up_share();
+    let (anchor, focus) = room.where_changed(version).ok_or("that change isn't in the document any more: look for it in the Review tab")?;
+    let doc = &app.session.doc;
+    let (Some(anchor), Some(focus)) = (doc.pos_of(anchor, None), doc.pos_of(focus, None)) else {
+        return Err("the text that change made isn't in the document any more".into());
+    };
+    let range = json!({"anchor": wordcraft_engine::cmd::pos_json(&anchor), "focus": wordcraft_engine::cmd::pos_json(&focus)});
+    app.execute("select.range", range)?;
+    app.execute("ui.tab", json!({"tab": "Review"}))?;
+    Ok(json!({"version": version, "shown": true}))
+}
+
+/// How a turn no one can answer (one a program asked for) answers its agent's permission
+/// requests: per the person's setting (`assist.allowUnattended`), refused unless they allowed it.
+fn unattended(app: &WordApp) -> PermissionPolicy {
+    if app.session.prefs.assistant.allow_unattended { PermissionPolicy::Allow } else { PermissionPolicy::Reject }
 }
 
 /// End the conversation there is, if any (its transcript stays for the pane).
@@ -285,8 +334,11 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
         (app.session.sel.anchor.clone(), app.session.sel.focus.clone())
     };
     let selection = doc.anchor_at(&anchor).zip(doc.anchor_at(&focus));
+    // The person is asked what the agent asks in their own turns; a program's turn is answered
+    // per the setting.
+    let policy = if app.assist.by_person { PermissionPolicy::Ask } else { unattended(app) };
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
-    a.ask_at(prompt, Some(context), selection).map_err(|e| e.to_string())?;
+    a.ask_with_policy(prompt, Some(context), selection, policy).map_err(|e| e.to_string())?;
     let (name, role, tracked) = (a.name().to_string(), a.role(), a.tracked());
     Ok(json!({"asked": true, "assistant": name, "role": role.name(), "tracked": tracked}))
 }
@@ -322,7 +374,8 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
         setting: Some(app.session.prefs.assistant.default_role),
         role,
         document: app.title_stem(),
-        permissions: PermissionPolicy::Ask,
+        // Each turn says how its requests are answered; this is for one that doesn't.
+        permissions: unattended(app),
         wake,
     };
     let assistant = Assistant::start(&room, backend, options).map_err(|e| e.to_string())?;

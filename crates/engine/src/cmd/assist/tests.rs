@@ -162,6 +162,7 @@ fn junk_params_never_panic() {
     }
     assert!(!s.can_undo());
     assert_ne!(s.prefs.assistant.default_role, Role::Owner);
+    assert!(!s.prefs.assistant.allow_unattended, "junk never allows what no one answers");
 }
 
 /// A participant's copy of a shared document can't start or drive an assistant: only the
@@ -189,13 +190,57 @@ fn a_participants_copy_cant_run_the_assistant() {
             ("assist.useDocument", json!({})),
             ("assist.backend", json!({"id": "fake"})),
             ("assist.defaultRole", json!({"value": "editor"})),
+            ("assist.allowUnattended", json!({"value": true})),
+            ("assist.showChange", json!({"version": 1})),
         ] {
             let why = disabled(copy.run(id, &v));
             assert!(why.contains("application's settings"), "{role} {id}: {why}");
         }
         assert!(copy.run("assist.pane", &json!({"value": true})).is_ok(), "{role}");
         assert_eq!(copy.session().prefs.assistant.default_role, Role::Suggester);
+        assert!(!copy.session().prefs.assistant.allow_unattended);
     }
+}
+
+/// What an agent asks in a turn no one can answer is refused unless the person allowed it: a
+/// preference of theirs, read back without a value.
+#[test]
+fn requests_no_one_can_answer_are_refused_unless_allowed() {
+    let mut s = Session::new(Document::new());
+    assert_eq!(s.run("assist.allowUnattended", &json!({})).unwrap(), json!({"value": false}));
+    for bad in [json!({"value": "yes"}), json!({"value": 1}), json!({"value": []}), json!({"value": {"on": true}})] {
+        assert!(matches!(s.run("assist.allowUnattended", &bad), Err(CmdError::Params(_))), "{bad}");
+    }
+    assert!(!s.prefs.assistant.allow_unattended);
+    assert_eq!(s.run("assist.allowUnattended", &json!({"value": true})).unwrap(), json!({"value": true}));
+    assert!(s.prefs.assistant.allow_unattended);
+    assert_eq!(s.run("assist.allowUnattended", &json!({"value": null})).unwrap(), json!({"value": true}));
+    assert_eq!(s.run("assist.allowUnattended", &json!({"value": false})).unwrap(), json!({"value": false}));
+    assert!(!s.can_undo(), "a preference, not an edit");
+    assert_eq!(Scope::of("assist.allowUnattended"), Some(Scope::App));
+}
+
+/// Showing a tool call's change hands the window its version; anything but a version from 1 is
+/// refused, and without a window there is nothing to show.
+#[test]
+fn showing_a_change_asks_the_window_for_its_version() {
+    let mut s = in_window();
+    assert_eq!(s.run("assist.showChange", &json!({"version": 3})).unwrap(), json!({"version": 3}));
+    assert_eq!(requests(&mut s), [json!({"assist": "show", "version": 3})]);
+    for bad in [
+        json!({}),
+        json!({"version": 0}),
+        json!({"version": -1}),
+        json!({"version": "3"}),
+        json!({"version": 1.5}),
+        json!({"version": u64::MAX as f64 * 2.0}),
+    ] {
+        assert!(matches!(s.run("assist.showChange", &bad), Err(CmdError::Params(_))), "{bad}");
+    }
+    assert!(requests(&mut s).is_empty());
+    assert!(!s.can_undo());
+    let mut alone = Session::new(Document::new());
+    assert!(disabled(alone.run("assist.showChange", &json!({"version": 1}))).contains("WordCraft window"));
 }
 
 /// A session in a window with an assistant set up and `pick` selected.

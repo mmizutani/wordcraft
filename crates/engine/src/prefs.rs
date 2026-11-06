@@ -77,11 +77,17 @@ pub struct AssistantPrefs {
     /// change the application's settings. A conversation may choose its own.
     #[serde(deserialize_with = "lenient_assistant_role")]
     pub default_role: Role,
+    /// Whether an assistant goes ahead when its agent asks permission in a turn no one can
+    /// answer (`assistant.allowUnattended`): one a program asked for (the control channel, MCP)
+    /// rather than the person in the Assistant pane. Off unless the person turns it on: such
+    /// requests are refused, and each answer is logged.
+    #[serde(deserialize_with = "lenient_flag")]
+    pub allow_unattended: bool,
 }
 
 impl Default for AssistantPrefs {
     fn default() -> Self {
-        AssistantPrefs { default_role: Role::Suggester }
+        AssistantPrefs { default_role: Role::Suggester, allow_unattended: false }
     }
 }
 
@@ -112,6 +118,12 @@ impl AssistantPrefs {
 fn lenient_assistant<'de, D: serde::Deserializer<'de>>(d: D) -> Result<AssistantPrefs, D::Error> {
     let value = serde_json::Value::deserialize(d)?;
     Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// A saved switch, or off for junk.
+fn lenient_flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(value.as_bool().unwrap_or(false))
 }
 
 /// A saved role an assistant may have, or suggester for owner, an unknown name or junk.
@@ -201,7 +213,7 @@ mod tests {
         assert_eq!(old.assistant.default_role(), Role::Suggester);
         let editor: Prefs = serde_json::from_str(r#"{"assistant":{"defaultRole":"editor"}}"#).unwrap();
         assert_eq!(editor.assistant.default_role(), Role::Editor);
-        assert_eq!(serde_json::to_value(&editor).unwrap()["assistant"], serde_json::json!({"defaultRole": "editor"}));
+        assert_eq!(serde_json::to_value(&editor).unwrap()["assistant"], serde_json::json!({"defaultRole": "editor", "allowUnattended": false}));
         for bad in [
             r#"{"assistant":{"defaultRole":"owner"},"checkSpelling":false}"#,
             r#"{"assistant":{"defaultRole":"admin"},"checkSpelling":false}"#,
@@ -214,10 +226,32 @@ mod tests {
             assert!(!prefs.check_spelling, "{bad}: the other preferences are kept");
         }
         // Set in code to owner, it still reads as suggester.
-        let owner = AssistantPrefs { default_role: Role::Owner };
+        let owner = AssistantPrefs { default_role: Role::Owner, ..AssistantPrefs::default() };
         assert_eq!(owner.default_role(), Role::Suggester);
         assert_eq!(AssistantPrefs::role_named(" editor ").unwrap(), Role::Editor);
         assert!(AssistantPrefs::role_named("owner").unwrap_err().contains("owner"));
         assert!(AssistantPrefs::role_named(&"x".repeat(10_000)).unwrap_err().len() < 200);
+    }
+
+    /// Requests no one can answer are refused unless the person allowed them; junk reads as
+    /// refused, and keeps the role and the other preferences.
+    #[test]
+    fn unattended_requests_are_refused_unless_allowed() {
+        assert!(!Prefs::default().assistant.allow_unattended);
+        let old: Prefs = serde_json::from_str(r#"{"assistant":{"defaultRole":"editor"}}"#).unwrap();
+        assert!(!old.assistant.allow_unattended);
+        let allowed: Prefs = serde_json::from_str(r#"{"assistant":{"allowUnattended":true}}"#).unwrap();
+        assert!(allowed.assistant.allow_unattended);
+        assert_eq!(allowed.assistant.default_role(), Role::Suggester);
+        assert_eq!(serde_json::to_value(&allowed).unwrap()["assistant"]["allowUnattended"], true);
+        for bad in [
+            r#"{"assistant":{"defaultRole":"editor","allowUnattended":"yes"},"checkSpelling":false}"#,
+            r#"{"assistant":{"defaultRole":"editor","allowUnattended":1},"checkSpelling":false}"#,
+        ] {
+            let prefs: Prefs = serde_json::from_str(bad).unwrap();
+            assert!(!prefs.assistant.allow_unattended, "{bad}");
+            assert_eq!(prefs.assistant.default_role(), Role::Editor, "{bad}: the role is kept");
+            assert!(!prefs.check_spelling, "{bad}: the other preferences are kept");
+        }
     }
 }

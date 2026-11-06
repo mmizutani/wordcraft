@@ -329,7 +329,11 @@ impl WordApp {
         }
         let retry = (id == "file.open").then(|| params.clone());
         let retry_path = retry.clone();
+        // The person asked for it: a turn of the assistant's it starts asks them its agent's
+        // permission requests ([`crate::assist`]). The origin is restored on every return.
+        let by_person = std::mem::replace(&mut self.assist.by_person, true);
         let r = self.execute(id, params);
+        self.assist.by_person = by_person;
         if let (Err(e), Some(params)) = (&r, retry)
             && wordcraft_engine::io::needs_password(e)
         {
@@ -1061,6 +1065,7 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "ui.checkForUpdates"
             | "assist.backend"
             | "assist.defaultRole"
+            | "assist.allowUnattended"
     ) || id.starts_with("help.")
 }
 
