@@ -674,6 +674,10 @@ impl TurnCtx<'_> {
             self.emit(Event::Permission(request));
         }
         self.emit(Event::Answered { id, answer: answer.clone() });
+        if answer != Answer::Cancelled && self.is_cancelled() {
+            self.emit(Event::Answered { id, answer: Answer::Cancelled });
+            return Answer::Cancelled;
+        }
         answer
     }
 }
@@ -706,6 +710,32 @@ pub trait Backend: Send {
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+
+    #[test]
+    fn a_stop_while_the_answer_waits_for_the_window_wins() {
+        for policy in [PermissionPolicy::Allow, PermissionPolicy::Reject] {
+            let cancel = Cancel::default();
+            let stop = cancel.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            tx.send(Event::Text { text: "queue is full".into() }).unwrap();
+            let rx = Mutex::new(rx);
+            let events = Events::new(
+                tx,
+                Some(Arc::new(move || {
+                    stop.set();
+                    let _ = rx.lock().unwrap().try_recv();
+                })),
+            );
+            let permissions = Permissions::default();
+            let mut tools = NoTools;
+            let ctx = TurnCtx { tools: &mut tools, events: &events, cancel: &cancel, permissions: &permissions, policy, calls: 0 };
+            let options = [
+                PermissionOption { id: "allow".into(), name: "Allow".into(), kind: PermissionKind::AllowOnce },
+                PermissionOption { id: "reject".into(), name: "Reject".into(), kind: PermissionKind::RejectOnce },
+            ];
+            assert_eq!(ctx.ask(PermissionRequest::bounded("Edit", options)), Answer::Cancelled, "{policy:?}");
+        }
+    }
 
     #[test]
     fn cancellation_during_tool_start_delivery_prevents_dispatch() {
