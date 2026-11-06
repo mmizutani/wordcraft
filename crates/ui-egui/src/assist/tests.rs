@@ -1146,3 +1146,60 @@ fn on_the_web_the_pane_says_the_assistant_needs_the_desktop_app() {
     assert!(h.query_by_label("Agents are programs WordCraft starts on your computer, so they are set up in the desktop app.").is_some());
     assert!(h.query_by_label_contains("Claude Code").is_none());
 }
+
+/// File › Options › Assistant on the web (#26): no role or unattended permission to set for an
+/// assistant the web can't run, and nothing that points at a role the pane doesn't offer.
+#[test]
+fn on_the_web_options_sets_no_role_or_permission() {
+    use egui_kittest::kittest::Queryable;
+    let mut a = window("one two three");
+    a.run("file.options", json!({"pane": "assistant"})).unwrap();
+    let mut h = harness(a);
+    h.run_steps(3);
+    assert!(h.query_by_label("Assistants join as:").is_some(), "the desktop page sets the role");
+    assert!(h.query_by_label("Allow what agents ask when no one can answer").is_some());
+    h.state_mut().assist_as_web();
+    h.run_steps(3);
+    assert!(h.query_by_label("Assistants join as:").is_none(), "no role on the web");
+    assert!(h.query_by_label_contains("Each conversation in the Assistant pane may choose another").is_none());
+    assert!(h.query_by_label("Allow what agents ask when no one can answer").is_none());
+    assert!(h.query_by_label("The assistant needs the desktop app").is_some(), "it says why");
+    assert!(h.query_by_label("Agents are programs WordCraft starts on your computer, so they are set up in the desktop app.").is_some());
+}
+
+/// A scripted assistant given before the window offers what the web does (#26) doesn't survive
+/// it, and one given after isn't run: the web window runs no assistant, and asking starts nothing.
+#[test]
+fn the_web_runs_no_scripted_assistant() {
+    use wordcraft_engine::cmd::assist::NEEDS_DESKTOP;
+    for given_first in [true, false] {
+        let mut a = window("one two three");
+        super::tick(&mut a);
+        if given_first {
+            a.assist_with(Box::new(Fake::new().then(vec![Step::say("Hi.")])));
+            assert_eq!(a.session.why_disabled("assist.ask"), None, "the scripted assistant is ready on the desktop");
+            a.assist_as_web();
+        } else {
+            a.assist_as_web();
+            a.assist_with(Box::new(Fake::new().then(vec![Step::say("Hi.")])));
+        }
+        super::tick(&mut a);
+        assert!(a.assist.offers.is_empty());
+        assert_eq!(a.session.why_disabled("assist.ask"), Some(NEEDS_DESKTOP), "given first: {given_first}");
+        let e = a.run("assist.ask", json!({"prompt": "Hi"})).unwrap_err();
+        assert!(e.contains("desktop app"), "{e}");
+        assert!(a.conversation().is_none(), "nothing started");
+        assert!(a.shared_room().is_none(), "nothing shared");
+    }
+}
+
+/// The web window never asks the backends for the scripted one (#26), though a test build
+/// offers it on the desktop.
+#[test]
+fn on_the_web_the_window_never_asks_for_the_fake() {
+    let mut a = window("one");
+    assert!(super::host(&a).fake, "test builds offer the fake on the desktop");
+    a.assist_as_web();
+    assert!(!super::host(&a).fake);
+    assert!(wordcraft_assist::offers::offers_in(&super::host(&a), super::desktop(&a)).is_empty());
+}

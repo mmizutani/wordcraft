@@ -232,7 +232,8 @@ Through those it can read the whole shared document.
 The web app has the Assistant pane and every `assist.*` command, but no assistant to run them.
 The pane says the assistant needs the desktop app, without a role to choose; the prompt box's
 Send and the writing actions stay greyed out, their tooltips saying the same, and a script's
-`assist.ask` is refused with that reason. File › Options › Assistant sets up no agent there.
+`assist.ask` is refused with that reason. File › Options › Assistant has no role, permission or
+agent to set there, only the same reason.
 Both kinds of backend are desktop only (`wordcraft_assist::offers::DESKTOP`: the web build
 compiles them out):
 
@@ -252,9 +253,13 @@ What would unblock the web:
   connection to it on a loopback port, with a key the page is given, as the room's own port
   takes invites today.
 
-Until then the web build offers nothing (`offers_in(host, false)` is empty whatever the host
-has), which `cargo test -p wordcraft-assist offers` and the pane's test
-`on_the_web_the_pane_says_the_assistant_needs_the_desktop_app` check on any build.
+Until then the web build offers nothing. `offers_in(host, false)` offers no ChatGPT and no agent
+whatever the host has, only the scripted fake when the host asks for it, and the window never
+asks for it on the web (`host()` asks only when `desktop(app)`); a scripted assistant a test
+gives the window isn't run there either. `cargo test -p wordcraft-assist offers` checks the
+first on any build (`the_web_offers_no_backend` reads no file), and the pane's tests
+(`on_the_web_the_pane_says_the_assistant_needs_the_desktop_app` and the ones after it) check the
+window on the desktop, by having it offer what the web does.
 
 ## Checking by hand
 

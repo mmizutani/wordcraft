@@ -90,7 +90,8 @@ pub(crate) struct Conversation {
 impl WordApp {
     /// Start the next conversation with `backend` instead of the assistant chosen in the pane:
     /// for tests and headless screenshots with a scripted assistant ([`wordcraft_assist::Fake`]).
-    /// The conversation there is ends, so the next prompt starts one.
+    /// The conversation there is ends, so the next prompt starts one. A window that offers what
+    /// the web app does ([`WordApp::assist_as_web`]) runs no assistant, this one included.
     pub fn assist_with(&mut self, backend: Box<dyn Backend>) {
         end(self);
         self.assist.next = Some(backend);
@@ -102,6 +103,7 @@ impl WordApp {
     /// ends.
     pub fn assist_as_web(&mut self) {
         end(self);
+        self.assist.next = None;
         self.assist.web = true;
         refresh_offers(self);
         self.session.assistant = status(self);
@@ -163,7 +165,8 @@ pub(crate) fn chosen(app: &WordApp) -> Option<&Offer> {
 /// What the assistant can do now, for the session.
 fn status(app: &WordApp) -> AssistantStatus {
     let live = app.conversation().filter(|a| !a.has_ended());
-    let ready = app.has_document() && (app.assist.next.is_some() || live.is_some() || chosen(app).is_some_and(|o| o.readiness == Readiness::Ready));
+    let scripted = app.assist.next.is_some() && desktop(app);
+    let ready = app.has_document() && (scripted || live.is_some() || chosen(app).is_some_and(|o| o.readiness == Readiness::Ready));
     AssistantStatus { window: true, ready, busy: live.is_some_and(Assistant::is_busy), desktop_only: !desktop(app) }
 }
 
@@ -418,7 +421,8 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
     if app.shared_room().is_some() && !app.shows_shared_document() {
         return Err("another open document is shared: choose Use this document in the Assistant pane to switch".into());
     }
-    let backend = match app.assist.next.take() {
+    // The web runs no assistant (#26), not even a scripted one given before or after.
+    let backend = match app.assist.next.take().filter(|_| desktop(app)) {
         Some(b) => b,
         None => {
             if app.assist.offers_at.is_none() {

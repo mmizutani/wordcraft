@@ -150,14 +150,18 @@ mod tests {
         assert!(refused(&"x".repeat(100_000), &host).len() < 200);
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     /// The web build (#26) offers nothing, however much its host has: no ChatGPT, no agent,
-    /// and the fake only when asked for.
+    /// and the fake only when asked for. It reads no file (the host's paths needn't exist), so
+    /// it holds on every target, the web's included.
     #[test]
     fn the_web_offers_no_backend() {
         let room = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9));
-        let host =
-            Host { settings: Some(std::env::temp_dir()), room: Some(room), cli: Some(std::env::temp_dir().join("wordcraft-cli")), fake: false };
+        let host = Host {
+            settings: Some(std::path::PathBuf::from("no-such-settings-folder")),
+            room: Some(room),
+            cli: Some(std::path::PathBuf::from("no-such-folder").join("wordcraft-cli")),
+            fake: false,
+        };
         assert!(super::offers_in(&host, false).is_empty());
         assert!(super::offers_in(&Host::default(), false).is_empty());
         let ids: Vec<String> = super::offers_in(&Host { fake: true, ..host.clone() }, false).into_iter().map(|o| o.id).collect();
@@ -167,6 +171,8 @@ mod tests {
         assert_eq!(super::DESKTOP, !cfg!(target_arch = "wasm32"));
     }
 
+    /// Desktop only: the web build has no ChatGPT or agent to list.
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn the_picker_lists_chatgpt_then_the_agents_then_the_fake() {
         let room = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9));

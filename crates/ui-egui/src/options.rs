@@ -708,11 +708,20 @@ fn agents(ui: &mut Ui) {
 /// (`assist.defaultRole`); a conversation may choose its own in the Assistant pane. Whether an
 /// agent goes ahead when it asks permission in a turn no one can answer
 /// (`assist.allowUnattended`, off by default, #23). And the agents, each with the command,
-/// arguments and environment it starts with (`agent_setup`, #24).
+/// arguments and environment it starts with (`agent_setup`, #24). The web app runs no
+/// assistant (#26), so there the page has none of these, only why.
 fn assistant(app: &mut WordApp, ui: &mut Ui) {
     use crate::assist::{role_label, role_note};
     use wordcraft_engine::AssistantPrefs;
     section(ui, "Assistant");
+    // On the web there is no assistant to give a role or a permission to, as its pane has no
+    // role to choose: the page says what the pane says (#26).
+    if !crate::assist::desktop(app) {
+        note(ui, "The assistant needs the desktop app");
+        section(ui, "Agents");
+        note(ui, "Agents are programs WordCraft starts on your computer, so they are set up in the desktop app.");
+        return;
+    }
     let role = app.session.prefs.assistant.default_role();
     ui.horizontal(|ui| {
         let label = ui.label(tl!("Assistants join as:"));
@@ -751,13 +760,8 @@ fn assistant(app: &mut WordApp, ui: &mut Ui) {
     );
     ui.add_space(8.0);
     // The agents and what each starts with (#24): desktop only, as agents are programs (#26).
-    if crate::assist::desktop(app) {
-        #[cfg(not(target_arch = "wasm32"))]
-        agent_setup::show(app, ui);
-    } else {
-        section(ui, "Agents");
-        note(ui, "Agents are programs WordCraft starts on your computer, so they are set up in the desktop app.");
-    }
+    #[cfg(not(target_arch = "wasm32"))]
+    agent_setup::show(app, ui);
 }
 
 /// Interface theme: Light, Dark, or follow the system's appearance (#115).
