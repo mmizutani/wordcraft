@@ -629,7 +629,7 @@ impl TurnCtx<'_> {
             detail: String::new(),
             version: None,
         }));
-        let out = self.tools.call(name, args);
+        let out = if self.is_cancelled() { ToolOutput::error("stopped: the person stopped this turn") } else { self.tools.call(name, args) };
         let status = if out.ok { ToolStatus::Completed } else { ToolStatus::Failed };
         let detail = crate::tools::summary(&out);
         self.emit(Event::Tool(ToolCall { id, title, kind, status, detail, version: out.version }));
@@ -706,6 +706,47 @@ pub trait Backend: Send {
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+
+    #[test]
+    fn cancellation_during_tool_start_delivery_prevents_dispatch() {
+        struct Calls(usize);
+        impl ToolHost for Calls {
+            fn tools(&self) -> &[ToolSpec] {
+                &[]
+            }
+            fn call(&mut self, _: &str, _: &Value) -> ToolOutput {
+                self.0 += 1;
+                ToolOutput { ok: true, text: String::new(), version: None }
+            }
+        }
+        for name in ["type_text", "execute"] {
+            let cancel = Cancel::default();
+            let stop = cancel.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            tx.send(Event::Text { text: "queue is full".into() }).unwrap();
+            let rx = Mutex::new(rx);
+            let events = Events::new(
+                tx,
+                Some(Arc::new(move || {
+                    stop.set();
+                    let _ = rx.lock().unwrap().try_recv();
+                })),
+            );
+            let permissions = Permissions::default();
+            let mut tools = Calls(0);
+            let mut ctx = TurnCtx {
+                tools: &mut tools,
+                events: &events,
+                cancel: &cancel,
+                permissions: &permissions,
+                policy: PermissionPolicy::Reject,
+                calls: 0,
+            };
+            let out = ctx.call_tool("call", name, &serde_json::json!({}));
+            assert!(!out.ok, "{name} must be cancelled");
+            assert_eq!(tools.0, 0, "{name} must not reach the tool host");
+        }
+    }
 
     #[test]
     fn cancellation_wins_over_a_queued_permission_answer() {
