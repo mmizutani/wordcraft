@@ -214,9 +214,13 @@ struct WriteDeadline<'a> {
 
 impl Write for WriteDeadline<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let left = self.until.checked_duration_since(Instant::now()).filter(|left| !left.is_zero()).ok_or(std::io::ErrorKind::TimedOut)?;
-        self.stream.set_write_timeout(Some(left))?;
-        self.stream.write(bytes)
+        loop {
+            let left = self.until.checked_duration_since(Instant::now()).filter(|left| !left.is_zero()).ok_or(std::io::ErrorKind::TimedOut)?;
+            match self.stream.write(bytes) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(left.min(Duration::from_millis(10))),
+                result => return result,
+            }
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -229,8 +233,15 @@ fn send(out: &mut TcpStream, id: &Value, mut v: Value) -> bool {
     if let Some(o) = v.as_object_mut() {
         o.insert("id".into(), id.clone());
     }
+    // A blocking write timeout can restart while the peer makes tiny progress inside one
+    // syscall. Nonblocking writes keep the total deadline under this loop's control.
+    if out.set_nonblocking(true).is_err() {
+        return false;
+    }
     let mut writer = WriteDeadline { stream: out, until: Instant::now() + Duration::from_secs(2) };
-    writeln!(writer, "{v}").is_ok()
+    let sent = writeln!(writer, "{v}").is_ok();
+    // Reader and writer are clones of one socket; restore blocking reads after the response.
+    out.set_nonblocking(false).is_ok() && sent
 }
 
 /// Whether `given` is `key`, compared in a time that doesn't depend on where they differ. An
