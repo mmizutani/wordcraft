@@ -7,10 +7,24 @@ use super::{InlineObject, Numbering, numbering, para, section, styles};
 /// alphanumeric char, plus each Han ideograph and kana as a word of its own (Chinese and Japanese
 /// are written without spaces, #4547; Korean is spaced, so Hangul counts by tokens).
 pub fn count_words(s: &str) -> usize {
-    // The half-width voiced sound marks belong to the kana before them, not a word of their own.
-    let word_char = |c: char| c.is_alphanumeric() && !matches!(c, '\u{FF9E}' | '\u{FF9F}');
-    let tokens = s.split(|c: char| c.is_whitespace() || c == para::OBJ || is_cjk_word(c)).filter(|w| w.chars().any(word_char)).count();
-    tokens.saturating_add(s.chars().filter(|c| is_cjk_word(*c)).count())
+    count_word_chars(s.chars())
+}
+
+fn count_word_chars(chars: impl Iterator<Item = char>) -> usize {
+    let (mut total, mut in_word) = (0usize, false);
+    for c in chars {
+        if is_cjk_word(c) {
+            total = total.saturating_add(1);
+            in_word = false;
+        } else if c.is_whitespace() || c == para::OBJ {
+            in_word = false;
+        } else if !in_word && c.is_alphanumeric() && !matches!(c, '\u{FF9E}' | '\u{FF9F}') {
+            // Half-width voiced sound marks belong to the preceding kana.
+            total = total.saturating_add(1);
+            in_word = true;
+        }
+    }
+    total
 }
 
 /// Words in a generated list label: whitespace-separated tokens holding a letter or digit, so a
@@ -175,7 +189,12 @@ pub(crate) fn story_word_count_of(
                 {
                     total = total.saturating_add(count_label_words(&label));
                 }
-                total = total.saturating_add(count_words(&p.plain_text()));
+                // Keep token state across inline boundaries without concatenating their text.
+                let chars = p.text.split(para::OBJ).enumerate().flat_map(|(i, text)| {
+                    let object = i.checked_sub(1).and_then(|k| p.objects.get(k)).map(InlineObject::plain_text).unwrap_or_default();
+                    object.chars().chain(text.chars())
+                });
+                total = total.saturating_add(count_word_chars(chars));
             }
             Block::Table(t) => {
                 for row in &t.rows {
@@ -187,4 +206,85 @@ pub(crate) fn story_word_count_of(
         }
     }
     total
+}
+
+#[cfg(test)]
+mod streaming_word_tests {
+    use super::*;
+    use crate::{CharProps, Document, ListKind, Paragraph, Run, StoryRef, para_block, props::NumRef};
+    use std::sync::Arc;
+
+    fn reference_words(text: &str) -> usize {
+        let tokens = text
+            .split(|c: char| c.is_whitespace() || c == para::OBJ || is_cjk_word(c))
+            .filter(|word| word.chars().any(|c| c.is_alphanumeric() && !matches!(c, '\u{FF9E}' | '\u{FF9F}')))
+            .count();
+        tokens + text.chars().filter(|c| is_cjk_word(*c)).count()
+    }
+
+    fn field(result: &str) -> InlineObject {
+        InlineObject::Field { instr: String::new(), result: result.into(), locked: false, dirty: false, code: false, form: String::new() }
+    }
+
+    fn paragraph(text: &str, objects: Vec<InlineObject>) -> Paragraph {
+        let mut p = Paragraph::new();
+        p.text = text.into();
+        p.runs = vec![Run { len: text.len(), props: CharProps::default() }];
+        p.objects = objects;
+        p
+    }
+
+    #[test]
+    fn streaming_words_match_reference_for_unicode_token_boundaries() {
+        let chars = ['a', '1', '-', ' ', '\t', '\u{a0}', para::OBJ, '日', 'ｶ', '\u{FF9E}', '\u{FF9F}', '안', '\u{301}', 'é', '\u{20000}'];
+        for a in chars {
+            for b in chars {
+                for c in chars {
+                    let text = format!("{a}{b}{c}");
+                    assert_eq!(count_words(&text), reference_words(&text), "{text:?}");
+                }
+            }
+        }
+        assert_eq!(count_word_chars("pre".chars().chain("fix".chars()).chain("tail".chars())), 1);
+        assert_eq!(count_words("ｶﾞｷﾟ ﾞ ﾟ"), 2);
+    }
+
+    #[test]
+    fn story_words_keep_tokens_across_inline_fields_and_include_tracked_deletions() {
+        let p = paragraph("pre\u{fffc}tail", vec![field("fix")]);
+        let mut doc = Document::new();
+        doc.body = vec![para_block(p)];
+        assert_eq!(doc.word_count(), 1, "a field boundary does not split a word");
+        let p = doc.para_mut(StoryRef::Body, &Path::top(0)).unwrap();
+        p.runs[0].props.del = Some(1);
+        assert_eq!(p.final_text(), "");
+        assert_eq!(doc.word_count(), 1, "the existing status count includes tracked deletions");
+
+        for result in ["", "-", "\t", "日ｶﾞ", "a\u{fffc}b", " two ", "é\u{301}"] {
+            let p = paragraph("a\u{fffc}z \u{fffc} suffix", vec![field(result), field("inner")]);
+            let expected = reference_words(&p.plain_text());
+            doc.body = vec![para_block(p)];
+            assert_eq!(doc.word_count(), expected, "field result {result:?}");
+        }
+        let p = paragraph("left\u{fffc}right", Vec::new());
+        doc.body = vec![para_block(p)];
+        assert_eq!(doc.word_count(), 1, "a missing object contributes no text");
+    }
+
+    #[test]
+    fn story_words_keep_numbered_labels_separate_from_streamed_text() {
+        let mut doc = Document::new();
+        let numbered = Arc::make_mut(&mut doc.numbering).add_list(ListKind::Numbered);
+        let bullets = Arc::make_mut(&mut doc.numbering).add_list(ListKind::Bullet);
+        let mut table = crate::Table::new(1, 2, 400.0);
+        let mut expected = 0usize;
+        for (i, cell) in table.rows[0].cells.iter_mut().enumerate() {
+            let mut p = paragraph("pre\u{fffc}tail 日本", vec![field("fix")]);
+            p.props.numbering = Some(NumRef { num: if i == 0 { numbered } else { bullets }, level: 0 });
+            expected += reference_words(&p.plain_text()) + usize::from(i == 0);
+            cell.blocks = vec![para_block(p)];
+        }
+        doc.body = vec![Arc::new(Block::Table(table))];
+        assert_eq!(doc.word_count(), expected);
+    }
 }
