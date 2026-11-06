@@ -211,7 +211,22 @@ impl Process {
     /// How it exited, if it has.
     pub fn exit_status(&mut self) -> Option<ExitStatus> {
         if self.reaped.is_none() {
-            self.reaped = self.child.try_wait().ok().flatten();
+            #[cfg(all(unix, not(target_os = "openbsd")))]
+            {
+                use rustix::process::{WaitId, WaitIdOptions, waitid};
+                let pid = rustix::process::Pid::from_child(&self.child);
+                if !matches!(waitid(WaitId::Pid(pid), WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT), Ok(Some(_))) {
+                    return None;
+                }
+                // Keep the exited leader's PID reserved until its descendants have been killed.
+                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+            }
+            #[cfg(not(target_os = "openbsd"))]
+            {
+                self.reaped = self.child.try_wait().ok().flatten();
+            }
+            // shortcut: OpenBSD has no nonreaping waitid; retain the leader until stop,
+            // and add nonreaping exit detection if prompt-level detection is needed there.
         }
         self.reaped
     }
@@ -254,8 +269,8 @@ impl Process {
         while self.exit_status().is_none() && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(10));
         }
-        if self.exit_status().is_none() {
-            // Only while the leader isn't reaped is its group certainly still ours.
+        if self.reaped.is_none() {
+            // The unreaped leader reserves its PID even when it has already exited.
             #[cfg(unix)]
             {
                 let pid = rustix::process::Pid::from_child(&self.child);
@@ -350,6 +365,37 @@ mod tests {
         assert!(matches!(classify(&junk), Message::Response { result: Err(RpcError { code: 0, .. }), .. }));
         for bad in [json!({}), json!({"id": 1}), json!({"method": 5, "id": 1}), json!({"result": 1})] {
             assert_eq!(classify(&obj(bad.clone())), Message::Invalid, "{bad}");
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "openbsd")))]
+    #[test]
+    fn stopping_an_exited_launcher_also_closes_its_workers_pipes() {
+        use super::{Incoming, Process};
+        use crate::acp::Launch;
+        use std::time::{Duration, Instant};
+        for on_eof in [false, true] {
+            let script = if on_eof {
+                "sleep 30 & printf '{\"worker\":%s}\\n' \"$!\"; cat >/dev/null"
+            } else {
+                "sleep 30 & printf '{\"worker\":%s}\\n' \"$!\"; exit 0"
+            };
+            let launch = Launch::new("/bin/sh", ["-c", script]);
+            let mut process = Process::spawn(&launch, &std::env::temp_dir(), vec![("PATH".into(), "/bin:/usr/bin".into())]).unwrap();
+            let Some(Incoming::Message(report)) = process.next(Duration::from_secs(5)) else { panic!("no worker report") };
+            let worker = rustix::process::Pid::from_raw(i32::try_from(report["worker"].as_u64().unwrap()).unwrap()).unwrap();
+            if !on_eof {
+                let until = Instant::now() + Duration::from_secs(5);
+                while process.exit_status().is_none() {
+                    assert!(Instant::now() < until, "launcher did not exit");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            process.stop(Duration::from_secs(1));
+            let closed = matches!(process.next(Duration::from_secs(1)), Some(Incoming::Closed));
+            // Clean up even when the regression fails.
+            let _ = rustix::process::kill_process(worker, rustix::process::Signal::KILL);
+            assert!(closed, "the launcher's descendant kept stdout open (on EOF: {on_eof})");
         }
     }
 
