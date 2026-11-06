@@ -6,8 +6,11 @@
 //! ([`make`]), the id `assist.backend {id}` names. The scripted [`crate::Fake`] is offered only
 //! when the host asks for it (tests, trying the pane without a model).
 //!
-//! The web build offers no backend: the ones that sign in or start agent processes are desktop
-//! only.
+//! On the desktop the picker lists ChatGPT first ([`crate::chatgpt`]), then, for a host that
+//! gives agents a way to the document (`wordcraft-cli`, the room's port), the ACP agents
+//! ([`crate::acp::presets`]: Claude Code, Codex, a custom one), each ready, or with what to
+//! install or set up first, and the fake last. The web build offers no backend but the fake:
+//! the ones that sign in or start agent processes are desktop only.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -57,11 +60,17 @@ pub struct Offer {
     pub readiness: Readiness,
 }
 
-/// The backends the host can offer, in the picker's order.
+/// The backends the host can offer, in the picker's order: ChatGPT, the ACP agents, then the
+/// fake.
 pub fn offers(host: &Host) -> Vec<Offer> {
     let mut all = Vec::new();
     #[cfg(not(target_arch = "wasm32"))]
-    all.push(crate::chatgpt::offer(host));
+    {
+        all.push(crate::chatgpt::offer(host));
+        if host.cli.is_some() || host.room.is_some() {
+            all.extend(crate::acp::presets::offers(host));
+        }
+    }
     if host.fake {
         let info = crate::backend::Backend::info(&Fake::new());
         all.push(Offer { id: info.id, label: info.label, readiness: Readiness::Ready });
@@ -95,6 +104,8 @@ pub fn make(id: &str, host: &Host) -> Result<Box<dyn Backend>, String> {
             Some(settings) => Ok(Box::new(crate::chatgpt::ChatGpt::new(settings))),
             None => Err(format!("{}: WordCraft has no settings folder to keep a sign-in in", offer.label)),
         },
+        #[cfg(not(target_arch = "wasm32"))]
+        id if id.starts_with("acp:") => crate::acp::presets::make(id, host).map_err(|e| format!("{}: {e}", offer.label)),
         _ => Err(format!("{}: can't be started", offer.label)),
     }
 }
@@ -123,5 +134,17 @@ mod tests {
         let e = refused("acp:nope\u{0}\u{7}", &host);
         assert!(e.contains("there are") && e.contains("fake") && !e.contains('\u{0}'), "{e}");
         assert!(refused(&"x".repeat(100_000), &host).len() < 200);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_picker_lists_chatgpt_then_the_agents_then_the_fake() {
+        let room = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9));
+        let host = Host { room: Some(room), cli: Some(std::env::temp_dir().join("wordcraft-cli")), fake: true, ..Host::default() };
+        let ids: Vec<String> = offers(&host).into_iter().map(|o| o.id).collect();
+        assert_eq!(ids, ["chatgpt", "acp:claude-code", "acp:codex", "acp:custom", "fake"]);
+        // Without a way to the document, no agent.
+        let ids: Vec<String> = offers(&Host { fake: true, ..Host::default() }).into_iter().map(|o| o.id).collect();
+        assert_eq!(ids, ["chatgpt", "fake"]);
     }
 }

@@ -18,6 +18,7 @@
 //! Desktop only: the web build starts no process.
 
 pub mod fake_agent;
+pub mod presets;
 mod room_port;
 mod rpc;
 #[cfg(test)]
@@ -137,6 +138,9 @@ pub struct AgentSpec {
     pub cancel_timeout: Duration,
     /// How it reaches the shared document.
     pub reach: Reach,
+    /// How to sign in when it needs that and offers no way WordCraft can run ("run `claude`
+    /// in a terminal and sign in, then try again").
+    pub sign_in: String,
 }
 
 impl AgentSpec {
@@ -154,6 +158,7 @@ impl AgentSpec {
             start_timeout: Duration::from_secs(120),
             cancel_timeout: Duration::from_secs(10),
             reach: Reach::Nothing,
+            sign_in: "sign in with the agent itself, then try again".into(),
         }
     }
 }
@@ -295,13 +300,12 @@ impl Acp {
     /// ask, or when the person declines, it's an error that names the agent's ways to sign in.
     fn sign_in(&self, process: &mut Process, methods: &[AuthMethod], ctx: &mut TurnCtx<'_>) -> Result<bool, String> {
         let name = self.name();
+        let how = &self.spec.sign_in;
         if methods.is_empty() {
-            return Err(format!(
-                "{name} needs you to sign in, and offers no way to do it from WordCraft: sign in with {name} itself, then try again"
-            ));
+            return Err(format!("{name} needs you to sign in, and offers no way to do it from WordCraft: {how}"));
         }
         let ways = methods.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", ");
-        let declined = || format!("{name} needs you to sign in ({ways}): sign in from the assistant pane, or with {name} itself, then try again");
+        let declined = || format!("{name} needs you to sign in ({ways}): sign in from the assistant pane, or {how}");
         if ctx.policy != PermissionPolicy::Ask {
             return Err(declined());
         }

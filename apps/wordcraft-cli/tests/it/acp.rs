@@ -11,13 +11,17 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use wordcraft_assist::acp::fake_agent::{Call, SCRIPT_VAR, Script, Step};
+use wordcraft_assist::acp::presets::{AgentPrefs, AgentSettings};
 use wordcraft_assist::acp::{Acp, AgentSpec, Launch, Reach, RoomPort};
-use wordcraft_assist::{Assistant, Options};
+use wordcraft_assist::{Assistant, Host, Options, Readiness};
 use wordcraft_doc::{Document, StoryRef};
 use wordcraft_engine::Session;
 use wordcraft_engine::room::{Lobby, Replica, Role, Room};
 
 const WAIT: Duration = Duration::from_secs(120);
+
+/// How this executable runs as the fake agent.
+const AS_AGENT: [&str; 6] = ["--exact", "acp::fake_agent", "--nocapture", "--test-threads", "1", "-q"];
 
 /// The fake agent: when this executable runs again with a script in [`SCRIPT_VAR`], this test
 /// is the agent, and the process ends with it.
@@ -77,7 +81,7 @@ impl Window {
     /// server.
     fn agent(&self, script: &Script) -> AgentSpec {
         let exe = std::env::current_exe().unwrap();
-        let mut spec = AgentSpec::new("Fake Agent", Launch::new(exe, ["--exact", "acp::fake_agent", "--nocapture", "--test-threads", "1", "-q"]));
+        let mut spec = AgentSpec::new("Fake Agent", Launch::new(exe, AS_AGENT));
         spec.env.push((SCRIPT_VAR.into(), serde_json::to_string(script).unwrap()));
         spec.reach = Reach::Mcp { cli: PathBuf::from(env!("CARGO_BIN_EXE_wordcraft-cli")), room: self.port.addr() };
         spec.start_timeout = WAIT;
@@ -196,4 +200,39 @@ fn ending_the_conversation_takes_the_agents_key_back() {
     assert_eq!(request(&w.port, &key, "document.inspect")["error"], json!("unauthorized"));
     assert!(w.lobby.join_with(&key).is_err());
     w.settle();
+}
+
+/// #24: the fake agent set up as the custom agent in the agents' settings, offered and made by
+/// its id as the pane does, edits the document end to end.
+#[test]
+fn the_fake_agent_runs_end_to_end_as_the_custom_agent() {
+    let mut w = Window::new();
+    let dir = std::env::temp_dir().join(format!("wordcraft-acp-custom-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let script = Script { turns: vec![rewrite_two()], ..Script::default() };
+    let mut settings = AgentSettings::default();
+    settings.agents.insert(
+        "custom".into(),
+        AgentPrefs {
+            name: "Fake Agent".into(),
+            command: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            args: AS_AGENT.map(String::from).to_vec(),
+            env: [(SCRIPT_VAR.to_string(), serde_json::to_string(&script).unwrap())].into(),
+        },
+    );
+    settings.save(&dir).unwrap();
+    let host =
+        Host { settings: Some(dir.clone()), room: Some(w.port.addr()), cli: Some(PathBuf::from(env!("CARGO_BIN_EXE_wordcraft-cli"))), fake: false };
+    let offer = wordcraft_assist::offers::offers(&host).into_iter().find(|o| o.id == "acp:custom").unwrap();
+    assert_eq!((offer.label.as_str(), &offer.readiness), ("Fake Agent", &Readiness::Ready));
+    let backend = wordcraft_assist::offers::make("acp:custom", &host).unwrap();
+    assert_eq!(backend.info().author, "Fake Agent");
+    let mut a = Assistant::start(&w.room, backend, Options { document: "Notes".into(), ..Options::default() }).unwrap();
+    let answer = ask(&mut a, "Write two as a digit");
+    assert!(answer.contains("type_text: ok"), "{answer}");
+    w.settle();
+    assert_eq!(w.accepted(), "one 2 three");
+    assert!(w.authors().iter().all(|a| a == "Fake Agent") && !w.authors().is_empty(), "{:?}", w.authors());
+    a.end();
+    let _ = std::fs::remove_dir_all(&dir);
 }
