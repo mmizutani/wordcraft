@@ -1,8 +1,8 @@
 //! The ACP agents WordCraft knows ([`PRESETS`]: Claude Code, Codex) and the person's own
 //! ([`CUSTOM_ID`]), as the assistant pane offers them: found on `PATH` (or run through `npx`),
 //! with the command, arguments and environment the person set up for them in the agents'
-//! settings file ([`AgentSettings`]). WordCraft never installs or bundles an agent: one that
-//! isn't there is offered with what to install ([`Readiness::Install`]).
+//! settings file ([`AgentSettings`]). Built-in npx fallback asks a person before downloading
+//! and running an adapter; missing tools are offered with what to install ([`Readiness::Install`]).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -209,8 +209,16 @@ fn candidates(dir: &Path, name: &str) -> Vec<PathBuf> {
     }
 }
 
+/// Windows' directly supported executable and batch-file names.
+fn windows_program_name(path: &Path) -> bool {
+    path.extension().and_then(OsStr::to_str).is_some_and(|ext| ["exe", "com", "bat", "cmd"].iter().any(|known| ext.eq_ignore_ascii_case(known)))
+}
+
 /// Whether `path` is a file the system can run.
 fn runnable(path: &Path) -> bool {
+    if cfg!(windows) && !windows_program_name(path) {
+        return false;
+    }
     let Ok(meta) = std::fs::metadata(path) else { return false };
     #[cfg(unix)]
     {
@@ -225,11 +233,11 @@ fn runnable(path: &Path) -> bool {
 
 /// How the agent `key` set up by `prefs` (a preset's when `preset` is given) starts, with `path`
 /// to look programs up on: its launch, or what is missing.
-fn launch(preset: Option<&Preset>, prefs: &AgentPrefs, path: Option<&OsStr>) -> Result<Launch, Readiness> {
+fn launch(preset: Option<&Preset>, prefs: &AgentPrefs, path: Option<&OsStr>) -> Result<(Launch, Option<String>), Readiness> {
     if !prefs.command.is_empty() {
         let shown = label(&prefs.command);
         return match find_program(&prefs.command, path) {
-            Some(program) => Ok(Launch::new(program, prefs.args.iter().map(OsString::from))),
+            Some(program) => Ok((Launch::new(program, prefs.args.iter().map(OsString::from)), None)),
             None => Err(Readiness::Install {
                 how: format!("`{shown}` wasn't found: install it, or change the agent's command in File › Options › Assistant"),
             }),
@@ -239,12 +247,12 @@ fn launch(preset: Option<&Preset>, prefs: &AgentPrefs, path: Option<&OsStr>) -> 
         return Err(Readiness::Unavailable { why: "no custom agent is set up: give its command in File › Options › Assistant".into() });
     };
     if let Some(program) = find_program(preset.program, path) {
-        return Ok(Launch::new(program, Vec::<OsString>::new()));
+        return Ok((Launch::new(program, Vec::<OsString>::new()), None));
     }
     if let Some(package) = preset.package
         && let Some(npx) = find_program("npx", path)
     {
-        return Ok(Launch::new(npx, ["-y", package]));
+        return Ok((Launch::new(npx, ["-y", package]), Some(package.to_string())));
     }
     Err(Readiness::Install { how: preset.install.to_string() })
 }
@@ -268,13 +276,38 @@ fn settings_on(host: &Host) -> AgentSettings {
 /// The agent `id` names on `host`, set up as its settings say, with programs looked up on
 /// `path`: its spec, or why it can't start.
 #[cfg(test)]
-fn spec_for(id: &str, host: &Host, path: Option<&OsStr>) -> Result<AgentSpec, Readiness> {
-    spec_with(id, host, &settings_on(host), path)
+pub(super) fn spec_for(id: &str, host: &Host, path: Option<&OsStr>) -> Result<AgentSpec, Readiness> {
+    spec_with(id, host, &settings_on(host), path, &[])
+}
+
+/// Common installed macOS package-manager bins, after the person's PATH.
+fn common_paths() -> Vec<PathBuf> {
+    if cfg!(target_os = "macos") { vec!["/opt/homebrew/bin".into(), "/usr/local/bin".into()] } else { Vec::new() }
+}
+
+/// One PATH for executable lookup and the child. Only trusted installed directories are added.
+fn effective_path(path: Option<&OsStr>, extra: &[PathBuf]) -> Option<OsString> {
+    #[cfg(unix)]
+    {
+        let mut dirs: Vec<PathBuf> = path.map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
+        for dir in extra {
+            let Ok(dir) = dir.canonicalize() else { continue };
+            if super::check_trusted_ancestors(&dir).is_ok() && !dirs.iter().any(|known| known.canonicalize().is_ok_and(|known| known == dir)) {
+                dirs.push(dir);
+            }
+        }
+        std::env::join_paths(dirs).ok().or_else(|| path.map(OsStr::to_os_string))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = extra;
+        path.map(OsStr::to_os_string)
+    }
 }
 
 /// The agent `id` names on `host`, set up as `settings` say, with programs looked up on `path`:
 /// its spec, or why it can't start.
-fn spec_with(id: &str, host: &Host, settings: &AgentSettings, path: Option<&OsStr>) -> Result<AgentSpec, Readiness> {
+fn spec_with(id: &str, host: &Host, settings: &AgentSettings, path: Option<&OsStr>, extra: &[PathBuf]) -> Result<AgentSpec, Readiness> {
     let preset = PRESETS.iter().find(|p| p.id == id);
     let key = match preset {
         Some(p) => p.key,
@@ -282,7 +315,9 @@ fn spec_with(id: &str, host: &Host, settings: &AgentSettings, path: Option<&OsSt
         None => return Err(Readiness::Unavailable { why: "WordCraft knows no such agent".into() }),
     };
     let prefs = settings.agent(key);
-    let launch = launch(preset, &prefs, path)?;
+    let configured_path = prefs.env.iter().find(|(name, _)| if cfg!(windows) { name.eq_ignore_ascii_case("PATH") } else { name.as_str() == "PATH" });
+    let path = effective_path(configured_path.map(|(_, value)| OsStr::new(value)).or(path), extra);
+    let (launch, setup) = launch(preset, &prefs, path.as_deref())?;
     let reach = reach(host)?;
     let name = match preset {
         Some(p) => p.label.to_string(),
@@ -291,6 +326,8 @@ fn spec_with(id: &str, host: &Host, settings: &AgentSettings, path: Option<&OsSt
     };
     let mut spec = AgentSpec::new(&name, launch);
     spec.id = id.to_string();
+    spec.setup = setup;
+    spec.path = path;
     spec.reach = reach;
     spec.sign_in = preset.map_or_else(|| format!("sign in with {name} itself, then try again"), |p| p.sign_in.to_string());
     // WordCraft's own control key and address come from WordCraft only, never from settings.
@@ -306,13 +343,18 @@ fn spec_with(id: &str, host: &Host, settings: &AgentSettings, path: Option<&OsSt
 /// It reads the agents' settings and looks programs up on `PATH`, so the pane asks when it
 /// opens the picker, not every frame.
 pub fn offers(host: &Host) -> Vec<Offer> {
-    offers_on(host, std::env::var_os("PATH").as_deref())
+    offers_with_paths(host, std::env::var_os("PATH").as_deref(), &common_paths())
 }
 
+#[cfg(test)]
 fn offers_on(host: &Host, path: Option<&OsStr>) -> Vec<Offer> {
+    offers_with_paths(host, path, &[])
+}
+
+fn offers_with_paths(host: &Host, path: Option<&OsStr>, extra: &[PathBuf]) -> Vec<Offer> {
     let settings = settings_on(host);
     let ids = PRESETS.iter().map(|p| p.id).chain([CUSTOM_ID]);
-    ids.map(|id| match spec_with(id, host, &settings, path) {
+    ids.map(|id| match spec_with(id, host, &settings, path, extra) {
         Ok(spec) => Offer { id: id.to_string(), label: spec.label, readiness: Readiness::Ready },
         Err(readiness) => {
             let label = PRESETS.iter().find(|p| p.id == id).map_or_else(|| custom_label(&settings), |p| p.label.to_string());
@@ -331,11 +373,16 @@ fn custom_label(settings: &AgentSettings) -> String {
 /// Make the ACP agent `id` names, as the settings set it up: an error that says what to install
 /// or set up when it can't start.
 pub fn make(id: &str, host: &Host) -> Result<Box<dyn Backend>, String> {
-    make_on(id, host, std::env::var_os("PATH").as_deref())
+    make_with_paths(id, host, std::env::var_os("PATH").as_deref(), &common_paths())
 }
 
+#[cfg(test)]
 fn make_on(id: &str, host: &Host, path: Option<&OsStr>) -> Result<Box<dyn Backend>, String> {
-    match spec_with(id, host, &settings_on(host), path) {
+    make_with_paths(id, host, path, &[])
+}
+
+fn make_with_paths(id: &str, host: &Host, path: Option<&OsStr>, extra: &[PathBuf]) -> Result<Box<dyn Backend>, String> {
+    match spec_with(id, host, &settings_on(host), path, extra) {
         Ok(spec) => Ok(Box::new(Acp::new(spec))),
         Err(Readiness::Install { how } | Readiness::SignIn { how }) => Err(how),
         Err(Readiness::Unavailable { why }) => Err(why),
@@ -494,6 +541,65 @@ mod tests {
     }
 
     #[test]
+    fn a_configured_path_is_used_to_find_the_agent_it_will_start() {
+        let dir = folder("configured-path");
+        let bin = folder("configured-path-bin");
+        let agent = program(&bin, "my-private-agent");
+        let path = std::env::join_paths([bin.clone()]).unwrap().into_string().unwrap();
+        let mut settings = AgentSettings::default();
+        settings.agents.insert(
+            "custom".into(),
+            AgentPrefs { command: "my-private-agent".into(), env: [("PATH".into(), path.clone())].into(), ..AgentPrefs::default() },
+        );
+        settings.save(&dir).unwrap();
+        let spec = spec_for(CUSTOM_ID, &host(&dir), None).unwrap();
+        assert_eq!(spec.launch.program, agent);
+        assert!(spec.env.contains(&("PATH".into(), path)));
+        let _ = (std::fs::remove_dir_all(&dir), std::fs::remove_dir_all(&bin));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_fallback_paths_are_trusted_installed_unique_and_after_configured_paths() {
+        let mut private = crate::acp::Folder::new().unwrap();
+        let bin = private.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let unsafe_dir = folder("untrusted-fallback");
+        std::fs::set_permissions(&unsafe_dir, std::os::unix::fs::PermissionsExt::from_mode(0o777)).unwrap();
+        let configured = OsString::from("/usr/bin:/bin");
+        let path = super::effective_path(Some(&configured), &[bin.clone(), bin.clone(), unsafe_dir.clone(), bin.join("missing")]).unwrap();
+        let dirs: Vec<_> = std::env::split_paths(&path).collect();
+        assert_eq!(dirs, [PathBuf::from("/usr/bin"), PathBuf::from("/bin"), bin.canonicalize().unwrap()]);
+        let fallback = program(&bin, "fallback-agent");
+        let mut settings = AgentSettings::default();
+        settings.agents.insert(
+            "custom".into(),
+            AgentPrefs { command: "fallback-agent".into(), env: [("PATH".into(), "/usr/bin:/bin".into())].into(), ..AgentPrefs::default() },
+        );
+        let spec =
+            super::spec_with(CUSTOM_ID, &host(private.path()), &settings, Some(OsString::from("/unused").as_os_str()), std::slice::from_ref(&bin))
+                .unwrap();
+        assert_eq!(spec.launch.program, fallback);
+        assert_eq!(spec.path, Some(path));
+        assert!(spec.setup.is_none());
+        private.remove();
+        let _ = std::fs::remove_dir_all(unsafe_dir);
+    }
+
+    #[test]
+    fn windows_program_names_reject_npm_shell_and_powershell_shims() {
+        let dir = folder("windows-shims");
+        for name in ["npx", "npx.ps1", "npx.cmd", "agent.EXE"] {
+            std::fs::write(dir.join(name), "shim").unwrap();
+        }
+        assert!(!super::windows_program_name(&dir.join("npx")));
+        assert!(!super::windows_program_name(&dir.join("npx.ps1")));
+        assert!(super::windows_program_name(&dir.join("npx.cmd")));
+        assert!(super::windows_program_name(&dir.join("agent.EXE")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_missing_agent_is_offered_with_what_to_install_and_never_started() {
         let dir = folder("missing");
         let host = host(&dir);
@@ -522,10 +628,12 @@ mod tests {
         let npx = program(&bin, "npx");
         let spec = spec_for("acp:codex", &host, Some(&path)).unwrap();
         assert_eq!(spec.launch.program, npx);
+        assert_eq!(spec.setup.as_deref(), Some("@agentclientprotocol/codex-acp"));
         assert_eq!(spec.launch.args, [OsString::from("-y"), OsString::from("@agentclientprotocol/codex-acp")]);
         // The adapter itself, when installed.
         let adapter = program(&bin, "claude-agent-acp");
         let spec = spec_for("acp:claude-code", &host, Some(&path)).unwrap();
+        assert!(spec.setup.is_none());
         assert_eq!((spec.launch.program.clone(), spec.launch.args.len()), (adapter, 0));
         assert_eq!((spec.id.as_str(), spec.label.as_str(), spec.author.as_str()), ("acp:claude-code", "Claude Code", "Claude Code"));
         assert_eq!(spec.reach, Reach::Mcp { cli: dir.join("wordcraft-cli"), room: SocketAddr::from((Ipv4Addr::LOCALHOST, 4567)) });

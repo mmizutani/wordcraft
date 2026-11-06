@@ -130,6 +130,8 @@ pub struct AgentSpec {
     /// Environment variables for its process, on top of WordCraft's own environment less
     /// WordCraft's `WORDCRAFT_*` variables, which never reach an agent unless set here.
     pub env: Vec<(String, String)>,
+    /// The exact PATH used for discovery and this child, including trusted desktop fallbacks.
+    pub path: Option<OsString>,
     /// How long it may take to start: to answer `initialize` and `session/new` (`npx`
     /// downloads the adapter the first time).
     pub start_timeout: Duration,
@@ -141,6 +143,9 @@ pub struct AgentSpec {
     /// How to sign in when it needs that and offers no way WordCraft can run ("run `claude`
     /// in a terminal and sign in, then try again").
     pub sign_in: String,
+    /// An automatic npx package whose download and execution need a person before each spawn.
+    /// Explicit custom commands leave this unset.
+    pub setup: Option<String>,
 }
 
 impl AgentSpec {
@@ -155,10 +160,12 @@ impl AgentSpec {
             author: name,
             launch,
             env: Vec::new(),
+            path: None,
             start_timeout: Duration::from_secs(120),
             cancel_timeout: Duration::from_secs(10),
             reach: Reach::Nothing,
             sign_in: "sign in with the agent itself, then try again".into(),
+            setup: None,
         }
     }
 }
@@ -244,9 +251,16 @@ impl Acp {
     fn start(&mut self, ctx: &mut TurnCtx<'_>) -> Result<Option<(Running, Option<String>)>, String> {
         let name = self.name().to_string();
         let mcp_servers = self.mcp_servers()?;
+        if !self.approve_setup(ctx)? || ctx.is_cancelled() {
+            return Ok(None);
+        }
         let folder = Folder::new().map_err(|e| format!("{name} couldn't start: no folder for it ({e})"))?;
         let cwd = folder.path().to_str().ok_or_else(|| format!("{name} couldn't start: the temporary folder's path isn't text"))?.to_string();
-        let env = agent_env(std::env::vars_os(), &self.spec.env);
+        let mut env = agent_env(std::env::vars_os(), &self.spec.env);
+        if let Some(path) = &self.spec.path {
+            env.retain(|(key, _)| if cfg!(windows) { !key.to_string_lossy().eq_ignore_ascii_case("PATH") } else { key != "PATH" });
+            env.push(("PATH".into(), path.clone()));
+        }
         let mut process = Process::spawn(&self.spec.launch, folder.path(), env).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 format!("{name} isn't installed: `{}` wasn't found", label(&self.spec.launch.program.to_string_lossy()))
@@ -292,6 +306,28 @@ impl Acp {
                 Err(e) if e.code == AUTH_REQUIRED => return Err(format!("{name} still needs you to sign in: {}", e.message)),
                 Err(e) => return Err(format!("{name} couldn't start a session: {}", e.message)),
             }
+        }
+    }
+
+    /// Built-in automatic setup downloads and runs code, so only a person may allow it.
+    /// This is asked before every new process, never remembered across agent sessions.
+    fn approve_setup(&self, ctx: &mut TurnCtx<'_>) -> Result<bool, String> {
+        let Some(package) = &self.spec.setup else { return Ok(true) };
+        let declined = || {
+            format!("{} needs your approval to download and run {package}; approve in the assistant pane, or install its adapter first", self.name())
+        };
+        if ctx.policy != PermissionPolicy::Ask {
+            return Err(declined());
+        }
+        let program = self.spec.launch.program.file_name().unwrap_or_default().to_string_lossy();
+        let options = [
+            PermissionOption { id: "wordcraft-setup".into(), name: "Download and run".into(), kind: PermissionKind::AllowOnce },
+            PermissionOption { id: NOT_NOW.into(), name: "Not now".into(), kind: PermissionKind::RejectOnce },
+        ];
+        match ctx.ask(PermissionRequest::bounded(&format!("Download and run {package} using {program}?"), options)) {
+            Answer::Selected { option } if option == "wordcraft-setup" => Ok(true),
+            _ if ctx.is_cancelled() => Ok(false),
+            _ => Err(declined()),
         }
     }
 

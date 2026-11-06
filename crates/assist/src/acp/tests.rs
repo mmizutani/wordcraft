@@ -126,6 +126,146 @@ impl Chat {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn discovered_path_also_reaches_the_agents_shebang_and_helpers() {
+    use super::presets;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("wordcraft-agent-shebang-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let adapter = dir.join("finder-agent");
+    let helper = dir.join("wordcraft-fake-node");
+    let marker = dir.join("started");
+    std::fs::write(&adapter, "#!/usr/bin/env wordcraft-fake-node\n").unwrap();
+    std::fs::write(
+        &helper,
+        "#!/bin/sh\nprintf started > \"$SETUP_MARKER\"; exec \"$SETUP_EXE\" --exact acp::tests::fake_agent --nocapture --test-threads 1 -q\n",
+    )
+    .unwrap();
+    for path in [&adapter, &helper] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let settings = presets::AgentSettings::from_value(&json!({"agents": {"custom": {"command": "finder-agent"}}}));
+    settings.save(&dir).unwrap();
+    let host = crate::offers::Host {
+        settings: Some(dir.clone()),
+        room: Some("127.0.0.1:4567".parse().unwrap()),
+        cli: Some(dir.join("wordcraft-cli")),
+        fake: false,
+    };
+    let mut found = presets::spec_for(presets::CUSTOM_ID, &host, Some(dir.as_os_str())).unwrap();
+    found.reach = Reach::Nothing;
+    found.env = spec(&turns(vec![vec![say("shebang works")]])).env;
+    found.env.push(("SETUP_MARKER".into(), marker.to_string_lossy().into_owned()));
+    found.env.push(("SETUP_EXE".into(), std::env::current_exe().unwrap().to_string_lossy().into_owned()));
+    let mut c = Chat::new(found, PermissionPolicy::Reject);
+    c.ask("First");
+    c.a.end();
+    let started = marker.exists();
+    let answer = c.answer();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(started, "the adapter was found but its env shebang could not find its helper");
+    assert_eq!(answer, "shebang works");
+}
+
+#[cfg(unix)]
+fn automatic_setup_spec(case: &str) -> (AgentSpec, std::path::PathBuf) {
+    let marker = std::env::temp_dir().join(format!("wordcraft-setup-{case}-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let mut spec = spec(&turns(vec![vec![say("ready")], vec![say("again")]]));
+    spec.launch = Launch::new(
+        "/bin/sh",
+        ["-c", "printf started > \"$SETUP_MARKER\"; exec \"$SETUP_EXE\" --exact acp::tests::fake_agent --nocapture --test-threads 1 -q"],
+    );
+    spec.env.push(("SETUP_MARKER".into(), marker.to_string_lossy().into_owned()));
+    spec.env.push(("SETUP_EXE".into(), std::env::current_exe().unwrap().to_string_lossy().into_owned()));
+    spec.setup = Some("@example/automatic-adapter".into());
+    (spec, marker)
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_setup_never_starts_under_allow_or_reject_policies() {
+    for (policy, case) in [(PermissionPolicy::Allow, "allow"), (PermissionPolicy::Reject, "reject")] {
+        let (spec, marker) = automatic_setup_spec(case);
+        let mut c = Chat::new(spec, policy);
+        c.ask("First");
+        let started = marker.exists();
+        c.a.end();
+        let _ = std::fs::remove_file(&marker);
+        assert!(!started, "programmatic policy started automatic setup");
+        assert!(c.error().is_some());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_setup_waits_for_a_person_before_launch_and_not_again_for_a_running_agent() {
+    let (spec, marker) = automatic_setup_spec("ask");
+    let mut c = Chat::new(spec, PermissionPolicy::Ask);
+    c.a.ask("First", None).unwrap();
+    c.until("the setup question", |c| c.a.pending_permission().is_some() || c.answer() == "ready" || c.error().is_some());
+    assert!(!marker.exists(), "setup ran before the person approved it");
+    let request = c.a.pending_permission().cloned().unwrap();
+    assert!(request.title.contains("@example/automatic-adapter") && request.title.contains("sh"));
+    let allow = request.options.iter().find(|o| o.kind.allows()).unwrap().id.clone();
+    assert!(c.a.answer(request.id, Answer::Selected { option: allow }));
+    assert!(c.a.wait_idle(WAIT));
+    assert!(marker.exists());
+    assert_eq!(c.answer(), "ready");
+    c.ask("Second");
+    assert_eq!(c.answer(), "again");
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_setup_asks_again_before_a_replacement_process() {
+    let (mut spec, marker) = automatic_setup_spec("restart");
+    let script = turns(vec![vec![say("running"), Step::Hang]]);
+    spec.env.retain(|(key, _)| key != SCRIPT_VAR);
+    spec.env.push((SCRIPT_VAR.into(), serde_json::to_string(&script).unwrap()));
+    spec.cancel_timeout = Duration::from_millis(20);
+    let mut c = Chat::new(spec, PermissionPolicy::Ask);
+    c.a.ask("First", None).unwrap();
+    c.until("setup", |c| c.a.pending_permission().is_some());
+    let request = c.a.pending_permission().cloned().unwrap();
+    let allow = request.options.iter().find(|o| o.kind.allows()).unwrap().id.clone();
+    assert!(c.a.answer(request.id, Answer::Selected { option: allow }));
+    c.until("running", |c| c.answer() == "running");
+    c.a.cancel();
+    assert!(c.a.wait_idle(WAIT));
+    std::fs::remove_file(&marker).unwrap();
+    c.a.ask("Again", None).unwrap();
+    c.until("setup again", |c| c.a.pending_permission().is_some() || marker.exists() || c.error().is_some());
+    assert!(!marker.exists(), "a replacement process reused old setup consent");
+    assert!(c.a.pending_permission().is_some());
+    c.a.cancel();
+    assert!(c.a.wait_idle(WAIT));
+}
+
+#[cfg(unix)]
+#[test]
+fn declining_or_cancelling_automatic_setup_starts_no_process() {
+    for cancel in [false, true] {
+        let (spec, marker) = automatic_setup_spec(if cancel { "cancel" } else { "decline" });
+        let mut c = Chat::new(spec, PermissionPolicy::Ask);
+        c.a.ask("First", None).unwrap();
+        c.until("the setup question", |c| c.a.pending_permission().is_some() || c.answer() == "ready" || c.error().is_some());
+        assert!(!marker.exists(), "setup ran before the person answered");
+        let request = c.a.pending_permission().cloned().unwrap();
+        if cancel {
+            c.a.cancel();
+        } else {
+            let deny = request.options.iter().find(|o| !o.kind.allows()).unwrap().id.clone();
+            assert!(c.a.answer(request.id, Answer::Selected { option: deny }));
+        }
+        assert!(c.a.wait_idle(WAIT));
+        assert!(!marker.exists(), "declined or cancelled setup started a process");
+    }
+}
+
 #[test]
 fn an_agent_streams_its_answer_thoughts_tool_calls_and_plan() {
     let script = turns(vec![vec![

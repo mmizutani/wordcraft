@@ -43,9 +43,21 @@ plans and does in the pane.
 
 ### Setting up an agent
 
-WordCraft never installs, downloads or bundles an agent. It looks for each preset's adapter on
-`PATH` (without a shell), and when the adapter isn't installed but Node.js is, runs it with
-`npx -y <package>`. When neither is there, the pane says what to install.
+WordCraft looks for each preset's installed adapter on `PATH` without a shell. When only
+Node.js/npx is available, the built-in preset can download and run its named npm package with
+`npx -y <package>`. Before every new fallback process, the pane asks you to approve the package
+and command. Declining or stopping starts no process; an already-running adapter does not ask
+again on its next turn. Programmatic Allow and Reject policies cannot approve this setup: install
+the adapter first for headless use. When neither tool is there, the pane says what to install.
+
+The agent's configured `PATH` takes precedence over WordCraft's inherited `PATH`. On macOS,
+installed `/opt/homebrew/bin` and `/usr/local/bin` are appended when their canonical ancestors
+are owned by you or root and are not writable by others. Discovery and the child receive the
+same PATH, so Node shebangs and helper programs can also find those bins when opened from Finder.
+Version managers such as NVM are not loaded from shell startup files: set the agent's PATH to
+include the selected Node version's bin directory, or configure an installed adapter and its
+required helper paths explicitly. Windows skips npm's bare shell and PowerShell shims and
+selects supported executable/batch extensions.
 
 - **Claude Code.** `npm install -g @agentclientprotocol/claude-agent-acp`, or have Node.js on
   `PATH` for npx. Sign in once by running `claude` in a terminal.
@@ -77,7 +89,8 @@ key):
 ```
 
 A preset's `command` and `args` replace its adapter; `env` adds to the environment the agent
-starts with. A damaged file is read for what it holds; anything that isn't what it should be is
+starts with. Explicit custom commands (including a configured npx command) are your chosen setup
+and do not use the built-in fallback approval. A damaged file is read for what it holds; anything that isn't what it should be is
 left out. `WORDCRAFT_CONTROL_KEY` and `WORDCRAFT_CONTROL_ADDR` are never taken from it.
 
 ## What an agent can reach
@@ -92,11 +105,11 @@ Through WordCraft, **the shared document and nothing else**:
 - With that key it gets a copy of the shared document of its own: it reads it, follows what
   others change, and runs commands within its role. Commands that open, save, print or export
   files, that open another document, or that reach the window or the settings are refused.
-- It starts in a new empty folder (`wordcraft-agent-…` in the temporary folder, only you may
-  open it), with WordCraft's environment minus WordCraft's own variables, plus the agent's
+- It starts in a new empty private folder (`wordcraft-agent-…` under your cache on Unix,
+  or the temporary folder on Windows; Unix ancestor ownership and write permissions are checked), with WordCraft's environment minus WordCraft's own variables, plus the agent's
   settings. WordCraft offers it no file access and no terminal through the protocol.
 - When the conversation ends, or the window closes, WordCraft ends the agent and everything it
-  started (on Unix, its whole process group), removes the folder, and takes the invite back:
+  started (its Unix process group or Windows Job Object; native Windows validation is pending), removes the folder, and takes the invite back:
   the key opens nothing from then on. Stop ends a turn; an agent that doesn't stop within 10
   seconds is ended, and starts again on the next turn.
 
