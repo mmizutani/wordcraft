@@ -64,7 +64,8 @@ to go on.
 | `acp:custom` | Custom agent | any agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com) on stdio |
 
 The pane lists them with what each needs first; `assist.backend {"id": "acp:claude-code"}` picks
-one from a script. Each conversation gets the backend picked when it starts.
+one from a script. Each conversation gets the backend picked when it starts. The web app offers
+none of them: see [On the web](#on-the-web).
 
 An ACP agent is a program on your computer that WordCraft starts for the conversation (on its
 first turn: the pane shows "Start Claude Code" while it starts) and speaks the Agent Client
@@ -225,6 +226,35 @@ turn WordCraft gives it your prompt and the selection with the paragraphs around
 outline, held to 32 KiB in all; the first turn adds a note that says which document it works
 on, its name and role, and how to use the `wordcraft` tools (for Pi, `wordcraft-cli call`).
 Through those it can read the whole shared document.
+
+## On the web
+
+The web app has the Assistant pane and every `assist.*` command, but no assistant to run them.
+The pane says the assistant needs the desktop app, without a role to choose; the prompt box's
+Send and the writing actions stay greyed out, their tooltips saying the same, and a script's
+`assist.ask` is refused with that reason. File › Options › Assistant sets up no agent there.
+Both kinds of backend are desktop only (`wordcraft_assist::offers::DESKTOP`: the web build
+compiles them out):
+
+- **Sign in with ChatGPT** signs in the way OpenAI documents for apps on a computer: the system
+  browser, a loopback port for the redirect, and a credentials file of WordCraft's own, which
+  keeps the tokens out of browser storage. OpenAI documents no flow for an app that runs in a
+  browser (its endpoints answering a web page, a redirect to a web origin).
+- **ACP agents** are programs WordCraft starts and speaks the protocol with over their standard
+  input and output; a web page can't start a program.
+
+What would unblock the web:
+
+- a browser sign-in OpenAI documents for apps (CORS on its endpoints and a redirect to a web
+  origin), with the tokens still kept out of browser storage; or
+- ACP's remote transport (HTTP or WebSocket, a work in progress in the protocol) reached through
+  a bridge the person runs on their computer, which starts the agent there and gives the page a
+  connection to it on a loopback port, with a key the page is given, as the room's own port
+  takes invites today.
+
+Until then the web build offers nothing (`offers_in(host, false)` is empty whatever the host
+has), which `cargo test -p wordcraft-assist offers` and the pane's test
+`on_the_web_the_pane_says_the_assistant_needs_the_desktop_app` check on any build.
 
 ## Checking by hand
 

@@ -44,12 +44,17 @@ pub struct AssistantStatus {
     pub ready: bool,
     /// A turn is running.
     pub busy: bool,
+    /// No assistant runs in this app: the web app's backends would sign in or start agents,
+    /// which take the desktop app (#26), so the buttons say that rather than how to set one up.
+    pub desktop_only: bool,
 }
 
 /// Why `assist.*` does nothing here.
 const NO_WINDOW: &str = "the assistant works in the WordCraft window, with the Assistant pane";
 /// Why a prompt can't start a turn yet. The tooltip on the assistant's buttons.
 pub const NOT_SET_UP: &str = "Set up an assistant first: open the Assistant pane (Home › Assistant) to sign in or set up an agent";
+/// Why a prompt can't start a turn in the web app.
+pub const NEEDS_DESKTOP: &str = "The assistant needs the WordCraft desktop app: a web page can't sign in to ChatGPT or start an agent";
 /// Why a prompt waits.
 const ANSWERING: &str = "the assistant is still answering: stop it first";
 /// Why there is nothing to stop.
@@ -132,7 +137,7 @@ pub fn can_ask(s: &Session) -> Option<&'static str> {
     if !s.assistant.window {
         Some(NO_WINDOW)
     } else if !s.assistant.ready {
-        Some(NOT_SET_UP)
+        Some(if s.assistant.desktop_only { NEEDS_DESKTOP } else { NOT_SET_UP })
     } else if s.assistant.busy {
         Some(ANSWERING)
     } else if s.column_segments().is_some() {

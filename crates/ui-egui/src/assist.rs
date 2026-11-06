@@ -17,6 +17,10 @@
 //! channel, MCP) has no one to ask: it answers per the person's setting
 //! (`assist.allowUnattended`), refusing unless they allowed it, and the answer is logged. A tool
 //! call's row links to the change it made in the shared document (`assist.showChange`).
+//!
+//! The web app (#26) has the pane and the commands but no assistant: its backends would sign in
+//! through a loopback port or start agents, which take the desktop app ([`desktop`]). The pane
+//! says so, and the buttons' tooltips too.
 
 use std::sync::Arc;
 
@@ -67,6 +71,9 @@ pub(crate) struct AssistState {
     /// The backend the next conversation starts with, in place of the chosen one: tests and
     /// headless screenshots with a scripted assistant.
     next: Option<Box<dyn Backend>>,
+    /// Offer what the web app offers, which is no assistant (#26): the web build always does;
+    /// tests and headless screenshots of its pane on the desktop ([`WordApp::assist_as_web`]).
+    pub(crate) web: bool,
     /// File › Options › Assistant's agents while the page shows them (#24): saved only through
     /// the agents' settings file, never logged.
     #[cfg(not(target_arch = "wasm32"))]
@@ -90,6 +97,16 @@ impl WordApp {
         self.session.assistant = status(self);
     }
 
+    /// Offer what the web app offers, which is no assistant, as the web build does (#26): for
+    /// tests and headless screenshots of the web's pane on the desktop. The conversation there is
+    /// ends.
+    pub fn assist_as_web(&mut self) {
+        end(self);
+        self.assist.web = true;
+        refresh_offers(self);
+        self.session.assistant = status(self);
+    }
+
     /// The conversation about the document the window shows, if there is one.
     pub(crate) fn conversation(&self) -> Option<&Assistant> {
         self.assist.conversation.as_ref().filter(|c| c.document == self.session.document_id()).map(|c| &c.assistant)
@@ -105,7 +122,13 @@ impl WordApp {
 /// document through the room's own port, which takes only invites' keys (the lobby's address,
 /// set when the app opened it), never through the control channel's.
 pub(crate) fn host(app: &WordApp) -> Host {
-    Host { settings: app.services.settings_dir.clone(), room: app.lobby.addr(), cli: cli(), fake: fake_offered() }
+    Host { settings: app.services.settings_dir.clone(), room: app.lobby.addr(), cli: cli(), fake: fake_offered() && desktop(app) }
+}
+
+/// Whether the window offers the backends that sign in or start agent processes: the desktop
+/// app's does; the web app's offers none (#26).
+pub(crate) fn desktop(app: &WordApp) -> bool {
+    wordcraft_assist::offers::DESKTOP && !app.assist.web
 }
 
 /// `wordcraft-cli` beside the app's executable, which an agent's MCP server runs; `None` when
@@ -126,7 +149,7 @@ fn fake_offered() -> bool {
 
 /// Ask what is offered now.
 pub(crate) fn refresh_offers(app: &mut WordApp) {
-    app.assist.offers = wordcraft_assist::offers::offers(&host(app));
+    app.assist.offers = wordcraft_assist::offers::offers_in(&host(app), desktop(app));
     app.assist.offers_at = Some(crate::clock::now_ms());
 }
 
@@ -141,7 +164,7 @@ pub(crate) fn chosen(app: &WordApp) -> Option<&Offer> {
 fn status(app: &WordApp) -> AssistantStatus {
     let live = app.conversation().filter(|a| !a.has_ended());
     let ready = app.has_document() && (app.assist.next.is_some() || live.is_some() || chosen(app).is_some_and(|o| o.readiness == Readiness::Ready));
-    AssistantStatus { window: true, ready, busy: live.is_some_and(Assistant::is_busy) }
+    AssistantStatus { window: true, ready, busy: live.is_some_and(Assistant::is_busy), desktop_only: !desktop(app) }
 }
 
 /// Every frame: take what came back, end a conversation whose shared document closed, ask

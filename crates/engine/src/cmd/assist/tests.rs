@@ -9,7 +9,7 @@ use crate::{CmdError, Session};
 /// A session in a window with an assistant set up.
 fn in_window() -> Session {
     let mut s = Session::new(Document::from_text("one two three"));
-    s.assistant = AssistantStatus { window: true, ready: true, busy: false };
+    s.assistant = AssistantStatus { window: true, ready: true, ..AssistantStatus::default() };
     s
 }
 
@@ -321,13 +321,23 @@ fn actions_on_the_selection_need_one_and_an_assistant() {
     for id in ["assist.draft", "assist.rewrite", "assist.shorten", "assist.expand", "assist.proofread", "assist.summarize"] {
         assert_eq!(s.why_disabled(id), Some(super::NOT_SET_UP), "{id}");
     }
+    // In the web app (#26), which runs no assistant, each says it needs the desktop app instead,
+    // and nothing is asked of the window.
+    requests(&mut s);
+    s.assistant.desktop_only = true;
+    for id in ["assist.ask", "assist.draft", "assist.rewrite", "assist.shorten", "assist.expand", "assist.proofread", "assist.summarize"] {
+        assert_eq!(s.why_disabled(id), Some(super::NEEDS_DESKTOP), "{id}");
+    }
+    let why = disabled(s.run("assist.ask", &json!({"prompt": "Hi"})));
+    assert!(why.contains("desktop app") && !why.contains("Set up"), "{why}");
+    assert!(requests(&mut s).is_empty());
 }
 
 #[test]
 fn block_selections_cannot_start_assistant_turns_or_send_their_bounding_range() {
     use wordcraft_doc::{Pos, StoryRef};
     let mut s = Session::new(Document::from_text("abc\nabc"));
-    s.assistant = AssistantStatus { window: true, ready: true, busy: false };
+    s.assistant = AssistantStatus { window: true, ready: true, ..AssistantStatus::default() };
     s.run("select.column", &json!({"anchor": Pos::body(0, 1), "focus": Pos::body(1, 2)})).unwrap();
     assert_eq!(s.selected_text(), "b\nb");
     assert_eq!(s.column_segments().unwrap().len(), 2);

@@ -1110,3 +1110,39 @@ fn show_change_selects_a_table_whose_rows_changed() {
     assert_eq!(start.path, cells[0], "from the first cell");
     assert!(end.path.0.len() > 1 && end.path.0[0] == cells[0].0[0] && end.path != cells[0], "to the table's last cell: {end:?}");
 }
+
+/// The web app (#26): the pane and the commands are there, but no assistant is offered, and the
+/// pane, the writing actions and File › Options › Assistant say it takes the desktop app.
+#[test]
+fn on_the_web_the_pane_says_the_assistant_needs_the_desktop_app() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_engine::cmd::assist::NEEDS_DESKTOP;
+    let mut a = window("one two three");
+    a.run("assist.pane", json!({"value": true})).unwrap();
+    let mut h = harness(a);
+    assert!(h.query_by_label("Role:").is_some(), "the desktop pane has a role to choose");
+    h.state_mut().assist_as_web();
+    h.run_steps(3);
+    assert!(h.state().assist.offers.is_empty(), "no backend on the web");
+    // Asking again what is offered (the pane does now and then) still finds none.
+    super::refresh_offers(h.state_mut());
+    h.run_steps(3);
+    assert!(h.state().assist.offers.is_empty());
+    assert!(h.query_by_label("The assistant needs the desktop app").is_some(), "the pane says so");
+    assert!(h.query_by_label_contains("a web page can't keep a sign-in safe or start a program").is_some());
+    assert!(h.query_by_label("Role:").is_none(), "no role to choose for no assistant");
+    // The prompt and the writing actions are off, and say why.
+    h.state_mut().run("select.all", json!({})).unwrap();
+    h.run_steps(2);
+    for id in ["assist.ask", "assist.draft", "assist.rewrite", "assist.shorten", "assist.expand", "assist.proofread", "assist.summarize"] {
+        assert_eq!(h.state().session.why_disabled(id), Some(NEEDS_DESKTOP), "{id}");
+    }
+    let e = h.state_mut().run("assist.ask", json!({"prompt": "Hi"})).unwrap_err();
+    assert!(e.contains("desktop app"), "{e}");
+    assert!(h.state().conversation().is_none(), "nothing started");
+    // And File › Options › Assistant sets no agent up.
+    h.state_mut().run("file.options", json!({"pane": "assistant"})).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label("Agents are programs WordCraft starts on your computer, so they are set up in the desktop app.").is_some());
+    assert!(h.query_by_label_contains("Claude Code").is_none());
+}

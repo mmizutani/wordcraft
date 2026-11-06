@@ -21,7 +21,8 @@
 //! in a program's: one from `engine.execute`, or typed with `ui.text` and sent with `ui.key`,
 //! which the window doesn't take as the person's). `{"run": id, "params": {…}}` runs command `id`
 //! as the person's own click does. `{"settingsDir": "/abs/dir"}` gives the window a settings
-//! folder (the agents' settings in File › Options › Assistant read and save there).
+//! folder (the agents' settings in File › Options › Assistant read and save there), and
+//! `{"web": true}` has it offer what the web app does: no assistant.
 
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{ControlRequest, Services, WordApp};
@@ -94,6 +95,10 @@ fn main() -> Result<(), String> {
                 }
                 Err(e) => eprintln!("render failed: {e}"),
             }
+        } else if l.get("web") == Some(&serde_json::Value::Bool(true)) {
+            // The pane as the web app has it: no assistant (#26).
+            harness.state_mut().assist_as_web();
+            step_n(&mut harness, 2);
         } else if let Some(turns) = l.get("assistScript").and_then(|v| v.as_array()) {
             harness.state_mut().assist_with(Box::new(scripted_assistant(turns)?));
             step_n(&mut harness, 2);
