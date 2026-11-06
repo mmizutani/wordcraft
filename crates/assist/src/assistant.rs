@@ -369,8 +369,9 @@ impl Work {
         };
         let begun = guarded(|| self.backend.begin(&self.seat));
         if let Err(e) = begun {
-            self.fail_turns(&e);
+            // What it started ends now, not when the conversation does.
             self.end_backend();
+            self.fail_turns(&e);
             return;
         }
         while let Ok(job) = self.jobs.recv() {

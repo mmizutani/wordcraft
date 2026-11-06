@@ -682,9 +682,11 @@ pub trait Backend: Send {
     /// What it is.
     fn info(&self) -> BackendInfo;
 
-    /// The conversation starts, with the assistant's seat in the shared document: get ready (an
-    /// agent process starts and opens its session). Called once, on the conversation's thread,
-    /// before the first turn; an error ends the conversation's turns with it.
+    /// The conversation starts, with the assistant's seat in the shared document: take what the
+    /// turns need from it. Called once, on the conversation's thread, before the first turn; an
+    /// error ends the backend and then every turn with that error. It can't report progress or be
+    /// stopped, so it returns at once: anything slow (starting an agent process, opening its
+    /// session, signing in) happens in the first turn, where the pane shows it and Stop ends it.
     fn begin(&mut self, seat: &Seat) -> Result<(), String> {
         let _ = seat;
         Ok(())

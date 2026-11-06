@@ -36,14 +36,30 @@ pub fn specs() -> &'static [ToolSpec] {
                 if let Some(p) = parameters.get_mut("properties").and_then(Value::as_object_mut) {
                     p.remove("doc");
                 }
-                ToolSpec {
-                    name: t.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
-                    description: t.get("description").and_then(Value::as_str).unwrap_or_default().to_string(),
-                    parameters,
-                }
+                let name = t.get("name").and_then(Value::as_str).unwrap_or_default();
+                let description = own_description(name).or_else(|| t.get("description").and_then(Value::as_str)).unwrap_or_default();
+                ToolSpec { name: name.to_string(), description: description.to_string(), parameters }
             })
             .collect()
     })
+}
+
+/// What the assistant's own tools say where the MCP server's speak of other open documents
+/// (`doc`; opening, switching and closing documents), which an assistant's copy can't reach:
+/// a model told it could would spend its turn on calls that can only fail.
+fn own_description(name: &str) -> Option<&'static str> {
+    match name {
+        "execute" => Some(
+            "Run one command by id with params, e.g. {command:\"format.bold\"} or {command:\"insert.table\", params:{rows:3, cols:4}}. \
+             Commands work on the shared document at your copy's selection. Ones that open, save, switch or close documents, or \
+             drive the window, are refused here.",
+        ),
+        "batch" => Some(
+            "Run commands in order, e.g. {commands:[{command:\"caret.docEnd\"}, {command:\"text.insert\", params:{text:\"!\"}}]}; \
+             stops at the first error unless keepGoing.",
+        ),
+        _ => None,
+    }
 }
 
 /// The assistant's copy of the shared document, which its model's tool calls work on.

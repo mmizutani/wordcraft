@@ -286,8 +286,9 @@ impl Room {
     }
 
     /// [`Room::invite`] under `name`, or under the first of "name (2)", "name (3)"… that no
-    /// invite or participant has had ([`Hub::invite_numbered`]): the name it got, and the key.
-    /// For a participant that comes again and again, like each conversation with an assistant.
+    /// invite, participant, tracked change or comment has had ([`Hub::invite_numbered`]): the
+    /// name it got, and the key. For a participant that comes again and again, like each
+    /// conversation with an assistant.
     pub fn invite_numbered(&self, name: &str, role: Role) -> Result<(String, String), RoomError> {
         self.hub().invite_numbered(name, role)
     }

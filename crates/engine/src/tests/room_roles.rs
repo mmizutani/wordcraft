@@ -119,6 +119,39 @@ fn a_numbered_invite_takes_the_first_name_no_one_has_had() {
     assert!(matches!(room.invite_numbered("Helper", Role::Viewer), Err(RoomError::Closed)));
 }
 
+/// A document that comes back to a new room still carries an earlier participant's tracked
+/// changes and comments in their name (an assistant's conversation in a room since closed, or
+/// another person's assistant's). A numbered invite doesn't take that name: under it, the role
+/// rules would let the newcomer take back those suggestions and rewrite those comments.
+#[test]
+fn a_numbered_invite_leaves_the_names_in_the_document_to_their_authors() {
+    let room = Room::new(Document::from_text("one two three"));
+    let mut earlier = vec![join_as(&room, "Writer", Role::Suggester)];
+    run(&mut earlier[0], "select.text", json!({"text": "two"}));
+    run(&mut earlier[0], "text.insert", json!({"text": "2"}));
+    run(&mut earlier[0], "review.newComment", json!({"text": "Digits read better."}));
+    settle(&mut earlier).unwrap();
+    let (_, doc) = room.document();
+    assert!(doc.revisions.iter().all(|r| r.author == "Writer") && !doc.revisions.is_empty());
+    assert!(doc.comments.values().all(|c| c.author == "Writer") && !doc.comments.is_empty());
+    // The same document in a new room: "Writer" is no one's here, but the document has it.
+    let again = Room::new(doc.clone());
+    let (name, key) = again.invite_numbered("writer", Role::Suggester).unwrap();
+    assert_eq!(name, "writer (2)");
+    // The newcomer can't take back the suggestions or take away the comment, as "Writer" could.
+    let mut newcomer = again.join_with(&key).unwrap();
+    refused(&mut newcomer, "review.rejectAll", json!({}));
+    let id = *doc.comments.keys().next().unwrap();
+    refused(&mut newcomer, "review.deleteComment", json!({"id": id}));
+    // A comment's author counts too, alone.
+    let mut noted = Document::from_text("Hello");
+    noted.comments.insert(1, wordcraft_doc::Comment { author: "Reviewer".into(), ..Default::default() });
+    let room = Room::new(noted);
+    assert_eq!(room.invite_numbered("Reviewer", Role::Commenter).unwrap().0, "Reviewer (2)");
+    // A plain invite still may: the owner can invite a person back under their own name.
+    assert!(room.invite("Reviewer", Role::Commenter).is_ok());
+}
+
 #[test]
 fn no_one_takes_another_s_name() {
     let room = Room::new(Document::from_text("Hello"));
