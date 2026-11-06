@@ -246,7 +246,30 @@ impl AgentSettings {
     /// Whether [`AgentSettings::save`] can write these settings and [`AgentSettings::load`] read
     /// them back whole: they fit in the 1 MiB it reads.
     pub fn fits(&self) -> bool {
-        serde_json::to_vec_pretty(self).is_ok_and(|b| b.len() as u64 <= MAX_SETTINGS)
+        fits_in_a_file(self)
+    }
+
+    /// Whether [`AgentSettings::save_value`] can write `file` and [`AgentSettings::read_value`]
+    /// read it back whole: it fits in the 1 MiB it reads.
+    pub fn value_fits(file: &Value) -> bool {
+        fits_in_a_file(file)
+    }
+
+    /// Put the file [`AgentSettings::set_aside`] set aside in `dir` back, after a save that
+    /// failed, never over a settings file that took its place (saved meanwhile by another
+    /// WordCraft, say): a hard link, which fails where a file is, then the aside name removed.
+    /// Whether it was put back; when not (a file is there, or `Err`: no hard links there), it
+    /// stays aside.
+    pub fn put_back_aside(dir: &Path) -> std::io::Result<bool> {
+        let aside = dir.join(format!("{SETTINGS_FILE}{SET_ASIDE_SUFFIX}"));
+        match std::fs::hard_link(&aside, dir.join(SETTINGS_FILE)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        // Back under its name; a second name left over holds the same bytes.
+        let _ = std::fs::remove_file(&aside);
+        Ok(true)
     }
 
     /// Put a settings file that can't be read aside (as `assistant-agents.json.damaged`, with
@@ -272,13 +295,13 @@ impl AgentSettings {
     /// Write the settings to `dir`: a new file renamed over the old one, so a failed write leaves
     /// it as it was. On Unix only its owner may read or write it.
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
-        write_settings(dir, serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?)
+        write_settings(dir, file_bytes(self)?)
     }
 
     /// Write `file` as the settings file in `dir`, as [`AgentSettings::save`] writes: whole or
     /// not at all, only its owner may read it, and never more than the 1 MiB it reads.
     pub fn save_value(dir: &Path, file: &Value) -> std::io::Result<()> {
-        write_settings(dir, serde_json::to_vec_pretty(file).map_err(std::io::Error::other)?)
+        write_settings(dir, file_bytes(file)?)
     }
 
     /// What the person set up for the agent with settings key `key`.
@@ -302,6 +325,33 @@ fn put(entry: &mut serde_json::Map<String, Value>, field: &str, value: Option<Va
 /// Write the settings file's `bytes` to `dir`: a new file renamed over the old one, so a failed
 /// write leaves it as it was; on Unix only its owner may read or write it. More than the 1 MiB
 /// the reader reads is refused.
+/// Whether `v`, written compactly, fits in the 1 MiB the settings file may hold: counted as it is
+/// written, stopping at the limit, with nothing kept.
+fn fits_in_a_file<T: Serialize + ?Sized>(v: &T) -> bool {
+    struct Count(u64);
+    impl Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(b.len() as u64);
+            if self.0 > MAX_SETTINGS { Err(std::io::Error::other("too large")) } else { Ok(b.len()) }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Count(0), v).is_ok()
+}
+
+/// What the settings file holds for `v`: pretty-printed, or compact when only that fits in the
+/// 1 MiB the file may hold (a large array WordCraft doesn't read, say); refused when neither does.
+fn file_bytes<T: Serialize + ?Sized>(v: &T) -> std::io::Result<Vec<u8>> {
+    let pretty = serde_json::to_vec_pretty(v).map_err(std::io::Error::other)?;
+    if pretty.len() as u64 <= MAX_SETTINGS {
+        return Ok(pretty);
+    }
+    drop(pretty);
+    serde_json::to_vec(v).map_err(std::io::Error::other)
+}
+
 fn write_settings(dir: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     if bytes.len() as u64 > MAX_SETTINGS {
@@ -328,7 +378,8 @@ fn agent_prefs(v: &Value) -> AgentPrefs {
     let args = v.get("args").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
     let env = v.get("env").and_then(Value::as_object).into_iter().flatten();
     AgentPrefs {
-        name: text(v.get("name")).map(|n| label(n.trim())).unwrap_or_default(),
+        // Trimmed again once what a label can't show is gone, so a name reads back as it is saved.
+        name: text(v.get("name")).map(|n| label(n.trim()).trim().to_string()).unwrap_or_default(),
         command: text(v.get("command")).map(|c| c.trim().to_string()).unwrap_or_default(),
         args: args.iter().filter_map(|a| text(Some(a))).take(MAX_ITEMS).collect(),
         env: env
@@ -768,6 +819,40 @@ mod tests {
         let big = json!({"agents": {}, "pad": "x".repeat(super::MAX_SETTINGS as usize)});
         assert!(AgentSettings::save_value(&dir, &big).is_err());
         assert_eq!(AgentSettings::read_value(&dir), Ok(Some(file)), "the previous file is kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_only_pretty_printing_takes_past_the_limit_is_written_compact() {
+        let dir = folder("compact");
+        // About 600 KB compact, over 2 MiB pretty-printed.
+        let file = json!({"agents": {"codex": {"env": {"OPENAI_API_KEY": "sk-old"}}}, "log": vec![0; 300_000]});
+        assert!(AgentSettings::value_fits(&file));
+        AgentSettings::save_value(&dir, &file).unwrap();
+        assert!(std::fs::metadata(dir.join(SETTINGS_FILE)).unwrap().len() <= super::MAX_SETTINGS);
+        assert_eq!(AgentSettings::read_value(&dir), Ok(Some(file)));
+        let big = json!({"agents": {}, "pad": "x".repeat(super::MAX_SETTINGS as usize)});
+        assert!(!AgentSettings::value_fits(&big));
+        // Small settings are still pretty-printed, for a person editing the file by hand.
+        let small = json!({"agents": {"pi": {"command": "/opt/pi"}}});
+        AgentSettings::save_value(&dir, &small).unwrap();
+        assert!(std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap().contains('\n'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_set_aside_is_put_back_only_where_none_took_its_place() {
+        let dir = folder("put-back-aside");
+        let path = dir.join(SETTINGS_FILE);
+        std::fs::write(&path, "junk").unwrap();
+        assert!(AgentSettings::set_aside(&dir).unwrap().is_some());
+        assert!(!path.exists());
+        assert!(AgentSettings::put_back_aside(&dir).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "junk");
+        assert!(AgentSettings::set_aside(&dir).unwrap().is_some());
+        std::fs::write(&path, "{}").unwrap();
+        assert!(!AgentSettings::put_back_aside(&dir).unwrap(), "a new file stays");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

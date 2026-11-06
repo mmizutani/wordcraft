@@ -4,7 +4,7 @@ use egui_kittest::kittest::{By, NodeT, Queryable};
 use serde_json::json;
 use wordcraft_assist::acp::presets::{AgentPrefs, AgentSettings, SETTINGS_FILE};
 
-use super::{AgentSetup, Draft, drafts, env_over, settings_over, var};
+use super::{AgentSetup, Draft, drafts, env_over, settings_over, var, written};
 use crate::{Services, WordApp};
 
 /// A secret no node of the page may show.
@@ -268,16 +268,40 @@ fn a_huge_paste_into_the_arguments_is_cut_to_fit() {
 /// Send the control channel's `method` (what MCP's `click`, `key` and `type` send), and run the
 /// passes that deliver it, as the window does.
 fn faked(h: &mut egui_kittest::Harness<'static, WordApp>, method: &str, params: serde_json::Value) {
+    faked_for(h, method, params, 20);
+}
+
+/// Input the control channel makes, then `steps` passes.
+fn faked_for(h: &mut egui_kittest::Harness<'static, WordApp>, method: &str, params: serde_json::Value, steps: usize) {
     let (req, _rx) = crate::control::ControlRequest::new(method, params);
     let ctx = h.ctx.clone();
     assert!(matches!(crate::control::handle(h.state_mut(), &ctx, &req), crate::control::Outcome::Done(_)), "{method} is queued");
-    for _ in 0..20 {
+    for _ in 0..steps {
         let ctx = h.ctx.clone();
         let mut raw = std::mem::take(h.input_mut());
         h.state_mut().raw_input_hook(&ctx, &mut raw);
         *h.input_mut() = raw;
         h.step();
     }
+}
+
+/// The value of the custom agent's first variable, as the page holds it.
+fn first_value(h: &egui_kittest::Harness<'static, WordApp>) -> String {
+    draft_of(h, "custom").env.first().map(|v| v.value.clone()).unwrap_or_default()
+}
+
+/// Whether any widget has keyboard focus.
+fn focused(h: &egui_kittest::Harness<'static, WordApp>) -> bool {
+    h.ctx.memory(|m| m.focused()).is_some()
+}
+
+/// The person's own click at `pos`: a press and, a pass later, its release.
+fn person_click(h: &mut egui_kittest::Harness<'static, WordApp>, pos: egui::Pos2) {
+    h.event(egui::Event::PointerMoved(pos));
+    h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(1);
 }
 
 /// A click the control channel makes at `pos`.
@@ -818,10 +842,12 @@ fn variables_merge_one_by_one_with_renames_and_swaps() {
     assert_eq!(env_over(&file, &read, &page, "x").unwrap(), map(&[("A", "1"), ("B", "2"), ("Z", "z")]));
 }
 
-/// confirmed[0]: the control channel can't move the person's focus or selection on the page: a
-/// faked click or Tab is put back, so the person's next keys go where they were going.
+/// Control-channel input lets go of keyboard focus and of the focused field's selection: a
+/// faked click, Tab, Shift+Tab or select-all never leaves the person's next keys going into a
+/// field (or button) it picked, nor replacing their text; the person clicks their field again.
+/// (Second and fourth reviews: before, an agent's click left focus in the plain Command field.)
 #[test]
-fn control_channel_focus_and_selection_are_put_back() {
+fn control_channel_input_lets_go_of_focus_and_selection() {
     let dir = folder("faked-focus");
     let mut h = harness(Some(&dir));
     open(&mut h, "Custom agent");
@@ -833,29 +859,35 @@ fn control_channel_focus_and_selection_are_put_back() {
     let command = h.get_by_label("Command:").rect().center();
     faked_click(&mut h, command);
     assert!(showing(&h, "Only you can change the agents' settings") > 0, "the page says why");
+    assert!(!focused(&h), "nothing has focus");
     h.event(egui::Event::Text(SECRET.into()));
     h.run_steps(2);
     assert!(!draft_of(&h, "custom").command.contains(SECRET), "the key never lands in the command");
-    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}").as_str()), "it goes on in its field");
+    assert_eq!(first_value(&h), "sk-", "nor anywhere: the person clicks their field again");
+    type_value(&mut h, 0, SECRET);
+    assert_eq!(first_value(&h), format!("sk-{SECRET}"), "and goes on there");
     // A faked Tab onto Remove, then the person's Space: nothing is removed.
     faked(&mut h, "ui.key", json!({"key": "Tab"}));
     h.key_press(egui::Key::Space);
     h.run_steps(2);
     assert_eq!(draft_of(&h, "custom").env.len(), 1, "Space didn't press Remove");
-    // A faked Shift+Tab (egui moves focus at the next pass): the person's next characters still
-    // go on in their field, not into its name.
+    // A faked Shift+Tab (egui moves focus at the next pass): the person's next characters go
+    // nowhere, not into the variable's name.
+    type_value(&mut h, 0, "");
     faked(&mut h, "ui.key", json!({"key": "Tab", "shift": true}));
+    assert!(!focused(&h), "nothing has focus");
     h.event(egui::Event::Text("x".into()));
     h.run_steps(2);
     assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.name.as_str()), Some("API_KEY"), "the name is as typed");
-    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}x").as_str()));
-    // A faked select-all in the person's field: their next character doesn't replace the key.
-    let before = draft_of(&h, "custom").env.first().map(|v| v.value.clone()).unwrap();
+    // A faked select-all in the person's field: their next character replaces nothing, and
+    // back in the field, they type on at its end.
+    type_value(&mut h, 0, "");
     faked(&mut h, "ui.key", json!({"key": "a", "cmd": true}));
     h.event(egui::Event::Text("Z".into()));
     h.run_steps(2);
-    let after = draft_of(&h, "custom").env.first().map(|v| v.value.clone()).unwrap();
-    assert!(after.starts_with(&before), "the selection was put back: {} → {} characters", before.len(), after.len());
+    assert_eq!(first_value(&h), format!("sk-{SECRET}"), "the key isn't replaced");
+    type_value(&mut h, 0, "Z");
+    assert_eq!(first_value(&h), format!("sk-{SECRET}Z"), "no selection is left");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -962,4 +994,406 @@ fn the_notes_say_a_path_variable_replaces_wordcrafts() {
     assert_eq!(notes("replaces WordCraft's own PATH"), open, "each note says it");
     assert_eq!(showing(&h, "comes first"), 0);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Third review (#24): each test below failed before its fix.
+
+/// A file holding codex's key, a custom agent and a large array WordCraft doesn't read: compact,
+/// it fits the 1 MiB the file may hold; pretty-printed, it doesn't.
+fn with_a_large_log(dir: &Path) -> AgentPrefs {
+    let custom = AgentPrefs { command: "/opt/mine".into(), args: vec!["--acp".into()], ..AgentPrefs::default() };
+    let file = json!({
+        "agents": {"codex": {"env": {"OPENAI_API_KEY": "sk-kept"}}, "custom": {"command": "/opt/mine", "args": ["--acp"]}},
+        "log": vec![0; 300_000],
+    });
+    std::fs::write(dir.join(SETTINGS_FILE), file.to_string()).unwrap();
+    custom
+}
+
+/// confirmed[0]: a Save over a file damaged after the page read it, whose write fails, loses
+/// nothing: the file is put back, and the next Save writes the page's last good read.
+#[test]
+fn a_save_over_a_damaged_file_that_fails_loses_nothing() {
+    let dir = folder("damaged-write-fails");
+    let file = dir.join(SETTINGS_FILE);
+    let custom = with_a_large_log(&dir);
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    type_into(&mut h, "Command:", 0, "2");
+    std::fs::write(&file, "").unwrap();
+    for _ in 0..3 {
+        button(&h, "Save").click();
+        h.run_steps(4);
+    }
+    let saved = AgentSettings::load(&dir);
+    assert_eq!(saved.agent("codex").env.get("OPENAI_API_KEY").map(String::as_str), Some("sk-kept"), "an agent not touched is kept");
+    assert_eq!(saved.agent("custom"), AgentPrefs { command: "/opt/mine2".into(), ..custom.clone() });
+    assert!(draft_of(&h, "codex").env.iter().any(|v| v.name == "OPENAI_API_KEY"), "the page still shows it");
+    // A write that fails after the damaged file was set aside puts it back (the new file's
+    // temporary name is taken by a folder, so it can't be made).
+    type_into(&mut h, "Command:", 0, "3");
+    std::fs::write(&file, "junk").unwrap();
+    button(&h, "Save").click();
+    h.run_steps(4);
+    let blocker = dir.join(format!(".{SETTINGS_FILE}.{}.tmp", std::process::id()));
+    std::fs::create_dir_all(blocker.join("x")).unwrap();
+    button(&h, "Save").click();
+    h.run_steps(4);
+    assert!(showing(&h, "Couldn't save") > 0, "the write failed");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "junk", "the damaged file is back");
+    std::fs::remove_dir_all(&blocker).unwrap();
+    button(&h, "Save").click();
+    h.run_steps(4);
+    let saved = AgentSettings::load(&dir);
+    assert_eq!(saved.agent("codex").env.get("OPENAI_API_KEY").map(String::as_str), Some("sk-kept"), "kept after a failed write");
+    assert_eq!(saved.agent("custom").command, "/opt/mine23");
+    // A file that went bad and then went missing: what the page shows is saved, not just edits.
+    type_into(&mut h, "Command:", 0, "4");
+    std::fs::write(&file, "junk").unwrap();
+    button(&h, "Save").click();
+    h.run_steps(4);
+    std::fs::remove_file(&file).unwrap();
+    button(&h, "Save").click();
+    h.run_steps(4);
+    let saved = AgentSettings::load(&dir);
+    assert_eq!(saved.agent("codex").env.get("OPENAI_API_KEY").map(String::as_str), Some("sk-kept"), "kept when the file went missing");
+    assert_eq!(saved.agent("custom").command, "/opt/mine234");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// confirmed[1]: what Save would write, the file's data the page doesn't show included, is
+/// measured: a file that only pretty-printing takes over 1 MiB saves, and one that the edits
+/// take over it keeps Save off and says why.
+#[test]
+fn save_measures_what_it_writes() {
+    let dir = folder("measured");
+    with_a_large_log(&dir);
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Codex");
+    type_value(&mut h, 0, "-new");
+    button(&h, "Save").click();
+    h.run_steps(4);
+    assert_eq!(AgentSettings::load(&dir).agent("codex").env.get("OPENAI_API_KEY").map(String::as_str), Some("sk-kept-new"), "saved");
+    let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap()).unwrap();
+    assert_eq!(raw["log"].as_array().map(Vec::len), Some(300_000), "with what the page doesn't show");
+    // Near the limit with data the page doesn't show: a long value would take it over.
+    let file = json!({"agents": {}, "pad": "x".repeat(1_048_576 - 2_000)});
+    std::fs::write(dir.join(SETTINGS_FILE), file.to_string()).unwrap();
+    let before = std::fs::read(dir.join(SETTINGS_FILE)).unwrap();
+    button(&h, "Check again").click();
+    h.run_steps(4);
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "BIG");
+    type_value(&mut h, 0, &"x".repeat(4_000));
+    assert!(showing(&h, "1 MiB") > 0, "the page says why");
+    assert!(showing(&h, "click Check again") > 0, "and what to do");
+    assert!(button(&h, "Save").accesskit_node().is_disabled(), "and keeps Save off");
+    assert_eq!(std::fs::read(dir.join(SETTINGS_FILE)).unwrap(), before);
+    // Fourth review confirmed[0]: the person makes room in the file and clicks Check again: Save
+    // is on, and saves what they typed.
+    std::fs::write(dir.join(SETTINGS_FILE), r#"{"agents": {}}"#).unwrap();
+    button(&h, "Check again").click();
+    h.run_steps(4);
+    assert!(!button(&h, "Save").accesskit_node().is_disabled(), "Save is on again");
+    button(&h, "Save").click();
+    h.run_steps(4);
+    assert_eq!(AgentSettings::load(&dir).agent("codex").env.get("BIG").map(String::len), Some(4_000), "the typed value is saved");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Third review confirmed[2]: a press the control channel never releases can't take the
+/// person's keys: no drag of the field it pressed starts, and while it is held, focus is let go
+/// of each pass, so its release (the agent's or the person's) leaves nothing focused.
+#[test]
+fn a_control_press_never_released_cant_take_the_keys() {
+    let dir = folder("held-press");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "API_KEY");
+    type_value(&mut h, 0, "sk-");
+    let c = h.get_by_label("Command:").rect().center();
+    faked(&mut h, "ui.press", json!({"x": c.x, "y": c.y}));
+    h.event(egui::Event::Text(SECRET.into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains(SECRET), "the key never lands in the command");
+    assert!(!focused(&h), "nothing has focus while it is held");
+    // Released: its click leaves nothing focused either.
+    faked(&mut h, "ui.release", json!({"x": c.x, "y": c.y}));
+    h.event(egui::Event::Text("x".into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains('x'), "nor after the release");
+    // The person's own release soon after its press clicks the field it pressed: let go too.
+    faked_for(&mut h, "ui.press", json!({"x": c.x, "y": c.y}), 3);
+    h.event(egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(1);
+    h.event(egui::Event::Text("y".into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains('y'), "nor after the person's release");
+    assert_eq!(first_value(&h), "sk-", "and the key field is as the person left it");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Third review confirmed[3]: what the control channel's input left in another window, where
+/// the page was then hidden, doesn't change what its input does here.
+#[test]
+fn another_windows_leftover_focus_doesnt_turn_the_put_back_off() {
+    let dir = folder("two-windows");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "API_KEY");
+    type_value(&mut h, 0, "sk-");
+    h.state_mut().assist.setup.as_mut().unwrap().agent_input.insert(egui::ViewportId::from_hash_of("window A"), true);
+    let command = h.get_by_label("Command:").rect().center();
+    faked_click(&mut h, command);
+    h.event(egui::Event::Text(SECRET.into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains(SECRET), "the key never lands in the command");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Fourth review (#24): each test below failed before its fix.
+
+/// confirmed[2]: a control step right after the person's release of a press the agent made
+/// doesn't make the field that release clicked the person's: nothing is left focused.
+#[test]
+fn a_control_step_after_the_persons_release_leaves_nothing_focused() {
+    let dir = folder("release-then-step");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "API_KEY");
+    type_value(&mut h, 0, "sk-");
+    let c = h.get_by_label("Command:").rect().center();
+    faked_for(&mut h, "ui.press", json!({"x": c.x, "y": c.y}), 3);
+    h.event(egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(1);
+    faked_for(&mut h, "ui.move", json!({"x": c.x, "y": c.y}), 3);
+    h.event(egui::Event::Text(SECRET.into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains(SECRET), "the key never lands in the command");
+    assert!(!focused(&h));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// confirmed[3]: the person's own click right after an agent's click stands: their keys go into
+/// the field they clicked, not back into the one they had before.
+#[test]
+fn the_persons_click_right_after_an_agents_click_stands() {
+    let dir = folder("click-after-click");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "API_KEY");
+    type_into(&mut h, "Command:", 0, "x");
+    let elsewhere = h.get_by_label_contains("Values are hidden here").rect().center();
+    faked_for(&mut h, "ui.click", json!({"x": elsewhere.x, "y": elsewhere.y}), 3);
+    let value = value_field(&h, 0).rect().center();
+    person_click(&mut h, value);
+    h.event(egui::Event::Text(SECRET.into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains(SECRET), "the key never lands in the command");
+    assert_eq!(first_value(&h), SECRET, "it goes where the person clicked");
+    // Exactly at the boundary, the person's click in the first pass after the agent's release
+    // (set up as that pass sees it: egui runs the release's pass again, which hides it here):
+    // letting go of what the agent left focused, at the start of that pass, leaves their click.
+    type_into(&mut h, "Command:", 0, "y");
+    h.state_mut().assist.setup.as_mut().unwrap().agent_input.insert(egui::ViewportId::ROOT, false);
+    person_click(&mut h, value);
+    h.event(egui::Event::Text("z".into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains('z'), "the key never lands in the command");
+    assert!(first_value(&h).contains('z'), "it goes where the person clicked");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex's review of #60: the person's release of a press the control channel made over
+/// Remove, Discard changes or Save (a click whose press was the agent's) removes, discards and
+/// saves nothing.
+#[test]
+fn the_persons_release_of_an_agents_press_clicks_nothing() {
+    let dir = folder("release-of-their-press");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "API_KEY");
+    type_value(&mut h, 0, "sk-");
+    let release = |h: &mut egui_kittest::Harness<'static, WordApp>, at: egui::Pos2| {
+        faked_for(h, "ui.press", json!({"x": at.x, "y": at.y}), 3);
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+        h.run_steps(3);
+    };
+    let remove = h.get_by_label("Remove API_KEY").rect().center();
+    release(&mut h, remove);
+    assert_eq!(draft_of(&h, "custom").env.len(), 1, "Remove removes nothing");
+    let discard = button(&h, "Discard changes").rect().center();
+    release(&mut h, discard);
+    assert_eq!(first_value(&h), "sk-", "Discard discards nothing");
+    let save = button(&h, "Save").rect().center();
+    release(&mut h, save);
+    assert!(AgentSettings::load(&dir).agent("custom").env.is_empty(), "Save saves nothing");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex's second review of #60: a file holding more variables (or agents) than WordCraft reads
+/// keeps those it doesn't show, so a change the page can hold may put one of its own past what
+/// WordCraft reads (a variable renamed to sort after the one the page doesn't show). That is
+/// refused before Save, saying why, and at Save if the file gained one meanwhile.
+#[test]
+fn a_change_past_what_wordcraft_reads_is_refused() {
+    let dir = folder("past-reader");
+    // 63 variables, then M, the 64th WordCraft reads, then MA, which it doesn't.
+    let mut env: serde_json::Map<String, serde_json::Value> = (0..63).map(|i| (format!("A{i:02}"), json!("a"))).collect();
+    env.insert("M".into(), json!("m"));
+    let without = json!({"agents": {"codex": {"env": env.clone()}}});
+    env.insert("MA".into(), json!("hidden"));
+    let with = json!({"agents": {"codex": {"env": env}}});
+    let write = |file: &serde_json::Value| std::fs::write(dir.join(SETTINGS_FILE), serde_json::to_vec_pretty(file).unwrap()).unwrap();
+    write(&with);
+    let before = std::fs::read(dir.join(SETTINGS_FILE)).unwrap();
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Codex");
+    assert_eq!(draft_of(&h, "codex").env.len(), 64, "the page shows what WordCraft reads");
+    // M renamed MZ: 64 variables, but MZ sorts after MA, past the 64 WordCraft reads.
+    type_into(&mut h, "Name", 63, "Z");
+    assert_eq!(draft_of(&h, "codex").env.get(63).map(|v| v.name.as_str()), Some("MZ"));
+    assert!(showing(&h, "past what WordCraft reads") > 0, "the page says why");
+    assert!(button(&h, "Save").accesskit_node().is_disabled(), "and keeps Save off");
+    assert_eq!(std::fs::read(dir.join(SETTINGS_FILE)).unwrap(), before);
+    // Without MA in the file, it can be saved; MA added again meanwhile, Save refuses. (The 64
+    // rows put the buttons below the window's edge: clicked as a screen reader clicks them.)
+    write(&without);
+    button(&h, "Check again").click_accesskit();
+    h.run_steps(4);
+    assert!(!button(&h, "Save").accesskit_node().is_disabled(), "Save is on");
+    write(&with);
+    button(&h, "Save").click_accesskit();
+    h.run_steps(4);
+    assert!(showing(&h, "Not saved") > 0, "Save says it didn't save");
+    assert_eq!(std::fs::read(dir.join(SETTINGS_FILE)).unwrap(), before, "and leaves the file as it was");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex's second review of #60, unit by unit: an agent the page sets up that would land past
+/// the 16 WordCraft reads is refused; a variable removed where the file holds one more than
+/// WordCraft reads saves (that one is read from then on); and what the page saves reads back as
+/// it, a name that only loses its ends once its invisible characters are gone included.
+#[test]
+fn what_save_writes_reads_back_as_the_page_saves_it() {
+    let file_with = |agents: serde_json::Value| json!({ "agents": agents });
+    // 15 agents, then codex: the 16 WordCraft reads; codey, which sorts after codex, it doesn't.
+    let mut agents: serde_json::Map<String, serde_json::Value> = (0..15).map(|i| (format!("a{i:02}"), json!({"command": "x"}))).collect();
+    agents.insert("codex".into(), json!({"command": "/opt/codex"}));
+    agents.insert("codey".into(), json!({"command": "y"}));
+    let file = file_with(serde_json::Value::Object(agents));
+    let now = AgentSettings::from_value(&file);
+    assert_eq!(now.agents.len(), 16);
+    let original = drafts(&now);
+    let mut ds = original.clone();
+    // Codex cleared and the custom agent set up: 16, but custom sorts after codey.
+    ds.iter_mut().find(|d| d.key == "codex").unwrap().command.clear();
+    ds.iter_mut().find(|d| d.key == "custom").unwrap().command = "/opt/mine".into();
+    let settings = settings_over(&now, &original, &ds).unwrap();
+    assert_eq!(settings.agents.len(), 16);
+    let e = written(&settings, &now, &file, &original, &ds).unwrap_err();
+    assert!(e.contains("past what WordCraft reads"), "{e}");
+
+    // 64 variables WordCraft reads and one it doesn't: removing one saves, and the 65th is read.
+    let env: serde_json::Map<String, serde_json::Value> = (0..65).map(|i| (format!("V{i:02}"), json!("v"))).collect();
+    let file = file_with(json!({"codex": {"env": env}}));
+    let now = AgentSettings::from_value(&file);
+    let original = drafts(&now);
+    let mut ds = original.clone();
+    ds.iter_mut().find(|d| d.key == "codex").unwrap().env.remove(0);
+    let settings = settings_over(&now, &original, &ds).unwrap();
+    let out = written(&settings, &now, &file, &original, &ds).unwrap();
+    let read = AgentSettings::from_value(&out).agent("codex").env;
+    assert!(!read.contains_key("V00") && read.contains_key("V64") && read.len() == 64);
+
+    // A name whose end is a space once an invisible character is taken out saves as it reads.
+    let now = AgentSettings::default();
+    let original = drafts(&now);
+    let mut ds = original.clone();
+    let custom = ds.iter_mut().find(|d| d.key == "custom").unwrap();
+    custom.name = "Bot \u{200B}".into();
+    custom.command = "/opt/bot".into();
+    let settings = settings_over(&now, &original, &ds).unwrap();
+    assert_eq!(settings.agent("custom").name, "Bot");
+    let out = written(&settings, &now, &serde_json::Value::Null, &original, &ds).unwrap();
+    assert_eq!(AgentSettings::from_value(&out).agent("custom").name, "Bot");
+}
+
+/// Independent review of the fix for Codex's second review of #60: only the agents the page
+/// shows (the only ones WordCraft uses) are checked, and a file that gained entries while the
+/// page was open loses nothing the person did: a variable they took out that the file now holds
+/// past the 64 WordCraft reads is taken out of the file too, and an agent they cleared that it
+/// now holds past the 16 can't come back.
+#[test]
+fn a_file_that_gained_entries_meanwhile_loses_nothing_the_page_did() {
+    let agents_of = |n: usize, more: &[(&str, serde_json::Value)]| {
+        let mut agents: serde_json::Map<String, serde_json::Value> = (0..n).map(|i| (format!("a{i:02}"), json!({"command": "x"}))).collect();
+        agents.extend(more.iter().map(|(k, v)| (k.to_string(), v.clone())));
+        json!({ "agents": agents })
+    };
+    let edit = |ds: &mut Vec<Draft>, key: &str, f: &dyn Fn(&mut Draft)| f(ds.iter_mut().find(|d| d.key == key).unwrap());
+    let save = |file: &serde_json::Value, now: &serde_json::Value, edits: &dyn Fn(&mut Vec<Draft>)| {
+        let original = drafts(&AgentSettings::from_value(file));
+        let mut ds = original.clone();
+        edits(&mut ds);
+        let now_read = AgentSettings::from_value(now);
+        let settings = settings_over(&now_read, &original, &ds)?;
+        written(&settings, &now_read, now, &original, &ds)
+    };
+
+    // Codex cleared (its entry kept for a field WordCraft doesn't read) and the custom agent set
+    // up: zz-old, which WordCraft never uses, goes past the 16. That saves.
+    let file = agents_of(14, &[("codex", json!({"command": "/opt/codex", "note": "laptop"})), ("zz-old", json!({"command": "/opt/old"}))]);
+    let both = |ds: &mut Vec<Draft>| {
+        edit(ds, "codex", &|d| d.command.clear());
+        edit(ds, "custom", &|d| d.command = "/opt/mine".into());
+    };
+    let out = save(&file, &file, &both).unwrap();
+    assert_eq!(AgentSettings::from_value(&out).agent("custom").command, "/opt/mine");
+    assert_eq!(out["agents"]["zz-old"], json!({"command": "/opt/old"}), "kept in the file");
+    // Pi, set up and not changed, would go past the 16 instead: refused.
+    let file = agents_of(14, &[("codex", json!({"command": "/opt/codex", "note": "laptop"})), ("pi", json!({"command": "/opt/pi"}))]);
+    assert!(save(&file, &file, &both).is_err_and(|e| e.contains("past what WordCraft reads")));
+
+    // 64 variables, the key last; the page removes it and B00, and meanwhile the file gains A,
+    // which puts the key past the 64 WordCraft reads from it: it is taken out all the same.
+    let mut env: serde_json::Map<String, serde_json::Value> = (0..63).map(|i| (format!("B{i:02}"), json!("b"))).collect();
+    env.insert("OPENAI_API_KEY".into(), json!("sk-old"));
+    let file = json!({"agents": {"codex": {"env": env.clone()}}});
+    env.insert("A".into(), json!("a"));
+    let now = json!({"agents": {"codex": {"env": env}}});
+    let out = save(&file, &now, &|ds| edit(ds, "codex", &|d| d.env.retain(|v| v.name != "OPENAI_API_KEY" && v.name != "B00"))).unwrap();
+    let saved = &out["agents"]["codex"]["env"];
+    assert!(saved.get("OPENAI_API_KEY").is_none() && saved.get("B00").is_none() && saved.get("A").is_some(), "{saved}");
+    assert!(!AgentSettings::from_value(&out).agent("codex").env.contains_key("OPENAI_API_KEY"));
+    // The key alone: nothing else changes, and it is taken out of the file.
+    let out = save(&file, &now, &|ds| edit(ds, "codex", &|d| d.env.retain(|v| v.name != "OPENAI_API_KEY"))).unwrap();
+    assert!(out["agents"]["codex"]["env"].get("OPENAI_API_KEY").is_none());
+    assert_eq!(out["agents"]["codex"]["env"].as_object().map(|e| e.len()), Some(64));
+
+    // Codex and Pi cleared, and meanwhile the file gains a13, which puts Pi past the 16: Pi would
+    // come back once Codex's entry goes, so it is refused.
+    let file = agents_of(
+        13,
+        &[("claude-code", json!({"command": "c"})), ("codex", json!({"command": "/opt/codex"})), ("pi", json!({"command": "/opt/pi"}))],
+    );
+    let mut now = file.clone();
+    now["agents"]["a13"] = json!({"command": "x"});
+    let cleared = |ds: &mut Vec<Draft>| {
+        edit(ds, "codex", &|d| d.command.clear());
+        edit(ds, "pi", &|d| d.command.clear());
+    };
+    assert!(save(&file, &file, &cleared).is_ok(), "without a13 it saves");
+    assert!(save(&file, &now, &cleared).is_err_and(|e| e.contains("past what WordCraft reads")));
 }
