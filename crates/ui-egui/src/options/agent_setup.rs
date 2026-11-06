@@ -7,11 +7,13 @@
 //!
 //! Which program WordCraft starts, and the keys an agent signs in with, are the person's alone:
 //! no command reads or writes them, and input the control channel makes (an agent's `click`,
-//! `key` or `type`) changes nothing here: the page puts back what it changed and says why. In a
-//! pass with its input, and while a press it made is held down, the page lets go of keyboard
-//! focus and of the focused field's selection (an agent's click or key never leaves the person's
-//! keys going into a field it picked), and gives focus back to nothing: the person clicks their
-//! field again. Their own clicks, in passes without its input, are never touched. The
+//! `key` or `type`) changes nothing here: the page puts back what it changed and says why. A
+//! press it made counts as its input until it is released, the release included, even the
+//! person's (that release would click what the agent pressed: Remove, Discard changes, Save). In
+//! a pass with its input the page also lets go of keyboard focus and of the focused field's
+//! selection (an agent's click or key never leaves the person's keys going into a field it
+//! picked), and gives focus back to nothing: the person clicks their field again. Their own
+//! clicks, in passes without its input, are never touched. The
 //! variables' values are masked (egui's password fields, which never show, copy or expose them
 //! as text) and never logged, and nothing here derives `Debug`.
 //!
@@ -454,14 +456,15 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
     // pass (an agent's click, key or text) is put back, and the page lets go of focus.
     let ctx = ui.ctx().clone();
     let from_control = app.input_from_control(&ctx);
-    let before = from_control.then(|| setup.drafts.clone());
     let last = setup.agent_input.get(&viewport).copied();
     // The person's first pass after its input: focus egui gave for its keys at the end of its
     // pass or the start of this one (an arrow key, Shift+Tab) is let go, before the page's
     // widgets see the person's input.
     let mut let_go_of = !from_control && last.is_some() && let_go(&ctx);
-    // A press it made, still held down: its release may click what it pressed.
+    // A press it made, still held down: its release, even the person's, may click what it
+    // pressed (Remove, Discard changes, Save), so that pass is treated as its input too.
     let held = last == Some(true);
+    let before = (from_control || held).then(|| setup.drafts.clone());
     let t = Tokens::get(&ctx);
     if let Some(damage) = &setup.damaged {
         let file = format!("{SETTINGS_FILE}{SET_ASIDE_SUFFIX}");

@@ -1212,3 +1212,32 @@ fn the_persons_click_right_after_an_agents_click_stands() {
     assert!(first_value(&h).contains('z'), "it goes where the person clicked");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Codex's review of #60: the person's release of a press the control channel made over
+/// Remove, Discard changes or Save (a click whose press was the agent's) removes, discards and
+/// saves nothing.
+#[test]
+fn the_persons_release_of_an_agents_press_clicks_nothing() {
+    let dir = folder("release-of-their-press");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "API_KEY");
+    type_value(&mut h, 0, "sk-");
+    let release = |h: &mut egui_kittest::Harness<'static, WordApp>, at: egui::Pos2| {
+        faked_for(h, "ui.press", json!({"x": at.x, "y": at.y}), 3);
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+        h.run_steps(3);
+    };
+    let remove = h.get_by_label("Remove API_KEY").rect().center();
+    release(&mut h, remove);
+    assert_eq!(draft_of(&h, "custom").env.len(), 1, "Remove removes nothing");
+    let discard = button(&h, "Discard changes").rect().center();
+    release(&mut h, discard);
+    assert_eq!(first_value(&h), "sk-", "Discard discards nothing");
+    let save = button(&h, "Save").rect().center();
+    release(&mut h, save);
+    assert!(AgentSettings::load(&dir).agent("custom").env.is_empty(), "Save saves nothing");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -146,11 +146,12 @@ its place meanwhile: that one is never replaced, and the page says the damaged o
 No command reads or writes these settings: they say which program WordCraft starts and may hold
 your keys, so they are yours alone, set in the page or in the file. Input from the control
 channel (MCP's `click`, `key` and `type`, or `ui.*`) changes nothing on the page: what it typed
-or clicked is put back, and its fields start afresh so undo can't bring it back. With any of its
-input, and while a press it made is held down, the page also lets go of keyboard focus and of the
-focused field's selection, and gives focus to nothing: your next keys never land where it clicked
-or tabbed, and you click your field again to go on. A press it holds down starts no drag. Your
-own clicks are never changed. The page says only you can change these settings. A script picks an agent with `assist.backend`, whose answer
+or clicked is put back, and its fields start afresh so undo can't bring it back. A press it made
+counts as its input until it is released, even when you release it: that release would click
+what it pressed (Remove, Discard changes, Save), so it does nothing. With any of its input the
+page also lets go of keyboard focus and of the focused field's selection, and gives focus to
+nothing: your next keys never land where it clicked or tabbed, and you click your field again to
+go on. A press it holds down starts no drag. Your own clicks are never changed. The page says only you can change these settings. A script picks an agent with `assist.backend`, whose answer
 says whether each one is ready, and never holds its environment.
 
 They are kept in `<settings>/assistant-agents.json` (`<settings>` is the folder
