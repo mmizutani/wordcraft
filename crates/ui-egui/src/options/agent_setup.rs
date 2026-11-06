@@ -243,7 +243,7 @@ impl AgentSetup {
         self.check = settings_over(&self.saved, &self.original, &self.drafts).and_then(|settings| {
             let base = AgentSettings::from_value(&self.latest);
             let at_save = if base == self.saved { settings.clone() } else { settings_over(&base, &self.original, &self.drafts)? };
-            written(&at_save, &base, &self.latest)?;
+            written(&at_save, &base, &self.latest, &self.original, &self.drafts)?;
             Ok(settings)
         });
     }
@@ -303,16 +303,100 @@ fn settings_over(base: &AgentSettings, original: &[Draft], drafts: &[Draft]) -> 
 
 /// The file `file` (what `before` was read from) with what `settings` change written into it,
 /// the data the page doesn't show included, or why it can't be saved: more than the 1 MiB the
-/// file may hold.
-fn written(settings: &AgentSettings, before: &AgentSettings, file: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let written = settings.written_over(before, file);
+/// file may hold, or what the person changed (from `original`, what the page read, to `drafts`)
+/// not read back from it.
+fn written(
+    settings: &AgentSettings,
+    before: &AgentSettings,
+    file: &serde_json::Value,
+    original: &[Draft],
+    drafts: &[Draft],
+) -> Result<serde_json::Value, String> {
+    let mut written = settings.written_over(before, file);
+    // A variable the person took out may be one the file now holds past those WordCraft reads
+    // (it gained some meanwhile), so not in `before`: it is taken out of the file all the same,
+    // or it would come back into view when another one is removed.
+    for d in drafts {
+        let gone = taken_out(original.iter().find(|o| o.key == d.key), d, &settings.agent(d.key));
+        take_out(&mut written, d.key, &gone);
+    }
     if !AgentSettings::value_fits(&written) {
         return Err(tl!(
             "the agents' settings file would be larger than the 1 MiB it may hold, with what it holds that this page doesn't show: make room in it, then click Check again"
         )
         .to_string());
     }
+    // What the file holds that the page doesn't show is kept, so it may hold more agents, or
+    // more variables for one, than WordCraft reads; what is set here must still be among those
+    // it reads (a variable renamed to sort after one the page doesn't show would be left out).
+    if !reads_back(settings, original, drafts, &written) {
+        return Err(fmt(
+            tl!(
+                "the agents' settings file holds more agents or variables than this page shows, and with these changes some of what's set here would be past what WordCraft reads (at most {agents} agents, and {vars} variables for each): make room in it, then click Check again"
+            ),
+            &[("agents", &MOST_AGENTS.to_string()), ("vars", &MOST.to_string())],
+        ));
+    }
     Ok(written)
+}
+
+/// The names of the variables the person took out of `d` (`o`: as the page read it), removed or
+/// renamed away, and not set again (`want`: what it saves).
+fn taken_out<'o>(o: Option<&'o Draft>, d: &Draft, want: &AgentPrefs) -> Vec<&'o str> {
+    let read = o.map_or(&[][..], |o| o.env.as_slice());
+    read.iter()
+        .filter(|r| !d.env.iter().any(|v| v.uid == r.uid && v.name == r.name))
+        .map(|r| r.name.as_str())
+        .filter(|name| !want.env.contains_key(*name))
+        .collect()
+}
+
+/// Take the variables `names` out of agent `key`'s entry in `file`, and the entry's `env`, or
+/// the entry, when nothing is left in it.
+fn take_out(file: &mut serde_json::Value, key: &str, names: &[&str]) {
+    let Some(agents) = file.get_mut("agents").and_then(serde_json::Value::as_object_mut) else {
+        return;
+    };
+    let Some(entry) = agents.get_mut(key).and_then(serde_json::Value::as_object_mut) else {
+        return;
+    };
+    let Some(env) = entry.get_mut("env").and_then(serde_json::Value::as_object_mut) else {
+        return;
+    };
+    let before = env.len();
+    for name in names {
+        env.remove(*name);
+    }
+    if env.len() == before {
+        return;
+    }
+    if env.is_empty() {
+        entry.remove("env");
+    }
+    if entry.is_empty() {
+        agents.remove(key);
+    }
+}
+
+/// Whether WordCraft reads `file` back as the person meant each agent the page shows (the only
+/// ones WordCraft uses): one they changed (from `original`) with the name, command and
+/// arguments `settings` saves, each variable it saves with its value, and none they took out;
+/// one they didn't keeps what it had, if anything. One of the file's own that comes into view
+/// (when one is removed, say) is no loss.
+fn reads_back(settings: &AgentSettings, original: &[Draft], drafts: &[Draft], file: &serde_json::Value) -> bool {
+    let read = AgentSettings::from_value(file);
+    drafts.iter().all(|d| {
+        let o = original.iter().find(|o| o.key == d.key);
+        let (want, got) = (settings.agent(d.key), read.agent(d.key));
+        if o == Some(d) {
+            return want == AgentPrefs::default() || got == want;
+        }
+        want.name == got.name
+            && want.command == got.command
+            && want.args == got.args
+            && want.env.iter().all(|(name, value)| got.env.get(name) == Some(value))
+            && taken_out(o, d, &want).iter().all(|name| !got.env.contains_key(*name))
+    })
 }
 
 /// One agent's settings: each field of `d` changed from `o` (what the page read; `None`: all of
@@ -593,7 +677,7 @@ fn save_setup(app: &mut WordApp, setup: &mut AgentSetup) {
         }
     };
     // Measured before a damaged file is set aside, so a save that can't be written leaves it.
-    let written = match written(&settings, &now, &file) {
+    let written = match written(&settings, &now, &file, &setup.original, &setup.drafts) {
         Ok(written) => written,
         Err(why) => {
             setup.notice = Some((fmt(tl!("Not saved: {why}"), &[("why", &why)]), true));

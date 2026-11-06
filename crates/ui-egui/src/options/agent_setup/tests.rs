@@ -4,7 +4,7 @@ use egui_kittest::kittest::{By, NodeT, Queryable};
 use serde_json::json;
 use wordcraft_assist::acp::presets::{AgentPrefs, AgentSettings, SETTINGS_FILE};
 
-use super::{AgentSetup, Draft, drafts, env_over, settings_over, var};
+use super::{AgentSetup, Draft, drafts, env_over, settings_over, var, written};
 use crate::{Services, WordApp};
 
 /// A secret no node of the page may show.
@@ -1240,4 +1240,160 @@ fn the_persons_release_of_an_agents_press_clicks_nothing() {
     release(&mut h, save);
     assert!(AgentSettings::load(&dir).agent("custom").env.is_empty(), "Save saves nothing");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex's second review of #60: a file holding more variables (or agents) than WordCraft reads
+/// keeps those it doesn't show, so a change the page can hold may put one of its own past what
+/// WordCraft reads (a variable renamed to sort after the one the page doesn't show). That is
+/// refused before Save, saying why, and at Save if the file gained one meanwhile.
+#[test]
+fn a_change_past_what_wordcraft_reads_is_refused() {
+    let dir = folder("past-reader");
+    // 63 variables, then M, the 64th WordCraft reads, then MA, which it doesn't.
+    let mut env: serde_json::Map<String, serde_json::Value> = (0..63).map(|i| (format!("A{i:02}"), json!("a"))).collect();
+    env.insert("M".into(), json!("m"));
+    let without = json!({"agents": {"codex": {"env": env.clone()}}});
+    env.insert("MA".into(), json!("hidden"));
+    let with = json!({"agents": {"codex": {"env": env}}});
+    let write = |file: &serde_json::Value| std::fs::write(dir.join(SETTINGS_FILE), serde_json::to_vec_pretty(file).unwrap()).unwrap();
+    write(&with);
+    let before = std::fs::read(dir.join(SETTINGS_FILE)).unwrap();
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Codex");
+    assert_eq!(draft_of(&h, "codex").env.len(), 64, "the page shows what WordCraft reads");
+    // M renamed MZ: 64 variables, but MZ sorts after MA, past the 64 WordCraft reads.
+    type_into(&mut h, "Name", 63, "Z");
+    assert_eq!(draft_of(&h, "codex").env.get(63).map(|v| v.name.as_str()), Some("MZ"));
+    assert!(showing(&h, "past what WordCraft reads") > 0, "the page says why");
+    assert!(button(&h, "Save").accesskit_node().is_disabled(), "and keeps Save off");
+    assert_eq!(std::fs::read(dir.join(SETTINGS_FILE)).unwrap(), before);
+    // Without MA in the file, it can be saved; MA added again meanwhile, Save refuses. (The 64
+    // rows put the buttons below the window's edge: clicked as a screen reader clicks them.)
+    write(&without);
+    button(&h, "Check again").click_accesskit();
+    h.run_steps(4);
+    assert!(!button(&h, "Save").accesskit_node().is_disabled(), "Save is on");
+    write(&with);
+    button(&h, "Save").click_accesskit();
+    h.run_steps(4);
+    assert!(showing(&h, "Not saved") > 0, "Save says it didn't save");
+    assert_eq!(std::fs::read(dir.join(SETTINGS_FILE)).unwrap(), before, "and leaves the file as it was");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Codex's second review of #60, unit by unit: an agent the page sets up that would land past
+/// the 16 WordCraft reads is refused; a variable removed where the file holds one more than
+/// WordCraft reads saves (that one is read from then on); and what the page saves reads back as
+/// it, a name that only loses its ends once its invisible characters are gone included.
+#[test]
+fn what_save_writes_reads_back_as_the_page_saves_it() {
+    let file_with = |agents: serde_json::Value| json!({ "agents": agents });
+    // 15 agents, then codex: the 16 WordCraft reads; codey, which sorts after codex, it doesn't.
+    let mut agents: serde_json::Map<String, serde_json::Value> = (0..15).map(|i| (format!("a{i:02}"), json!({"command": "x"}))).collect();
+    agents.insert("codex".into(), json!({"command": "/opt/codex"}));
+    agents.insert("codey".into(), json!({"command": "y"}));
+    let file = file_with(serde_json::Value::Object(agents));
+    let now = AgentSettings::from_value(&file);
+    assert_eq!(now.agents.len(), 16);
+    let original = drafts(&now);
+    let mut ds = original.clone();
+    // Codex cleared and the custom agent set up: 16, but custom sorts after codey.
+    ds.iter_mut().find(|d| d.key == "codex").unwrap().command.clear();
+    ds.iter_mut().find(|d| d.key == "custom").unwrap().command = "/opt/mine".into();
+    let settings = settings_over(&now, &original, &ds).unwrap();
+    assert_eq!(settings.agents.len(), 16);
+    let e = written(&settings, &now, &file, &original, &ds).unwrap_err();
+    assert!(e.contains("past what WordCraft reads"), "{e}");
+
+    // 64 variables WordCraft reads and one it doesn't: removing one saves, and the 65th is read.
+    let env: serde_json::Map<String, serde_json::Value> = (0..65).map(|i| (format!("V{i:02}"), json!("v"))).collect();
+    let file = file_with(json!({"codex": {"env": env}}));
+    let now = AgentSettings::from_value(&file);
+    let original = drafts(&now);
+    let mut ds = original.clone();
+    ds.iter_mut().find(|d| d.key == "codex").unwrap().env.remove(0);
+    let settings = settings_over(&now, &original, &ds).unwrap();
+    let out = written(&settings, &now, &file, &original, &ds).unwrap();
+    let read = AgentSettings::from_value(&out).agent("codex").env;
+    assert!(!read.contains_key("V00") && read.contains_key("V64") && read.len() == 64);
+
+    // A name whose end is a space once an invisible character is taken out saves as it reads.
+    let now = AgentSettings::default();
+    let original = drafts(&now);
+    let mut ds = original.clone();
+    let custom = ds.iter_mut().find(|d| d.key == "custom").unwrap();
+    custom.name = "Bot \u{200B}".into();
+    custom.command = "/opt/bot".into();
+    let settings = settings_over(&now, &original, &ds).unwrap();
+    assert_eq!(settings.agent("custom").name, "Bot");
+    let out = written(&settings, &now, &serde_json::Value::Null, &original, &ds).unwrap();
+    assert_eq!(AgentSettings::from_value(&out).agent("custom").name, "Bot");
+}
+
+/// Independent review of the fix for Codex's second review of #60: only the agents the page
+/// shows (the only ones WordCraft uses) are checked, and a file that gained entries while the
+/// page was open loses nothing the person did: a variable they took out that the file now holds
+/// past the 64 WordCraft reads is taken out of the file too, and an agent they cleared that it
+/// now holds past the 16 can't come back.
+#[test]
+fn a_file_that_gained_entries_meanwhile_loses_nothing_the_page_did() {
+    let agents_of = |n: usize, more: &[(&str, serde_json::Value)]| {
+        let mut agents: serde_json::Map<String, serde_json::Value> = (0..n).map(|i| (format!("a{i:02}"), json!({"command": "x"}))).collect();
+        agents.extend(more.iter().map(|(k, v)| (k.to_string(), v.clone())));
+        json!({ "agents": agents })
+    };
+    let edit = |ds: &mut Vec<Draft>, key: &str, f: &dyn Fn(&mut Draft)| f(ds.iter_mut().find(|d| d.key == key).unwrap());
+    let save = |file: &serde_json::Value, now: &serde_json::Value, edits: &dyn Fn(&mut Vec<Draft>)| {
+        let original = drafts(&AgentSettings::from_value(file));
+        let mut ds = original.clone();
+        edits(&mut ds);
+        let now_read = AgentSettings::from_value(now);
+        let settings = settings_over(&now_read, &original, &ds)?;
+        written(&settings, &now_read, now, &original, &ds)
+    };
+
+    // Codex cleared (its entry kept for a field WordCraft doesn't read) and the custom agent set
+    // up: zz-old, which WordCraft never uses, goes past the 16. That saves.
+    let file = agents_of(14, &[("codex", json!({"command": "/opt/codex", "note": "laptop"})), ("zz-old", json!({"command": "/opt/old"}))]);
+    let both = |ds: &mut Vec<Draft>| {
+        edit(ds, "codex", &|d| d.command.clear());
+        edit(ds, "custom", &|d| d.command = "/opt/mine".into());
+    };
+    let out = save(&file, &file, &both).unwrap();
+    assert_eq!(AgentSettings::from_value(&out).agent("custom").command, "/opt/mine");
+    assert_eq!(out["agents"]["zz-old"], json!({"command": "/opt/old"}), "kept in the file");
+    // Pi, set up and not changed, would go past the 16 instead: refused.
+    let file = agents_of(14, &[("codex", json!({"command": "/opt/codex", "note": "laptop"})), ("pi", json!({"command": "/opt/pi"}))]);
+    assert!(save(&file, &file, &both).is_err_and(|e| e.contains("past what WordCraft reads")));
+
+    // 64 variables, the key last; the page removes it and B00, and meanwhile the file gains A,
+    // which puts the key past the 64 WordCraft reads from it: it is taken out all the same.
+    let mut env: serde_json::Map<String, serde_json::Value> = (0..63).map(|i| (format!("B{i:02}"), json!("b"))).collect();
+    env.insert("OPENAI_API_KEY".into(), json!("sk-old"));
+    let file = json!({"agents": {"codex": {"env": env.clone()}}});
+    env.insert("A".into(), json!("a"));
+    let now = json!({"agents": {"codex": {"env": env}}});
+    let out = save(&file, &now, &|ds| edit(ds, "codex", &|d| d.env.retain(|v| v.name != "OPENAI_API_KEY" && v.name != "B00"))).unwrap();
+    let saved = &out["agents"]["codex"]["env"];
+    assert!(saved.get("OPENAI_API_KEY").is_none() && saved.get("B00").is_none() && saved.get("A").is_some(), "{saved}");
+    assert!(!AgentSettings::from_value(&out).agent("codex").env.contains_key("OPENAI_API_KEY"));
+    // The key alone: nothing else changes, and it is taken out of the file.
+    let out = save(&file, &now, &|ds| edit(ds, "codex", &|d| d.env.retain(|v| v.name != "OPENAI_API_KEY"))).unwrap();
+    assert!(out["agents"]["codex"]["env"].get("OPENAI_API_KEY").is_none());
+    assert_eq!(out["agents"]["codex"]["env"].as_object().map(|e| e.len()), Some(64));
+
+    // Codex and Pi cleared, and meanwhile the file gains a13, which puts Pi past the 16: Pi would
+    // come back once Codex's entry goes, so it is refused.
+    let file = agents_of(
+        13,
+        &[("claude-code", json!({"command": "c"})), ("codex", json!({"command": "/opt/codex"})), ("pi", json!({"command": "/opt/pi"}))],
+    );
+    let mut now = file.clone();
+    now["agents"]["a13"] = json!({"command": "x"});
+    let cleared = |ds: &mut Vec<Draft>| {
+        edit(ds, "codex", &|d| d.command.clear());
+        edit(ds, "pi", &|d| d.command.clear());
+    };
+    assert!(save(&file, &file, &cleared).is_ok(), "without a13 it saves");
+    assert!(save(&file, &now, &cleared).is_err_and(|e| e.contains("past what WordCraft reads")));
 }

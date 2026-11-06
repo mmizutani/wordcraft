@@ -378,7 +378,8 @@ fn agent_prefs(v: &Value) -> AgentPrefs {
     let args = v.get("args").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
     let env = v.get("env").and_then(Value::as_object).into_iter().flatten();
     AgentPrefs {
-        name: text(v.get("name")).map(|n| label(n.trim())).unwrap_or_default(),
+        // Trimmed again once what a label can't show is gone, so a name reads back as it is saved.
+        name: text(v.get("name")).map(|n| label(n.trim()).trim().to_string()).unwrap_or_default(),
         command: text(v.get("command")).map(|c| c.trim().to_string()).unwrap_or_default(),
         args: args.iter().filter_map(|a| text(Some(a))).take(MAX_ITEMS).collect(),
         env: env

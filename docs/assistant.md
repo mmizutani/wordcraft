@@ -120,11 +120,16 @@ both for finding its program and for what it runs, so it must hold every folder 
 logged; for a screen reader each row says whether it is open, and each value field and Remove
 button is named after its variable. Save waits until what you typed can be kept, and says why
 not: a variable with a value but no name, a name with `=` in it, a name given twice, more than
-64 arguments or variables, or settings larger than the 1 MiB the file may hold (measured as
+64 arguments or variables, settings larger than the 1 MiB the file may hold (measured as
 written, with what the page doesn't show; a file only pretty-printing would take past it is
-written compact). When the file's own data is what takes it past, make room in the file and click
-Check again: the page measures again, keeping your edits. What is saved
-applies the next time the agent starts; one already running keeps what it started with.
+written compact), or, in a file holding more agents or variables than WordCraft reads (16 agents,
+64 variables each), a change that would put something set here past those it reads (a variable
+renamed to sort after one the page doesn't show, say): Save checks that the file it writes reads
+back as you set each agent the page shows, and a variable you removed is taken out of the file
+even when it gained others meanwhile and holds it past the 64 WordCraft reads. When the file's
+own data is what takes it past, make room in the file and click Check again: the page measures
+again, keeping your edits. What is saved applies the next time the agent starts; one already
+running keeps what it started with.
 
 Save writes only what you changed, over the file as it is when you save: an agent you didn't
 touch, each field you didn't change, and each variable you didn't add, change or remove keep what
