@@ -350,7 +350,13 @@ fn serve(stream: TcpStream, lobby: &Lobby, seats: &Seats, first: Duration) {
     };
     let deadline = reader.get_mut();
     deadline.until = None;
-    deadline.participant = Some((copy.room().clone(), copy.id()));
+    deadline.participant = Some({
+        let Ok(copy) = copy.lock() else {
+            let _ = send(&mut out, &request.id, json!({"ok": false, "error": "the copy of the shared document broke: connect again"}));
+            return;
+        };
+        (copy.room().clone(), copy.id())
+    });
     serve_copy(&mut reader, &mut out, copy, &key, request);
 }
 
