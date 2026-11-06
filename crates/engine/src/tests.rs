@@ -9433,8 +9433,8 @@ fn review_language_validates_tags_and_marks_text_unchecked() {
     assert_eq!(run(&mut s, "format.state", json!({}))["lang"], "pl");
     run(&mut s, "review.language", json!({}));
     assert_eq!(run(&mut s, "format.state", json!({}))["lang"], "en-US");
-    // A language without proofing tools: no marks.
-    run(&mut s, "review.language", json!({"lang": "fr-FR"}));
+    // A reserved private-use language has no host-installed proofing tools: no marks.
+    run(&mut s, "review.language", json!({"lang": "qaa"}));
     assert_eq!(run(&mut s, "review.issues", json!({})), json!([]));
 }
 
