@@ -2,7 +2,7 @@
 //! starts and ends in, the paragraphs around it and the outline, as text, held to hard caps
 //! however large the document or the selection is.
 
-use wordcraft_doc::{Block, Blocks, Document, Paragraph, Path, Pos, para::OBJ};
+use wordcraft_doc::{Block, Blocks, Document, Paragraph, Path, Pos, StoryRef, para::OBJ};
 use wordcraft_engine::Session;
 
 use crate::backend::{cut, label};
@@ -258,23 +258,108 @@ fn flat_char(c: char) -> char {
     if c.is_control() { ' ' } else { c }
 }
 
+// Match the document's paragraph walk and text export depth.
+const PARA_DEPTH: usize = 16;
+
+/// Visit a range in either direction with one depth-bounded scratch path, stopping on false.
+fn visit_paths(
+    doc: &Document,
+    story: StoryRef,
+    range: (Option<&Path>, Option<&Path>),
+    reverse: bool,
+    mut visit: impl FnMut(&Path, &Paragraph) -> bool,
+) {
+    if let Some(blocks) = doc.story(story) {
+        walk_paths(blocks, &mut Path::default(), range, reverse, &mut visit);
+    }
+}
+
+fn walk_paths(
+    blocks: &Blocks,
+    path: &mut Path,
+    range: (Option<&Path>, Option<&Path>),
+    reverse: bool,
+    visit: &mut impl FnMut(&Path, &Paragraph) -> bool,
+) -> bool {
+    if path.0.len() / 3 > PARA_DEPTH {
+        return true;
+    }
+    let overlaps = |path: &Path| {
+        let side = |bound: &Path| {
+            let n = path.0.len().min(bound.0.len());
+            path.0.get(..n).unwrap_or_default().cmp(bound.0.get(..n).unwrap_or_default())
+        };
+        range.0.is_none_or(|from| !side(from).is_lt()) && range.1.is_none_or(|to| !side(to).is_gt())
+    };
+    let index = |len: usize, i: usize| if reverse { len.saturating_sub(i.saturating_add(1)) } else { i };
+    for i in 0..blocks.len() {
+        let i = index(blocks.len(), i);
+        let (Some(block), Ok(i)) = (blocks.get(i), u32::try_from(i)) else { continue };
+        path.0.push(i);
+        if overlaps(path) {
+            match &**block {
+                Block::Para(p) => {
+                    if range.0.is_none_or(|from| &*path >= from) && range.1.is_none_or(|to| &*path <= to) && !visit(path, p) {
+                        return false;
+                    }
+                }
+                Block::Table(table) => {
+                    for r in 0..table.rows.len() {
+                        let r = index(table.rows.len(), r);
+                        let (Some(row), Ok(r)) = (table.rows.get(r), u32::try_from(r)) else { continue };
+                        path.0.push(r);
+                        for c in 0..row.cells.len() {
+                            let c = index(row.cells.len(), c);
+                            let (Some(cell), Ok(c)) = (row.cells.get(c), u32::try_from(c)) else { continue };
+                            path.0.push(c);
+                            if overlaps(path) && !walk_paths(&cell.blocks, path, range, reverse, visit) {
+                                return false;
+                            }
+                            path.0.pop();
+                        }
+                        path.0.pop();
+                    }
+                }
+            }
+        }
+        path.0.pop();
+    }
+    true
+}
+
+fn selection_paths(doc: &Document, a: &Pos, b: &Pos, limit: usize) -> (Vec<Path>, bool) {
+    let (mut paths, mut cut) = (Vec::new(), false);
+    if a.story == b.story {
+        visit_paths(doc, a.story, (Some(&a.path), Some(&b.path)), false, |path, _| {
+            // An empty ending slice carries the previous paragraph's mark, without counting as selected.
+            let mark = a.path != b.path && path == &b.path && b.off == 0;
+            if paths.len() >= limit.max(1) && !mark {
+                cut = true;
+                return false;
+            }
+            paths.push(path.clone());
+            true
+        });
+    }
+    (paths, cut)
+}
+
 /// The selected text from `a` to `b`, read from at most `caps.selection_paragraphs`
 /// paragraphs, cut to `caps.selection_bytes`; and whether it was cut.
 fn selected(doc: &Document, a: &Pos, b: &Pos, caps: &Caps) -> (String, bool) {
     if a == b {
         return (String::new(), false);
     }
-    let paths = doc.para_paths_in(a, b);
-    let mut end = b.clone();
-    let mut cut_short = false;
-    if paths.len() > caps.selection_paragraphs.max(1)
-        && let Some(last) = paths.get(caps.selection_paragraphs.max(1) - 1)
-        && let Some(p) = doc.para(a.story, last)
-    {
-        end = Pos { story: a.story, path: last.clone(), off: p.text.len() };
-        cut_short = true;
-    }
-    let (text, cut_here) = prefix(&mut selection_chars(doc, a, &end).peekable(), caps.selection_bytes);
+    let (paths, cut_short) = selection_paths(doc, a, b, caps.selection_paragraphs);
+    let end = if cut_short {
+        paths
+            .last()
+            .and_then(|path| doc.para(a.story, path).map(|p| Pos { story: a.story, path: path.clone(), off: p.text.len() }))
+            .unwrap_or_else(|| b.clone())
+    } else {
+        b.clone()
+    };
+    let (text, cut_here) = prefix(&mut selection_chars(doc, a, &end, paths).peekable(), caps.selection_bytes);
     (text, cut_short || cut_here)
 }
 
@@ -332,20 +417,43 @@ fn ceil_boundary(text: &str, i: usize) -> usize {
 /// selection that ends at a paragraph's start leaves that paragraph out of it: it is the first
 /// one after.
 fn around(doc: &Document, a: &Pos, b: &Pos, caps: &Caps) -> (Vec<String>, Vec<String>) {
-    let text = |path: &Path| doc.para(a.story, path).and_then(|p| trimmed_prefix(p, caps.paragraph_bytes)).unwrap_or_default();
-    let all = doc.para_paths(a.story);
-    // Paragraphs with no text don't count, but only so many are looked at.
+    let (mut before, mut after) = (Vec::new(), Vec::new());
+    if caps.around == 0 || caps.paragraph_bytes == 0 {
+        return (before, after);
+    }
+    let anchor = |path: &Path| path.0.len() % 3 == 1 && path.depth() <= PARA_DEPTH && doc.para(a.story, path).is_some();
     let looked = caps.around.saturating_mul(8);
-    let mut before: Vec<String> = match all.binary_search(&a.path) {
-        Ok(i) => all.get(..i).unwrap_or_default().iter().rev().take(looked).map(text).filter(|t| !t.is_empty()).take(caps.around).collect(),
-        Err(_) => Vec::new(),
-    };
-    before.reverse();
-    let first_after = |i: usize| if a != b && b.off == 0 { i } else { i.saturating_add(1) };
-    let after = match all.binary_search(&b.path) {
-        Ok(i) => all.get(first_after(i)..).unwrap_or_default().iter().take(looked).map(text).filter(|t| !t.is_empty()).take(caps.around).collect(),
-        Err(_) => Vec::new(),
-    };
+    if anchor(&a.path) {
+        let mut visited = 0usize;
+        visit_paths(doc, a.story, (None, Some(&a.path)), true, |path, p| {
+            if path == &a.path {
+                return true;
+            }
+            visited = visited.saturating_add(1);
+            if let Some(text) = trimmed_prefix(p, caps.paragraph_bytes)
+                && !text.is_empty()
+            {
+                before.push(text);
+            }
+            visited < looked && before.len() < caps.around
+        });
+        before.reverse();
+    }
+    if anchor(&b.path) {
+        let mut visited = 0usize;
+        visit_paths(doc, a.story, (Some(&b.path), None), false, |path, p| {
+            if path == &b.path && (a == b || b.off != 0) {
+                return true;
+            }
+            visited = visited.saturating_add(1);
+            if let Some(text) = trimmed_prefix(p, caps.paragraph_bytes)
+                && !text.is_empty()
+            {
+                after.push(text);
+            }
+            visited < looked && after.len() < caps.around
+        });
+    }
     (before, after)
 }
 
@@ -449,7 +557,7 @@ fn trim_newlines(chars: impl Iterator<Item = char>) -> impl Iterator<Item = char
 
 /// The final text walk's table separators, with borrowed paragraphs and a bounded depth.
 fn block_chars(block: &Block, depth: usize) -> Box<dyn Iterator<Item = char> + '_> {
-    if depth > 16 {
+    if depth > PARA_DEPTH {
         return Box::new(std::iter::empty());
     }
     match block {
@@ -473,8 +581,46 @@ fn blocks_chars(blocks: &Blocks, depth: usize) -> impl Iterator<Item = char> + '
     blocks.iter().flat_map(move |block| block_chars(block, depth))
 }
 
+/// Recognize a fully selected table without collecting every paragraph in its story.
+fn selected_table<'a>(doc: &'a Document, a: &Pos, b: &Pos) -> Option<&'a Block> {
+    if a.story != b.story || a.off != 0 || a.path.parent() == b.path.parent() || b.path.depth() > PARA_DEPTH {
+        return None;
+    }
+    if b.off < doc.para(b.story, &b.path)?.text.len() {
+        return None;
+    }
+    let mut n = 1usize;
+    while n.saturating_add(3) <= a.path.0.len() {
+        let pre = a.path.0.get(..n)?;
+        if !b.path.0.starts_with(pre) {
+            return None;
+        }
+        let table = Path(pre.to_vec());
+        if let Some(block @ Block::Table(_)) = doc.block(a.story, &table) {
+            let mut first = false;
+            visit_paths(doc, a.story, (Some(&table), Some(&a.path)), false, |path, _| {
+                first = path == &a.path;
+                false
+            });
+            let mut last = true;
+            visit_paths(doc, a.story, (Some(&b.path), None), false, |path, _| {
+                if path == &b.path {
+                    return true;
+                }
+                last = !path.0.starts_with(pre);
+                false
+            });
+            if first && last {
+                return Some(block);
+            }
+        }
+        n = n.saturating_add(3);
+    }
+    None
+}
+
 /// Match copy_range's partial paragraphs and whole-table cases without copying a fragment.
-fn selection_chars<'a>(doc: &'a Document, a: &Pos, b: &Pos) -> impl Iterator<Item = char> + 'a {
+fn selection_chars<'a>(doc: &'a Document, a: &Pos, b: &Pos, paths: Vec<Path>) -> impl Iterator<Item = char> + 'a {
     let chars: Box<dyn Iterator<Item = char> + 'a> = if a.story != b.story {
         Box::new(std::iter::empty())
     } else if a.path.parent() == b.path.parent() {
@@ -487,11 +633,11 @@ fn selection_chars<'a>(doc: &'a Document, a: &Pos, b: &Pos) -> impl Iterator<Ite
                 Block::Table(_) => block_chars(block, 0),
             })
         }))
-    } else if let Some(table) = doc.whole_table(a, b).and_then(|path| doc.block(a.story, &path)) {
+    } else if let Some(table) = selected_table(doc, a, b) {
         block_chars(table, 0)
     } else {
         let (a, b) = (a.clone(), b.clone());
-        Box::new(doc.paths_between(&a, &b).into_iter().flat_map(move |path| {
+        Box::new(paths.into_iter().flat_map(move |path| {
             let Some(p) = doc.para(a.story, &path) else { return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = char>> };
             Box::new(
                 final_chars(p, if path == a.path { a.off } else { 0 }, if path == b.path { b.off } else { p.text.len() })
@@ -606,6 +752,113 @@ mod bounded_tests {
                 let expected = (!text.trim().is_empty()).then(|| cut(text.trim().to_string(), max));
                 assert_eq!(trimmed_prefix(&p, max), expected, "{text:?}, cap {max}");
             }
+        }
+    }
+
+    #[test]
+    fn paragraph_walk_reuses_bounded_scratch_and_stops_at_the_requested_neighbor() {
+        let doc = Document::from_text(&"paragraph\n".repeat(1000));
+        let (mut visited, mut scratch) = (0usize, None);
+        visit_paths(&doc, StoryRef::Body, (Some(&Path::top(400)), None), false, |path, _| {
+            let address = path.0.as_ptr();
+            if let Some(previous) = scratch {
+                assert_eq!(address, previous, "one scratch path, without collecting the story");
+            }
+            scratch = Some(address);
+            assert_eq!(path, &Path::top(400 + visited));
+            visited += 1;
+            visited < 3
+        });
+        assert_eq!(visited, 3);
+    }
+
+    #[test]
+    fn selection_metadata_never_collects_beyond_the_paragraph_budget() {
+        let doc = Document::from_text(&"paragraph\n".repeat(1000));
+        let a = Pos::body(0, 0);
+        let b = Pos::body(1000, 0);
+        let (paths, cut) = selection_paths(&doc, &a, &b, 2);
+        assert!(cut);
+        assert!(paths.len() <= 3, "at most the budget plus its ending paragraph mark: {}", paths.len());
+        assert_eq!(paths.first(), Some(&a.path));
+    }
+
+    #[test]
+    fn neighbors_match_reference_across_tables_empty_paragraphs_and_anchors() {
+        let mut doc = Document::from_text("first\n\nlast");
+        let mut table = Table::new(2, 2, 300.0);
+        for (i, row) in table.rows.iter_mut().enumerate() {
+            for (j, cell) in row.cells.iter_mut().enumerate() {
+                cell.blocks = vec![para_block(Paragraph::new()), para_block(Paragraph::with_text(&format!("Cell {i} {j}"), CharProps::default()))];
+            }
+        }
+        doc.body.insert(1, std::sync::Arc::new(Block::Table(table)));
+        let all = doc.para_paths(StoryRef::Body);
+        for (i, path) in all.iter().enumerate() {
+            for selected in [false, true] {
+                for around_count in [0, 1, 3] {
+                    let caps = Caps { around: around_count, ..Caps::default() };
+                    let b = Pos { story: StoryRef::Body, path: path.clone(), off: 0 };
+                    let a = if selected && i > 0 { Pos { path: all[i - 1].clone(), ..b.clone() } } else { b.clone() };
+                    let index_a = all.binary_search(&a.path).unwrap();
+                    let text = |path: &Path| trimmed_prefix(doc.para(StoryRef::Body, path).unwrap(), caps.paragraph_bytes).unwrap_or_default();
+                    let mut before: Vec<_> =
+                        all[..index_a].iter().rev().take(caps.around * 8).map(text).filter(|t| !t.is_empty()).take(caps.around).collect();
+                    before.reverse();
+                    let index_after = if a != b { i } else { i + 1 };
+                    let after: Vec<_> =
+                        all[index_after..].iter().take(caps.around * 8).map(text).filter(|t| !t.is_empty()).take(caps.around).collect();
+                    assert_eq!(around(&doc, &a, &b, &caps), (before, after), "{a:?}..{b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_table_selection_matches_copying_through_empty_cells_and_marks() {
+        let mut doc = Document::from_text("before\nafter");
+        let mut inner = Table::new(1, 2, 200.0);
+        inner.rows[0].cells[1].blocks = vec![para_block(Paragraph::with_text("inner", CharProps::default()))];
+        let mut outer = Table::new(2, 2, 400.0);
+        outer.rows[0].cells[0].blocks.insert(0, std::sync::Arc::new(Block::Table(inner)));
+        outer.rows[1].cells[0].blocks = vec![para_block(Paragraph::with_text("outer", CharProps::default()))];
+        doc.body.insert(1, std::sync::Arc::new(Block::Table(outer)));
+        let paths = doc.para_paths(StoryRef::Body);
+        for (i, a) in paths.iter().enumerate() {
+            for b in paths.iter().skip(i) {
+                for off in [0, doc.para(StoryRef::Body, b).unwrap().len()] {
+                    let (a, b) = (Pos::new(StoryRef::Body, a.clone(), 0), Pos::new(StoryRef::Body, b.clone(), off));
+                    let table = doc.whole_table(&a, &b).and_then(|path| doc.block(a.story, &path));
+                    assert_eq!(selected_table(&doc, &a, &b), table, "{a:?}..{b:?}");
+                    let expected = doc.copy_range(&a, &b).to_document().final_text(StoryRef::Body);
+                    assert_eq!(selected(&doc, &a, &b, &Caps::default()), (expected, false), "{a:?}..{b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paragraph_walk_matches_document_depth_limit_in_both_directions() {
+        let mut block = para_block(Paragraph::new());
+        for _ in 0..18 {
+            let mut table = Table::new(1, 1, 200.0);
+            table.rows[0].cells[0].blocks.insert(0, block);
+            block = std::sync::Arc::new(Block::Table(table));
+        }
+        let mut doc = Document::new();
+        doc.body = vec![block];
+        let expected = doc.para_paths(StoryRef::Body);
+        assert_eq!(expected.iter().map(Path::depth).max(), Some(PARA_DEPTH));
+        for reverse in [false, true] {
+            let mut actual = Vec::new();
+            visit_paths(&doc, StoryRef::Body, (None, None), reverse, |path, _| {
+                actual.push(path.clone());
+                true
+            });
+            if reverse {
+                actual.reverse()
+            }
+            assert_eq!(actual, expected);
         }
     }
 }
