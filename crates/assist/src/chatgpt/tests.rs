@@ -76,6 +76,8 @@ pub(super) struct Script {
     pub(super) nonce: Mutex<String>,
     /// The scopes the token endpoint grants, when not all of them.
     pub(super) scope: Mutex<Option<String>>,
+    /// Omit scope when all requested scopes were granted.
+    pub(super) omit_scope: Mutex<bool>,
     /// What the token endpoint answers instead of tokens.
     pub(super) refuse: Mutex<Option<(u16, Value)>>,
     /// How long the token endpoint takes.
@@ -130,17 +132,18 @@ fn token(script: &Script, r: &Request, n: usize) -> Reply {
     let first = r.field("grant_type").as_deref() == Some("authorization_code");
     let nonce = script.nonce.lock().unwrap().clone();
     let scope = script.scope.lock().unwrap().clone().unwrap_or_else(|| SCOPES.to_string());
-    Reply::json(
-        200,
-        &json!({
-            "access_token": format!("access-{n}"),
-            "refresh_token": format!("refresh-{n}"),
-            "id_token": id_token(&claims(&client, first.then_some(nonce.as_str()))),
-            "token_type": "Bearer",
-            "expires_in": 3600,
-            "scope": scope,
-        }),
-    )
+    let mut body = json!({
+        "access_token": format!("access-{n}"),
+        "refresh_token": format!("refresh-{n}"),
+        "id_token": id_token(&claims(&client, first.then_some(nonce.as_str()))),
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": scope,
+    });
+    if *script.omit_scope.lock().unwrap() {
+        body.as_object_mut().unwrap().remove("scope");
+    }
+    Reply::json(200, &body)
 }
 
 pub(super) fn options(endpoints: &Endpoints) -> SignInOptions {
@@ -338,6 +341,37 @@ fn signing_in_registers_wordcraft_exchanges_the_code_and_keeps_the_tokens_privat
     for secret in ["access-0", "refresh-0", "the-code", "eyJ"] {
         assert!(!shown.contains(secret), "{shown}");
     }
+}
+
+#[test]
+fn sign_in_without_returned_scopes_keeps_the_requested_scopes() {
+    let folder = Folder::new();
+    let script = Arc::new(Script::default());
+    *script.omit_scope.lock().unwrap() = true;
+    let server = server(script.clone(), no_api);
+    let endpoints = Endpoints::local(server.base());
+    let account = sign_in_with(folder.path(), &script, &endpoints, "code=c&client_id=oaiapp_issued-1").unwrap();
+    assert!(account.plan_usage);
+    assert_eq!(readiness(Some(folder.path())), Readiness::Ready);
+    assert_eq!(store::read_credentials(folder.path()).unwrap().scopes, SCOPES.split_whitespace().collect::<Vec<_>>());
+}
+
+#[test]
+fn finishing_registration_preserves_the_model_chosen_while_waiting_for_the_browser() {
+    let folder = Folder::new();
+    let script = Arc::new(Script::default());
+    let server = server(script.clone(), no_api);
+    let endpoints = Endpoints::local(server.base());
+    let mut sign_in = SignIn::start(folder.path(), options(&endpoints)).unwrap();
+    let url = sign_in.url().to_string();
+    *script.nonce.lock().unwrap() = param(&url, "nonce").unwrap();
+    choose_model(folder.path(), Some("gpt-test-mini")).unwrap();
+    let (status, page) = callback(sign_in.redirect_uri(), &format!("code=c&state={}&client_id=oaiapp_issued-1", param(&url, "state").unwrap()));
+    assert_eq!(status, 200, "{page}");
+    sign_in.wait(WAIT).cloned().unwrap().unwrap();
+    let client = store::client(folder.path()).unwrap();
+    assert_eq!(client.model.as_deref(), Some("gpt-test-mini"));
+    assert_eq!(client.client_id.as_deref(), Some("oaiapp_issued-1"));
 }
 
 #[test]

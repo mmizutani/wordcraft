@@ -505,7 +505,9 @@ fn client_id(p: &Pending, issued: Option<&str>) -> Result<String, AuthError> {
             let id = issued
                 .filter(|id| valid_client_id(id))
                 .ok_or_else(|| AuthError::Failed("WordCraft's registration with ChatGPT didn't finish: start signing in again".into()))?;
-            let client = Client { client_id: Some(id.to_string()), ..p.client.clone() };
+            let _lock = Lock::take(&p.settings).map_err(AuthError::Storage)?;
+            let current = store::client(&p.settings).map_err(AuthError::Storage)?;
+            let client = Client { client_id: Some(id.to_string()), ..current };
             store::save_client(&p.settings, &client).map_err(AuthError::Storage)?;
             Ok(id.to_string())
         }
@@ -513,7 +515,7 @@ fn client_id(p: &Pending, issued: Option<&str>) -> Result<String, AuthError> {
 }
 
 /// Forget the issued client id `dead`, which ChatGPT no longer knows (`invalid_client`): the
-/// host id and the chosen model stay, and the next sign-in registers WordCraft again.
+/// host id and the chosen model stay, and the next sign-in registers WordCraft again. The caller holds the lock.
 fn forget_client(settings: &Path, dead: &str) -> Result<(), String> {
     let client = store::client(settings)?;
     if client.client_id.as_deref() != Some(dead) {
@@ -541,7 +543,7 @@ fn exchange(p: &Pending, client_id: &str, code: &str) -> Result<Account, AuthErr
         return Err(AuthError::Failed(match code_name.as_str() {
             "invalid_grant" => "the sign-in code was refused (it may have been used already): start signing in again".into(),
             "invalid_client" => {
-                if let Err(e) = forget_client(&p.settings, client_id) {
+                if let Err(e) = Lock::take(&p.settings).and_then(|_lock| forget_client(&p.settings, client_id)) {
                     log::warn!("ChatGPT sign-in: {e}");
                 }
                 "ChatGPT no longer knows WordCraft's registration: start signing in again".into()
@@ -564,7 +566,7 @@ fn exchange(p: &Pending, client_id: &str, code: &str) -> Result<Account, AuthErr
         refresh_token: tokens.refresh_token,
         token_type: tokens.token_type,
         expires_at: now().saturating_add(tokens.expires_in),
-        scopes: tokens.scopes.unwrap_or_default(),
+        scopes: tokens.scopes.unwrap_or_else(|| SCOPES.split_whitespace().map(str::to_string).collect()),
         saved_at: 0,
     };
     // Saved under the lock: a refresh in flight (here or in another WordCraft process) finishes
@@ -1014,6 +1016,7 @@ pub fn choose_model(settings: &Path, slug: Option<&str>) -> Result<(), AuthError
     if slug.is_some_and(|s| s.len() > 128 || !s.chars().all(|c| c.is_ascii_graphic())) {
         return Err(AuthError::Failed("that isn't a model's name".into()));
     }
+    let _lock = Lock::take(settings).map_err(AuthError::Storage)?;
     let client = store::client(settings).map_err(AuthError::Storage)?;
     store::save_client(settings, &Client { model: slug.map(str::to_string), ..client }).map_err(AuthError::Storage)
 }
