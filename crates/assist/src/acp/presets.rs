@@ -24,8 +24,8 @@ pub const SETTINGS_FILE: &str = "assistant-agents.json";
 /// The custom agent's id.
 pub const CUSTOM_ID: &str = "acp:custom";
 
-/// Its settings key.
-const CUSTOM: &str = "custom";
+/// The custom agent's key in the agents' settings.
+pub const CUSTOM_KEY: &str = "custom";
 
 /// Most bytes of the settings file read.
 const MAX_SETTINGS: u64 = 1 << 20;
@@ -350,7 +350,7 @@ fn spec_with(id: &str, host: &Host, settings: &AgentSettings, path: Option<&OsSt
     let preset = PRESETS.iter().find(|p| p.id == id);
     let key = match preset {
         Some(p) => p.key,
-        None if id == CUSTOM_ID => CUSTOM,
+        None if id == CUSTOM_ID => CUSTOM_KEY,
         None => return Err(Readiness::Unavailable { why: "WordCraft knows no such agent".into() }),
     };
     let prefs = settings.agent(key);
@@ -402,7 +402,7 @@ fn offers_with_paths(host: &Host, path: Option<&OsStr>, extra: &[PathBuf]) -> Ve
 
 /// The custom agent's name in the picker.
 fn custom_label(settings: &AgentSettings) -> String {
-    let name = settings.agent(CUSTOM).name;
+    let name = settings.agent(CUSTOM_KEY).name;
     if name.is_empty() { "Custom agent".into() } else { name }
 }
 

@@ -20,7 +20,8 @@
 //! `{"run": "assist.ask", "params": {"prompt": …}}`, and answers it per `assist.allowUnattended`
 //! in a program's: one from `engine.execute`, or typed with `ui.text` and sent with `ui.key`,
 //! which the window doesn't take as the person's). `{"run": id, "params": {…}}` runs command `id`
-//! as the person's own click does.
+//! as the person's own click does. `{"settingsDir": "/abs/dir"}` gives the window a settings
+//! folder (the agents' settings in File › Options › Assistant read and save there).
 
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{ControlRequest, Services, WordApp};
@@ -58,7 +59,10 @@ fn main() -> Result<(), String> {
         }
         None => {}
     }
-    let mut app = WordApp::new(Session::new(doc), Services::default()).with_control(rx);
+    // `{"settingsDir": "/abs/dir"}`: the settings folder, where File › Options › Assistant keeps
+    // the agents' settings (#24); none otherwise, as in tests.
+    let settings_dir = lines.iter().find_map(|l| l.get("settingsDir").and_then(|v| v.as_str())).map(std::path::PathBuf::from);
+    let mut app = WordApp::new(Session::new(doc), Services { settings_dir, ..Services::default() }).with_control(rx);
     app.integrated_titlebar = true;
     if lines.first().is_some_and(|l| l.get("startScreen").is_some()) {
         app.start_screen();

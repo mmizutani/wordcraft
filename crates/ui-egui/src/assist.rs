@@ -67,6 +67,10 @@ pub(crate) struct AssistState {
     /// The backend the next conversation starts with, in place of the chosen one: tests and
     /// headless screenshots with a scripted assistant.
     next: Option<Box<dyn Backend>>,
+    /// File › Options › Assistant's agents while the page shows them (#24): saved only through
+    /// the agents' settings file, never logged.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) setup: Option<crate::options::agent_setup::AgentSetup>,
 }
 
 /// One conversation, and the document it is about.

@@ -107,10 +107,25 @@ sign in yourself. A script never gets that question: its turn fails with what to
 
 ### The agents' settings
 
-File › Options › Assistant edits each agent's command, arguments and environment. They are kept
-in `<settings>/assistant-agents.json` (`<settings>` is the folder [Keys](control-protocol.md#keys)
-names), which may hold an API key, so on Unix only you may read it (mode 0600, like the control
-key):
+File › Options › Assistant › Agents lists Claude Code, Codex, Pi and the custom agent, each with
+whether it can start: Ready, Not found (with what to install), or Unavailable (with why). A row
+opens to the agent's command, its arguments, one per line, and its environment variables, and
+Save writes them; Discard changes goes back to what is saved, and Check again looks for the
+programs again after you install one. A preset's command left empty runs its adapter (from
+`PATH`, or with npx); its arguments go with a command of your own. The variables' values are
+masked (never shown, copied or read out as text) and never logged. Save waits until what you
+typed can be kept, and says why not: a variable with a value but no name, a name with `=` in
+it, a name given twice, or more than 64 arguments or variables. What is saved applies the next
+time the agent starts; one already running keeps what it started with. The page reads the file
+again each time it opens, unless it has edits not saved.
+
+No command reads or writes these settings: they say which program WordCraft starts and may hold
+your keys, so they are yours alone, set in the page or in the file. A script picks an agent with
+`assist.backend`, whose answer says whether each one is ready, and never holds its environment.
+
+They are kept in `<settings>/assistant-agents.json` (`<settings>` is the folder
+[Keys](control-protocol.md#keys) names), which may hold an API key, so on Unix only you may read
+it (mode 0600, like the control key):
 
 ```json
 {

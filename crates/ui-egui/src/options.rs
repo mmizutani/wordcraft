@@ -705,9 +705,10 @@ fn agents(ui: &mut Ui) {
 }
 
 /// The built-in assistant (#15): the role assistants join a shared document with
-/// (`assist.defaultRole`); a conversation may choose its own in the Assistant pane. And whether
-/// an agent goes ahead when it asks permission in a turn no one can answer
-/// (`assist.allowUnattended`, off by default, #23).
+/// (`assist.defaultRole`); a conversation may choose its own in the Assistant pane. Whether an
+/// agent goes ahead when it asks permission in a turn no one can answer
+/// (`assist.allowUnattended`, off by default, #23). And the agents, each with the command,
+/// arguments and environment it starts with (`agent_setup`, #24).
 fn assistant(app: &mut WordApp, ui: &mut Ui) {
     use crate::assist::{role_label, role_note};
     use wordcraft_engine::AssistantPrefs;
@@ -748,6 +749,15 @@ fn assistant(app: &mut WordApp, ui: &mut Ui) {
         ui,
         "When you ask, the Assistant pane asks you before an agent goes ahead. A script or another app that asks the assistant (the control channel, MCP) has no one to ask: its agent's requests are refused unless this is on. Each answer is logged.",
     );
+    ui.add_space(8.0);
+    // The agents and what each starts with (#24): desktop only, as agents are programs.
+    #[cfg(not(target_arch = "wasm32"))]
+    agent_setup::show(app, ui);
+    #[cfg(target_arch = "wasm32")]
+    {
+        section(ui, "Agents");
+        note(ui, "Agents are programs WordCraft starts on your computer, so they are set up in the desktop app.");
+    }
 }
 
 /// Interface theme: Light, Dark, or follow the system's appearance (#115).
@@ -961,5 +971,8 @@ fn numeral_picker(app: &mut WordApp, ui: &mut Ui) {
     });
 }
 
+/// File › Options › Assistant › Agents (#24).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod agent_setup;
 #[cfg(test)]
 mod tests;
