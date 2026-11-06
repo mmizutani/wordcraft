@@ -110,18 +110,35 @@ sign in yourself. A script never gets that question: its turn fails with what to
 File › Options › Assistant › Agents lists Claude Code, Codex, Pi and the custom agent, each with
 whether it can start: Ready, Not found (with what to install), or Unavailable (with why). A row
 opens to the agent's command, its arguments, one per line, and its environment variables, and
-Save writes them; Discard changes goes back to what is saved, and Check again looks for the
-programs again after you install one. A preset's command left empty runs its adapter (from
-`PATH`, or with npx); its arguments go with a command of your own. The variables' values are
-masked (never shown, copied or read out as text) and never logged. Save waits until what you
-typed can be kept, and says why not: a variable with a value but no name, a name with `=` in
-it, a name given twice, or more than 64 arguments or variables. What is saved applies the next
-time the agent starts; one already running keeps what it started with. The page reads the file
-again each time it opens, unless it has edits not saved.
+Save writes them; Discard changes reads the file again, dropping your edits, and Check again
+looks for the programs again after you install one. A preset's command left empty runs its
+adapter (from `PATH`, or, approved in the pane each time, with npx); its arguments go with a
+command of your own. A `PATH` variable set for the agent is where its program is looked for
+first. The variables' values are masked (never shown, copied or read out as text) and never
+logged; for a screen reader each row says whether it is open, and each value field and Remove
+button is named after its variable. Save waits until what you typed can be kept, and says why
+not: a variable with a value but no name, a name with `=` in it, a name given twice, more than
+64 arguments or variables, or settings larger than the 1 MiB the file may hold. What is saved
+applies the next time the agent starts; one already running keeps what it started with.
+
+Save writes only what you changed, over the file as it is when you save: an agent you didn't
+touch, and each field you didn't change, keep what the file holds, even if it changed while the
+page was open (by hand, or by another WordCraft), and the page says when it had. Arguments the
+one-per-line field can't show as they are (empty, with spaces at their ends, or with a line break
+in them) are kept as they are unless you change that agent's arguments; the row says so. The page
+reads the file again each time it is shown, unless it has edits not saved. A file that can't be
+read (not JSON, larger than 1 MiB, or unreadable) is never shown as nothing set up and then
+replaced in silence: the page says it can't be read, and Save first keeps it as
+`assistant-agents.json.damaged` (replacing an older one) beside the new file. If it became
+unreadable after the page read it, the first Save writes nothing and says so; the next one keeps
+it aside and saves.
 
 No command reads or writes these settings: they say which program WordCraft starts and may hold
-your keys, so they are yours alone, set in the page or in the file. A script picks an agent with
-`assist.backend`, whose answer says whether each one is ready, and never holds its environment.
+your keys, so they are yours alone, set in the page or in the file. Input from the control
+channel (MCP's `click`, `key` and `type`, or `ui.*`) changes nothing on the page: what it typed
+or clicked is put back, its fields start afresh so undo can't bring it back, and the page says
+only you can change these settings. A script picks an agent with `assist.backend`, whose answer
+says whether each one is ready, and never holds its environment.
 
 They are kept in `<settings>/assistant-agents.json` (`<settings>` is the folder
 [Keys](control-protocol.md#keys) names), which may hold an API key, so on Unix only you may read
@@ -139,8 +156,8 @@ it (mode 0600, like the control key):
 
 Each agent's entry is under its key: `claude-code`, `codex`, `pi` or `custom`. A preset's `command` and `args` replace its adapter; `env` adds to the environment the agent
 starts with. Explicit custom commands (including a configured npx command) are your chosen setup
-and do not use the built-in fallback approval. A damaged file is read for what it holds; anything that isn't what it should be is
-left out. `WORDCRAFT_CONTROL_KEY` and `WORDCRAFT_CONTROL_ADDR` are never taken from it.
+and do not use the built-in fallback approval. An agent reads a damaged file for what it holds; anything that isn't what it
+should be is left out (the page instead says it can't be read, as above). `WORDCRAFT_CONTROL_KEY` and `WORDCRAFT_CONTROL_ADDR` are never taken from it.
 
 ## What an agent can reach
 

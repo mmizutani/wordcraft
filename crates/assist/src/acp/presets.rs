@@ -21,6 +21,10 @@ use crate::offers::{Host, Offer, Readiness};
 /// environment), so on Unix only its owner may read it, like the control key.
 pub const SETTINGS_FILE: &str = "assistant-agents.json";
 
+/// Added to [`SETTINGS_FILE`]'s name when [`AgentSettings::set_aside`] keeps a file that can't be
+/// read: `assistant-agents.json.damaged`.
+pub const SET_ASIDE_SUFFIX: &str = ".damaged";
+
 /// The custom agent's id.
 pub const CUSTOM_ID: &str = "acp:custom";
 
@@ -156,6 +160,49 @@ impl AgentSettings {
             Ok(_) => serde_json::from_slice::<Value>(&bytes).map(|v| AgentSettings::from_value(&v)).unwrap_or_default(),
             Err(_) => AgentSettings::default(),
         }
+    }
+
+    /// The settings in `dir`, telling a missing file (`Ok(None)`) from one that is there but
+    /// can't be read: too large to read whole, not JSON, not the settings' shape, or a read that
+    /// failed (`Err`, saying why, never what it holds). Where [`AgentSettings::load`] shows such
+    /// a file as nothing set up, a page that saves over it can say so first.
+    pub fn read(dir: &Path) -> Result<Option<AgentSettings>, String> {
+        let file = match std::fs::File::open(dir.join(SETTINGS_FILE)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.kind().to_string()),
+        };
+        let mut bytes = Vec::new();
+        // One byte past the limit tells a file that is too large from one that just fits.
+        file.take(MAX_SETTINGS.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| e.kind().to_string())?;
+        if bytes.len() as u64 > MAX_SETTINGS {
+            return Err("it is larger than 1 MiB".into());
+        }
+        let v: Value = serde_json::from_slice(&bytes).map_err(|_| "it isn't JSON".to_string())?;
+        let shaped = v.as_object().is_some_and(|o| o.get("agents").is_none_or(Value::is_object));
+        if !shaped {
+            return Err("it doesn't hold agents' settings".into());
+        }
+        Ok(Some(AgentSettings::from_value(&v)))
+    }
+
+    /// Whether [`AgentSettings::save`] can write these settings and [`AgentSettings::load`] read
+    /// them back whole: they fit in the 1 MiB it reads.
+    pub fn fits(&self) -> bool {
+        serde_json::to_vec_pretty(self).is_ok_and(|b| b.len() as u64 <= MAX_SETTINGS)
+    }
+
+    /// Put a settings file that can't be read aside (as `assistant-agents.json.damaged`, with
+    /// [`SET_ASIDE_SUFFIX`], over an older one), so saving new settings doesn't lose what it held.
+    /// Where it went, or `None` when there was no file.
+    pub fn set_aside(dir: &Path) -> std::io::Result<Option<PathBuf>> {
+        let path = dir.join(SETTINGS_FILE);
+        if std::fs::symlink_metadata(&path).is_err() {
+            return Ok(None);
+        }
+        let aside = dir.join(format!("{SETTINGS_FILE}{SET_ASIDE_SUFFIX}"));
+        std::fs::rename(&path, &aside)?;
+        Ok(Some(aside))
     }
 
     /// The settings `v` holds, leniently.
@@ -509,6 +556,76 @@ mod tests {
         );
         assert!(settings.save(&dir).is_err());
         assert_eq!(std::fs::read(dir.join(SETTINGS_FILE)).unwrap(), previous);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_file_is_told_from_one_that_cant_be_read() {
+        let dir = folder("read");
+        assert_eq!(AgentSettings::read(&dir), Ok(None), "no file is nothing set up");
+        let mut settings = AgentSettings::default();
+        settings.agents.insert("pi".into(), AgentPrefs { command: "/opt/pi".into(), ..AgentPrefs::default() });
+        settings.save(&dir).unwrap();
+        assert_eq!(AgentSettings::read(&dir), Ok(Some(settings.clone())));
+        std::fs::write(dir.join(SETTINGS_FILE), "{}").unwrap();
+        assert_eq!(AgentSettings::read(&dir), Ok(Some(AgentSettings::default())), "an empty object is settings with nothing set up");
+        for (junk, why) in [
+            (b"{\"agents\": {\"pi\": " as &[u8], "isn't JSON"),
+            (b"\xff\xfe\x00junk", "isn't JSON"),
+            (b"[1, 2, 3]", "doesn't hold"),
+            (b"{\"agents\": [\"pi\"]}", "doesn't hold"),
+            (b"\"agents\"", "doesn't hold"),
+        ] {
+            std::fs::write(dir.join(SETTINGS_FILE), junk).unwrap();
+            let read = AgentSettings::read(&dir);
+            assert!(read.as_ref().is_err_and(|e| e.contains(why)), "{junk:?} reads as {read:?}");
+            assert_eq!(AgentSettings::load(&dir), AgentSettings::default(), "load still shows nothing");
+        }
+        // Larger than what's read: an error, not the first megabyte cut short.
+        let mut big = b"{\"agents\": {}, \"pad\": \"".to_vec();
+        big.resize(super::MAX_SETTINGS as usize + 8, b'x');
+        big.extend_from_slice(b"\"}");
+        std::fs::write(dir.join(SETTINGS_FILE), &big).unwrap();
+        assert!(AgentSettings::read(&dir).is_err_and(|e| e.contains("larger")));
+        // A folder where the file should be can't be read either.
+        std::fs::remove_file(dir.join(SETTINGS_FILE)).unwrap();
+        std::fs::create_dir(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(AgentSettings::read(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_settings_that_can_be_read_back_fit() {
+        let mut settings = AgentSettings::default();
+        assert!(settings.fits());
+        settings.agents.insert(
+            "custom".into(),
+            AgentPrefs { env: (0..33).map(|i| (format!("TOKEN_{i}"), "x".repeat(super::MAX_TEXT))).collect(), ..AgentPrefs::default() },
+        );
+        assert!(!settings.fits(), "over 1 MiB");
+        let dir = folder("fits");
+        assert!(settings.save(&dir).is_err(), "what doesn't fit isn't saved");
+        if let Some(prefs) = settings.agents.get_mut("custom") {
+            prefs.env.retain(|k, _| k.len() < 8);
+        }
+        assert!(settings.fits());
+        settings.save(&dir).unwrap();
+        assert_eq!(AgentSettings::read(&dir), Ok(Some(settings)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_file_is_set_aside_not_lost() {
+        let dir = folder("set-aside");
+        assert!(AgentSettings::set_aside(&dir).unwrap().is_none(), "nothing to set aside");
+        std::fs::write(dir.join(SETTINGS_FILE), "not json").unwrap();
+        let aside = AgentSettings::set_aside(&dir).unwrap().unwrap();
+        assert_eq!(std::fs::read(&aside).unwrap(), b"not json");
+        assert_eq!(AgentSettings::read(&dir), Ok(None), "the settings file is gone");
+        // A second damaged file replaces the first one set aside.
+        std::fs::write(dir.join(SETTINGS_FILE), "still not json").unwrap();
+        assert_eq!(AgentSettings::set_aside(&dir).unwrap(), Some(aside.clone()));
+        assert_eq!(std::fs::read(&aside).unwrap(), b"still not json");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
