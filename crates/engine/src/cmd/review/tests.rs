@@ -1221,3 +1221,26 @@ fn one_reviewers_deletion_of_anothers_insertion() {
     assert_eq!(text(&s), "one");
     assert!(changes_left(&mut s).is_empty());
 }
+
+#[test]
+fn author_change_counts_include_headers_and_footnotes() {
+    use wordcraft_doc::StoryRef;
+    let mut s = Session::new(Document::from_text("Body text"));
+    let header = s.run("insert.header", &json!({"text": "Head alpha"})).unwrap()["story"].as_u64().unwrap() as u32;
+    s.run("insert.closeHeader", &json!({})).unwrap();
+    let note = s.run("references.footnote", &json!({"text": "Note gamma"})).unwrap()["id"].as_u64().unwrap() as u32;
+    let original = [s.doc.plain_text(StoryRef::Part(header)), s.doc.plain_text(StoryRef::Part(note))];
+    s.author = "Test Assistant".into();
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    for (i, (story, word)) in [(StoryRef::Part(header), "alpha"), (StoryRef::Part(note), "gamma")].into_iter().enumerate() {
+        let start = s.doc.para(story, &wordcraft_doc::Path::top(0)).unwrap().text.find(word).unwrap();
+        let pos = |off| json!({"story": story, "path": [0], "off": off});
+        s.run("select.range", &json!({"anchor": pos(start), "focus": pos(start + word.len())})).unwrap();
+        s.run("text.insert", &json!({"text": "new"})).unwrap();
+        assert_eq!(super::changes_by(&s, "Test Assistant"), (i + 1) * 2);
+    }
+    s.run("review.rejectAll", &json!({"author": "Test Assistant"})).unwrap();
+    assert_eq!(super::changes_by(&s, "Test Assistant"), 0);
+    assert_eq!(s.doc.plain_text(StoryRef::Part(header)), original[0]);
+    assert_eq!(s.doc.plain_text(StoryRef::Part(note)), original[1]);
+}

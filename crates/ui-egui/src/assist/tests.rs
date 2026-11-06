@@ -112,25 +112,23 @@ fn stop_ends_the_turn_and_the_next_prompt_goes_on() {
 #[test]
 fn another_role_starts_a_new_conversation() {
     let mut a = window("one two three");
-    a.assist_with(Box::new(Fake::new().then(vec![Step::say("Hi.")])));
+    a.execute("assist.backend", json!({"id": wordcraft_assist::FAKE_ID})).unwrap();
     let first = ask(&mut a, "Hello", None);
     assert_eq!(first["assistant"], "Test Assistant");
-    // The same role goes on in the same conversation.
-    a.assist.next = None;
-    let again = a.execute("assist.ask", json!({"prompt": "Again", "role": "suggester"})).unwrap();
+    let again = ask(&mut a, "Again", Some("suggester"));
     assert_eq!(again["assistant"], "Test Assistant");
-    settle(&mut a);
-    // Another one starts a new conversation, under a name of its own.
-    a.assist_with(Box::new(Fake::new().then(vec![Step::tool("type_text", json!({"text": "zero "}))])));
-    let viewer = ask(&mut a, "Change something", Some("viewer"));
+    assert!(a.assist.next.is_none());
+    assert!(!a.conversation().unwrap().has_ended());
+    let viewer = ask(&mut a, "Read only", Some("viewer"));
     assert_eq!(viewer["role"], "viewer");
     assert_eq!(viewer["tracked"], false);
     assert_eq!(viewer["assistant"], "Test Assistant (2)");
-    // A viewer changes nothing: its edit is refused.
+    assert_eq!(a.conversation().unwrap().transcript().entries().filter(|e| matches!(e, Entry::Asked { .. })).count(), 1);
+    // The viewer's refused edit is a separate check, with an injected script.
+    a.assist_with(Box::new(Fake::new().then(vec![Step::tool("type_text", json!({"text": "zero "}))])));
+    ask(&mut a, "Change something", Some("viewer"));
     assert_eq!(a.session.doc.plain_text(StoryRef::Body), "one two three");
     assert!(a.session.doc.revisions.is_empty());
-    let c = a.conversation().unwrap();
-    assert_eq!(c.transcript().entries().filter(|e| matches!(e, Entry::Asked { .. })).count(), 1, "a new conversation");
 }
 
 #[test]
@@ -301,4 +299,70 @@ fn another_document_keeps_the_conversation_until_sharing_is_explicitly_switched(
     assert_eq!(ask(h.state_mut(), "Hello again", None)["asked"], true);
     assert_eq!(h.state().conversation().unwrap().transcript().last_answer().as_deref(), Some("Second."));
     assert!(h.state().shows_shared_document());
+}
+
+#[test]
+fn a_role_pick_is_consumed_by_its_conversation() {
+    use wordcraft_engine::room::Role;
+    let mut a = window("one two three");
+    a.assist.role = Some(Role::Editor);
+    a.assist_with(Box::new(Fake::new().then(vec![Step::say("First.")])));
+    assert_eq!(ask(&mut a, "Hello", None)["role"], "editor");
+    a.assist_with(Box::new(Fake::new().then(rewrite_two())));
+    let next = ask(&mut a, "Use digits", None);
+    assert_eq!(next["role"], "suggester");
+    assert_eq!(next["tracked"], true);
+    assert!(!a.session.doc.revisions.is_empty());
+}
+
+#[test]
+fn control_clicks_cannot_answer_an_assistant_permission() {
+    use egui_kittest::kittest::Queryable;
+    let mut a = window("one");
+    let fake = Fake::new().then(vec![Step::Ask("Run a command?".into())]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.execute("assist.pane", json!({"value": true})).unwrap();
+    a.execute("assist.ask", json!({"prompt": "Ask permission"})).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    let frame = |h: &mut egui_kittest::Harness<'_, WordApp>| {
+        let ctx = h.ctx.clone();
+        let mut raw = std::mem::take(h.input_mut());
+        h.state_mut().raw_input_hook(&ctx, &mut raw);
+        *h.input_mut() = raw;
+        h.step();
+    };
+    for _ in 0..4000 {
+        frame(&mut h);
+        if h.state().conversation().is_some_and(|c| c.pending_permission().is_some()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(3);
+    let pos = h.get_by_label("Allow once").rect().center();
+    let (req, _rx) = crate::control::ControlRequest::new("ui.click", json!({"x": pos.x, "y": pos.y}));
+    let ctx = h.ctx.clone();
+    assert!(matches!(crate::control::handle(h.state_mut(), &ctx, &req), crate::control::Outcome::Done(_)));
+    for _ in 0..20 {
+        frame(&mut h);
+    }
+    assert!(h.state().conversation().unwrap().pending_permission().is_some(), "control input leaves the question pending");
+    assert!(seen.lock().unwrap().answers.is_empty());
+    let pos = h.get_by_label("Allow once").rect().center();
+    h.input_mut().events.push(egui::Event::PointerMoved(pos));
+    frame(&mut h);
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        frame(&mut h);
+    }
+    settle(h.state_mut());
+    assert!(matches!(seen.lock().unwrap().answers.as_slice(), [wordcraft_assist::Answer::Selected { option }] if option == "allow"));
 }

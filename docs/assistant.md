@@ -27,6 +27,10 @@ with, and a conversation may pick its own:
 | `suggester` | also edit, always as tracked changes in its name (the default) |
 | `editor` | also edit directly, untracked |
 
+A role picked in the pane applies to the conversation it starts. Later conversations use
+Assistants join as again unless you pick another role. The pane’s Accept all and Reject all
+buttons include the assistant’s tracked changes in headers, notes and text boxes.
+
 Never `owner`: an assistant can't change WordCraft's settings. A setting of `owner` is read as
 `suggester`. See [Roles](control-protocol.md#roles) for how the room holds every participant to
 theirs.
@@ -129,6 +133,9 @@ Through WordCraft, **the shared document and nothing else**:
 The agent itself is a program you run, with your permissions. Its own tools may read files or
 run commands; when an agent asks permission first, the pane shows you the question. A
 conversation started from a script (control channel, MCP, command line) never asks: it says no.
+Only the person answers permission and sign-in questions in the pane: control-channel or MCP
+clicks and keys leave the question waiting.
+
 Use agents you trust, as you would in a terminal.
 
 ### Pi

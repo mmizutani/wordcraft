@@ -226,10 +226,12 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
                     None if waiting == Some(request.id) => {
                         ui.horizontal_wrapped(|ui| {
                             for o in &request.options {
-                                if ui.button(&o.name).clicked()
-                                    && let Some(a) = app.conversation_mut()
-                                {
-                                    a.answer(request.id, Answer::Selected { option: o.id.clone() });
+                                if ui.button(&o.name).clicked() {
+                                    if app.input_from_control(ui.ctx()) {
+                                        app.assist.notice = Some(tl!("Only you can answer the assistant: click it yourself.").to_string());
+                                    } else if let Some(a) = app.conversation_mut() {
+                                        a.answer(request.id, Answer::Selected { option: o.id.clone() });
+                                    }
                                 }
                             }
                         });
@@ -337,7 +339,10 @@ fn prompt(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     };
     let id = app.window_id("assistant_prompt");
     let mut text = std::mem::take(&mut app.assist.prompt);
-    let r = ui.add(
+    let r = super::comments::capped_field(
+        ui,
+        id.with("scroll"),
+        None,
         egui::TextEdit::multiline(&mut text)
             .id(id)
             .hint_text(hint)

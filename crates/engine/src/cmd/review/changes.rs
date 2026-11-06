@@ -362,14 +362,18 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool) -> CmdResult {
 }
 
 fn changes(s: &Session) -> Vec<Change> {
+    changes_in(s, StoryRef::Body)
+}
+
+fn changes_in(s: &Session, story: StoryRef) -> Vec<Change> {
     let mut out: Vec<Change> = Vec::new();
-    let mk = |path: &wordcraft_doc::Path, off| Pos { story: StoryRef::Body, path: path.clone(), off };
-    for path in s.doc.para_paths(StoryRef::Body) {
-        let Some(p) = s.doc.para(StoryRef::Body, &path) else { continue };
+    let mk = |path: &wordcraft_doc::Path, off| Pos { story, path: path.clone(), off };
+    for path in s.doc.para_paths(story) {
+        let Some(p) = s.doc.para(story, &path) else { continue };
         // A table's, row's and cell's changes sit at the start of the cell's first paragraph.
         if path.last() == 0
             && let Some((tp, r, c)) = path.cell()
-            && let Some(t) = s.doc.table(StoryRef::Body, &tp)
+            && let Some(t) = s.doc.table(story, &tp)
         {
             let row = t.rows.get(r);
             let cell = row.and_then(|x| x.cells.get(c));
@@ -405,13 +409,15 @@ fn changes(s: &Session) -> Vec<Change> {
             let end = mk(&path, p.len());
             out.push(Change::format(end.clone(), end, ch.rev, fmt_revisions::char_diff(&p.mark)));
         }
-        out.extend(mark_change(s, StoryRef::Body, &path));
+        out.extend(mark_change(s, story, &path));
         if let Some(ch) = p.section.as_ref().and_then(|x| x.fmt_change.as_ref().map(|ch| (ch.rev, x))) {
             let end = mk(&path, p.len());
             out.push(Change::format(end.clone(), end, ch.0, fmt_revisions::section_diff(ch.1)));
         }
     }
-    if let Some(ch) = &s.doc.last_section.fmt_change {
+    if story == StoryRef::Body
+        && let Some(ch) = &s.doc.last_section.fmt_change
+    {
         let end = s.doc.end_of(StoryRef::Body);
         out.push(Change::format(end.clone(), end, ch.rev, fmt_revisions::section_diff(&s.doc.last_section)));
     }
@@ -560,20 +566,25 @@ fn select_next_unresolved(s: &mut Session) -> CmdResult {
     sel_result(s)
 }
 
-/// How many of the body's tracked changes `author` made: the assistant pane's Accept all and
+/// How many tracked changes `author` made across the document: the assistant pane's Accept all and
 /// Reject all of its changes (#15) are greyed out without any.
 pub fn changes_by(s: &Session, author: &str) -> usize {
     let theirs = |rev: Option<u32>| rev.and_then(|r| s.doc.revisions.get(r as usize)).is_some_and(|r| r.author == author);
-    let shown = changes(s).iter().filter(|c| theirs(c.rev)).count();
-    // The reviewing list shows an insertion first; its overlapping deletion is still unresolved.
-    let hidden_deletions = s
-        .doc
-        .para_paths(StoryRef::Body)
-        .iter()
-        .filter_map(|path| s.doc.para(StoryRef::Body, path))
-        .map(|p| p.runs.iter().map(|r| &r.props).chain(std::iter::once(&p.mark)).filter(|c| c.ins.is_some() && theirs(c.del)).count())
-        .sum::<usize>();
-    shown + hidden_deletions
+    std::iter::once(StoryRef::Body)
+        .chain(s.doc.parts.keys().map(|id| StoryRef::Part(*id)))
+        .map(|story| {
+            let shown = changes_in(s, story).iter().filter(|c| theirs(c.rev)).count();
+            // The reviewing list shows an insertion first; its overlapping deletion is still unresolved.
+            let hidden_deletions = s
+                .doc
+                .para_paths(story)
+                .iter()
+                .filter_map(|path| s.doc.para(story, path))
+                .map(|p| p.runs.iter().map(|r| &r.props).chain(std::iter::once(&p.mark)).filter(|c| c.ins.is_some() && theirs(c.del)).count())
+                .sum::<usize>();
+            shown + hidden_deletions
+        })
+        .sum()
 }
 
 pub(super) fn list_changes(s: &mut Session, _: &Value) -> CmdResult {

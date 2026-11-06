@@ -233,6 +233,9 @@ fn wanted(app: &WordApp, role: Option<Role>) -> Option<Role> {
 pub(crate) fn ask(app: &mut WordApp, prompt: &str, role: Option<Role>) -> Result<Value, String> {
     let r = ask_inner(app, prompt, role);
     app.assist.notice = r.as_ref().err().cloned();
+    if r.is_ok() && role.is_none() {
+        app.assist.role = None;
+    }
     r
 }
 

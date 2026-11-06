@@ -469,3 +469,16 @@ fn a_long_comment_card_keeps_its_buttons_and_the_next_card_in_view() {
     assert_eq!(go_to.len(), 2, "one Go to button per card");
     assert!(go_to.iter().all(|r| r.max.y < 900.0), "both cards' buttons are in view: {go_to:?}");
 }
+
+#[test]
+fn a_long_assistant_prompt_keeps_send_and_stop_in_view() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = crate::WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("one")), crate::Services::default());
+    app.assist.prompt = "A line of prompt text\n".repeat(200);
+    app.run("assist.pane", serde_json::json!({"value": true})).unwrap();
+    let h = pane_harness(app);
+    for label in ["Send", "Stop"] {
+        let r = h.get_by_label(label).rect();
+        assert!(r.max.y <= 900.0, "{label} stays in view: {r:?}");
+    }
+}
