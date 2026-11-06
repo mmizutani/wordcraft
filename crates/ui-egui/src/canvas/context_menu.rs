@@ -124,6 +124,10 @@ pub(super) fn context_menu(app: &mut WordApp, ui: &mut Ui) {
     item(ui, app, "Paragraph…", "ui.dialog", json!({"name": "paragraph"}));
     item(ui, app, "Link…", "ui.dialog", json!({"name": "link"}));
     item(ui, app, "New Comment", "review.newComment", json!({}));
+    // The assistant's writing actions (#18), on text.
+    if !crate::ribbon::has_picture_selected(&app.session) && wordcraft_engine::cmd::objects::object_selection(&app.session).is_none() {
+        ui.menu_button(tl!("Assistant"), |ui| crate::rtl::root(ui, |ui| crate::assist::action_items(ui, app)));
+    }
     if !wordcraft_engine::cmd::fields::selected(&app.session).is_empty() {
         ui.separator();
         item(ui, app, tl!("Update Field"), "references.updateFields", json!({}));

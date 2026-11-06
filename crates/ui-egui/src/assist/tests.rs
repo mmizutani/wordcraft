@@ -85,8 +85,6 @@ fn a_prompt_makes_tracked_changes_in_the_assistant_s_name() {
     assert!(matches!(entries.first(), Some(Entry::Asked { text }) if text == "Use digits"), "{entries:?}");
     assert_eq!(c.transcript().last_answer().as_deref(), Some("Rewriting “two”.\n\nDone."));
     assert_eq!(entries.iter().filter(|e| matches!(e, Entry::Tool(_))).count(), 2);
-    // The prompt box is emptied for the next one.
-    assert!(a.assist.prompt.is_empty());
 }
 
 #[test]
@@ -263,10 +261,192 @@ fn the_pane_sends_a_prompt_and_accepts_the_assistant_s_changes() {
     h.run_steps(2);
     assert_eq!(accepted(h.state()), "one 2 three");
     assert_eq!(authors(h.state()), ["Test Assistant", "Test Assistant"]);
+    assert!(h.state().assist.prompt.is_empty(), "the prompt box is emptied for the next one");
     h.get_by_label("Accept all").click();
     h.run_steps(3);
     assert_eq!(h.state().session.doc.plain_text(StoryRef::Body), "one 2 three");
     assert_eq!(wordcraft_engine::cmd::review::changes_by(&h.state().session, "Test Assistant"), 0);
+}
+
+/// The prompt the scripted assistant was asked last, and the context it came with.
+fn last_turn(seen: &std::sync::Arc<std::sync::Mutex<wordcraft_assist::Seen>>) -> (String, String) {
+    let seen = seen.lock().unwrap();
+    let turn = seen.turns.last().expect("a turn");
+    (turn.prompt.clone(), turn.context.clone().unwrap_or_default())
+}
+
+/// A window showing two sentences of the sample's opening, with `pick` selected.
+fn selected(pick: &str) -> WordApp {
+    let mut a = window("Every Thursday evening the old print shop fills with people who make things.\nRent is the obvious reason.");
+    a.execute("select.text", json!({"text": pick})).unwrap();
+    super::tick(&mut a);
+    a
+}
+
+/// Run writing action `id` with the scripted assistant doing `steps`: what it was asked.
+fn act(a: &mut WordApp, id: &str, params: Value, steps: Vec<Step>) -> (String, String) {
+    let fake = Fake::new().then(steps);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    let r = a.execute(id, params).unwrap();
+    assert_eq!(r["asked"], true, "{id}: {r}");
+    settle(a);
+    last_turn(&seen)
+}
+
+#[test]
+fn rewrite_shorten_expand_and_proofread_replace_the_selection_as_tracked_changes() {
+    for (id, params, asks) in [
+        ("assist.rewrite", json!({}), "Rewrite the selected text"),
+        ("assist.rewrite", json!({"tone": "friendly"}), "in a friendly tone"),
+        ("assist.shorten", json!({}), "shorter"),
+        ("assist.expand", json!({}), "longer"),
+        ("assist.proofread", json!({}), "Proofread"),
+    ] {
+        let mut a = selected("the old print shop");
+        a.assist.prompt = "half a question".into();
+        // The scripted assistant types over what its copy has selected: the person's selection.
+        let (prompt, context) = act(&mut a, id, params, vec![Step::tool("type_text", json!({"text": "the print shop"}))]);
+        assert!(prompt.contains(asks), "{id}: {prompt}");
+        assert!(context.contains("the old print shop"), "{id}: the selection goes with it: {context}");
+        assert!(accepted(&a).starts_with("Every Thursday evening the print shop fills"), "{id}: {}", accepted(&a));
+        assert_eq!(authors(&a), ["Test Assistant", "Test Assistant"], "{id}: a deletion and an insertion in its name");
+        assert!(a.session.view.assistant_pane, "{id}: the pane shows the turn");
+        assert_eq!(a.assist.prompt, "half a question", "{id}: what the person was typing stays");
+    }
+}
+
+#[test]
+fn draft_writes_at_the_caret() {
+    let mut a = window("Rent is the obvious reason.");
+    a.execute("caret.docEnd", json!({})).unwrap();
+    super::tick(&mut a);
+    let (prompt, _) = act(
+        &mut a,
+        "assist.draft",
+        json!({"about": "why people come back"}),
+        vec![Step::tool("type_text", json!({"text": " People come back for each other."}))],
+    );
+    assert!(prompt.contains("why people come back"), "{prompt}");
+    assert_eq!(accepted(&a), "Rent is the obvious reason. People come back for each other.");
+    assert_eq!(authors(&a), ["Test Assistant"]);
+    assert!(a.execute("assist.draft", json!({})).is_err(), "Draft needs to know what to write");
+    // With text selected, the draft goes after it and the selection stays.
+    let mut a = selected("Every Thursday evening");
+    act(&mut a, "assist.draft", json!({"about": "a date"}), vec![Step::tool("type_text", json!({"text": " (May 2)"}))]);
+    assert!(accepted(&a).starts_with("Every Thursday evening (May 2) the old print shop"), "{}", accepted(&a));
+}
+
+#[test]
+fn summarize_comments_on_the_selection_or_writes_after_it() {
+    let mut a = selected("Rent is the obvious reason.");
+    let comment = Step::tool("execute", json!({"command": "review.newComment", "params": {"text": "Why rent isn't the reason."}}));
+    let (prompt, _) = act(&mut a, "assist.summarize", json!({}), vec![comment]);
+    assert!(prompt.contains("comment"), "{prompt}");
+    let doc = &a.session.doc;
+    let notes: Vec<(String, String)> = doc.comments.values().map(|c| (c.author.clone(), doc.plain_text(StoryRef::Part(c.part)))).collect();
+    assert_eq!(notes, [("Test Assistant".to_string(), "Why rent isn't the reason.".to_string())]);
+    assert!(doc.revisions.is_empty(), "the text is left alone");
+    // With `insert`, after the selection, which stays as it is.
+    let mut a = selected("Rent is the obvious reason.");
+    let (prompt, _) = act(&mut a, "assist.summarize", json!({"insert": true}), vec![Step::tool("type_text", json!({"text": " In short: rent."}))]);
+    assert!(prompt.contains("at the caret"), "{prompt}");
+    assert!(accepted(&a).ends_with("Rent is the obvious reason. In short: rent."), "{}", accepted(&a));
+}
+
+#[test]
+fn actions_on_the_selection_need_one_and_an_assistant() {
+    let mut a = window("one two three");
+    super::tick(&mut a);
+    for id in ["assist.rewrite", "assist.shorten", "assist.expand", "assist.proofread"] {
+        assert_eq!(a.session.why_disabled(id), Some("select the text first"), "{id}");
+    }
+    assert_eq!(a.session.why_disabled("assist.summarize"), None, "the document, with nothing selected");
+    assert_eq!(a.session.why_disabled("assist.draft"), None);
+    // No assistant offered: every action says where to set one up.
+    a.assist.offers.clear();
+    a.execute("select.all", json!({})).unwrap();
+    a.session.assistant = super::status(&a);
+    for id in ["assist.draft", "assist.rewrite", "assist.shorten", "assist.expand", "assist.proofread", "assist.summarize"] {
+        assert_eq!(a.session.why_disabled(id), Some(wordcraft_engine::cmd::assist::NOT_SET_UP), "{id}");
+    }
+}
+
+#[test]
+fn the_person_s_undo_leaves_the_assistant_s_change_alone() {
+    let mut a = selected("the old print shop");
+    // The first action shares the document; then the person types, and the assistant shortens.
+    act(&mut a, "assist.proofread", json!({}), vec![Step::say("Nothing to correct.")]);
+    a.execute("caret.docEnd", json!({})).unwrap();
+    a.execute("text.insert", json!({"text": " Mine."})).unwrap();
+    a.execute("select.text", json!({"text": "the old print shop"})).unwrap();
+    act(&mut a, "assist.shorten", json!({}), vec![Step::tool("type_text", json!({"text": "the shop"}))]);
+    assert!(accepted(&a).ends_with("reason. Mine."), "{}", accepted(&a));
+    a.execute("edit.undo", json!({})).unwrap();
+    settle(&mut a);
+    assert!(!accepted(&a).contains("Mine."), "the person's own typing is undone: {}", accepted(&a));
+    assert!(accepted(&a).starts_with("Every Thursday evening the shop fills"), "the assistant's change stays: {}", accepted(&a));
+    // Its deletion and insertion, in the name of the second conversation's assistant (the first
+    // may still be leaving the room as the second joins, so it can be "Test Assistant (2)").
+    let names = authors(&a);
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names.iter().all(|n| n.starts_with("Test Assistant")), "{names:?}");
+}
+
+#[test]
+fn a_whole_document_selection_is_capped() {
+    let long: Vec<String> = (0..4000).map(|i| format!("Paragraph {i} says something about the studio and its people.")).collect();
+    let mut a = window(&long.join("\n"));
+    a.execute("select.all", json!({})).unwrap();
+    super::tick(&mut a);
+    let (_, context) = act(&mut a, "assist.summarize", json!({}), vec![Step::say("A summary.")]);
+    let caps = wordcraft_assist::Caps::default();
+    assert!(context.len() <= caps.total_bytes, "{} bytes", context.len());
+    assert!(context.contains("Paragraph 0 "), "it starts with the selection's start");
+    // Nothing selected: the document around the caret, capped the same way.
+    a.execute("caret.docStart", json!({})).unwrap();
+    let (prompt, context) = act(&mut a, "assist.summarize", json!({}), vec![Step::say("Again.")]);
+    assert!(prompt.starts_with("Summarize the document"), "{prompt}");
+    assert!(context.len() <= caps.total_bytes, "{} bytes", context.len());
+}
+
+/// The menus' Draft opens the pane with its box turned to drafting; what is typed there and
+/// sent with Enter is written at the caret.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn draft_from_the_pane_writes_what_the_box_says() {
+    let mut app = window("Rent is the obvious reason.");
+    app.execute("caret.docEnd", json!({})).unwrap();
+    app.assist_with(Box::new(Fake::new().then(vec![Step::tool("type_text", json!({"text": " People stay."}))])));
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(2560.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        app,
+    );
+    h.run_steps(4);
+    super::start_draft(h.state_mut());
+    h.state_mut().canvas.want_focus = true;
+    h.run_steps(4);
+    assert!(h.state().assist.draft && h.state().session.view.assistant_pane);
+    h.input_mut().events.push(egui::Event::Text("why people stay".into()));
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(1);
+    for _ in 0..4000 {
+        if !h.state().conversation().is_some_and(|c| c.is_busy()) && h.state().share_settled() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+    assert_eq!(accepted(h.state()), "Rent is the obvious reason. People stay.");
+    assert!(h.state().assist.prompt.is_empty() && !h.state().assist.draft, "the box is emptied and asks again");
+    let c = h.state().conversation().unwrap();
+    assert!(matches!(c.transcript().entries().next(), Some(Entry::Asked { text }) if text.contains("why people stay")));
 }
 
 #[test]

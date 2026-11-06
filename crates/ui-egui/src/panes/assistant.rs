@@ -5,8 +5,9 @@
 //! conversation. Then the conversation: the prompts, the answers, thoughts folded away, a row per
 //! tool call with how it went, the plan, permission requests with their options while they wait,
 //! errors, and why a turn stopped. At the bottom, Accept all and Reject all of this assistant's
-//! changes, and the prompt box with Send and Stop. Everything it does goes through the `assist.*`
-//! and `review.*` commands.
+//! changes, the writing actions (#18), and the prompt box with Send and Stop; Draft turns the box
+//! into what to write at the caret. Everything it does goes through the `assist.*` and `review.*`
+//! commands.
 
 use egui::{Color32, RichText, Stroke, Ui, vec2};
 use serde_json::json;
@@ -51,6 +52,8 @@ pub(super) fn assistant(app: &mut WordApp, ui: &mut Ui) {
     let bottom = ui
         .vertical(|ui| {
             review(app, ui);
+            ui.add_space(4.0);
+            actions(app, ui);
             ui.add_space(4.0);
             prompt(app, ui, &t);
         })
@@ -330,13 +333,70 @@ fn review(app: &mut WordApp, ui: &mut Ui) {
     }
 }
 
-/// The prompt box, with Send (Enter) and Stop; Shift+Enter starts a new line.
+/// The writing actions (#18) on the selection: Write a Draft writes what the prompt box says at
+/// the caret (or turns the box to it, while it is empty).
+fn actions(app: &mut WordApp, ui: &mut Ui) {
+    ui.horizontal_wrapped(|ui| {
+        let draft = action_button(ui, app, "Write a Draft", "assist.draft");
+        if draft.clicked() {
+            let about = app.assist.prompt.trim().to_string();
+            if about.is_empty() {
+                crate::assist::start_draft(app);
+            } else {
+                send(app, "assist.draft", json!({"about": about}));
+            }
+        }
+        for (label, id) in [
+            ("Rewrite", "assist.rewrite"),
+            ("Make Shorter", "assist.shorten"),
+            ("Make Longer", "assist.expand"),
+            ("Proofread", "assist.proofread"),
+            ("Summarize", "assist.summarize"),
+        ] {
+            if action_button(ui, app, label, id).clicked() {
+                let _ = app.run(id, json!({}));
+            }
+        }
+    });
+}
+
+/// A small button for writing action `id`, greyed out with the reason in its tooltip.
+fn action_button(ui: &mut Ui, app: &WordApp, label: &str, id: &str) -> egui::Response {
+    let r = ui.add_enabled(crate::widgets::enabled(app, id), egui::Button::new(RichText::new(tl!(label)).small()));
+    match app.session.why_disabled(id) {
+        Some(why) => r.on_disabled_hover_text(tl!(why)),
+        None => r,
+    }
+}
+
+/// Send what the prompt box says with `id`; once it is asked, the box is emptied for the next.
+fn send(app: &mut WordApp, id: &str, params: serde_json::Value) {
+    if app.run(id, params).is_ok() {
+        app.assist.prompt.clear();
+        app.assist.draft = false;
+    }
+    app.assist.focus_prompt = crate::assist::FOCUS_FRAMES;
+}
+
+/// The prompt box, with Send (Enter) and Stop; Shift+Enter starts a new line. While drafting it
+/// says what to write at the caret, and Write (Enter) drafts it.
 fn prompt(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     let busy = app.conversation().is_some_and(|a| a.is_busy());
+    let drafting = app.assist.draft;
     let hint = match app.conversation().filter(|a| !a.has_ended()) {
+        _ if drafting => tl!("Say what to write at the caret…").to_string(),
         Some(a) => fmt(tl!("Ask {name}…"), &[("name", a.name())]),
         None => tl!("Ask the assistant…").to_string(),
     };
+    if drafting {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(tl!("Drafting at the caret")).small().color(t.text_dim));
+            if ui.link(RichText::new(tl!("Ask instead")).small()).clicked() {
+                app.assist.draft = false;
+                app.assist.focus_prompt = crate::assist::FOCUS_FRAMES;
+            }
+        });
+    }
     let id = app.window_id("assistant_prompt");
     let mut text = std::mem::take(&mut app.assist.prompt);
     let r = super::comments::capped_field(
@@ -358,17 +418,18 @@ fn prompt(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
         app.canvas.want_focus = false;
     }
     let enter = r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.is_none());
-    let can_send = !busy && !app.assist.prompt.trim().is_empty() && crate::widgets::enabled(app, "assist.ask");
+    let id = if drafting { "assist.draft" } else { "assist.ask" };
+    let can_send = !busy && !app.assist.prompt.trim().is_empty() && crate::widgets::enabled(app, id);
     ui.horizontal(|ui| {
-        let send = ui.add_enabled(can_send, egui::Button::new(tl!("Send")));
-        let send = match app.session.why_disabled("assist.ask") {
-            Some(why) if !busy => send.on_disabled_hover_text(tl!(why)),
-            _ => send,
+        let send_button = ui.add_enabled(can_send, egui::Button::new(if drafting { tl!("Write") } else { tl!("Send") }));
+        let send_button = match app.session.why_disabled(id) {
+            Some(why) if !busy => send_button.on_disabled_hover_text(tl!(why)),
+            _ => send_button,
         };
-        if (send.clicked() || (enter && can_send)) && can_send {
-            let prompt = app.assist.prompt.clone();
-            let _ = app.run("assist.ask", json!({"prompt": prompt}));
-            app.assist.focus_prompt = crate::assist::FOCUS_FRAMES;
+        if (send_button.clicked() || (enter && can_send)) && can_send {
+            let text = app.assist.prompt.clone();
+            let params = if drafting { json!({"about": text}) } else { json!({"prompt": text}) };
+            send(app, id, params);
         }
         if ui.add_enabled(busy, egui::Button::new(tl!("Stop"))).clicked() {
             let _ = app.run("assist.cancel", json!({}));

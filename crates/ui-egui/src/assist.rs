@@ -8,6 +8,9 @@
 //! a prompt for another role starts a new conversation. Every frame [`tick`] takes what came
 //! back and tells the session what the assistant can do ([`AssistantStatus`]), so its commands
 //! are greyed out, with a tooltip saying why, when there is no assistant to ask.
+//!
+//! The writing actions (#18) are prompts like any other; [`action_items`] lists them for the
+//! mini toolbar's Assistant menu and the right-click menu, and the pane has them as buttons.
 
 use std::sync::Arc;
 
@@ -38,6 +41,8 @@ pub(crate) struct AssistState {
     pub(crate) role: Option<Role>,
     /// The prompt being typed in the pane.
     pub(crate) prompt: String,
+    /// The prompt box says what to draft at the caret (`assist.draft`) rather than asking.
+    pub(crate) draft: bool,
     /// Frames left in which the prompt box takes the keyboard: a few, as the click that opened
     /// the pane hands the keyboard back to the page.
     pub(crate) focus_prompt: u8,
@@ -169,7 +174,8 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
         "ask" => {
             let prompt = req.get("prompt").and_then(Value::as_str).unwrap_or("");
             let role = req.get("role").and_then(Value::as_str).and_then(Role::named);
-            ask(app, prompt, role)
+            let at_end = req.get("at").and_then(Value::as_str) == Some("end");
+            ask(app, prompt, role, at_end)
         }
         "cancel" => {
             let stopping = app.conversation_mut().is_some_and(|a| {
@@ -227,19 +233,24 @@ fn wanted(app: &WordApp, role: Option<Role>) -> Option<Role> {
     role.or(app.assist.role)
 }
 
-/// Ask `prompt` (checked by `assist.ask`), as `role` when it names one: in the conversation
-/// there is, or in a new one when there is none, it ended, it is about another document or
-/// another assistant, or it has another role.
-pub(crate) fn ask(app: &mut WordApp, prompt: &str, role: Option<Role>) -> Result<Value, String> {
-    let r = ask_inner(app, prompt, role);
+/// Ask `prompt` (checked by `assist.ask` or a writing action), as `role` when it names one: in
+/// the conversation there is, or in a new one when there is none, it ended, it is about another
+/// document or another assistant, or it has another role. The assistant starts with the
+/// person's selection, or with the caret at its end (`at_end`). The pane opens, so the person
+/// sees the turn and can stop it; the keyboard stays where it is.
+pub(crate) fn ask(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) -> Result<Value, String> {
+    let r = ask_inner(app, prompt, role, at_end);
     app.assist.notice = r.as_ref().err().cloned();
-    if r.is_ok() && role.is_none() {
-        app.assist.role = None;
+    if r.is_ok() {
+        app.session.view.assistant_pane = true;
+        if role.is_none() {
+            app.assist.role = None;
+        }
     }
     r
 }
 
-fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>) -> Result<Value, String> {
+fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) -> Result<Value, String> {
     if !app.has_document() {
         return Err("no document is open".into());
     }
@@ -256,11 +267,16 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>) -> Result<Valu
     // The person's selection, by paragraph id: the assistant's copy finds it there, though the
     // paragraphs moved with edits it has and the window hasn't yet.
     let doc = &app.session.doc;
-    let selection = doc.anchor_at(&app.session.sel.anchor).zip(doc.anchor_at(&app.session.sel.focus));
+    let (anchor, focus) = if at_end {
+        let end = app.session.sel.ordered().1;
+        (end.clone(), end)
+    } else {
+        (app.session.sel.anchor.clone(), app.session.sel.focus.clone())
+    };
+    let selection = doc.anchor_at(&anchor).zip(doc.anchor_at(&focus));
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
     a.ask_at(prompt, Some(context), selection).map_err(|e| e.to_string())?;
     let (name, role, tracked) = (a.name().to_string(), a.role(), a.tracked());
-    app.assist.prompt.clear();
     Ok(json!({"asked": true, "assistant": name, "role": role.name(), "tracked": tracked}))
 }
 
@@ -301,6 +317,61 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
     let assistant = Assistant::start(&room, backend, options).map_err(|e| e.to_string())?;
     app.assist.conversation = Some(Conversation { assistant, document: app.session.document_id() });
     Ok(())
+}
+
+/// The tones Rewrite offers in menus: the label shown, and the tone asked for.
+pub(crate) const TONES: [(&str, &str); 3] = [("Formal", "formal"), ("Friendly", "friendly"), ("Plain", "plain")];
+
+/// Draft at the caret: the pane opens with the keyboard in its prompt box, which then says what
+/// to write instead of asking.
+pub(crate) fn start_draft(app: &mut WordApp) {
+    if app.run("assist.pane", json!({"value": true})).is_ok() {
+        app.assist.draft = true;
+    }
+}
+
+/// A writing action as a menu item, greyed out with the reason in its tooltip.
+fn action_item(ui: &mut egui::Ui, app: &mut WordApp, label: &str, id: &str, params: Value) {
+    let on = crate::widgets::enabled(app, id);
+    let mut r = ui.add_enabled(on, crate::rtl::menu_item(ui, tl!(label), "", 0.0));
+    if let Some(why) = app.session.why_disabled(id) {
+        r = r.on_disabled_hover_text(tl!(why));
+    }
+    if r.clicked() {
+        let _ = app.run(id, params);
+        ui.close();
+    }
+}
+
+/// The writing actions (#18) as menu items: the mini toolbar's Assistant menu and the
+/// right-click menu's. Draft asks what to write in the pane's prompt box.
+pub(crate) fn action_items(ui: &mut egui::Ui, app: &mut WordApp) {
+    let on = crate::widgets::enabled(app, "assist.draft");
+    let mut r = ui.add_enabled(on, crate::rtl::menu_item(ui, tl!("Draft…"), "", 0.0));
+    if let Some(why) = app.session.why_disabled("assist.draft") {
+        r = r.on_disabled_hover_text(tl!(why));
+    }
+    if r.clicked() {
+        start_draft(app);
+        ui.close();
+    }
+    action_item(ui, app, "Rewrite", "assist.rewrite", json!({}));
+    let tones = crate::widgets::enabled(app, "assist.rewrite");
+    ui.add_enabled_ui(tones, |ui| {
+        ui.menu_button(tl!("Rewrite in a Tone"), |ui| {
+            crate::rtl::root(ui, |ui| {
+                for (label, tone) in TONES {
+                    action_item(ui, app, label, "assist.rewrite", json!({"tone": tone}));
+                }
+            })
+        })
+    });
+    action_item(ui, app, "Make Shorter", "assist.shorten", json!({}));
+    action_item(ui, app, "Make Longer", "assist.expand", json!({}));
+    action_item(ui, app, "Proofread", "assist.proofread", json!({}));
+    ui.separator();
+    action_item(ui, app, "Summarize in a Comment", "assist.summarize", json!({}));
+    action_item(ui, app, "Insert a Summary", "assist.summarize", json!({"insert": true}));
 }
 
 /// The roles a conversation may have, with their names in the pane and what each lets the

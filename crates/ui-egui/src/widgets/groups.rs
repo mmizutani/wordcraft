@@ -179,7 +179,13 @@ fn group_icon(title: &str) -> &'static str {
 pub fn command_icon(id: &str) -> &str {
     const ICONS: &[(&str, &str)] = &[
         ("arrange.wrap", "wrapText"),
+        ("assist.draft", "assistant"),
+        ("assist.expand", "assistant"),
         ("assist.pane", "assistant"),
+        ("assist.proofread", "assistant"),
+        ("assist.rewrite", "assistant"),
+        ("assist.shorten", "assistant"),
+        ("assist.summarize", "assistant"),
         ("draw.highlighter", "highlight"),
         ("format.border", "charborder"),
         ("format.color", "fontcolor"),
