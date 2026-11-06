@@ -147,8 +147,16 @@ both for finding its program and for what it runs, so it must hold every folder 
 logged; for a screen reader each row says whether it is open, and each value field and Remove
 button is named after its variable. Save waits until what you typed can be kept, and says why
 not: a variable with a value but no name, a name with `=` in it, a name given twice, more than
-64 arguments or variables, or settings larger than the 1 MiB the file may hold. What is saved
-applies the next time the agent starts; one already running keeps what it started with.
+64 arguments or variables, settings larger than the 1 MiB the file may hold (measured as
+written, with what the page doesn't show; a file only pretty-printing would take past it is
+written compact), or, in a file holding more agents or variables than WordCraft reads (16 agents,
+64 variables each), a change that would put something set here past those it reads (a variable
+renamed to sort after one the page doesn't show, say): Save checks that the file it writes reads
+back as you set each agent the page shows, and a variable you removed is taken out of the file
+even when it gained others meanwhile and holds it past the 64 WordCraft reads. When the file's
+own data is what takes it past, make room in the file and click Check again: the page measures
+again, keeping your edits. What is saved applies the next time the agent starts; one already
+running keeps what it started with.
 
 Save writes only what you changed, over the file as it is when you save: an agent you didn't
 touch, each field you didn't change, and each variable you didn't add, change or remove keep what
@@ -163,14 +171,19 @@ replaced in silence: the page says it can't be read, and Save first keeps it as
 `assistant-agents.json.damaged` (replacing an older one) beside the new file. If it became
 unreadable after the page read it, the first Save writes nothing and says so, and the page says it
 shows the file as it was when read; the next Save keeps it aside and saves what the page shows:
-that read, with your edits.
+that read, with your edits (also when the file has gone missing since). If that write fails, the
+file set aside is put back, so nothing is lost and Save can try again, unless a settings file took
+its place meanwhile: that one is never replaced, and the page says the damaged one is kept aside.
 
 No command reads or writes these settings: they say which program WordCraft starts and may hold
 your keys, so they are yours alone, set in the page or in the file. Input from the control
 channel (MCP's `click`, `key` and `type`, or `ui.*`) changes nothing on the page: what it typed
-or clicked is put back, its fields start afresh so undo can't bring it back, where your keys go
-(the focused field and its selection) is put back too, so your next keys don't land where it
-clicked or tabbed, and the page says only you can change these settings. A script picks an agent with `assist.backend`, whose answer
+or clicked is put back, and its fields start afresh so undo can't bring it back. A press it made
+counts as its input until it is released, even when you release it: that release would click
+what it pressed (Remove, Discard changes, Save), so it does nothing. With any of its input the
+page also lets go of keyboard focus and of the focused field's selection, and gives focus to
+nothing: your next keys never land where it clicked or tabbed, and you click your field again to
+go on. A press it holds down starts no drag. Your own clicks are never changed. The page says only you can change these settings. A script picks an agent with `assist.backend`, whose answer
 says whether each one is ready, and never holds its environment.
 
 They are kept in `<settings>/assistant-agents.json` (`<settings>` is the folder
