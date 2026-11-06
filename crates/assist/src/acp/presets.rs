@@ -167,6 +167,13 @@ impl AgentSettings {
     /// failed (`Err`, saying why, never what it holds). Where [`AgentSettings::load`] shows such
     /// a file as nothing set up, a page that saves over it can say so first.
     pub fn read(dir: &Path) -> Result<Option<AgentSettings>, String> {
+        Ok(AgentSettings::read_value(dir)?.map(|v| AgentSettings::from_value(&v)))
+    }
+
+    /// The settings file in `dir` as it is, all of it (fields and entries WordCraft doesn't
+    /// read included), checked as [`AgentSettings::read`] checks it: `Ok(None)` when it is
+    /// missing, `Err` saying why it can't be read.
+    pub fn read_value(dir: &Path) -> Result<Option<Value>, String> {
         let file = match std::fs::File::open(dir.join(SETTINGS_FILE)) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -183,7 +190,57 @@ impl AgentSettings {
         if !shaped {
             return Err("it doesn't hold agents' settings".into());
         }
-        Ok(Some(AgentSettings::from_value(&v)))
+        Ok(Some(v))
+    }
+
+    /// The settings file `file` (as [`AgentSettings::read_value`] gives it) with what these
+    /// settings change from `before` (what [`AgentSettings::from_value`] read in it) written
+    /// into it, and nothing else: each agent's name, command and arguments where they differ,
+    /// its variables one by one, and every other entry, field and value, those WordCraft doesn't
+    /// read included, as the file has them.
+    pub fn written_over(&self, before: &AgentSettings, file: &Value) -> Value {
+        let mut out = file.as_object().cloned().unwrap_or_default();
+        let mut agents = out.get("agents").and_then(Value::as_object).cloned().unwrap_or_default();
+        let keys: std::collections::BTreeSet<&String> = before.agents.keys().chain(self.agents.keys()).collect();
+        for key in keys {
+            let (old, new) = (before.agent(key), self.agent(key));
+            if old == new {
+                continue;
+            }
+            let mut entry = agents.get(key.as_str()).and_then(Value::as_object).cloned().unwrap_or_default();
+            let text = |s: &str| (!s.is_empty()).then(|| Value::String(s.to_string()));
+            if old.name != new.name {
+                put(&mut entry, "name", text(&new.name));
+            }
+            if old.command != new.command {
+                put(&mut entry, "command", text(&new.command));
+            }
+            if old.args != new.args {
+                put(&mut entry, "args", (!new.args.is_empty()).then(|| Value::from(new.args.clone())));
+            }
+            if old.env != new.env {
+                let mut env = entry.get("env").and_then(Value::as_object).cloned().unwrap_or_default();
+                for name in old.env.keys().chain(new.env.keys()) {
+                    match (old.env.get(name), new.env.get(name)) {
+                        (a, b) if a == b => {}
+                        (_, Some(value)) => {
+                            env.insert(name.clone(), Value::String(value.clone()));
+                        }
+                        (_, None) => {
+                            env.remove(name);
+                        }
+                    }
+                }
+                put(&mut entry, "env", (!env.is_empty()).then_some(Value::Object(env)));
+            }
+            if entry.is_empty() {
+                agents.remove(key.as_str());
+            } else {
+                agents.insert(key.clone(), Value::Object(entry));
+            }
+        }
+        out.insert("agents".into(), Value::Object(agents));
+        Value::Object(out)
     }
 
     /// Whether [`AgentSettings::save`] can write these settings and [`AgentSettings::load`] read
@@ -215,29 +272,53 @@ impl AgentSettings {
     /// Write the settings to `dir`: a new file renamed over the old one, so a failed write leaves
     /// it as it was. On Unix only its owner may read or write it.
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dir)?;
-        let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
-        if bytes.len() as u64 > MAX_SETTINGS {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "agent settings exceed the 1 MiB file limit"));
-        }
-        let path = dir.join(SETTINGS_FILE);
-        let tmp = dir.join(format!(".{SETTINGS_FILE}.{}.tmp", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
-        let mut open = std::fs::OpenOptions::new();
-        open.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
-        let written = open.open(&tmp).and_then(|mut f| f.write_all(&bytes).and_then(|()| f.sync_all())).and_then(|()| std::fs::rename(&tmp, &path));
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        written
+        write_settings(dir, serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?)
+    }
+
+    /// Write `file` as the settings file in `dir`, as [`AgentSettings::save`] writes: whole or
+    /// not at all, only its owner may read it, and never more than the 1 MiB it reads.
+    pub fn save_value(dir: &Path, file: &Value) -> std::io::Result<()> {
+        write_settings(dir, serde_json::to_vec_pretty(file).map_err(std::io::Error::other)?)
     }
 
     /// What the person set up for the agent with settings key `key`.
     pub fn agent(&self, key: &str) -> AgentPrefs {
         self.agents.get(key).cloned().unwrap_or_default()
     }
+}
+
+/// Set `field` of a settings entry to `value`, or take it out.
+fn put(entry: &mut serde_json::Map<String, Value>, field: &str, value: Option<Value>) {
+    match value {
+        Some(value) => {
+            entry.insert(field.to_string(), value);
+        }
+        None => {
+            entry.remove(field);
+        }
+    }
+}
+
+/// Write the settings file's `bytes` to `dir`: a new file renamed over the old one, so a failed
+/// write leaves it as it was; on Unix only its owner may read or write it. More than the 1 MiB
+/// the reader reads is refused.
+fn write_settings(dir: &Path, bytes: Vec<u8>) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    if bytes.len() as u64 > MAX_SETTINGS {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "agent settings exceed the 1 MiB file limit"));
+    }
+    let path = dir.join(SETTINGS_FILE);
+    let tmp = dir.join(format!(".{SETTINGS_FILE}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+    let written = open.open(&tmp).and_then(|mut f| f.write_all(&bytes).and_then(|()| f.sync_all())).and_then(|()| std::fs::rename(&tmp, &path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// One agent's settings, leniently: strings that are strings, held to sizes, and no NUL (which
@@ -484,6 +565,7 @@ mod tests {
     use super::{AgentPrefs, AgentSettings, CUSTOM_ID, SETTINGS_FILE, find_program, make_on, offers_on, spec_for};
     use crate::acp::Reach;
     use crate::offers::{Host, Readiness};
+    use serde_json::Value;
 
     /// A new empty folder for a test.
     fn folder(name: &str) -> PathBuf {
@@ -627,6 +709,89 @@ mod tests {
         assert_eq!(AgentSettings::set_aside(&dir).unwrap(), Some(aside.clone()));
         assert_eq!(std::fs::read(&aside).unwrap(), b"still not json");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn written_over_changes_only_what_changed() {
+        let file = json!({
+            "version": 2,
+            "agents": {
+                "pi": {"command": "/opt/pi", "cwd": "/work", "env": {"PORT": 8080, "OK": "1"}},
+                "codex": {"env": {"A": "1", "B": "2", "N": 5}, "extra": true, "args": ["--x", 7]},
+                "future": "not an object"
+            }
+        });
+        let before = AgentSettings::from_value(&file);
+        assert_eq!(before.agent("pi").env.len(), 1, "the lenient reader skips PORT");
+        // Nothing changed: the file as it is.
+        assert_eq!(before.written_over(&before, &file), file);
+        let mut after = before.clone();
+        if let Some(codex) = after.agents.get_mut("codex") {
+            codex.env.remove("A");
+            codex.env.insert("B".into(), "two".into());
+            codex.env.insert("C".into(), "3".into());
+        }
+        after.agents.insert("custom".into(), AgentPrefs { command: "/opt/mine".into(), ..AgentPrefs::default() });
+        let out = after.written_over(&before, &file);
+        assert_eq!(out["version"], 2);
+        assert_eq!(out["agents"]["pi"], file["agents"]["pi"], "an agent not changed is as the file has it");
+        assert_eq!(out["agents"]["future"], "not an object");
+        assert_eq!(out["agents"]["codex"], json!({"env": {"B": "two", "C": "3", "N": 5}, "extra": true, "args": ["--x", 7]}));
+        assert_eq!(out["agents"]["custom"], json!({"command": "/opt/mine"}));
+        assert_eq!(AgentSettings::from_value(&out), after, "and it reads back as the settings");
+        // An agent with nothing left is taken out; one with fields WordCraft doesn't read keeps
+        // those.
+        let mut cleared = after.clone();
+        cleared.agents.remove("custom");
+        cleared.agents.remove("codex");
+        let out = cleared.written_over(&after, &out);
+        assert!(out["agents"].get("custom").is_none());
+        assert_eq!(out["agents"]["codex"], json!({"env": {"N": 5}, "extra": true}), "its arguments cleared too");
+        // A missing or damaged file is written from nothing: each agent set up.
+        let fresh = AgentSettings::from_value(&after.written_over(&AgentSettings::default(), &Value::Null));
+        let set_up: Vec<_> = after.agents.iter().filter(|(_, p)| **p != AgentPrefs::default()).collect();
+        assert_eq!(fresh.agents.iter().collect::<Vec<_>>(), set_up);
+    }
+
+    #[test]
+    fn a_whole_file_value_saves_and_reads_back_but_not_past_the_limit() {
+        let dir = folder("save-value");
+        assert_eq!(AgentSettings::read_value(&dir), Ok(None));
+        let file = json!({"version": 2, "agents": {"pi": {"command": "/opt/pi", "cwd": "/work"}}});
+        AgentSettings::save_value(&dir, &file).unwrap();
+        assert_eq!(AgentSettings::read_value(&dir), Ok(Some(file.clone())));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(dir.join(SETTINGS_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let big = json!({"agents": {}, "pad": "x".repeat(super::MAX_SETTINGS as usize)});
+        assert!(AgentSettings::save_value(&dir, &big).is_err());
+        assert_eq!(AgentSettings::read_value(&dir), Ok(Some(file)), "the previous file is kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_configured_path_replaces_the_inherited_one() {
+        // What the page's notes say: a PATH set for the agent is the only PATH its program is
+        // looked for on (on macOS the trusted desktop bins come after it), not one searched first.
+        let dir = folder("path-replaces");
+        let inherited = folder("path-replaces-inherited");
+        let configured = folder("path-replaces-configured");
+        program(&inherited, "my-inherited-agent");
+        let mut settings = AgentSettings::default();
+        let path = std::env::join_paths([configured.clone()]).unwrap().into_string().unwrap();
+        settings.agents.insert(
+            "custom".into(),
+            AgentPrefs { command: "my-inherited-agent".into(), env: [("PATH".into(), path)].into(), ..AgentPrefs::default() },
+        );
+        settings.save(&dir).unwrap();
+        let on = std::env::join_paths([inherited.clone()]).unwrap();
+        assert!(matches!(spec_for(CUSTOM_ID, &host(&dir), Some(&on)), Err(Readiness::Install { .. })), "not found on WordCraft's PATH");
+        settings.agents.insert("custom".into(), AgentPrefs { command: "my-inherited-agent".into(), ..AgentPrefs::default() });
+        settings.save(&dir).unwrap();
+        assert!(spec_for(CUSTOM_ID, &host(&dir), Some(&on)).is_ok(), "found there without one");
+        let _ = (std::fs::remove_dir_all(&dir), std::fs::remove_dir_all(&inherited), std::fs::remove_dir_all(&configured));
     }
 
     #[test]

@@ -81,7 +81,8 @@ and command. Declining or stopping starts no process; an already-running adapter
 again on its next turn. Programmatic Allow and Reject policies cannot approve this setup: install
 the adapter first for headless use. When neither tool is there, the pane says what to install.
 
-The agent's configured `PATH` takes precedence over WordCraft's inherited `PATH`. On macOS,
+A `PATH` set in the agent's environment replaces WordCraft's inherited `PATH` for that agent
+(it is not added in front of it), so it must hold every folder the agent needs. On macOS,
 installed `/opt/homebrew/bin` and `/usr/local/bin` are appended when their canonical ancestors
 are owned by you or root and are not writable by others. Discovery and the child receive the
 same PATH, so Node shebangs and helper programs can also find those bins when opened from Finder.
@@ -113,8 +114,9 @@ opens to the agent's command, its arguments, one per line, and its environment v
 Save writes them; Discard changes reads the file again, dropping your edits, and Check again
 looks for the programs again after you install one. A preset's command left empty runs its
 adapter (from `PATH`, or, approved in the pane each time, with npx); its arguments go with a
-command of your own. A `PATH` variable set for the agent is where its program is looked for
-first. The variables' values are masked (never shown, copied or read out as text) and never
+command of your own. A `PATH` variable set for the agent replaces WordCraft's own `PATH` for it,
+both for finding its program and for what it runs, so it must hold every folder the agent needs
+(Node's too, for an npm adapter); the notes say so. The variables' values are masked (never shown, copied or read out as text) and never
 logged; for a screen reader each row says whether it is open, and each value field and Remove
 button is named after its variable. Save waits until what you typed can be kept, and says why
 not: a variable with a value but no name, a name with `=` in it, a name given twice, more than
@@ -122,22 +124,26 @@ not: a variable with a value but no name, a name with `=` in it, a name given tw
 applies the next time the agent starts; one already running keeps what it started with.
 
 Save writes only what you changed, over the file as it is when you save: an agent you didn't
-touch, and each field you didn't change, keep what the file holds, even if it changed while the
-page was open (by hand, or by another WordCraft), and the page says when it had. Arguments the
+touch, each field you didn't change, and each variable you didn't add, change or remove keep what
+the file holds, even if it changed while the page was open (by hand, or by another WordCraft), and
+the page says when it had. What the page doesn't show stays as the file has it too: keys outside
+`agents`, entries and fields WordCraft doesn't read, and values of other types. Arguments the
 one-per-line field can't show as they are (empty, with spaces at their ends, or with a line break
 in them) are kept as they are unless you change that agent's arguments; the row says so. The page
 reads the file again each time it is shown, unless it has edits not saved. A file that can't be
 read (not JSON, larger than 1 MiB, or unreadable) is never shown as nothing set up and then
 replaced in silence: the page says it can't be read, and Save first keeps it as
 `assistant-agents.json.damaged` (replacing an older one) beside the new file. If it became
-unreadable after the page read it, the first Save writes nothing and says so; the next one keeps
-it aside and saves.
+unreadable after the page read it, the first Save writes nothing and says so, and the page says it
+shows the file as it was when read; the next Save keeps it aside and saves what the page shows:
+that read, with your edits.
 
 No command reads or writes these settings: they say which program WordCraft starts and may hold
 your keys, so they are yours alone, set in the page or in the file. Input from the control
 channel (MCP's `click`, `key` and `type`, or `ui.*`) changes nothing on the page: what it typed
-or clicked is put back, its fields start afresh so undo can't bring it back, and the page says
-only you can change these settings. A script picks an agent with `assist.backend`, whose answer
+or clicked is put back, its fields start afresh so undo can't bring it back, where your keys go
+(the focused field and its selection) is put back too, so your next keys don't land where it
+clicked or tabbed, and the page says only you can change these settings. A script picks an agent with `assist.backend`, whose answer
 says whether each one is ready, and never holds its environment.
 
 They are kept in `<settings>/assistant-agents.json` (`<settings>` is the folder

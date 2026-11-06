@@ -7,14 +7,16 @@
 //!
 //! Which program WordCraft starts, and the keys an agent signs in with, are the person's alone:
 //! no command reads or writes them, and input the control channel makes (an agent's `click`,
-//! `key` or `type`) changes nothing here: the page puts back what it changed and says why. The
+//! `key` or `type`) changes nothing here: the page puts back what it changed, and where the
+//! person's keys go (focus and selection), and says why. The
 //! variables' values are masked (egui's password fields, which never show, copy or expose them
 //! as text) and never logged, and nothing here derives `Debug`.
 //!
 //! Save writes only what the person changed, over the file as it is then: an agent they didn't
-//! touch, and each field they didn't change, keep what the file holds, even if it changed while
-//! the page was open. It never writes what the library couldn't read back whole, and a file that
-//! can't be read is shown as such, and kept aside before a save replaces it.
+//! touch, each field and each variable they didn't change, and what the page doesn't show keep
+//! what the file holds, even if it changed while the page was open. It never writes what the
+//! library couldn't read back whole, and a file that can't be read is shown as such, and kept
+//! aside before a save replaces it with what the page shows.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -64,6 +66,9 @@ pub(crate) struct AgentSetup {
     /// As the file held them when the page read it: nothing set up when it is missing or can't
     /// be read.
     saved: AgentSettings,
+    /// The file `saved` was read from, all of it, what the page doesn't show included (`Null`
+    /// when there was none): what a save over a file gone bad since keeps.
+    read: serde_json::Value,
     /// The drafts `saved` gives: a field of a draft still as it is here wasn't changed.
     original: Vec<Draft>,
     /// As edited, in the picker's order: the presets, then the custom agent.
@@ -78,12 +83,59 @@ pub(crate) struct AgentSetup {
     notice: Option<(String, bool)>,
     /// Why the file can't be read, while it can't: the page says so, and Save keeps it aside
     /// before replacing it.
-    damaged: Option<String>,
+    damaged: Option<Damage>,
     /// Part of the fields' ids, new when the control channel's input is put back: the fields
     /// start afresh, with no undo history holding what it typed.
     generation: u64,
     /// The pass each window last drew the page in: egui counts passes per window.
     passes: HashMap<egui::ViewportId, u64>,
+    /// The person's focus and selection in a window from before the control channel's input
+    /// there, while that input lasts and one pass after: put back when it moved them.
+    focus: Option<(egui::ViewportId, Focus)>,
+}
+
+/// A settings file that can't be read.
+struct Damage {
+    /// Why not (never what it holds).
+    why: String,
+    /// Whether it went bad after the page read it, so the page shows that last good read; else
+    /// the page shows nothing set up.
+    after_read: bool,
+}
+
+/// Where the person's keys go: the focused widget, and its text field's selection.
+#[derive(Clone, Copy, PartialEq)]
+struct Focus {
+    id: Option<egui::Id>,
+    selection: Option<egui::text::CCursorRange>,
+}
+
+impl Focus {
+    fn now(ctx: &egui::Context) -> Focus {
+        let id = ctx.memory(|m| m.focused());
+        let selection = id.and_then(|id| egui::text_edit::TextEditState::load(ctx, id)).and_then(|s| s.cursor.char_range());
+        Focus { id, selection }
+    }
+
+    /// Put this focus and selection back where they moved. Whether they had.
+    fn put_back(self, ctx: &egui::Context) -> bool {
+        let now = Focus::now(ctx);
+        if now == self {
+            return false;
+        }
+        match (self.id, now.id) {
+            (Some(id), Some(moved)) if id == moved => {
+                if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
+                    state.cursor.set_char_range(self.selection);
+                    state.store(ctx, id);
+                }
+            }
+            (Some(id), _) => ctx.memory_mut(|m| m.request_focus(id)),
+            (None, Some(moved)) => ctx.memory_mut(|m| m.surrender_focus(moved)),
+            (None, None) => {}
+        }
+        true
+    }
 }
 
 /// One agent as the page edits it. No `Debug`: its variables may hold API keys.
@@ -130,6 +182,7 @@ impl AgentSetup {
         let mut setup = AgentSetup {
             dir,
             saved: AgentSettings::default(),
+            read: serde_json::Value::Null,
             original: Vec::new(),
             drafts: Vec::new(),
             check: Ok(AgentSettings::default()),
@@ -138,6 +191,7 @@ impl AgentSetup {
             damaged: None,
             generation: fresh(),
             passes: HashMap::new(),
+            focus: None,
         };
         setup.reload();
         setup
@@ -146,20 +200,22 @@ impl AgentSetup {
     /// Read the file again and start from it, edits dropped. A file that can't be read is
     /// nothing set up, and the page says why.
     fn reload(&mut self) {
-        let (saved, damaged) = match AgentSettings::read(&self.dir) {
-            Ok(saved) => (saved.unwrap_or_default(), None),
-            Err(why) => (AgentSettings::default(), Some(why)),
+        let (read, damaged) = match AgentSettings::read_value(&self.dir) {
+            Ok(read) => (read.unwrap_or_default(), None),
+            Err(why) => (serde_json::Value::Null, Some(Damage { why, after_read: false })),
         };
         self.damaged = damaged;
-        self.start_from(saved);
+        self.start_from(read);
     }
 
-    /// Start from `saved`: new drafts, nothing to save.
-    fn start_from(&mut self, saved: AgentSettings) {
+    /// Start from the file as `read`: new drafts, nothing to save.
+    fn start_from(&mut self, read: serde_json::Value) {
+        let saved = AgentSettings::from_value(&read);
         self.original = drafts(&saved);
         self.drafts = self.original.clone();
         self.check = Ok(saved.clone());
         self.saved = saved;
+        self.read = read;
     }
 
     /// Whether a draft differs from what the page read (a blank variable added counts).
@@ -248,7 +304,7 @@ fn prefs_over(base: &AgentPrefs, o: Option<&Draft>, d: &Draft) -> Result<AgentPr
         prefs.args = args_of(d, &agent)?;
     }
     if changed(|o, d| o.env == d.env) {
-        prefs.env = env_of(d, &agent)?;
+        prefs.env = env_over(&base.env, o.map_or(&[], |o| o.env.as_slice()), &d.env, &agent)?;
     }
     Ok(prefs)
 }
@@ -267,11 +323,33 @@ fn args_of(d: &Draft, agent: &str) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
-/// The variables: names trimmed, blank variables left out, what can't be kept refused.
-fn env_of(d: &Draft, agent: &str) -> Result<BTreeMap<String, String>, String> {
-    let mut env = BTreeMap::new();
-    for v in &d.env {
-        let name = clean(v.name.trim());
+/// The variables over `base` (the file's), one by one: a variable the person removed (from
+/// `original`, what the page read) is taken out, one they added or changed is set (its old name
+/// taken out when renamed), and every other one is as `base` has it, so what changed in the file
+/// meanwhile is kept. Names trimmed, blank variables left out, what can't be kept refused.
+fn env_over(base: &BTreeMap<String, String>, original: &[Var], vars: &[Var], agent: &str) -> Result<BTreeMap<String, String>, String> {
+    let names: Vec<String> = vars.iter().map(|v| clean(v.name.trim())).collect();
+    // The ones the person changed (with what each was, if the page read it) or added.
+    let mut set = Vec::new();
+    for (v, name) in vars.iter().zip(&names) {
+        let o = original.iter().find(|o| o.uid == v.uid);
+        if o.is_none_or(|o| o.name != v.name || o.value != v.value) {
+            set.push((v, name.as_str(), o));
+        }
+    }
+    let mut env = base.clone();
+    // First every name the person took out, renamed or changed, so a swap keeps both.
+    for o in original {
+        if !vars.iter().any(|v| v.uid == o.uid) {
+            env.remove(&o.name);
+        }
+    }
+    for (_, _, o) in &set {
+        if let Some(o) = o {
+            env.remove(&o.name);
+        }
+    }
+    for (v, name, _) in set {
         if name.is_empty() && v.value.is_empty() {
             continue;
         }
@@ -279,11 +357,12 @@ fn env_of(d: &Draft, agent: &str) -> Result<BTreeMap<String, String>, String> {
             return Err(fmt(tl!("{agent}: a variable has a value but no name"), &[("agent", agent)]));
         }
         if name.contains('=') {
-            return Err(fmt(tl!("{agent}: {name}: a variable's name can't hold ="), &[("agent", agent), ("name", &name)]));
+            return Err(fmt(tl!("{agent}: {name}: a variable's name can't hold ="), &[("agent", agent), ("name", name)]));
         }
-        if env.insert(name.clone(), clean(&v.value)).is_some() {
-            return Err(fmt(tl!("{agent}: {name} is there twice"), &[("agent", agent), ("name", &name)]));
+        if names.iter().filter(|n| n.as_str() == name).count() > 1 {
+            return Err(fmt(tl!("{agent}: {name} is there twice"), &[("agent", agent), ("name", name)]));
         }
+        env.insert(name.to_string(), clean(&v.value));
     }
     if env.len() > MOST {
         return Err(fmt(tl!("{agent}: at most {n} variables"), &[("agent", agent), ("n", &MOST.to_string())]));
@@ -326,7 +405,11 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
         Some(mut s) if s.dir == dir => {
             if shown_again(&mut s.passes, viewport, pass) {
                 // Shown again: the file may have changed (kept while there are edits: Save
-                // writes them over the file as it is then), and so may what is installed.
+                // writes them over the file as it is then), and so may what is installed. Focus
+                // kept from before isn't the person's now.
+                if s.focus.is_some_and(|(w, _)| w == viewport) {
+                    s.focus = None;
+                }
                 if !s.touched() {
                     s.reload();
                 }
@@ -341,16 +424,33 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
         }
     };
     // Only the person changes these settings: what the control channel's input changes in this
-    // pass (an agent's click, key or text) is put back.
-    let from_control = app.input_from_control(ui.ctx());
+    // pass (an agent's click, key or text) is put back, and so is where the person's keys go.
+    let ctx = ui.ctx().clone();
+    let from_control = app.input_from_control(&ctx);
     let before = from_control.then(|| setup.drafts.clone());
-    let t = Tokens::get(ui.ctx());
-    if let Some(why) = &setup.damaged {
+    let mut put_back = false;
+    match (setup.focus, from_control) {
+        // The first pass after it in its window, before the page's widgets see the person's
+        // input: put back what its click or key moved, including what egui moves at the end of
+        // a pass (an arrow key) or at the start of the next (Shift+Tab).
+        (Some((w, focus)), false) if w == viewport => {
+            put_back = focus.put_back(&ctx);
+            setup.focus = None;
+        }
+        (None, true) => setup.focus = Some((viewport, Focus::now(&ctx))),
+        _ => {}
+    }
+    let t = Tokens::get(&ctx);
+    if let Some(damage) = &setup.damaged {
         let file = format!("{SETTINGS_FILE}{SET_ASIDE_SUFFIX}");
-        let text = fmt(
-            tl!("The agents' settings file can't be read ({why}), so nothing in it is shown. Saving keeps it as {file} and starts a new one."),
-            &[("why", why), ("file", &file)],
-        );
+        let text = if damage.after_read {
+            tl!(
+                "The agents' settings file can't be read now ({why}): the page shows it as it was when read. Saving keeps it as {file} and saves what's here."
+            )
+        } else {
+            tl!("The agents' settings file can't be read ({why}), so nothing in it is shown. Saving keeps it as {file} and starts a new one.")
+        };
+        let text = fmt(text, &[("why", &damage.why), ("file", &file)]);
         ui.add(egui::Label::new(RichText::new(text).small().color(t.orange)).wrap());
     }
     let mut edited = false;
@@ -373,14 +473,23 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
     note(ui, "An agent starts with what's saved here the next time it starts; one already running keeps what it started with.");
     if let Some(before) = before {
         if save || discard || setup.drafts != before {
-            // Put back, in fields with no undo history of what was typed, and say why.
+            // Put back, in fields with no undo history of what was typed, none of them focused.
             setup.drafts = before;
             setup.generation = fresh();
-            let why = tl!("Only you can change the agents' settings: type and click here yourself.");
-            setup.notice = Some((why.to_string(), true));
-            ui.ctx().request_repaint();
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+            setup.focus = Some((viewport, Focus { id: None, selection: None }));
+            put_back = true;
         }
         (edited, save, discard) = (false, false, false);
+    }
+    if put_back {
+        let why = tl!("Only you can change the agents' settings: type and click here yourself.");
+        setup.notice = Some((why.to_string(), true));
+        ctx.request_repaint();
     }
     if edited {
         setup.edited();
@@ -414,15 +523,17 @@ fn ask_again(app: &mut WordApp, setup: &mut AgentSetup) {
 }
 
 /// Save what the person changed over the file as it is now, through the library, then ask again
-/// whether each agent can start (the pane's picker too). A file that can't be read is kept aside
-/// first, once the page has said so.
+/// whether each agent can start (the pane's picker too). Only what changed is written: the rest
+/// of the file, what the page doesn't show included, stays as it is. A file that can't be read is
+/// kept aside first, once the page has said so, and what the page shows is saved in its place.
 fn save_setup(app: &mut WordApp, setup: &mut AgentSetup) {
     if setup.check.is_err() {
         return;
     }
-    let read = AgentSettings::read(&setup.dir);
-    let now = match &read {
-        Ok(now) => now.clone().unwrap_or_default(),
+    let read = AgentSettings::read_value(&setup.dir);
+    let (file, now) = match &read {
+        Ok(Some(file)) => (file.clone(), AgentSettings::from_value(file)),
+        Ok(None) => (serde_json::Value::Null, AgentSettings::default()),
         Err(why) if setup.damaged.is_none() => {
             // It could be read when the page read it: say so before saving over it.
             let file = format!("{SETTINGS_FILE}{SET_ASIDE_SUFFIX}");
@@ -431,10 +542,11 @@ fn save_setup(app: &mut WordApp, setup: &mut AgentSetup) {
                 &[("why", why), ("file", &file)],
             );
             setup.notice = Some((text, true));
-            setup.damaged = Some(why.clone());
+            setup.damaged = Some(Damage { why: why.clone(), after_read: true });
             return;
         }
-        Err(_) => AgentSettings::default(),
+        // What's here: the page's last good read (nothing, if it never had one) and the edits.
+        Err(_) => (setup.read.clone(), setup.saved.clone()),
     };
     let settings = match settings_over(&now, &setup.original, &setup.drafts) {
         Ok(settings) => settings,
@@ -443,6 +555,7 @@ fn save_setup(app: &mut WordApp, setup: &mut AgentSetup) {
             return;
         }
     };
+    let written = settings.written_over(&now, &file);
     let aside = match read {
         Ok(_) => None,
         Err(_) => match AgentSettings::set_aside(&setup.dir) {
@@ -455,7 +568,7 @@ fn save_setup(app: &mut WordApp, setup: &mut AgentSetup) {
             }
         },
     };
-    match settings.save(&setup.dir) {
+    match AgentSettings::save_value(&setup.dir, &written) {
         Ok(()) => {
             let said = match &aside {
                 Some(aside) => {
@@ -468,7 +581,7 @@ fn save_setup(app: &mut WordApp, setup: &mut AgentSetup) {
                 None => tl!("Saved.").to_string(),
             };
             setup.damaged = None;
-            setup.start_from(settings);
+            setup.start_from(written);
             setup.notice = Some((said, false));
             ask_again(app, setup);
         }
@@ -598,13 +711,13 @@ fn fields(ui: &mut Ui, t: &Tokens, d: &mut Draft, generation: u64, shows_all: bo
             let text = match p.package {
                 Some(package) => fmt(
                     tl!(
-                        "Leave the command empty to run {program} from PATH (a PATH variable set below comes first), or, when it isn't installed, to download and run {package} with npx, which the Assistant pane asks you to allow each time. Arguments, one per line, go with a command of your own."
+                        "Leave the command empty to run {program} from PATH, or, when it isn't installed, to download and run {package} with npx, which the Assistant pane asks you to allow each time. A PATH variable set below replaces WordCraft's own PATH for this agent, so it must hold every folder it needs, Node's too. Arguments, one per line, go with a command of your own."
                     ),
                     &[("program", p.program), ("package", package)],
                 ),
                 None => fmt(
                     tl!(
-                        "Leave the command empty to run {program} from PATH (a PATH variable set below comes first). Arguments, one per line, go with a command of your own."
+                        "Leave the command empty to run {program} from PATH. A PATH variable set below replaces WordCraft's own PATH for this agent, so it must hold every folder it needs. Arguments, one per line, go with a command of your own."
                     ),
                     &[("program", p.program)],
                 ),
@@ -613,7 +726,7 @@ fn fields(ui: &mut Ui, t: &Tokens, d: &mut Draft, generation: u64, shows_all: bo
         }
         None => note(
             ui,
-            "The command is an absolute path, or a program's name looked up on PATH (a PATH variable set below comes first). Arguments: one per line.",
+            "The command is an absolute path, or a program's name looked up on PATH. A PATH variable set below replaces WordCraft's own PATH for this agent, so it must hold every folder it needs. Arguments: one per line.",
         ),
     }
     ui.add_space(4.0);

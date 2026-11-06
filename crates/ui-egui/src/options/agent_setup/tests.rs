@@ -4,7 +4,7 @@ use egui_kittest::kittest::{By, NodeT, Queryable};
 use serde_json::json;
 use wordcraft_assist::acp::presets::{AgentPrefs, AgentSettings, SETTINGS_FILE};
 
-use super::{AgentSetup, Draft, drafts, settings_over, var};
+use super::{AgentSetup, Draft, drafts, env_over, settings_over, var};
 use crate::{Services, WordApp};
 
 /// A secret no node of the page may show.
@@ -700,5 +700,266 @@ fn rows_say_whether_they_are_open_and_variables_are_named() {
         nth(&h, Role::PasswordInput, 0, move |l| l == format!("{name} value"));
         assert!(h.query_by_label(&format!("Remove {name}")).is_some(), "Remove names {name}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Second review (#24): each test below failed before its fix.
+
+/// The settings file in `dir`, as JSON, all of it.
+fn raw(dir: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(dir.join(SETTINGS_FILE)).unwrap()).unwrap()
+}
+
+/// confirmed[1] and [3]: a file that goes bad after the page read it is kept aside on the second
+/// Save, which saves what the page shows (its last good read and the edits), not the edits alone.
+#[test]
+fn a_file_damaged_after_the_page_read_it_saves_what_the_page_shows() {
+    let dir = folder("damaged-later");
+    let file = dir.join(SETTINGS_FILE);
+    let mut first = AgentSettings::default();
+    first.agents.insert("codex".into(), AgentPrefs { env: [("OPENAI_API_KEY".to_string(), "sk-kept".to_string())].into(), ..AgentPrefs::default() });
+    let custom = AgentPrefs {
+        command: "/opt/mine".into(),
+        args: vec!["--acp".into()],
+        env: [("AGENT_TOKEN".to_string(), "tok".to_string())].into(),
+        ..AgentPrefs::default()
+    };
+    first.agents.insert("custom".into(), custom.clone());
+    // With what the page doesn't show: a key outside the agents and a field it doesn't read.
+    let mut value = serde_json::to_value(&first).unwrap();
+    value["version"] = json!(2);
+    value["agents"]["codex"]["extra"] = json!(true);
+    std::fs::write(&file, value.to_string()).unwrap();
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    type_into(&mut h, "Command:", 0, "2");
+    // An editor leaves it empty.
+    std::fs::write(&file, "").unwrap();
+    button(&h, "Save").click();
+    h.run_steps(4);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "", "not saved over without saying so");
+    button(&h, "Save").click();
+    h.run_steps(4);
+    let saved = AgentSettings::load(&dir);
+    assert_eq!(saved.agent("codex").env.get("OPENAI_API_KEY").map(String::as_str), Some("sk-kept"), "an agent not touched is kept");
+    assert_eq!(saved.agent("custom"), AgentPrefs { command: "/opt/mine2".into(), ..custom.clone() }, "and the edited agent's other fields");
+    assert!(draft_of(&h, "codex").env.iter().any(|v| v.name == "OPENAI_API_KEY"), "the page still shows it");
+    let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!((&raw["version"], &raw["agents"]["codex"]["extra"]), (&json!(2), &json!(true)), "and what the page doesn't show");
+    // While it can't be read, the page says it shows the file as it was when read.
+    type_into(&mut h, "Command:", 0, "3");
+    std::fs::write(&file, "junk").unwrap();
+    button(&h, "Save").click();
+    h.run_steps(4);
+    assert!(showing(&h, "as it was when") > 0, "the page shows its last good read and says so");
+    assert_eq!(showing(&h, "nothing in it is shown"), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// confirmed[2]: Save merges an agent's variables one by one with the file as it is then: a
+/// variable the file added, changed or removed meanwhile stays that way, and the person's own
+/// changes are applied.
+#[test]
+fn save_merges_each_variable_with_the_file() {
+    let dir = folder("merge-vars");
+    let env = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let write = |pairs: &[(&str, &str)]| {
+        let mut s = AgentSettings::default();
+        s.agents.insert("codex".into(), AgentPrefs { env: env(pairs), ..AgentPrefs::default() });
+        s.save(&dir).unwrap();
+    };
+    write(&[("A", "1")]);
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Codex");
+    // The page adds B; meanwhile the file loses A and gains C.
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 1, "B");
+    type_value(&mut h, 1, "2");
+    write(&[("C", "3")]);
+    button(&h, "Save").click();
+    h.run_steps(4);
+    assert_eq!(AgentSettings::load(&dir).agent("codex").env, env(&[("B", "2"), ("C", "3")]), "C kept, A not brought back");
+    // The page removes A; meanwhile the file changes B and gains D.
+    write(&[("A", "1"), ("B", "2")]);
+    button(&h, "Check again").click();
+    h.run_steps(4);
+    button(&h, "Remove A").click();
+    h.run_steps(3);
+    write(&[("A", "1"), ("B", "3"), ("D", "4")]);
+    button(&h, "Save").click();
+    h.run_steps(4);
+    assert_eq!(AgentSettings::load(&dir).agent("codex").env, env(&[("B", "3"), ("D", "4")]), "A removed, B and D as the file has them");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// confirmed[2]: variables merge one by one: a rename takes the old name out, two swapped names
+/// keep both values, an unchanged variable is as the file has it now, and a clash is refused.
+#[test]
+fn variables_merge_one_by_one_with_renames_and_swaps() {
+    let map = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<std::collections::BTreeMap<_, _>>();
+    let read = vec![var("A".into(), "1".into()), var("B".into(), "2".into()), var("K".into(), "k".into())];
+    let mut page = read.clone();
+    // Swap A and B's names; K unchanged (the file has changed it since), and the file gained Z.
+    page[0].name = "B".into();
+    page[1].name = "A".into();
+    let file = map(&[("A", "1"), ("B", "2"), ("K", "k2"), ("Z", "z")]);
+    assert_eq!(env_over(&file, &read, &page, "x").unwrap(), map(&[("A", "2"), ("B", "1"), ("K", "k2"), ("Z", "z")]));
+    // A rename takes the old name out; a rename onto another row's name is refused.
+    let mut page = read.clone();
+    page[0].name = " C ".into();
+    assert_eq!(env_over(&file, &read, &page, "x").unwrap(), map(&[("B", "2"), ("C", "1"), ("K", "k2"), ("Z", "z")]));
+    page[0].name = "K".into();
+    assert!(env_over(&file, &read, &page, "x").unwrap_err().contains("K is there twice"));
+    // Blanking a variable removes it.
+    let mut page = read.clone();
+    page[2].name.clear();
+    page[2].value.clear();
+    assert_eq!(env_over(&file, &read, &page, "x").unwrap(), map(&[("A", "1"), ("B", "2"), ("Z", "z")]));
+}
+
+/// confirmed[0]: the control channel can't move the person's focus or selection on the page: a
+/// faked click or Tab is put back, so the person's next keys go where they were going.
+#[test]
+fn control_channel_focus_and_selection_are_put_back() {
+    let dir = folder("faked-focus");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "API_KEY");
+    type_value(&mut h, 0, "sk-");
+    // A faked click on the Command field, then the person goes on typing their key.
+    let command = h.get_by_label("Command:").rect().center();
+    faked_click(&mut h, command);
+    assert!(showing(&h, "Only you can change the agents' settings") > 0, "the page says why");
+    h.event(egui::Event::Text(SECRET.into()));
+    h.run_steps(2);
+    assert!(!draft_of(&h, "custom").command.contains(SECRET), "the key never lands in the command");
+    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}").as_str()), "it goes on in its field");
+    // A faked Tab onto Remove, then the person's Space: nothing is removed.
+    faked(&mut h, "ui.key", json!({"key": "Tab"}));
+    h.key_press(egui::Key::Space);
+    h.run_steps(2);
+    assert_eq!(draft_of(&h, "custom").env.len(), 1, "Space didn't press Remove");
+    // A faked Shift+Tab (egui moves focus at the next pass): the person's next characters still
+    // go on in their field, not into its name.
+    faked(&mut h, "ui.key", json!({"key": "Tab", "shift": true}));
+    h.event(egui::Event::Text("x".into()));
+    h.run_steps(2);
+    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.name.as_str()), Some("API_KEY"), "the name is as typed");
+    assert_eq!(draft_of(&h, "custom").env.first().map(|v| v.value.as_str()), Some(format!("sk-{SECRET}x").as_str()));
+    // A faked select-all in the person's field: their next character doesn't replace the key.
+    let before = draft_of(&h, "custom").env.first().map(|v| v.value.clone()).unwrap();
+    faked(&mut h, "ui.key", json!({"key": "a", "cmd": true}));
+    h.event(egui::Event::Text("Z".into()));
+    h.run_steps(2);
+    let after = draft_of(&h, "custom").env.first().map(|v| v.value.clone()).unwrap();
+    assert!(after.starts_with(&before), "the selection was put back: {} → {} characters", before.len(), after.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// confirmed[5]: Save keeps what the page doesn't show: fields and values WordCraft doesn't read,
+/// and keys outside the agents, as the file has them.
+#[test]
+fn saving_keeps_what_the_page_does_not_show() {
+    let dir = folder("unknown-fields");
+    let file = json!({
+        "version": 2,
+        "agents": {
+            "pi": {"command": "/opt/pi", "cwd": "/work", "env": {"PORT": 8080, "OK": "1"}},
+            "codex": {"env": {"N": 5}, "extra": true}
+        }
+    });
+    std::fs::write(dir.join(SETTINGS_FILE), serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Codex");
+    button(&h, "Add variable").click();
+    h.run_steps(3);
+    type_into(&mut h, "Name", 0, "OPENAI_API_KEY");
+    type_value(&mut h, 0, "sk-test");
+    button(&h, "Save").click();
+    h.run_steps(4);
+    let saved = raw(&dir);
+    assert_eq!(saved["version"], 2, "a key outside the agents is kept");
+    assert_eq!(saved["agents"]["pi"], file["agents"]["pi"], "an agent not touched is as the file has it");
+    assert_eq!(saved["agents"]["codex"], json!({"env": {"N": 5, "OPENAI_API_KEY": "sk-test"}, "extra": true}));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// confirmed[6]: what the control channel typed into a field the person was typing in can't be
+/// brought back by the person's undo, even when egui had kept it as an undo point (typing
+/// without a pause for 30 seconds makes one): the field is a new one.
+#[test]
+fn text_the_control_channel_typed_cant_come_back_with_undo() {
+    let dir = folder("faked-undo");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    h.get_by_label("Command:").focus();
+    h.run_steps(2);
+    // The person types a character every half second for 29.5 seconds (a step is 0.25 s)…
+    for _ in 0..60 {
+        h.event(egui::Event::Text("a".into()));
+        h.step();
+        h.step();
+    }
+    // …and the control channel's text lands at 30 seconds, as egui makes it an undo point.
+    faked(&mut h, "ui.text", json!({"text": "/bin/sh"}));
+    assert_eq!(draft_of(&h, "custom").command, "a".repeat(60), "put back");
+    h.get_by_label("Command:").focus();
+    h.run_steps(2);
+    for undo in 1..=3 {
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        h.run_steps(2);
+        assert!(!draft_of(&h, "custom").command.contains("/bin/sh"), "undo {undo} doesn't bring it back");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// confirmed[6]: Discard changes, and Check again with nothing changed, read the file again.
+#[test]
+fn discard_and_check_again_read_the_file_again() {
+    let dir = folder("reread-buttons");
+    let write = |command: &str| {
+        let mut s = AgentSettings::default();
+        s.agents.insert("custom".into(), AgentPrefs { command: command.into(), ..AgentPrefs::default() });
+        s.save(&dir).unwrap();
+    };
+    write("/opt/a");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Custom agent");
+    write("/opt/b");
+    button(&h, "Check again").click();
+    h.run_steps(4);
+    assert_eq!(h.get_by_label("Command:").value().as_deref(), Some("/opt/b"), "Check again with nothing changed");
+    type_into(&mut h, "Command:", 0, "-edited");
+    write("/opt/c");
+    button(&h, "Check again").click();
+    h.run_steps(4);
+    assert_eq!(h.get_by_label("Command:").value().as_deref(), Some("/opt/b-edited"), "Check again keeps edits");
+    button(&h, "Discard changes").click();
+    h.run_steps(4);
+    assert_eq!(h.get_by_label("Command:").value().as_deref(), Some("/opt/c"), "Discard changes");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// confirmed[4]: the notes say what a PATH variable does: it replaces WordCraft's PATH for the
+/// agent (the library's `a_configured_path_replaces_the_inherited_one`).
+#[test]
+fn the_notes_say_a_path_variable_replaces_wordcrafts() {
+    let dir = folder("path-note");
+    let mut h = harness(Some(&dir));
+    open(&mut h, "Codex");
+    open(&mut h, "Custom agent");
+    // Every open row's note (a label, whose wrapped rows are its children): Codex's and the
+    // custom agent's.
+    let notes = |text: &str| {
+        let text = text.to_string();
+        h.query_all(By::new().role(egui::accesskit::Role::Label).predicate(move |n| n.value().is_some_and(|v| v.contains(&text)))).count()
+    };
+    let open = notes("from PATH") + notes("looked up on PATH");
+    assert_eq!(open, 2, "Codex's and the custom agent's notes are open");
+    assert_eq!(notes("replaces WordCraft's own PATH"), open, "each note says it");
+    assert_eq!(showing(&h, "comes first"), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
