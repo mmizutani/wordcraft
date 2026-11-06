@@ -569,14 +569,22 @@ fn exchange(p: &Pending, client_id: &str, code: &str) -> Result<Account, AuthErr
         scopes: tokens.scopes.unwrap_or_else(|| SCOPES.split_whitespace().map(str::to_string).collect()),
         saved_at: 0,
     };
-    // Saved under the lock: a refresh in flight (here or in another WordCraft process) finishes
-    // first, and can't save the last sign-in's tokens over these.
     let lock = Lock::take(&p.settings);
-    if let Err(e) = &lock {
-        log::warn!("ChatGPT sign-in: {e}; the new sign-in is saved without the lock");
+    keep_sign_in(&p.settings, &p.endpoints, credentials, lock)
+}
+
+/// Keep one issued sign-in after the credentials lock has been acquired.
+pub(super) fn keep_sign_in(
+    settings: &Path,
+    endpoints: &Endpoints,
+    credentials: Credentials,
+    lock: Result<Lock, String>,
+) -> Result<Account, AuthError> {
+    let kept = lock.and_then(|_lock| store::write_credentials(settings, &credentials));
+    if let Err(e) = kept {
+        revoke_unkept(endpoints, credentials);
+        return Err(AuthError::Storage(e));
     }
-    store::write_credentials(&p.settings, &credentials).map_err(AuthError::Storage)?;
-    drop(lock);
     let account = credentials.account();
     log::info!("ChatGPT sign-in: signed in (plan usage {})", if account.plan_usage { "allowed" } else { "not allowed" });
     Ok(account)

@@ -375,6 +375,43 @@ fn finishing_registration_preserves_the_model_chosen_while_waiting_for_the_brows
 }
 
 #[test]
+fn an_unsaved_sign_in_preserves_credentials_when_the_lock_times_out_and_revokes_new_tokens() {
+    let (folder, _script, server, endpoints) = signed_in(no_api);
+    let old = store::read_credentials(folder.path()).unwrap();
+    let mut fresh = old.clone();
+    fresh.access_token = "new-access".into();
+    fresh.refresh_token = "unkept-refresh".into();
+    let holder = hold_lock(folder.path());
+    let lock = store::Lock::within(folder.path(), Duration::ZERO);
+    assert!(lock.is_err(), "the system file lock is actually held");
+    let result = super::auth::keep_sign_in(folder.path(), &endpoints, fresh, lock);
+    assert!(matches!(result, Err(AuthError::Storage(_))));
+    assert_eq!(store::read_credentials(folder.path()), Some(old));
+    assert!(held(&folder.path().join(store::LOCK_FILE)), "the live holder was not displaced");
+    eventually("unkept tokens revoked after lock failure", || {
+        server.to("/oauth/revoke").iter().any(|r| r.field("token").as_deref() == Some("unkept-refresh"))
+    });
+    drop(holder);
+}
+
+#[test]
+fn an_unsaved_sign_in_revokes_new_tokens_when_the_credentials_cannot_be_written() {
+    let (folder, _script, server, endpoints) = signed_in(no_api);
+    let mut fresh = store::read_credentials(folder.path()).unwrap();
+    fresh.refresh_token = "unwritten-refresh".into();
+    let path = folder.path().join(CREDENTIALS_FILE);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let lock = store::Lock::take(folder.path());
+    let result = super::auth::keep_sign_in(folder.path(), &endpoints, fresh, lock);
+    assert!(matches!(result, Err(AuthError::Storage(_))));
+    assert!(path.is_dir(), "the failed save left the existing filesystem entry alone");
+    eventually("unwritten tokens revoked after storage failure", || {
+        server.to("/oauth/revoke").iter().any(|r| r.field("token").as_deref() == Some("unwritten-refresh"))
+    });
+}
+
+#[test]
 fn signing_in_again_reuses_the_issued_client_with_hints_and_refuses_another_registration() {
     let (folder, script, server, endpoints) = signed_in(no_api);
     let host_id = store::client(folder.path()).unwrap().host_id;
