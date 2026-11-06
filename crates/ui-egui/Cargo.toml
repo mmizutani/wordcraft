@@ -24,6 +24,8 @@ wordcraft-layout = { workspace = true }
 wordcraft-render = { workspace = true }
 wordcraft-engine = { workspace = true }
 wordcraft-zotero = { workspace = true }
+# The built-in assistant (#15): conversations the Assistant pane shows.
+wordcraft-assist = { workspace = true }
 egui = { workspace = true, features = ["default_fonts", "monochrome_emoji_fonts"] }
 egui_extras = { workspace = true }
 serde = { workspace = true }

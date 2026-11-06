@@ -166,6 +166,7 @@ fn group_icon(title: &str) -> &'static str {
         "Styles" => "styles",
         "Editing" => "find",
         "Voice" => "dictate",
+        "Assistant" => "assistant",
         "Tables" => "table",
         "Links" => "link",
         _ => "more",
@@ -178,6 +179,7 @@ fn group_icon(title: &str) -> &'static str {
 pub fn command_icon(id: &str) -> &str {
     const ICONS: &[(&str, &str)] = &[
         ("arrange.wrap", "wrapText"),
+        ("assist.pane", "assistant"),
         ("draw.highlighter", "highlight"),
         ("format.border", "charborder"),
         ("format.color", "fontcolor"),

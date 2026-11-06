@@ -130,6 +130,7 @@ fn pane_label(id: &str) -> &'static str {
         "accessibility" => "Accessibility",
         "advanced" => "Advanced",
         "agents" => "Agents",
+        "assistant" => "Assistant",
         _ => "General",
     }
 }
@@ -182,6 +183,7 @@ pub fn page(app: &mut WordApp, ui: &mut Ui) {
                 "accessibility" => accessibility(app, ui),
                 "advanced" => advanced(app, ui),
                 "agents" => agents(ui),
+                "assistant" => assistant(app, ui),
                 _ => general(app, ui),
             }
         });
@@ -700,6 +702,31 @@ fn templates_folder(app: &mut WordApp, ui: &mut Ui) {
 fn agents(ui: &mut Ui) {
     section(ui, "Agents");
     ui.label(tl!("Every command is available to scripts and AI agents: run `wordcraft-cli mcp` for an MCP server, or start the app with `--control <port>` for the JSON control channel."));
+}
+
+/// The built-in assistant (#15): the role assistants join a shared document with
+/// (`assist.defaultRole`); a conversation may choose its own in the Assistant pane.
+fn assistant(app: &mut WordApp, ui: &mut Ui) {
+    use crate::assist::{role_label, role_note};
+    use wordcraft_engine::AssistantPrefs;
+    section(ui, "Assistant");
+    let role = app.session.prefs.assistant.default_role();
+    ui.horizontal(|ui| {
+        let label = ui.label(tl!("Assistants join as:"));
+        let combo = craft_ui::ComboBox::from_id_salt("assistant_default_role").selected_text(tl!(role_label(role))).width(220.0).show_ui(ui, |ui| {
+            for r in AssistantPrefs::ROLES {
+                if ui.selectable_label(r == role, tl!(role_label(r))).clicked() {
+                    let _ = app.run("assist.defaultRole", json!({"value": r.name()}));
+                }
+            }
+        });
+        combo.response.labelled_by(label.id);
+    });
+    note(ui, role_note(role));
+    note(
+        ui,
+        "An assistant works in the document like a person you share it with: its role says what it may do. Each conversation in the Assistant pane may choose another.",
+    );
 }
 
 /// Interface theme: Light, Dark, or follow the system's appearance (#115).

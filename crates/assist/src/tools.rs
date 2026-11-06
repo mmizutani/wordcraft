@@ -6,6 +6,7 @@
 use std::sync::{Arc, OnceLock};
 
 use serde_json::{Value, json};
+use wordcraft_doc::change::Anchor;
 use wordcraft_engine::room::{Replica, Room, RoomError, hosted};
 use wordcraft_mcp::tools::{ToolResult, call_tool, tool_definitions};
 
@@ -146,6 +147,15 @@ impl ToolHost for CopyTools {
         };
         let changed = self.copy.stats().sent > sent;
         ToolOutput { version: changed.then(|| self.copy.received()), ..out }
+    }
+
+    fn select(&mut self, anchor: Anchor, focus: Anchor) -> bool {
+        // What the hub took since, the person's edits among it, first.
+        self.copy.receive();
+        let doc = &self.copy.session().doc;
+        let (Some(a), Some(f)) = (doc.pos_of(anchor, None), doc.pos_of(focus, None)) else { return false };
+        let range = json!({"anchor": wordcraft_engine::cmd::pos_json(&a), "focus": wordcraft_engine::cmd::pos_json(&f)});
+        self.copy.run("select.range", &range).is_ok()
     }
 }
 

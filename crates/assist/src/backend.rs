@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use wordcraft_doc::change::Anchor;
 use wordcraft_engine::room::Role;
 
 /// Most bytes of text one event carries; more is cut at a character boundary.
@@ -387,6 +388,14 @@ pub trait ToolHost {
     /// Call tool `name` with `args`. Junk arguments and unknown tools are error outputs, never
     /// panics.
     fn call(&mut self, name: &str, args: &Value) -> ToolOutput;
+    /// Select from `anchor` to `focus` in the host's copy of the document before a turn: the
+    /// person's selection in the window, as places in paragraphs named by id, which edits that
+    /// moved the paragraphs don't move. Whether it could; a host without a copy of its own
+    /// can't.
+    fn select(&mut self, anchor: Anchor, focus: Anchor) -> bool {
+        let _ = (anchor, focus);
+        false
+    }
 }
 
 /// No tools: for a backend whose agent reaches the document on its own (ACP).

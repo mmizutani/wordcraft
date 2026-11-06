@@ -1,24 +1,40 @@
-use super::{CmdError, CmdResult, InlineObject, Paragraph, Pos, Selection, Session, StoryRef, Value, fmt_revisions, json, p, pos_json, sel_result};
+use std::collections::BTreeSet;
 
-/// Accept or reject the tracked formatting and text of `from..to` in one paragraph (not its mark).
-fn resolve_runs(para: &mut wordcraft_doc::Paragraph, from: usize, to: usize, props: bool, accept: bool) -> Result<(), CmdError> {
-    if props && (para.props.fmt_change.is_some() || para.props.num_change.is_some()) {
+use super::{CmdError, CmdResult, InlineObject, Paragraph, Pos, Selection, Session, StoryRef, Value, fmt_revisions, json, p, pos_json, sel_result};
+use fmt_revisions::Which;
+
+/// Accept or reject the tracked formatting and text of `from..to` in one paragraph (not its mark)
+/// that `which` names.
+fn resolve_runs(para: &mut wordcraft_doc::Paragraph, from: usize, to: usize, props: bool, accept: bool, which: Which) -> Result<(), CmdError> {
+    // A paragraph's list numbering change goes with its formatting change.
+    let props = props
+        && match para.props.fmt_change.as_deref() {
+            Some(ch) => which.has(Some(ch.rev)),
+            None => which.has(para.props.num_change.as_ref().map(|n| n.rev)),
+        };
+    if props {
         fmt_revisions::resolve_para(&mut para.props, accept);
         para.touch();
     }
     let ranges: Vec<(usize, usize, bool, bool, bool)> = para
         .run_ranges()
         .filter(|(r, _)| r.end > from && r.start < to)
-        .map(|(r, c)| (r.start.max(from), r.end.min(to), c.ins.is_some(), c.del.is_some(), c.fmt_change.is_some()))
+        .map(|(r, c)| (r.start.max(from), r.end.min(to), which.has(c.ins), which.has(c.del), which.has_change(c.fmt_change.as_deref())))
         .collect();
     for (a, b, ins, del, fmt) in ranges.into_iter().rev() {
         if (del && accept) || (ins && !accept) {
             para.delete(a, b)?;
         } else if ins || del || fmt {
             para.format(a, b, &|c| {
-                c.ins = None;
-                c.del = None;
-                fmt_revisions::resolve_char(c, accept);
+                if ins {
+                    c.ins = None;
+                }
+                if del {
+                    c.del = None;
+                }
+                if fmt {
+                    fmt_revisions::resolve_char(c, accept);
+                }
             })?;
         }
     }
@@ -26,7 +42,8 @@ fn resolve_runs(para: &mut wordcraft_doc::Paragraph, from: usize, to: usize, pro
 }
 
 /// Accept or reject a revision range in one paragraph; `mark` includes its paragraph mark (and
-/// the section break on it), `props` the paragraph's own formatting change.
+/// the section break on it), `props` the paragraph's own formatting change. Only the changes
+/// `which` names are resolved.
 fn resolve_para(
     s: &mut Session,
     story: StoryRef,
@@ -34,37 +51,50 @@ fn resolve_para(
     (from, to): (usize, usize),
     (mark, props): (bool, bool),
     accept: bool,
+    which: Which,
 ) -> Result<(), CmdError> {
     let para = s.doc.para_mut(story, path)?;
-    resolve_runs(para, from, to, props, accept)?;
+    resolve_runs(para, from, to, props, accept, which)?;
     if !mark {
         return Ok(());
     }
-    if para.mark.fmt_change.is_some() || para.section.as_ref().is_some_and(|x| x.fmt_change.is_some()) {
-        fmt_revisions::resolve_char(&mut para.mark, accept);
-        if let Some(sec) = para.section.as_deref_mut() {
-            fmt_revisions::resolve_section(sec, accept);
-        }
-        para.touch();
-    }
-    let (ins, del) = (para.mark.ins, para.mark.del);
-    if ins.is_none() && del.is_none() {
+    resolve_mark_formatting(para, accept, which);
+    let (ins, del) = (which.has(para.mark.ins), which.has(para.mark.del));
+    if !ins && !del {
         return Ok(());
     }
     // An inserted paragraph mark that is rejected, or a deleted one that is accepted, goes away:
     // the next paragraph joins this one (the split is undone). A paragraph left empty goes away
     // whole, so the next one keeps its own style and numbering, as in Word. The mark at the end
     // of a story or cell can't go, so it just stops being a revision.
-    if ((del.is_some() && accept) || (ins.is_some() && !accept))
-        && (crate::cmd::remove_empty_para(s, story, path)? || crate::cmd::join_next_para(s, story, path)?)
-    {
+    if ((del && accept) || (ins && !accept)) && (crate::cmd::remove_empty_para(s, story, path)? || crate::cmd::join_next_para(s, story, path)?) {
         return Ok(());
     }
     let para = s.doc.para_mut(story, path)?;
-    para.mark.ins = None;
-    para.mark.del = None;
+    if ins {
+        para.mark.ins = None;
+    }
+    if del {
+        para.mark.del = None;
+    }
     para.touch();
     Ok(())
+}
+
+/// Accept or reject the tracked formatting of a paragraph's mark and of the section break on it
+/// that `which` names.
+fn resolve_mark_formatting(para: &mut wordcraft_doc::Paragraph, accept: bool, which: Which) {
+    let mark = which.has_change(para.mark.fmt_change.as_deref());
+    let section = which.has_change(para.section.as_ref().and_then(|x| x.fmt_change.as_deref()));
+    if mark {
+        fmt_revisions::resolve_char(&mut para.mark, accept);
+    }
+    if section && let Some(sec) = para.section.as_deref_mut() {
+        fmt_revisions::resolve_section(sec, accept);
+    }
+    if mark || section {
+        para.touch();
+    }
 }
 
 /// Accept or reject the changes of the table cell `path` is in: the table's, its row's and the
@@ -158,61 +188,77 @@ pub fn move_changes(s: &Session) -> Vec<(Pos, String, bool)> {
 }
 
 /// Accept or reject the tracked text and paragraph marks of the top-level paragraphs in a block
-/// list that is not a story (a note separator).
-fn resolve_loose_blocks(blocks: &mut wordcraft_doc::Blocks, accept: bool) -> Result<(), CmdError> {
+/// list that is not a story (a note separator) that `which` names.
+fn resolve_loose_blocks(blocks: &mut wordcraft_doc::Blocks, accept: bool, which: Which) -> Result<(), CmdError> {
     for b in blocks.iter_mut() {
         let wordcraft_doc::Block::Para(p) = std::sync::Arc::make_mut(b) else { continue };
         let len = p.len();
-        resolve_runs(p, 0, len, true, accept)?;
-        if p.mark.fmt_change.is_some() || p.section.as_ref().is_some_and(|x| x.fmt_change.is_some()) {
-            fmt_revisions::resolve_char(&mut p.mark, accept);
-            if let Some(sec) = p.section.as_deref_mut() {
-                fmt_revisions::resolve_section(sec, accept);
-            }
-        }
+        resolve_runs(p, 0, len, true, accept, which)?;
+        resolve_mark_formatting(p, accept, which);
         // A mark can't be removed here (no neighbour to join), so it just stops being a revision.
-        p.mark.ins = None;
-        p.mark.del = None;
+        if which.has(p.mark.ins) {
+            p.mark.ins = None;
+        }
+        if which.has(p.mark.del) {
+            p.mark.del = None;
+        }
         p.touch();
     }
-    fmt_revisions::resolve_containers(blocks, accept, 0);
+    fmt_revisions::resolve_containers(blocks, accept, which, 0);
     Ok(())
 }
 
-fn resolve_all(s: &mut Session, accept: bool) -> CmdResult {
+/// Accept or reject the tracked changes `which` names, everywhere in the document.
+fn resolve_all(s: &mut Session, accept: bool, which: Which) -> CmdResult {
     let stories: Vec<StoryRef> = std::iter::once(StoryRef::Body).chain(s.doc.parts.keys().map(|k| StoryRef::Part(*k))).collect();
     for st in stories {
         for path in s.doc.para_paths(st).into_iter().rev() {
             let len = s.doc.para(st, &path).map(|p| p.len()).unwrap_or(0);
-            resolve_para(s, st, &path, (0, len), (true, true), accept)?;
+            resolve_para(s, st, &path, (0, len), (true, true), accept, which)?;
         }
     }
     // Tables, rows, cells and sections.
-    fmt_revisions::resolve_containers(&mut s.doc.body, accept, 0);
+    fmt_revisions::resolve_containers(&mut s.doc.body, accept, which, 0);
     for part in s.doc.parts.values_mut() {
-        fmt_revisions::resolve_containers(&mut part.blocks, accept, 0);
+        fmt_revisions::resolve_containers(&mut part.blocks, accept, which, 0);
     }
-    fmt_revisions::resolve_section(&mut s.doc.last_section, accept);
+    if which.has_change(s.doc.last_section.fmt_change.as_deref()) {
+        fmt_revisions::resolve_section(&mut s.doc.last_section, accept);
+    }
     // The note separators are block lists of their own, not stories; they must not keep ids of
     // revisions that are about to be dropped.
     for sep in [&mut s.doc.footnote_separators, &mut s.doc.endnote_separators] {
         for blocks in [&mut sep.separator, &mut sep.continuation_separator, &mut sep.continuation_notice].into_iter().flatten() {
-            resolve_loose_blocks(blocks, accept)?;
+            resolve_loose_blocks(blocks, accept, which)?;
         }
     }
-    s.doc.revisions.clear();
+    // Every change resolved: the revisions go. Some resolved: the others still name theirs by
+    // their place in the list, so it stays as it is.
+    if matches!(which, Which::All) {
+        s.doc.revisions.clear();
+    }
     s.clamp_selection();
     sel_result(s)
 }
 
 /// Reject every tracked change of the session's document, as Reject All does.
 pub(crate) fn reject_all(s: &mut Session) -> Result<(), CmdError> {
-    resolve_all(s, false).map(|_| ())
+    resolve_all(s, false, Which::All).map(|_| ())
 }
 
 /// Accept or Reject All; with `stopTracking`, Track Changes is turned off as well.
 pub(super) fn resolve_all_then(s: &mut Session, v: &Value, accept: bool) -> CmdResult {
-    let out = resolve_all(s, accept)?;
+    let out = match v.get("author") {
+        None | Some(Value::Null) => resolve_all(s, accept, Which::All)?,
+        Some(Value::String(author)) if !author.trim().is_empty() => {
+            // One reviewer's changes (Accept All from one assistant): their revisions only.
+            let author = author.trim();
+            let theirs: BTreeSet<u32> =
+                s.doc.revisions.iter().enumerate().filter(|(_, r)| r.author == author).filter_map(|(i, _)| u32::try_from(i).ok()).collect();
+            resolve_all(s, accept, Which::Revisions(&theirs))?
+        }
+        Some(_) => return Err(CmdError::Params("`author` is the name of the reviewer whose changes to resolve".into())),
+    };
     if p::bool(v, "stopTracking") == Some(true) {
         s.doc.settings.track_changes = false;
     }
@@ -304,7 +350,7 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool) -> CmdResult {
         // A paragraph's mark is in the selection when the selection goes on past it.
         let mark = path != b.path || caret_mark.as_ref() == Some(&path);
         let props = (ranged && (path != b.path || to > from)) || caret_props.as_ref() == Some(&path);
-        resolve_para(s, a.story, &path, (from, to), (mark, props), accept)?;
+        resolve_para(s, a.story, &path, (from, to), (mark, props), accept, Which::All)?;
         if ranged {
             resolve_cell(s, a.story, &path, accept)?;
         }
@@ -512,6 +558,12 @@ fn select_next_unresolved(s: &mut Session) -> CmdResult {
         s.sel = Selection { anchor: c.a.clone(), focus: c.b.clone() };
     }
     sel_result(s)
+}
+
+/// How many of the body's tracked changes `author` made: the assistant pane's Accept all and
+/// Reject all of its changes (#15) are greyed out without any.
+pub fn changes_by(s: &Session, author: &str) -> usize {
+    changes(s).iter().filter(|c| c.rev.and_then(|r| s.doc.revisions.get(r as usize)).is_some_and(|r| r.author == author)).count()
 }
 
 pub(super) fn list_changes(s: &mut Session, _: &Value) -> CmdResult {

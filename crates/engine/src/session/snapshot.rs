@@ -93,6 +93,8 @@ impl Session {
             author: _,
             // Like the author: who edits, not an edit.
             role: _,
+            // The window's assistant, which the window keeps up to date: not an edit.
+            assistant: _,
             initials: _,
             painter: _,
             status: _,

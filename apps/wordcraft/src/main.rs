@@ -309,6 +309,8 @@ fn services(file_dialog: file_dialogs::Hook, ctx: &egui::Context) -> Services {
         make_default_app: default_apps::hook(),
         // Personal templates live in `Templates` in the settings folder (#2852), made on first save.
         templates_dir: wordcraft_control_key::settings_dir().map(|d| d.join("Templates")),
+        // What the assistant's sign-ins and agent set-ups keep (#15).
+        settings_dir: wordcraft_control_key::settings_dir(),
         animations_enabled: Some(animations::hook(ctx)),
         clipboard_text: Some(Box::new(clipboard::text)),
         clipboard_html: Some(Box::new(clipboard::html)),

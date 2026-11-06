@@ -12,7 +12,10 @@
 //! `{"demoPacks": true}` lists a few sample Language packs (installs only record themselves), and
 //! (with `{"network": true}` on a line, downloading is already on) `{"demoPacks": "store"}` uses a real font store, as the desktop app does, in a new temporary
 //! folder rather than the person's, or in `"storeDir"` given on the same line (with
-//! `CRAFT_LANGUAGE_PACK_INDEX` for a local pack index).
+//! `CRAFT_LANGUAGE_PACK_INDEX` for a local pack index). `{"assistScript": [[step, …], …]}` has the
+//! next assistant conversation use the scripted assistant, one list of steps per turn: `{"say":
+//! text}`, `{"think": text}`, `{"tool": name, "args": {…}}`, `{"plan": [text, …]}` or `{"ask":
+//! title}` (a permission request).
 
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{ControlRequest, Services, WordApp};
@@ -82,6 +85,9 @@ fn main() {
                 }
                 Err(e) => eprintln!("render failed: {e}"),
             }
+        } else if let Some(turns) = l.get("assistScript").and_then(|v| v.as_array()) {
+            harness.state_mut().assist_with(Box::new(scripted_assistant(turns)));
+            step_n(&mut harness, 2);
         } else if let Some(n) = l.get("steps").and_then(|v| v.as_u64()) {
             step_n(&mut harness, n as usize);
         } else if let Some(ms) = l.get("wait").and_then(|v| v.as_u64()) {
@@ -106,6 +112,33 @@ fn main() {
             step_n(&mut harness, 2);
         }
     }
+}
+
+/// The scripted assistant `{"assistScript": …}` describes.
+fn scripted_assistant(turns: &[serde_json::Value]) -> wordcraft_assist::Fake {
+    use wordcraft_assist::{PlanEntry, PlanStatus, Priority, Step};
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    let step = |s: &serde_json::Value| {
+        if let Some(t) = s.get("say") {
+            Step::Say(text(t))
+        } else if let Some(t) = s.get("think") {
+            Step::Think(text(t))
+        } else if let Some(name) = s.get("tool") {
+            Step::tool(&text(name), s.get("args").cloned().unwrap_or_default())
+        } else if let Some(entries) = s.get("plan").and_then(|v| v.as_array()) {
+            let status = |i: usize| if i == 0 { PlanStatus::Completed } else { PlanStatus::Pending };
+            Step::Plan(
+                entries.iter().enumerate().map(|(i, e)| PlanEntry { content: text(e), priority: Priority::Medium, status: status(i) }).collect(),
+            )
+        } else if let Some(t) = s.get("ask") {
+            Step::Ask(text(t))
+        } else {
+            panic!("an assistScript step is say, think, tool, plan or ask: {s}")
+        }
+    };
+    turns
+        .iter()
+        .fold(wordcraft_assist::Fake::new(), |fake, turn| fake.then(turn.as_array().map(|t| t.iter().map(step).collect()).unwrap_or_default()))
 }
 
 /// Applies the harness's pending raw input and advances one UI frame.

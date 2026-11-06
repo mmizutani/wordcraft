@@ -194,6 +194,21 @@ impl<'a> Exempt<'a> {
         if let Some(sugg) = app.canvas.context_issue.as_ref().and_then(|i| i.get("suggestions")).and_then(Value::as_array) {
             names.extend(sugg.iter().filter_map(Value::as_str).map(str::to_string));
         }
+        // The Assistant pane (#15): the assistants' names and what each needs, as their backends
+        // say, and the conversation itself.
+        for o in &app.assist.offers {
+            names.insert(o.label.clone());
+            if let wordcraft_assist::Readiness::SignIn { how } | wordcraft_assist::Readiness::Install { how } = &o.readiness {
+                names.insert(how.clone());
+            }
+            if let wordcraft_assist::Readiness::Unavailable { why } = &o.readiness {
+                names.insert(why.clone());
+            }
+        }
+        if let Some(c) = app.conversation() {
+            names.insert(c.name().to_string());
+            names.extend(c.transcript().entries().flat_map(crate::assist::entry_texts));
+        }
         // The proofing pane displays document context and dictionary suggestions, not UI wording.
         if let Some(form) = &app.spelling_review {
             names.extend(form.content_text());
@@ -326,8 +341,14 @@ fn untranslated_interface_text() {
         record(&app, &format!("dialog {name}"), drawn);
         app.dialog = None;
     }
-    let panes: Vec<String> =
-        app.session.registry.all().iter().map(|c| c.id.to_string()).filter(|id| id.starts_with("view.") && id.ends_with("Pane")).collect();
+    let panes: Vec<String> = app
+        .session
+        .registry
+        .all()
+        .iter()
+        .map(|c| c.id.to_string())
+        .filter(|id| (id.starts_with("view.") && id.ends_with("Pane")) || id == "assist.pane")
+        .collect();
     for pane in &panes {
         let _ = app.run(pane, json!({"value": true}));
         let drawn = frame(&ctx, &mut app);
@@ -794,8 +815,14 @@ fn the_arabic_interface_is_mirrored_and_never_panics() {
         frame(&ctx, &mut app);
         app.dialog = None;
     }
-    let panes: Vec<String> =
-        app.session.registry.all().iter().map(|c| c.id.to_string()).filter(|id| id.starts_with("view.") && id.ends_with("Pane")).collect();
+    let panes: Vec<String> = app
+        .session
+        .registry
+        .all()
+        .iter()
+        .map(|c| c.id.to_string())
+        .filter(|id| (id.starts_with("view.") && id.ends_with("Pane")) || id == "assist.pane")
+        .collect();
     for pane in &panes {
         let _ = app.run(pane, json!({"value": true}));
         frame(&ctx, &mut app);

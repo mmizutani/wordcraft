@@ -256,6 +256,8 @@ impl Session {
             author: _,
             // The participant's role in a shared document, like their name.
             role: _,
+            // The window's assistant: one for the window, whichever document it shows.
+            assistant: _,
             initials: _,
             painter: _,
             status: _,

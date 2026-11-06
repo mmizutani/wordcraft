@@ -58,7 +58,8 @@ impl Scope {
             "caret" | "select" => Scope::Selection,
             "view" | "readAloud" => Scope::View,
             "file" => Scope::File,
-            "font" | "proof" | "tools" => Scope::App,
+            // The assistant is the person's: a conversation is started and driven from their window.
+            "font" | "proof" | "tools" | "assist" => Scope::App,
             "ui" => Scope::Ui,
             "arrange" | "canvas" | "chart" | "design" | "developer" | "document" | "draw" | "edit" | "equation" | "fields" | "format" | "hf"
             | "insert" | "layout" | "link" | "list" | "mailings" | "object" | "outline" | "para" | "picture" | "references" | "review" | "shape"
@@ -191,6 +192,8 @@ pub const OVERRIDES: &[(&str, Scope)] = &[
     ("tools.detachTemplate", Scope::Document),
     ("tools.linkStyles", Scope::Document),
     ("tools.updateStyles", Scope::Document),
+    // Showing the Assistant pane is the participant's own view.
+    ("assist.pane", Scope::View),
 ];
 
 fn overrides() -> &'static HashMap<&'static str, Scope> {

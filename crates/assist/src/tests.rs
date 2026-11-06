@@ -975,3 +975,40 @@ fn the_conversation_thread_and_its_copy_can_be_moved_to_other_threads() {
     send::<Box<dyn crate::Backend>>();
     let _ = Value::Null;
 }
+
+/// The person's selection in the window is the assistant's copy's when its turn starts: what it
+/// types replaces what the person selected, though the same word comes earlier and a paragraph
+/// put in since moved it down. A selection the copy can't find leaves it where it was, and the
+/// turn still runs.
+#[test]
+fn a_turn_starts_with_the_person_s_selection() {
+    use wordcraft_doc::change::Anchor;
+    use wordcraft_doc::{BlockId, Pos};
+    let mut w = Window::new("one\ntwo one two");
+    // The person's selection, the second "two", as the window has it.
+    let at = |w: &Window, off| w.session.doc.anchor_at(&Pos::body(1, off)).unwrap();
+    let second = (at(&w, 8), at(&w, 11));
+    // Meanwhile someone puts a paragraph in above it, which the window hasn't had yet: the
+    // copy finds the selection by its paragraph, not by where that paragraph was.
+    let key = w.room.invite("Ana", Role::Editor).unwrap();
+    let mut ana = w.room.join_with(&key).unwrap();
+    for (command, params) in
+        [("caret.docStart", json!({})), ("text.newParagraph", json!({})), ("caret.docStart", json!({})), ("text.insert", json!({"text": "zero"}))]
+    {
+        wordcraft_engine::room::hosted::call(&mut ana, "engine.execute", &json!({"command": command, "params": params})).unwrap();
+    }
+    let fake = Fake::new().then(vec![Step::tool("type_text", json!({"text": "2"}))]).then(vec![Step::say("Still here.")]);
+    let mut a = w.start(fake, Options::default());
+    a.ask_at("Use a digit", None, Some(second)).unwrap();
+    assert!(a.wait_idle(WAIT));
+    w.settle();
+    assert_eq!(w.accepted(), "zero\none\ntwo one 2");
+    assert_eq!(w.authors(), ["Test Assistant", "Test Assistant"]);
+    // Only the model's own call is a row in the pane.
+    assert_eq!(tool_rows(a.transcript()), [("type_text".to_string(), ToolStatus::Completed)]);
+    // A paragraph the copy doesn't have leaves the copy's own selection; the turn goes on.
+    let nowhere = Anchor { block: BlockId::default(), off: 3 };
+    a.ask_at("Again", None, Some((nowhere, nowhere))).unwrap();
+    assert!(a.wait_idle(WAIT));
+    assert_eq!(a.transcript().last_answer().as_deref(), Some("Still here."));
+}

@@ -107,6 +107,7 @@ impl Session {
             registry,
             author: "WordCraft User".into(),
             role: None,
+            assistant: Default::default(),
             initials: String::new(),
             painter: None,
             status: String::new(),

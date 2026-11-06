@@ -92,6 +92,9 @@ pub struct Services {
     /// used while File › Options names none. File › New lists personal templates from it and Save
     /// as Word Template starts in it. `None` (web) hides personal templates.
     pub templates_dir: Option<std::path::PathBuf>,
+    /// Desktop: the settings folder, where the assistant keeps what a sign-in or an agent's
+    /// set-up saved (#15). `None` (web, tests) offers only what needs nothing saved.
+    pub settings_dir: Option<std::path::PathBuf>,
 }
 
 /// Files delivered asynchronously.

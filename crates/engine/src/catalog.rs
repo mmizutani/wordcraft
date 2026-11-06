@@ -143,6 +143,9 @@ Home|Editing|Select Objects|select.objects
 Home|Editing|Select Similar Formatting|select.similar
 Home|Voice|Dictate|tools.dictate
 Home|Editor|Editor|review.editor
+Home|Copilot|Copilot Pane|assist.pane
+Home|Copilot|Prompt|assist.ask
+Home|Copilot|Stop Generating|assist.cancel
 Insert|Pages|Cover Page|insert.coverPage
 Insert|Pages|Blank Page|insert.blankPage
 Insert|Pages|Page Break|insert.pageBreak
@@ -593,7 +596,7 @@ mod tests {
         let p = parity(&reg);
         let pct = p["percent"].as_f64().unwrap();
         // The floor only ever rises.
-        assert!(pct >= 90.4, "parity {pct}%");
+        assert!(pct >= 97.1, "parity {pct}%");
     }
 
     #[test]

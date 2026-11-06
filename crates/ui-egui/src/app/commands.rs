@@ -209,6 +209,9 @@ impl WordApp {
             None if self.ime_origin => self.session.run_ime(id, &params).map_err(|e| e.to_string()),
             None => self.session.run(id, &params).map_err(|e| e.to_string()),
         };
+        // The assistant's commands checked their params and asked the window: it does what they
+        // ask now, and answers for them ([`crate::assist`]).
+        let r = if r.is_ok() && id.starts_with("assist.") { crate::assist::take_requests(self).unwrap_or(r) } else { r };
         if self.session.ime_body_epoch() != body_epoch {
             self.canvas.ime_interrupted_preedit |= composing_before;
             // The body (or the whole document) was replaced under the same id — setText, a
@@ -424,6 +427,13 @@ impl WordApp {
             let app_wide = req.get("interfaceTheme").is_some() || req.get("toggle").and_then(Value::as_str) == Some("interfaceTheme");
             if app_wide || req.get("close").is_some() || !self.queue_for_window(document, req) {
                 self.handle_request_for(document, req);
+            }
+            return;
+        }
+        // The assistant's, from a command `execute` didn't run (it answers those itself).
+        if req.get("assist").is_some() {
+            if let Err(e) = crate::assist::handle(self, req) {
+                self.status(e);
             }
             return;
         }
@@ -1042,6 +1052,8 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "ui.caretAnimation"
             | "ui.startScreen"
             | "ui.checkForUpdates"
+            | "assist.backend"
+            | "assist.defaultRole"
     ) || id.starts_with("help.")
 }
 

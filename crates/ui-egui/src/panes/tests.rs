@@ -275,6 +275,7 @@ fn pane_bodies_fit_the_narrowest_pane() {
         Pane::FormatShape,
         Pane::RestrictEditing,
         Pane::Comments,
+        Pane::Assistant,
     ];
     let widths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let seen = widths.clone();

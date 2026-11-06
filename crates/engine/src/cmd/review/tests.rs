@@ -1121,3 +1121,100 @@ mod spelling_navigation_tests {
         }
     }
 }
+
+/// The tracked changes left, as (kind, text, author).
+fn changes_left(s: &mut Session) -> Vec<(String, String, String)> {
+    let list = s.run("review.changes", &json!({})).unwrap();
+    let field = |c: &serde_json::Value, k: &str| c[k].as_str().unwrap_or_default().to_string();
+    list.as_array().unwrap().iter().map(|c| (field(c, "kind"), field(c, "text"), field(c, "author"))).collect()
+}
+
+/// A document with Ana's insertion, and the assistant's insertion, deletion, formatting change
+/// and new paragraph.
+fn two_reviewers() -> Session {
+    let mut s = Session::new(Document::new());
+    s.run("document.setText", &json!({"text": "one two three"})).unwrap();
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    s.author = "Ana".into();
+    s.run("caret.docStart", &json!({})).unwrap();
+    s.run("text.insert", &json!({"text": "Ana "})).unwrap();
+    s.author = "Test Assistant".into();
+    // "Ana one two three": the assistant deletes "two", bolds "three" and adds a paragraph.
+    s.run("select.range", &json!({"anchor": {"block": 0, "off": 8}, "focus": {"block": 0, "off": 11}})).unwrap();
+    s.run("text.delete", &json!({})).unwrap();
+    s.run("select.range", &json!({"anchor": {"block": 0, "off": 12}, "focus": {"block": 0, "off": 17}})).unwrap();
+    s.run("format.bold", &json!({"value": true})).unwrap();
+    s.run("caret.docEnd", &json!({})).unwrap();
+    s.run("text.newParagraph", &json!({})).unwrap();
+    s.run("text.insert", &json!({"text": "bot"})).unwrap();
+    let kinds: Vec<(String, String)> = changes_left(&mut s).into_iter().map(|(k, _, a)| (k, a)).collect();
+    for want in [("insert", "Ana"), ("delete", "Test Assistant"), ("format", "Test Assistant"), ("insert", "Test Assistant")] {
+        assert!(kinds.contains(&(want.0.to_string(), want.1.to_string())), "{want:?} in {kinds:?}");
+    }
+    s
+}
+
+/// The assistant pane's Accept all / Reject all from this assistant: one reviewer's changes are
+/// resolved, everyone else's stay as they were.
+#[test]
+fn accept_and_reject_all_from_one_reviewer_leave_the_others() {
+    let bold = |s: &Session| s.doc.para(wordcraft_doc::StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().props_at(13).bold == Some(true);
+    let ana = vec![("insert".to_string(), "Ana ".to_string(), "Ana".to_string())];
+
+    let mut s = two_reviewers();
+    s.run("review.acceptAll", &json!({"author": "Test Assistant"})).unwrap();
+    assert_eq!(s.doc.final_text(wordcraft_doc::StoryRef::Body), "Ana one  three\nbot");
+    assert!(bold(&s), "the accepted formatting stays");
+    assert_eq!(changes_left(&mut s), ana);
+    // Ana's change is still there for Accept All.
+    s.run("review.acceptAll", &json!({})).unwrap();
+    assert!(changes_left(&mut s).is_empty());
+    assert!(s.doc.revisions.is_empty());
+
+    let mut s = two_reviewers();
+    s.run("review.rejectAll", &json!({"author": " Test Assistant "})).unwrap();
+    assert_eq!(s.doc.final_text(wordcraft_doc::StoryRef::Body), "Ana one two three");
+    assert!(!bold(&s), "the rejected formatting is taken back");
+    assert_eq!(changes_left(&mut s), ana);
+
+    // A reviewer with no changes: nothing happens. A name that isn't a string is refused.
+    let mut s = two_reviewers();
+    let before = changes_left(&mut s);
+    s.run("review.acceptAll", &json!({"author": "Nobody"})).unwrap();
+    assert_eq!(changes_left(&mut s), before);
+    for bad in [json!({"author": 7}), json!({"author": ""}), json!({"author": ["Ana"]})] {
+        assert!(s.run("review.rejectAll", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(changes_left(&mut s), before);
+}
+
+/// A deletion of someone else's insertion: rejecting the deleter's changes keeps the insertion,
+/// accepting them takes the text out; rejecting the inserter's takes it out too.
+#[test]
+fn one_reviewers_deletion_of_anothers_insertion() {
+    let setup = || {
+        let mut s = Session::new(Document::new());
+        s.run("document.setText", &json!({"text": "one"})).unwrap();
+        s.run("review.trackChanges", &json!({"value": true})).unwrap();
+        s.author = "Ana".into();
+        s.run("caret.docEnd", &json!({})).unwrap();
+        s.run("text.insert", &json!({"text": " two"})).unwrap();
+        s.author = "Test Assistant".into();
+        s.run("select.range", &json!({"anchor": {"block": 0, "off": 3}, "focus": {"block": 0, "off": 7}})).unwrap();
+        s.run("text.delete", &json!({})).unwrap();
+        s
+    };
+    let text = |s: &Session| s.doc.final_text(wordcraft_doc::StoryRef::Body);
+    let mut s = setup();
+    s.run("review.rejectAll", &json!({"author": "Test Assistant"})).unwrap();
+    assert_eq!(text(&s), "one two");
+    assert_eq!(changes_left(&mut s), vec![("insert".to_string(), " two".to_string(), "Ana".to_string())]);
+    let mut s = setup();
+    s.run("review.acceptAll", &json!({"author": "Test Assistant"})).unwrap();
+    assert_eq!(text(&s), "one");
+    assert!(changes_left(&mut s).is_empty());
+    let mut s = setup();
+    s.run("review.rejectAll", &json!({"author": "Ana"})).unwrap();
+    assert_eq!(text(&s), "one");
+    assert!(changes_left(&mut s).is_empty());
+}
