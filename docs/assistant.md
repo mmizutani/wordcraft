@@ -6,6 +6,13 @@ it joins the document's room with an invite of its own, under its backend's name
 "Codex"…), and acts only through the commands the [MCP server](mcp.md) offers any agent. So what
 it may do is what its role lets a participant do, and every change it makes carries its name.
 
+## Switching documents
+
+One window shares one document at a time. If another open document is shared, the Assistant
+pane offers **Use this document** (`assist.useDocument`). Switching ends the previous
+conversation and disconnects that document's participants; both documents stay open with their
+edits. A prompt that cannot start in another document leaves the previous conversation running.
+
 ## Roles
 
 An assistant joins as a **suggester** unless you choose otherwise: everything it changes is a

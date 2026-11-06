@@ -270,3 +270,35 @@ fn the_pane_sends_a_prompt_and_accepts_the_assistant_s_changes() {
     assert_eq!(h.state().session.doc.plain_text(StoryRef::Body), "one 2 three");
     assert_eq!(wordcraft_engine::cmd::review::changes_by(&h.state().session, "Test Assistant"), 0);
 }
+
+#[test]
+fn another_document_keeps_the_conversation_until_sharing_is_explicitly_switched() {
+    use egui_kittest::kittest::Queryable;
+    let mut a = window("one two three");
+    a.assist_with(Box::new(Fake::new().then(vec![Step::say("First.")])));
+    ask(&mut a, "Hello", None);
+    let first = a.session.document_id();
+    let room = a.shared_room().unwrap();
+    a.execute("file.new", json!({})).unwrap();
+    a.assist.next = Some(Box::new(Fake::new().then(vec![Step::say("Second.")])));
+    assert!(a.execute("assist.ask", json!({"prompt": "Hello again"})).is_err());
+    assert!(!a.assist.conversation.as_ref().unwrap().assistant.has_ended());
+    assert!(a.assist.next.is_some(), "a refused prompt keeps the next backend");
+    a.session.view.assistant_pane = true;
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(3);
+    h.get_by_label("Use this document").click();
+    h.run_steps(3);
+    assert!(room.is_closed());
+    assert!(h.state().session.is_open(first));
+    assert_eq!(ask(h.state_mut(), "Hello again", None)["asked"], true);
+    assert_eq!(h.state().conversation().unwrap().transcript().last_answer().as_deref(), Some("Second."));
+    assert!(h.state().shows_shared_document());
+}

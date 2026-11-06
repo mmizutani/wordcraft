@@ -58,6 +58,12 @@ pub fn specs() -> Vec<CommandSpec> {
         })
         .when(answering)
         .pure(),
+        CommandSpec::new("assist.useDocument", "Use this document", "Home › Assistant", |s, _| {
+            s.push_ui_request(json!({"assist": "useDocument"}));
+            Ok(json!({"switched": true}))
+        })
+        .when(in_window)
+        .pure(),
         CommandSpec::new("assist.backend", "Assistant", "Home › Assistant", backend)
             .params(r#"{"id"?: string (one the window offers; omit to list them)} → the assistants offered, whether each is ready, and the one chosen"#)
             .when(in_window)

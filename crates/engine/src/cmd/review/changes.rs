@@ -563,7 +563,17 @@ fn select_next_unresolved(s: &mut Session) -> CmdResult {
 /// How many of the body's tracked changes `author` made: the assistant pane's Accept all and
 /// Reject all of its changes (#15) are greyed out without any.
 pub fn changes_by(s: &Session, author: &str) -> usize {
-    changes(s).iter().filter(|c| c.rev.and_then(|r| s.doc.revisions.get(r as usize)).is_some_and(|r| r.author == author)).count()
+    let theirs = |rev: Option<u32>| rev.and_then(|r| s.doc.revisions.get(r as usize)).is_some_and(|r| r.author == author);
+    let shown = changes(s).iter().filter(|c| theirs(c.rev)).count();
+    // The reviewing list shows an insertion first; its overlapping deletion is still unresolved.
+    let hidden_deletions = s
+        .doc
+        .para_paths(StoryRef::Body)
+        .iter()
+        .filter_map(|path| s.doc.para(StoryRef::Body, path))
+        .map(|p| p.runs.iter().map(|r| &r.props).chain(std::iter::once(&p.mark)).filter(|c| c.ins.is_some() && theirs(c.del)).count())
+        .sum::<usize>();
+    shown + hidden_deletions
 }
 
 pub(super) fn list_changes(s: &mut Session, _: &Value) -> CmdResult {

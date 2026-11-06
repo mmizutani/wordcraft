@@ -116,7 +116,7 @@ fn stop_and_the_backend_choice() {
 #[test]
 fn no_window_or_no_assistant_set_up_greys_the_commands_out() {
     let mut s = Session::new(Document::new());
-    for id in ["assist.ask", "assist.cancel", "assist.backend"] {
+    for id in ["assist.ask", "assist.cancel", "assist.backend", "assist.useDocument"] {
         assert!(disabled(s.run(id, &json!({"prompt": "Hi", "id": "fake"}))).contains("WordCraft window"), "{id}");
     }
     s.assistant.window = true;
@@ -160,6 +160,7 @@ fn a_participants_copy_cant_run_the_assistant() {
     assert_eq!(Scope::of("assist.ask"), Some(Scope::App));
     assert_eq!(Scope::of("assist.cancel"), Some(Scope::App));
     assert_eq!(Scope::of("assist.backend"), Some(Scope::App));
+    assert_eq!(Scope::of("assist.useDocument"), Some(Scope::App));
     assert_eq!(Scope::of("assist.defaultRole"), Some(Scope::App));
     assert_eq!(Scope::of("assist.pane"), Some(Scope::View));
     let room = Room::new(Document::from_text("Shared"));
@@ -171,6 +172,7 @@ fn a_participants_copy_cant_run_the_assistant() {
         for (id, v) in [
             ("assist.ask", json!({"prompt": "Rewrite everything"})),
             ("assist.cancel", json!({})),
+            ("assist.useDocument", json!({})),
             ("assist.backend", json!({"id": "fake"})),
             ("assist.defaultRole", json!({"value": "editor"})),
         ] {

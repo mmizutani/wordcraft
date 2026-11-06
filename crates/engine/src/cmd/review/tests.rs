@@ -1206,7 +1206,10 @@ fn one_reviewers_deletion_of_anothers_insertion() {
     };
     let text = |s: &Session| s.doc.final_text(wordcraft_doc::StoryRef::Body);
     let mut s = setup();
+    assert_eq!(super::changes_by(&s, "Test Assistant"), 1, "the deletion overlaps Ana’s insertion");
+    assert_eq!(super::changes_by(&s, "Ana"), 1);
     s.run("review.rejectAll", &json!({"author": "Test Assistant"})).unwrap();
+    assert_eq!(super::changes_by(&s, "Test Assistant"), 0);
     assert_eq!(text(&s), "one two");
     assert_eq!(changes_left(&mut s), vec![("insert".to_string(), " two".to_string(), "Ana".to_string())]);
     let mut s = setup();

@@ -22,7 +22,7 @@ use wordcraft_ui_egui::{ControlRequest, Services, WordApp};
 
 static READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn main() {
+fn main() -> Result<(), String> {
     let path = std::env::args().nth(1).expect("usage: ui_shot script.jsonl");
     let script = std::fs::read_to_string(&path).expect("read script");
     let (tx, rx) = std::sync::mpsc::channel::<ControlRequest>();
@@ -86,7 +86,7 @@ fn main() {
                 Err(e) => eprintln!("render failed: {e}"),
             }
         } else if let Some(turns) = l.get("assistScript").and_then(|v| v.as_array()) {
-            harness.state_mut().assist_with(Box::new(scripted_assistant(turns)));
+            harness.state_mut().assist_with(Box::new(scripted_assistant(turns)?));
             step_n(&mut harness, 2);
         } else if let Some(n) = l.get("steps").and_then(|v| v.as_u64()) {
             step_n(&mut harness, n as usize);
@@ -112,14 +112,15 @@ fn main() {
             step_n(&mut harness, 2);
         }
     }
+    Ok(())
 }
 
 /// The scripted assistant `{"assistScript": …}` describes.
-fn scripted_assistant(turns: &[serde_json::Value]) -> wordcraft_assist::Fake {
+fn scripted_assistant(turns: &[serde_json::Value]) -> Result<wordcraft_assist::Fake, String> {
     use wordcraft_assist::{PlanEntry, PlanStatus, Priority, Step};
     let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
     let step = |s: &serde_json::Value| {
-        if let Some(t) = s.get("say") {
+        Ok(if let Some(t) = s.get("say") {
             Step::Say(text(t))
         } else if let Some(t) = s.get("think") {
             Step::Think(text(t))
@@ -133,12 +134,13 @@ fn scripted_assistant(turns: &[serde_json::Value]) -> wordcraft_assist::Fake {
         } else if let Some(t) = s.get("ask") {
             Step::Ask(text(t))
         } else {
-            panic!("an assistScript step is say, think, tool, plan or ask: {s}")
-        }
+            return Err(format!("an assistScript step is say, think, tool, plan or ask: {s}"));
+        })
     };
-    turns
-        .iter()
-        .fold(wordcraft_assist::Fake::new(), |fake, turn| fake.then(turn.as_array().map(|t| t.iter().map(step).collect()).unwrap_or_default()))
+    turns.iter().try_fold(wordcraft_assist::Fake::new(), |fake, turn| {
+        let steps = turn.as_array().ok_or("an assistScript turn must be an array of steps")?;
+        Ok(fake.then(steps.iter().map(step).collect::<Result<Vec<_>, String>>()?))
+    })
 }
 
 /// Applies the harness's pending raw input and advances one UI frame.
@@ -153,5 +155,16 @@ fn step(harness: &mut egui_kittest::Harness<'_, WordApp>) {
 fn step_n(harness: &mut egui_kittest::Harness<'_, WordApp>, n: usize) {
     for _ in 0..n {
         step(harness);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unsupported_assistant_steps_do_not_panic() {
+        let turns = vec![serde_json::json!([{}])];
+        assert!(super::scripted_assistant(&turns).is_err());
+        assert!(super::scripted_assistant(&[serde_json::json!(null)]).is_err());
+        assert!(super::scripted_assistant(&[serde_json::json!([{"say": "Hello"}])]).is_ok());
     }
 }

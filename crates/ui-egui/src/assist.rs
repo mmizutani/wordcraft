@@ -179,6 +179,18 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
             });
             Ok(json!({"stopping": stopping}))
         }
+        "useDocument" => {
+            if !app.has_document() {
+                return Err("no document is open".into());
+            }
+            let switched = app.shared_room().is_some() && !app.shows_shared_document();
+            if switched {
+                end(app);
+                app.stop_sharing();
+                app.assist.notice = None;
+            }
+            Ok(json!({"switched": switched}))
+        }
         "backend" => backend(app, req.get("id").and_then(Value::as_str)),
         other => Err(format!("`{}`: not an assistant request", other.chars().take(40).collect::<String>())),
     };
@@ -254,6 +266,9 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>) -> Result<Valu
 fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
     if role == Some(Role::Owner) {
         return Err("an assistant can't be an owner".into());
+    }
+    if app.shared_room().is_some() && !app.shows_shared_document() {
+        return Err("another open document is shared: choose Use this document in the Assistant pane to switch".into());
     }
     let backend = match app.assist.next.take() {
         Some(b) => b,

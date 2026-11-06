@@ -30,6 +30,16 @@ pub(super) fn assistant(app: &mut WordApp, ui: &mut Ui) {
     picker(app, ui, &t);
     ui.add_space(4.0);
     who(app, ui, &t);
+    if app.has_document() && app.shared_room().is_some() && !app.shows_shared_document() {
+        ui.label(
+            RichText::new(tl!("Another document is shared. Switching ends its conversation and disconnects its participants."))
+                .small()
+                .color(t.orange),
+        );
+        if ui.button(tl!("Use this document")).clicked() {
+            let _ = app.run("assist.useDocument", json!({}));
+        }
+    }
     ui.separator();
     // The conversation takes the height that the buttons and the prompt box under it leave, as
     // they measured on the last frame.
