@@ -1,5 +1,9 @@
-//! HTTP for the sign-in and the API: one `ureq` agent with timeouts and bounded bodies, URL and
+//! HTTP for the sign-in and the API: `ureq` agents with timeouts and bounded bodies, URL and
 //! form encoding, and the redaction every error text goes through before the person sees it.
+//!
+//! ureq-proto's `trace` records are the raw bytes of each request and answer (a bearer token, the
+//! token endpoint's answers): a logger must keep the `ureq_proto` and `ureq` targets at `debug`
+//! or quieter, whatever it is asked for. The desktop app's logger does.
 
 use std::io::Read;
 use std::time::Duration;
@@ -7,8 +11,13 @@ use std::time::Duration;
 /// Longest a connection takes to open.
 pub(crate) const CONNECT: Duration = Duration::from_secs(15);
 
-/// Longest a whole call that doesn't stream takes (the token endpoint, the models list).
+/// Longest a whole call that doesn't stream takes (the models list), and a streamed answer's
+/// start.
 pub(crate) const CALL: Duration = Duration::from_secs(180);
+
+/// Longest a whole call to the sign-in server takes (the token endpoint, its configuration, the
+/// revocation): a refresh holds the credentials' lock across one.
+pub(crate) const AUTH_CALL: Duration = Duration::from_secs(30);
 
 /// Longest one read of a streamed answer waits for its next bytes.
 pub(crate) const STREAM_READ: Duration = Duration::from_secs(120);
@@ -45,15 +54,31 @@ impl Reply {
     }
 }
 
-/// The agent requests go through: no redirects (tokens stay on the host they were sent to),
+/// The agent API requests go through: no redirects (tokens stay on the host they were sent to),
 /// statuses as answers rather than errors, timeouts, and no proxy for servers on this machine.
+/// A streamed answer has [`CALL`] to start and [`STREAM_READ`] between reads; any other call
+/// has [`CALL`] in all.
 pub(crate) fn agent(local: bool, streaming: bool) -> ureq::Agent {
+    agent_with(local, if streaming { None } else { Some(CALL) })
+}
+
+/// The agent the sign-in server's calls go through: [`agent`]'s, with [`AUTH_CALL`] for each
+/// whole call.
+pub(crate) fn auth_agent(local: bool) -> ureq::Agent {
+    agent_with(local, Some(AUTH_CALL))
+}
+
+/// An agent whose calls take at most `whole` each, or (None) that streams.
+fn agent_with(local: bool, whole: Option<Duration>) -> ureq::Agent {
     let mut config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_connect(Some(CONNECT))
         .user_agent(format!("WordCraft/{}", env!("CARGO_PKG_VERSION")));
-    config = if streaming { config.timeout_recv_response(Some(CALL)).timeout_per_read(Some(STREAM_READ)) } else { config.timeout_global(Some(CALL)) };
+    config = match whole {
+        Some(whole) => config.timeout_global(Some(whole)),
+        None => config.timeout_recv_response(Some(CALL)).timeout_per_read(Some(STREAM_READ)),
+    };
     if local {
         config = config.proxy(None);
     }

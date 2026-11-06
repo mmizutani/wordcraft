@@ -3,26 +3,31 @@
 //!
 //! A sign-in attempt ([`SignIn`]) listens on `127.0.0.1` (port [`DEFAULT_PORT`], or any free
 //! one) before it gives the window the address to open, with a fresh `state`, `nonce` and PKCE
-//! verifier. Its thread answers the browser's callback: a `state` that isn't this attempt's is
-//! refused (the attempt goes on waiting), an `error` ends it, and a `code` is exchanged at the
-//! token endpoint with the verifier (no client secret). The first sign-in registers WordCraft
-//! (`dynamic_agent_client`) and keeps the client id it is issued, before the exchange; later
-//! ones reuse it. The id token's claims are checked (issuer, audience, expiry, nonce); its
-//! signature is not, as OpenID Connect Core §3.1.3.7 allows for an id token taken straight from
-//! the token endpoint over TLS.
+//! verifier. Its thread answers the requests on the port, each read on a thread of its own (an
+//! idle connection doesn't hold back the browser's): a `state` that isn't this attempt's is
+//! refused (the attempt goes on waiting, however many there are), an `error` ends it, and a
+//! `code` is exchanged at the token endpoint with the verifier (no client secret). The first
+//! sign-in registers WordCraft (`dynamic_agent_client`) and keeps the client id it is issued,
+//! before the exchange; later ones reuse it, until ChatGPT no longer knows it
+//! (`invalid_client`): then it is forgotten, and the next sign-in registers again. The id
+//! token's claims are checked (issuer, audience, expiry, nonce); its signature is not, as
+//! OpenID Connect Core §3.1.3.7 allows for an id token taken straight from the token endpoint
+//! over TLS.
 //!
 //! Plan usage is granted only with the [`PLAN_SCOPE`] scope: a sign-in without it is kept, and
 //! the account says so ([`Account::plan_usage`]); signing in again with `consent` asks again.
 //!
-//! Refreshes ([`access_token`]) run one at a time in the process, and with a lock file between
-//! WordCraft processes, because each refresh token works once.
+//! Refreshes ([`access_token`]), sign-outs and the saving of a new sign-in take turns, in the
+//! process and (with the system's lock on a file) between WordCraft processes, because each
+//! refresh token works once. A refresh keeps its tokens only in place of the ones it was sent
+//! with: tokens that come back after a sign-out are revoked, not saved.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, channel};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -57,8 +62,8 @@ pub const SIGN_IN_WAIT: Duration = Duration::from_secs(10 * 60);
 /// Most bytes of a callback request's line and headers.
 const MAX_REQUEST_HEAD: usize = 8 << 10;
 
-/// Most requests one sign-in answers on its port before it gives up.
-const MAX_CALLBACK_REQUESTS: usize = 256;
+/// Most requests on the sign-in port read at once; the rest wait their turn.
+const MAX_CALLBACK_CONNECTIONS: usize = 16;
 
 /// Longest a callback request takes to arrive, and its answer to go out.
 const CALLBACK_IO: Duration = Duration::from_secs(5);
@@ -113,7 +118,8 @@ pub struct SignInOptions {
     pub endpoints: Endpoints,
     /// The port to listen on when it's free; 0 for any.
     pub port: u16,
-    /// How long to wait for the person.
+    /// How long to wait for the person: any length (one too long to count never ends on its
+    /// own; cancelling or dropping the attempt ends it).
     pub wait: Duration,
     /// Ask the person again whether WordCraft may use their plan (after they declined).
     pub consent: bool,
@@ -168,7 +174,8 @@ impl SignIn {
         };
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, done) = channel();
-        let until = Instant::now() + options.wait;
+        // A wait too long to count has no deadline.
+        let until = Instant::now().checked_add(options.wait);
         let minutes = u64::try_from(options.wait.as_millis().div_ceil(60_000)).unwrap_or(u64::MAX).max(1);
         let stopping = stop.clone();
         std::thread::Builder::new()
@@ -221,7 +228,7 @@ impl SignIn {
     }
 
     /// Stop waiting for the browser: the attempt ends with [`AuthError::Cancelled`] (unless it
-    /// already ended).
+    /// already ended, or is finishing the browser's answer).
     pub fn cancel(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
@@ -300,36 +307,78 @@ struct Pending {
     client: Client,
 }
 
-/// Answer requests on the port until one finishes the sign-in, the attempt is cancelled or
-/// its time is up.
-fn wait_for_callback(listener: &TcpListener, p: &Pending, stop: &AtomicBool, until: Instant, minutes: u64) -> Result<Account, AuthError> {
-    let mut served = 0usize;
+/// Answer requests on the port, each read on a thread of its own (at most
+/// [`MAX_CALLBACK_CONNECTIONS`] at once), until the browser's answer with this attempt's state
+/// finishes the sign-in, the attempt is cancelled, or its time (`until`; None: none) is up.
+fn wait_for_callback(listener: &TcpListener, p: &Pending, stop: &AtomicBool, until: Option<Instant>, minutes: u64) -> Result<Account, AuthError> {
+    let (tx, callbacks) = channel();
+    let busy = Arc::new(AtomicUsize::new(0));
+    let state: Arc<str> = Arc::from(p.state.as_str());
     loop {
         if stop.load(Ordering::Relaxed) {
             return Err(AuthError::Cancelled);
         }
-        if Instant::now() >= until {
+        if until.is_some_and(|until| Instant::now() >= until) {
             return Err(AuthError::TimedOut(minutes));
         }
+        if let Ok(callback) = callbacks.try_recv() {
+            return finish_callback(p, callback);
+        }
+        if busy.load(Ordering::Relaxed) >= MAX_CALLBACK_CONNECTIONS {
+            // The rest wait in the port's queue.
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
         match listener.accept() {
-            Ok((stream, _)) => {
-                served = served.saturating_add(1);
-                if served > MAX_CALLBACK_REQUESTS {
-                    return Err(AuthError::Failed("too many requests reached the sign-in port: start the sign-in again".into()));
-                }
-                if let Some(done) = answer(stream, p) {
-                    return done;
-                }
-            }
+            Ok((stream, _)) => read_on_its_own(stream, &state, &busy, &tx),
             // Nothing yet (or a connection that went away before it was taken): look again.
-            Err(_) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
         }
     }
 }
 
-/// Answer one request on the port: the sign-in's result when it was the callback that ends
-/// it, else None (the attempt goes on waiting).
-fn answer(mut stream: TcpStream, p: &Pending) -> Option<Result<Account, AuthError>> {
+/// The browser's answer with this attempt's state, for the attempt's thread to finish.
+struct Callback {
+    stream: TcpStream,
+    params: Vec<(String, String)>,
+}
+
+/// A request being read on the sign-in port, counted in `busy` while it lives.
+struct Reading(Arc<AtomicUsize>);
+
+impl Reading {
+    fn start(busy: &Arc<AtomicUsize>) -> Reading {
+        busy.fetch_add(1, Ordering::Relaxed);
+        Reading(busy.clone())
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Read the request on `stream` on a thread of its own: the browser's answer with `state` goes
+/// to `tx`; anything else is answered there.
+fn read_on_its_own(stream: TcpStream, state: &Arc<str>, busy: &Arc<AtomicUsize>, tx: &Sender<Callback>) {
+    let reading = Reading::start(busy);
+    let (state, tx) = (state.clone(), tx.clone());
+    let spawned = std::thread::Builder::new().name("chatgpt sign-in request".into()).spawn(move || {
+        let _reading = reading;
+        if let Some(callback) = read_callback(stream, &state) {
+            let _ = tx.send(callback);
+        }
+    });
+    if let Err(e) = spawned {
+        // The connection closes unanswered (with the thread's work): the browser can try again.
+        log::warn!("ChatGPT sign-in: a request on the port can't be read here: {e}");
+    }
+}
+
+/// The browser's answer with `state` on `stream`, or None when the request was something else
+/// (it is answered: not found, not allowed, or not for this attempt).
+fn read_callback(mut stream: TcpStream, state: &str) -> Option<Callback> {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(CALLBACK_IO));
     let _ = stream.set_write_timeout(Some(CALLBACK_IO));
@@ -349,26 +398,38 @@ fn answer(mut stream: TcpStream, p: &Pending) -> Option<Result<Account, AuthErro
         return None;
     }
     let params = http::parse_query(query);
-    let param = |name: &str| params.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
-    if !param("state").is_some_and(|s| same_secret(s, &p.state)) {
+    let sent = params.iter().find(|(k, _)| k == "state").map(|(_, v)| v.as_str());
+    if !sent.is_some_and(|s| same_secret(s, state)) {
         respond(&mut stream, 400, "This sign-in answer isn't for the sign-in WordCraft is waiting for. Start signing in again from WordCraft.");
         return None;
     }
+    Some(Callback { stream, params })
+}
+
+/// Finish the sign-in from the browser's answer, and tell the browser how it went.
+fn finish_callback(p: &Pending, mut callback: Callback) -> Result<Account, AuthError> {
+    let params = &callback.params;
+    let param = |name: &str| params.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
     let result = finish(p, param("error"), param("error_description"), param("code"), param("client_id"));
     match &result {
-        Ok(_) => respond(&mut stream, 200, "You're signed in. You can close this tab and go back to WordCraft."),
-        Err(e) => respond(&mut stream, 400, &format!("The sign-in didn't work: {e}. You can close this tab and go back to WordCraft.")),
+        Ok(_) => respond(&mut callback.stream, 200, "You're signed in. You can close this tab and go back to WordCraft."),
+        Err(e) => respond(&mut callback.stream, 400, &format!("The sign-in didn't work: {e}. You can close this tab and go back to WordCraft.")),
     }
-    Some(result)
+    result
 }
 
 /// The request line and headers of a request, at most [`MAX_REQUEST_HEAD`] bytes: None when
-/// they don't arrive whole in time.
+/// they don't arrive whole within [`CALLBACK_IO`].
 fn read_head(stream: &mut TcpStream) -> Option<String> {
     let mut head = Vec::new();
     let mut chunk = [0u8; 1024];
-    let until = Instant::now() + CALLBACK_IO;
-    while head.len() < MAX_REQUEST_HEAD && Instant::now() < until {
+    let until = Instant::now().checked_add(CALLBACK_IO);
+    while head.len() < MAX_REQUEST_HEAD {
+        // Each read waits only for the time left.
+        let left = until.map_or(CALLBACK_IO, |until| until.saturating_duration_since(Instant::now()));
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => head.extend_from_slice(chunk.get(..n).unwrap_or_default()),
@@ -451,9 +512,20 @@ fn client_id(p: &Pending, issued: Option<&str>) -> Result<String, AuthError> {
     }
 }
 
+/// Forget the issued client id `dead`, which ChatGPT no longer knows (`invalid_client`): the
+/// host id and the chosen model stay, and the next sign-in registers WordCraft again.
+fn forget_client(settings: &Path, dead: &str) -> Result<(), String> {
+    let client = store::client(settings)?;
+    if client.client_id.as_deref() != Some(dead) {
+        return Ok(());
+    }
+    log::warn!("ChatGPT sign-in: ChatGPT no longer knows WordCraft's registration; the next sign-in registers again");
+    store::save_client(settings, &Client { client_id: None, ..client })
+}
+
 /// Exchange the code for tokens, check the id token, and keep them.
 fn exchange(p: &Pending, client_id: &str, code: &str) -> Result<Account, AuthError> {
-    let agent = http::agent(p.endpoints.is_local(), false);
+    let agent = http::auth_agent(p.endpoints.is_local());
     let fields = [
         ("grant_type", "authorization_code"),
         ("client_id", client_id),
@@ -466,10 +538,15 @@ fn exchange(p: &Pending, client_id: &str, code: &str) -> Result<Account, AuthErr
     if !reply.ok() {
         let (code_name, why) = oauth_error(&reply, &[code, &p.verifier]);
         log::warn!("ChatGPT sign-in: the code exchange was refused (HTTP {}, {code_name}, request {:?})", reply.status, reply.request_id);
-        return Err(AuthError::Failed(if code_name == "invalid_grant" {
-            "the sign-in code was refused (it may have been used already): start signing in again".into()
-        } else {
-            format!("ChatGPT refused the sign-in: {why}")
+        return Err(AuthError::Failed(match code_name.as_str() {
+            "invalid_grant" => "the sign-in code was refused (it may have been used already): start signing in again".into(),
+            "invalid_client" => {
+                if let Err(e) = forget_client(&p.settings, client_id) {
+                    log::warn!("ChatGPT sign-in: {e}");
+                }
+                "ChatGPT no longer knows WordCraft's registration: start signing in again".into()
+            }
+            _ => format!("ChatGPT refused the sign-in: {why}"),
         }));
     }
     let tokens = Tokens::from(&reply.json(), true)?;
@@ -490,24 +567,40 @@ fn exchange(p: &Pending, client_id: &str, code: &str) -> Result<Account, AuthErr
         scopes: tokens.scopes.unwrap_or_default(),
         saved_at: 0,
     };
+    // Saved under the lock: a refresh in flight (here or in another WordCraft process) finishes
+    // first, and can't save the last sign-in's tokens over these.
+    let lock = Lock::take(&p.settings);
+    if let Err(e) = &lock {
+        log::warn!("ChatGPT sign-in: {e}; the new sign-in is saved without the lock");
+    }
     store::write_credentials(&p.settings, &credentials).map_err(AuthError::Storage)?;
+    drop(lock);
     let account = credentials.account();
     log::info!("ChatGPT sign-in: signed in (plan usage {})", if account.plan_usage { "allowed" } else { "not allowed" });
     Ok(account)
 }
 
-/// An OAuth error answer: its `error` code and a message without the `secrets`.
+/// An error answer's code and a message without the `secrets`. The code is OAuth's
+/// `{"error": "<code>"}`, OpenAI's `{"error": {"code": "<code>", "message": …}}`, or a bare
+/// `{"code": "<code>"}`; the message is `error_description`, the error's `message`, or `detail`.
 fn oauth_error(reply: &Reply, secrets: &[&str]) -> (String, String) {
     let json = reply.json();
-    let code = json.get("error").and_then(Value::as_str).unwrap_or_default();
+    let nested = json.get("error").filter(|e| e.is_object());
+    let code = first_text([json.get("error"), nested.and_then(|e| e.get("code")), json.get("code")]);
     let code: String = code.chars().filter(|c| c.is_ascii_graphic()).take(64).collect();
-    let description = json.get("error_description").and_then(Value::as_str).unwrap_or_default();
+    let description = first_text([json.get("error_description"), nested.and_then(|e| e.get("message")), json.get("detail")]);
     let why = match (code.is_empty(), description.is_empty()) {
-        (true, _) => format!("HTTP {}", reply.status),
+        (true, true) => format!("HTTP {}", reply.status),
+        (true, false) => format!("HTTP {}: {description}", reply.status),
         (false, true) => code.clone(),
         (false, false) => format!("{code}: {description}"),
     };
     (code, redact(&why, secrets))
+}
+
+/// The first of `candidates` that is text and not empty, else "".
+fn first_text(candidates: [Option<&Value>; 3]) -> &str {
+    candidates.into_iter().find_map(|v| v.and_then(Value::as_str).filter(|t| !t.is_empty())).unwrap_or_default()
 }
 
 /// The tokens a token endpoint answer holds.
@@ -614,7 +707,7 @@ pub(crate) fn access_token(settings: &Path, endpoints: &Endpoints, refused: Opti
     if usable(&saved) {
         return Ok(saved);
     }
-    let _lock = Lock::take(settings);
+    let _lock = Lock::take(settings).map_err(AuthError::Failed)?;
     let saved = store::read_credentials(settings).filter(Credentials::signed_in).ok_or(AuthError::NotSignedIn)?;
     if usable(&saved) {
         return Ok(saved);
@@ -625,7 +718,7 @@ pub(crate) fn access_token(settings: &Path, endpoints: &Endpoints, refused: Opti
 /// Refresh `saved`'s tokens (the caller holds the lock) and keep them.
 fn refresh(settings: &Path, endpoints: &Endpoints, saved: Credentials) -> Result<Credentials, AuthError> {
     endpoints.check().map_err(AuthError::Failed)?;
-    let agent = http::agent(endpoints.is_local(), false);
+    let agent = http::auth_agent(endpoints.is_local());
     let fields = [
         ("grant_type", "refresh_token"),
         ("client_id", saved.client_id.as_str()),
@@ -634,35 +727,12 @@ fn refresh(settings: &Path, endpoints: &Endpoints, saved: Credentials) -> Result
     ];
     let reply = http::post_form(&agent, &endpoints.token, &fields).map_err(AuthError::Network)?;
     if !reply.ok() {
-        let (code, why) = oauth_error(&reply, &[&saved.refresh_token, &saved.access_token]);
-        log::warn!("ChatGPT sign-in: the refresh was refused (HTTP {}, {code}, request {:?})", reply.status, reply.request_id);
-        if SIGN_IN_AGAIN.contains(&code.as_str()) {
-            // The refresh token is spent: forget the tokens, keep who it was (the next
-            // sign-in's hints).
-            let ended = Credentials { access_token: String::new(), refresh_token: String::new(), ..saved };
-            store::write_credentials(settings, &ended).map_err(AuthError::Storage)?;
-            return Err(AuthError::SignInAgain);
-        }
-        if code == "invalid_client" {
-            return Err(AuthError::Failed("ChatGPT no longer knows WordCraft's registration: sign out and sign in again".into()));
-        }
-        // A server's or the network's trouble: the sign-in stays.
-        return Err(AuthError::Network(match reply.retry_after {
-            Some(wait) => format!("{why} (try again in {} s)", wait.as_secs()),
-            None => why,
-        }));
+        return Err(refused(settings, endpoints, &saved, &reply));
     }
     let tokens = Tokens::from(&reply.json(), false)?;
-    let mut fresh = saved;
-    if !tokens.id_token.is_empty() {
-        let claims = check_id_token(&tokens.id_token, &fresh.issuer, &fresh.client_id, None)?;
-        if claims.subject != fresh.subject {
-            return Err(AuthError::Failed("ChatGPT's refreshed sign-in is for another account: sign in again".into()));
-        }
-        fresh.email = claims.email;
-        fresh.name = claims.name;
-        fresh.id_token = tokens.id_token;
-    }
+    // The server has spent the refresh token it was sent: the new tokens are kept, whatever
+    // their id token says (unless it names another account).
+    let mut fresh = saved.clone();
     fresh.access_token = tokens.access_token;
     if !tokens.refresh_token.is_empty() {
         fresh.refresh_token = tokens.refresh_token;
@@ -672,9 +742,80 @@ fn refresh(settings: &Path, endpoints: &Endpoints, saved: Credentials) -> Result
     if let Some(scopes) = tokens.scopes {
         fresh.scopes = scopes;
     }
-    store::write_credentials(settings, &fresh).map_err(AuthError::Storage)?;
+    if !tokens.id_token.is_empty() {
+        match check_id_token(&tokens.id_token, &fresh.issuer, &fresh.client_id, None) {
+            Ok(claims) if claims.subject != fresh.subject => {
+                // Another account's tokens: neither used nor kept (they're revoked), and the
+                // sign-in ends.
+                revoke_unkept(endpoints, fresh);
+                save_over(settings, endpoints, &saved, &ended(&saved))?;
+                return Err(AuthError::Failed("ChatGPT's refreshed sign-in is for another account: sign in again (Options › Account)".into()));
+            }
+            Ok(claims) => {
+                fresh.email = claims.email;
+                fresh.name = claims.name;
+                fresh.id_token = tokens.id_token;
+            }
+            // The tokens are kept with the last id token and its claims (a clock running ahead
+            // makes a new id token look expired).
+            Err(e) => log::warn!("ChatGPT sign-in: the refreshed id token isn't kept ({e})"),
+        }
+    }
+    save_over(settings, endpoints, &saved, &fresh)?;
     log::info!("ChatGPT sign-in: refreshed");
     Ok(fresh)
+}
+
+/// What a refused refresh means. The sign-in ends when the refresh token is spent or turned away
+/// (or the registration is gone, which is forgotten too); it stays through the server's trouble
+/// and through other refusals, which say how to start again.
+fn refused(settings: &Path, endpoints: &Endpoints, saved: &Credentials, reply: &Reply) -> AuthError {
+    let (code, why) = oauth_error(reply, &[&saved.refresh_token, &saved.access_token]);
+    log::warn!("ChatGPT sign-in: the refresh was refused (HTTP {}, {code}, request {:?})", reply.status, reply.request_id);
+    let registration_gone = code == "invalid_client";
+    if registration_gone || SIGN_IN_AGAIN.contains(&code.as_str()) || reply.status == 401 {
+        if registration_gone && let Err(e) = forget_client(settings, &saved.client_id) {
+            log::warn!("ChatGPT sign-in: {e}");
+        }
+        // The refresh token is spent: the tokens are forgotten, and who it was is kept (the next
+        // sign-in's hints).
+        return match save_over(settings, endpoints, saved, &ended(saved)) {
+            Ok(()) => AuthError::SignInAgain,
+            Err(e) => e,
+        };
+    }
+    if matches!(reply.status, 408 | 429 | 500..=599) {
+        // The server's or the network's trouble: the sign-in stays.
+        return AuthError::Network(match reply.retry_after {
+            Some(wait) => format!("{why} (try again in {} s)", wait.as_secs()),
+            None => why,
+        });
+    }
+    AuthError::Failed(format!("ChatGPT didn't renew your sign-in ({why}): try again, or sign out and sign in again in Options › Account"))
+}
+
+/// `c` without its tokens: a sign-in that has ended.
+fn ended(c: &Credentials) -> Credentials {
+    Credentials { access_token: String::new(), refresh_token: String::new(), ..c.clone() }
+}
+
+/// Save `next` in place of `used`, the credentials a refresh was sent with, if the file still
+/// holds them. When it doesn't (a sign-out or a new sign-in came in between, which only a
+/// folder that can't lock files lets happen), `next`'s new refresh token is kept by nobody: it
+/// is revoked, and the file stays as it is.
+fn save_over(settings: &Path, endpoints: &Endpoints, used: &Credentials, next: &Credentials) -> Result<(), AuthError> {
+    let current = store::read_credentials(settings).filter(Credentials::signed_in);
+    if current.as_ref().is_some_and(|c| c.client_id == used.client_id && c.refresh_token == used.refresh_token) {
+        return store::write_credentials(settings, next).map_err(AuthError::Storage);
+    }
+    log::warn!("ChatGPT sign-in: the sign-in changed while it was renewed; the renewed tokens aren't kept");
+    if next.signed_in() && next.refresh_token != used.refresh_token {
+        revoke_unkept(endpoints, next.clone());
+    }
+    Err(match current {
+        None => AuthError::NotSignedIn,
+        Some(_) => AuthError::Failed("your ChatGPT sign-in changed while it was renewed: try again".into()),
+    })
 }
 
 /// How a sign-out went.
@@ -691,11 +832,20 @@ pub fn sign_out(settings: &Path) -> Result<SignedOut, AuthError> {
     sign_out_with(settings, &Endpoints::default())
 }
 
-/// Sign out: revoke the refresh token (from the issuer's discovery document) and delete the
-/// credentials. The host id and the issued client id stay, for the next sign-in.
+/// Sign out: delete the credentials, once a refresh in flight (here or in another WordCraft
+/// process) has finished, then revoke their refresh token (at the endpoint the issuer's
+/// discovery document names; tried twice). The host id and the issued client id stay, for the
+/// next sign-in.
 pub fn sign_out_with(settings: &Path, endpoints: &Endpoints) -> Result<SignedOut, AuthError> {
-    let _lock = Lock::take(settings);
-    let revoked = match store::read_credentials(settings).filter(Credentials::signed_in) {
+    let signed_in = {
+        // Under the lock: the token revoked is the newest, and no refresh starts from it.
+        let _lock = Lock::take(settings).map_err(AuthError::Failed)?;
+        let saved = store::read_credentials(settings).filter(Credentials::signed_in);
+        store::delete_credentials(settings).map_err(AuthError::Storage)?;
+        saved
+    };
+    log::info!("ChatGPT sign-in: signed out");
+    let revoked = match signed_in {
         None => true,
         Some(c) => {
             let first = revoke(endpoints, &c);
@@ -709,15 +859,13 @@ pub fn sign_out_with(settings: &Path, endpoints: &Endpoints) -> Result<SignedOut
             done.is_ok()
         }
     };
-    store::delete_credentials(settings).map_err(AuthError::Storage)?;
-    log::info!("ChatGPT sign-in: signed out");
     Ok(SignedOut { revoked })
 }
 
 /// Revoke `c`'s refresh token at the endpoint the issuer's discovery document names.
 fn revoke(endpoints: &Endpoints, c: &Credentials) -> Result<(), String> {
     endpoints.check()?;
-    let agent = http::agent(endpoints.is_local(), false);
+    let agent = http::auth_agent(endpoints.is_local());
     let discovery = http::get_json(&agent, &endpoints.discovery, None)?;
     if !discovery.ok() {
         return Err(format!("the sign-in server's configuration couldn't be read (HTTP {})", discovery.status));
@@ -731,6 +879,19 @@ fn revoke(endpoints: &Endpoints, c: &Credentials) -> Result<(), String> {
     let fields = [("token", c.refresh_token.as_str()), ("token_type_hint", "refresh_token"), ("client_id", c.client_id.as_str())];
     let reply = http::post_form(&agent, &url, &fields)?;
     if reply.ok() { Ok(()) } else { Err(oauth_error(&reply, &[&c.refresh_token]).1) }
+}
+
+/// Revoke `c`'s refresh token on a thread of its own, as well as it can: tokens nobody keeps.
+fn revoke_unkept(endpoints: &Endpoints, c: Credentials) {
+    let endpoints = endpoints.clone();
+    let spawned = std::thread::Builder::new().name("chatgpt revoke".into()).spawn(move || {
+        if let Err(e) = revoke(&endpoints, &c) {
+            log::warn!("ChatGPT sign-in: tokens nobody keeps weren't revoked: {e}");
+        }
+    });
+    if let Err(e) = spawned {
+        log::warn!("ChatGPT sign-in: tokens nobody keeps can't be revoked here: {e}");
+    }
 }
 
 /// A sign-out running on a thread of its own, for the window: [`SignOut::poll`] each frame.
@@ -798,14 +959,27 @@ pub fn models(settings: &Path) -> Result<Vec<Model>, AuthError> {
 }
 
 /// The models the signed-in account may use, in ChatGPT's order (the first is the default). It
-/// waits for the network (and a refresh, when the token is old).
+/// waits for the network (and a refresh, when the token is old or turned away).
 pub fn models_with(settings: &Path, endpoints: &Endpoints) -> Result<Vec<Model>, AuthError> {
-    let c = access_token(settings, endpoints, None)?;
+    endpoints.check().map_err(AuthError::Failed)?;
     let agent = http::agent(endpoints.is_local(), false);
     let url = format!("{}/models", endpoints.api.trim_end_matches('/'));
-    let reply = http::get_json(&agent, &url, Some(&c.access_token)).map_err(AuthError::Network)?;
+    let ask = |refused: Option<&str>| -> Result<(String, Reply), AuthError> {
+        let c = access_token(settings, endpoints, refused)?;
+        let reply = http::get_json(&agent, &url, Some(&c.access_token)).map_err(AuthError::Network)?;
+        Ok((c.access_token, reply))
+    };
+    let (token, mut reply) = ask(None)?;
     if reply.status == 401 {
-        return Err(AuthError::SignInAgain);
+        // Turned away though it looks fresh here: refreshed once (the sign-in ends only when
+        // the refresh says so), as a turn's token is.
+        log::info!("ChatGPT: the models list turned the token away; refreshing it once");
+        reply = ask(Some(&token))?.1;
+        if reply.status == 401 {
+            return Err(AuthError::Failed(
+                "ChatGPT didn't accept your sign-in: try again, or sign out and sign in again in Options › Account".into(),
+            ));
+        }
     }
     if !reply.ok() {
         return Err(AuthError::Failed(format!("ChatGPT's models couldn't be listed (HTTP {})", reply.status)));

@@ -4,16 +4,19 @@
 //!   sign-in and kept for good) and the client id the first sign-in was issued. Kept when the
 //!   person signs out.
 //! - [`CREDENTIALS_FILE`]: the signed-in account and its tokens. Deleted when they sign out.
+//! - [`LOCK_FILE`]: empty. Its lock ([`Lock`]) is held while the tokens are refreshed, saved
+//!   by a new sign-in or deleted, so WordCraft processes that share the folder take turns.
 //!
-//! Both are written atomically (a temporary file in the same folder, then a rename) with mode
-//! 0600 on Unix, read with a size cap, and a damaged file reads as missing. The tokens never
+//! The client and credentials files are written atomically (a temporary file in the same
+//! folder, then a rename) with mode 0600 on Unix, read with a size cap, and a damaged file reads
+//! as missing. The tokens never
 //! reach the log: [`Credentials`]'s `Debug` leaves them out.
 
-use std::fs;
+use std::fs::{self, TryLockError};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,8 +28,10 @@ pub const CREDENTIALS_FILE: &str = "chatgpt-credentials.json";
 /// The host id and issued client id, in the settings folder.
 pub const CLIENT_FILE: &str = "chatgpt-client.json";
 
-/// The lock file that keeps two WordCraft processes from refreshing at once.
-const LOCK_FILE: &str = "chatgpt-credentials.lock";
+/// The file whose lock keeps two WordCraft processes from refreshing at once. It stays when the
+/// lock is let go of: deleting it would let a waiter lock the old file while a newcomer locks a
+/// new one.
+pub(crate) const LOCK_FILE: &str = "chatgpt-credentials.lock";
 
 /// Most bytes either file may have; a bigger one reads as damaged.
 const MAX_FILE: u64 = 256 << 10;
@@ -230,62 +235,65 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// The process's own lock on refreshing (one refresh at a time across its windows).
+/// The process's own lock on the credentials (its windows take turns).
 static REFRESHING: Mutex<()> = Mutex::new(());
 
-/// Longest [`Lock::take`] waits for another process's refresh.
-const LOCK_WAIT: Duration = Duration::from_secs(20);
+/// Longest [`Lock::take`] waits for another process: twice as long as a holder holds it (a
+/// refresh's one call to the token endpoint, bounded by `http::AUTH_CALL`).
+const LOCK_WAIT: Duration = Duration::from_secs(60);
 
-/// A lock file older than this was left by a process that stopped: it's taken over.
-const STALE_LOCK: Duration = Duration::from_secs(60);
-
-/// Held while the credentials are refreshed or signed out: no other refresh in this process,
-/// nor in another WordCraft process with the same settings folder (a lock file).
+/// Held while the credentials are refreshed, saved by a new sign-in or deleted: no other holder
+/// in this process, nor in another WordCraft process with the same settings folder (the
+/// system's lock on [`LOCK_FILE`], which it lets go of when its holder ends, however it ends).
+/// A live holder is waited for, never taken over.
 pub(crate) struct Lock {
+    // Declared first: the file's lock is let go of before the process's.
+    _file: Option<fs::File>,
     _process: MutexGuard<'static, ()>,
-    file: Option<PathBuf>,
 }
 
 impl Lock {
-    /// Wait for the lock. The file lock is skipped (with a warning) when the folder can't hold
-    /// one, and taken over when it's stale or the wait is over: a refresh never waits forever.
-    pub(crate) fn take(settings: &Path) -> Lock {
+    /// Wait for the lock, at most [`LOCK_WAIT`].
+    pub(crate) fn take(settings: &Path) -> Result<Lock, String> {
+        Lock::within(settings, LOCK_WAIT)
+    }
+
+    /// Wait at most `wait` for the lock: an error when another process still holds it then. A
+    /// folder (or system) that can't lock a file goes without the file's lock, with a warning.
+    pub(crate) fn within(settings: &Path, wait: Duration) -> Result<Lock, String> {
         let process = REFRESHING.lock().unwrap_or_else(PoisonError::into_inner);
-        let path = settings.join(LOCK_FILE);
-        let until = Instant::now() + LOCK_WAIT;
-        let _ = fs::create_dir_all(settings);
-        let mut took_over = false;
+        let file = match open_lock(settings) {
+            Ok(file) => file,
+            Err(e) => {
+                log::warn!("ChatGPT sign-in: no lock file ({e}); going on without one");
+                return Ok(Lock { _file: None, _process: process });
+            }
+        };
+        let until = Instant::now().checked_add(wait);
         loop {
-            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Lock { _process: process, file: Some(path) },
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let age = fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| SystemTime::now().duration_since(t).ok());
-                    if age.is_some_and(|a| a > STALE_LOCK) || Instant::now() >= until {
-                        if took_over {
-                            // It came back, or can't be removed: go on without it rather than wait.
-                            log::warn!("ChatGPT sign-in: the lock file {} stays; going on without it", path.display());
-                            return Lock { _process: process, file: None };
-                        }
-                        log::warn!("ChatGPT sign-in: taking over the lock file {}", path.display());
-                        let _ = fs::remove_file(&path);
-                        took_over = true;
-                        continue;
-                    }
+            match file.try_lock() {
+                Ok(()) => return Ok(Lock { _file: Some(file), _process: process }),
+                Err(TryLockError::WouldBlock) if until.is_none_or(|until| Instant::now() < until) => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(e) => {
-                    log::warn!("ChatGPT sign-in: no lock file ({e}); refreshing without one");
-                    return Lock { _process: process, file: None };
+                Err(TryLockError::WouldBlock) => {
+                    return Err("another WordCraft window is busy with your ChatGPT sign-in: try again in a moment".into());
+                }
+                Err(TryLockError::Error(e)) => {
+                    log::warn!("ChatGPT sign-in: the lock file can't be locked ({e}); going on without it");
+                    return Ok(Lock { _file: None, _process: process });
                 }
             }
         }
     }
 }
 
-impl Drop for Lock {
-    fn drop(&mut self) {
-        if let Some(path) = &self.file {
-            let _ = fs::remove_file(path);
-        }
-    }
+/// The lock file, made (empty, mode 0600 on Unix) if it isn't there.
+fn open_lock(settings: &Path) -> std::io::Result<fs::File> {
+    fs::create_dir_all(settings)?;
+    let mut open = fs::OpenOptions::new();
+    open.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+    open.open(settings.join(LOCK_FILE))
 }

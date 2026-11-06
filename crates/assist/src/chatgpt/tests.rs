@@ -1,12 +1,13 @@
 //! Sign in with ChatGPT against fake servers on this machine: the whole flow, refreshes,
 //! sign-out, and junk from the browser, the servers and the disk.
 
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -81,6 +82,8 @@ pub(super) struct Script {
     pub(super) slow: Mutex<Duration>,
     /// What the revocation endpoint answers (200 when 0).
     pub(super) revoke: Mutex<u16>,
+    /// Access tokens the models list turns away (401), as a server that no longer takes them.
+    pub(super) turned_away: Mutex<Vec<String>>,
 }
 
 /// The fake sign-in server: the token, discovery, revocation and models endpoints, with
@@ -96,6 +99,9 @@ pub(super) fn server(script: Arc<Script>, api: impl Fn(&Request, usize) -> Reply
             0 => 200,
             s => s,
         }),
+        ("GET", "/v1/models") if turned_away(&script, r) => {
+            Reply::json(401, &json!({"error": {"code": "subscription_sharing_invalid_user", "message": "who are you"}}))
+        }
         ("GET", "/v1/models") => Reply::json(
             200,
             &json!({"models": [
@@ -107,6 +113,12 @@ pub(super) fn server(script: Arc<Script>, api: impl Fn(&Request, usize) -> Reply
         _ if r.path.starts_with("/v1/") => api(r, n),
         _ => Reply::json(404, &json!({"detail": "Not Found"})),
     })
+}
+
+/// Whether `r` carries an access token the script turns away.
+fn turned_away(script: &Script, r: &Request) -> bool {
+    let sent = r.header("authorization").and_then(|h| h.strip_prefix("Bearer "));
+    sent.is_some_and(|t| script.turned_away.lock().unwrap().iter().any(|away| away == t))
 }
 
 fn token(script: &Script, r: &Request, n: usize) -> Reply {
@@ -187,6 +199,34 @@ pub(super) fn expire(settings: &Path) {
     store::write_credentials(settings, &c).unwrap();
 }
 
+/// Wait (at most [`WAIT`]) until `done` holds.
+pub(super) fn eventually(what: &str, done: impl Fn() -> bool) {
+    let until = Instant::now() + WAIT;
+    while !done() {
+        assert!(Instant::now() < until, "never: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The lock on `settings`' sign-in, as another WordCraft process holds it while it refreshes (a
+/// second handle stands in for that process: the system's locks on a file keep two handles
+/// apart). It has held it for two minutes: a live holder is waited for, however long it takes.
+fn hold_lock(settings: &Path) -> File {
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(settings.join(store::LOCK_FILE)).unwrap();
+    file.lock().unwrap();
+    file.set_modified(SystemTime::now() - Duration::from_secs(120)).unwrap();
+    file
+}
+
+/// Whether somebody holds the lock file at `path`.
+fn held(path: &Path) -> bool {
+    match OpenOptions::new().read(true).write(true).open(path).unwrap().try_lock() {
+        Ok(()) => false,
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(e)) => panic!("{e}"),
+    }
+}
+
 #[cfg(unix)]
 fn mode(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
@@ -249,11 +289,15 @@ fn assert_kept(folder: &Folder, host_id: &str) {
     assert_eq!((saved.access_token.as_str(), saved.refresh_token.as_str()), ("access-0", "refresh-0"));
     assert_eq!((saved.subject.as_str(), saved.issuer.as_str()), ("user-123", ISSUER));
     assert!(saved.plan_usage() && saved.expires_at > now() + 3000 && saved.id_token.split('.').count() == 3);
-    assert_eq!(folder.files(), [CLIENT_FILE, CREDENTIALS_FILE]);
+    // The lock the tokens were saved under stays: empty, and let go of.
+    assert_eq!(folder.files(), [CLIENT_FILE, CREDENTIALS_FILE, store::LOCK_FILE]);
+    let lock = folder.path().join(store::LOCK_FILE);
+    assert!(std::fs::metadata(&lock).unwrap().len() == 0 && !held(&lock));
     #[cfg(unix)]
     {
         assert_eq!(mode(&folder.path().join(CREDENTIALS_FILE)), 0o600);
         assert_eq!(mode(&folder.path().join(CLIENT_FILE)), 0o600);
+        assert_eq!(mode(&lock), 0o600);
     }
 }
 
@@ -351,9 +395,14 @@ fn a_declined_refused_or_untrustworthy_sign_in_ends_plainly_and_keeps_no_tokens(
     // No code.
     assert!(attempt("client_id=oaiapp_issued-1").unwrap_err().to_string().contains("no code"));
     // The token endpoint refuses the code, or fails.
-    *script.refuse.lock().unwrap() = Some((400, json!({"error": "invalid_grant", "error_description": "code the-code was used"})));
-    let e = attempt("code=the-code&client_id=oaiapp_issued-1").unwrap_err().to_string();
-    assert!(e.contains("start signing in again") && !e.contains("the-code"), "{e}");
+    for refusal in [
+        json!({"error": "invalid_grant", "error_description": "code the-code was used"}),
+        json!({"error": {"code": "invalid_grant", "message": "code the-code was used"}}),
+    ] {
+        *script.refuse.lock().unwrap() = Some((400, refusal));
+        let e = attempt("code=the-code&client_id=oaiapp_issued-1").unwrap_err().to_string();
+        assert!(e.contains("start signing in again") && !e.contains("the-code"), "{e}");
+    }
     *script.refuse.lock().unwrap() = Some((500, json!("<html>oops</html>")));
     assert!(attempt("code=c&client_id=oaiapp_issued-1").unwrap_err().to_string().contains("HTTP 500"));
     *script.refuse.lock().unwrap() = Some((200, json!({"access_token": "a", "token_type": "Bearer"})));
@@ -429,6 +478,43 @@ fn a_sign_in_can_be_cancelled_times_out_and_finds_a_free_port() {
 }
 
 #[test]
+fn a_flood_of_junk_or_idle_connections_on_the_sign_in_port_neither_ends_nor_holds_back_the_sign_in() {
+    let folder = Folder::new();
+    let script = Arc::new(Script::default());
+    let server = server(script.clone(), no_api);
+    let endpoints = Endpoints::local(server.base());
+    let mut sign_in = SignIn::start(folder.path(), options(&endpoints)).unwrap();
+    let url = sign_in.url().to_string();
+    let redirect = sign_in.redirect_uri().to_string();
+    let host = redirect.strip_prefix("http://").unwrap().split_once('/').unwrap().0.to_string();
+    // More requests than the port once answered (256): unknown paths, and answers with another
+    // state.
+    for i in 0..300 {
+        let (status, _) = if i % 2 == 0 { raw(&host, b"GET /x HTTP/1.1\r\n\r\n") } else { callback(&redirect, "code=stolen&state=wrong") };
+        assert!(status == 404 || status == 400, "request {i} wasn't answered: {status}");
+    }
+    assert!(sign_in.poll().is_none(), "the sign-in goes on: {:?}", sign_in.poll());
+    // Connections that say nothing and stay open don't hold back the browser's answer.
+    let idle: Vec<TcpStream> = (0..8).map(|_| TcpStream::connect(&host).unwrap()).collect();
+    *script.nonce.lock().unwrap() = param(&url, "nonce").unwrap();
+    let (status, page) = callback(&redirect, &format!("code=c&state={}&client_id=oaiapp_issued-1", param(&url, "state").unwrap()));
+    assert_eq!(status, 200, "{page}");
+    assert!(sign_in.wait(WAIT).unwrap().is_ok());
+    drop(idle);
+}
+
+#[test]
+fn a_sign_in_takes_any_wait() {
+    let folder = Folder::new();
+    let endpoints = Endpoints::local("http://127.0.0.1:9");
+    // However long (it panicked on Duration::MAX): it waits, and cancelling ends it.
+    let mut s = SignIn::start(folder.path(), SignInOptions { wait: Duration::MAX, ..options(&endpoints) }).unwrap();
+    assert!(s.wait(Duration::from_millis(200)).is_none(), "an endless wait doesn't end at once");
+    s.cancel();
+    assert_eq!(s.wait(WAIT).cloned(), Some(Err(AuthError::Cancelled)));
+}
+
+#[test]
 fn an_old_token_is_refreshed_once_for_two_callers_and_the_rotated_token_kept() {
     let (folder, script, server, endpoints) = signed_in(no_api);
     // Fresh enough: no refresh.
@@ -457,7 +543,7 @@ fn an_old_token_is_refreshed_once_for_two_callers_and_the_rotated_token_kept() {
     let saved = store::read_credentials(folder.path()).unwrap();
     assert_eq!((saved.access_token.as_str(), saved.refresh_token.as_str()), ("access-1", "refresh-1"));
     assert!(saved.expires_at > now() + 3000);
-    assert!(!folder.path().join("chatgpt-credentials.lock").exists(), "the lock is let go");
+    assert!(!held(&folder.path().join(store::LOCK_FILE)), "the lock is let go of");
     // A token the API turned away is refreshed though it hasn't expired; once another caller
     // has, the newer one is used as it is.
     *script.slow.lock().unwrap() = Duration::ZERO;
@@ -467,28 +553,51 @@ fn an_old_token_is_refreshed_once_for_two_callers_and_the_rotated_token_kept() {
 }
 
 #[test]
-fn a_refused_refresh_signs_out_but_trouble_on_the_server_keeps_the_sign_in() {
+fn trouble_on_the_server_or_another_refusal_keeps_the_sign_in() {
+    let (folder, script, _server, endpoints) = signed_in(no_api);
+    expire(folder.path());
+    // The server's trouble, or too many requests: the sign-in stays, and the error says so.
+    for (status, body, code) in [
+        (503, json!({"error": "temporarily_unavailable"}), "temporarily_unavailable"),
+        (429, json!({"error": {"code": "rate_limit_exceeded", "message": "slow down"}}), "rate_limit_exceeded: slow down"),
+    ] {
+        *script.refuse.lock().unwrap() = Some((status, body));
+        let e = access_token(folder.path(), &endpoints, None).unwrap_err();
+        assert!(matches!(&e, AuthError::Network(why) if why.contains(code)), "{e:?}");
+        assert!(super::account(folder.path()).is_some());
+    }
+    // Another refusal keeps it too, and says how to start again, without the token.
+    *script.refuse.lock().unwrap() = Some((400, json!({"error": "invalid_request", "error_description": "refresh-0 isn't for this resource"})));
+    let e = access_token(folder.path(), &endpoints, None).unwrap_err();
+    assert!(matches!(&e, AuthError::Failed(why) if why.contains("invalid_request") && why.contains("sign in again")), "{e:?}");
+    assert!(!e.to_string().contains("refresh-0"), "{e}");
+    assert!(super::account(folder.path()).is_some());
+}
+
+#[test]
+fn a_spent_or_turned_away_refresh_token_ends_the_sign_in_whatever_shape_the_refusal_has() {
     let (folder, script, server, endpoints) = signed_in(no_api);
     expire(folder.path());
-    // The server's trouble: the sign-in stays, and the error says when to try again.
-    *script.refuse.lock().unwrap() = Some((503, json!({"error": "temporarily_unavailable"})));
-    let e = access_token(folder.path(), &endpoints, None).unwrap_err();
-    assert!(matches!(&e, AuthError::Network(why) if why.contains("temporarily_unavailable")), "{e:?}");
-    assert!(super::account(folder.path()).is_some());
-    // A configuration problem says so, and keeps the sign-in too.
-    *script.refuse.lock().unwrap() = Some((401, json!({"error": "invalid_client"})));
-    assert!(access_token(folder.path(), &endpoints, None).unwrap_err().to_string().contains("registration"));
-    assert!(super::account(folder.path()).is_some());
-    // A refresh token that was used or expired: the person signs in again.
-    for code in ["invalid_grant", "refresh_token_reused", "refresh_token_expired"] {
-        *script.refuse.lock().unwrap() = Some((400, json!({"error": code, "error_description": "refresh-0 is spent"})));
+    // OAuth's shape, OpenAI's error envelope, a bare code, or a 401 with no code at all.
+    let spent = [
+        (400, json!({"error": "invalid_grant", "error_description": "refresh-0 is spent"})),
+        (400, json!({"error": "refresh_token_reused"})),
+        (
+            401,
+            json!({"error": {"message": "Your refresh token has already been used to generate a new access token. Please try signing in again.",
+                             "type": "invalid_request_error", "param": null, "code": "refresh_token_reused"}}),
+        ),
+        (401, json!({"error": {"code": "refresh_token_expired", "message": "refresh-0 has expired"}})),
+        (400, json!({"code": "refresh_token_invalidated"})),
+        (401, json!({"detail": "Unauthorized"})),
+    ];
+    for (status, body) in spent {
+        *script.refuse.lock().unwrap() = Some((status, body.clone()));
         let mut c = store::read_credentials(folder.path()).unwrap();
         c.refresh_token = "refresh-0".into();
         store::write_credentials(folder.path(), &c).unwrap();
-        let e = access_token(folder.path(), &endpoints, None).unwrap_err();
-        assert_eq!(e, AuthError::SignInAgain, "{code}");
-        assert!(!e.to_string().contains("refresh-0"));
-        assert_eq!(super::account(folder.path()), None);
+        assert_eq!(access_token(folder.path(), &endpoints, None).unwrap_err(), AuthError::SignInAgain, "{body}");
+        assert_eq!(super::account(folder.path()), None, "{body}");
         assert!(matches!(readiness(Some(folder.path())), Readiness::SignIn { .. }));
         assert_eq!(access_token(folder.path(), &endpoints, None).unwrap_err(), AuthError::NotSignedIn);
     }
@@ -501,6 +610,172 @@ fn a_refused_refresh_signs_out_but_trouble_on_the_server_keeps_the_sign_in() {
 }
 
 #[test]
+fn a_registration_chatgpt_no_longer_knows_is_forgotten_and_signing_in_again_registers_anew() {
+    let (folder, script, server, endpoints) = signed_in(no_api);
+    let host_id = store::client(folder.path()).unwrap().host_id;
+    choose_model(folder.path(), Some("gpt-test")).unwrap();
+    expire(folder.path());
+    *script.refuse.lock().unwrap() = Some((401, json!({"error": "invalid_client"})));
+    assert_eq!(access_token(folder.path(), &endpoints, None).unwrap_err(), AuthError::SignInAgain);
+    // The refused client id is forgotten, with the sign-in; the host id and the model stay.
+    let client = store::client(folder.path()).unwrap();
+    assert_eq!((client.host_id.as_str(), client.client_id.as_deref(), client.model.as_deref()), (host_id.as_str(), None, Some("gpt-test")));
+    assert_eq!(super::account(folder.path()), None);
+    // Signing in again, as the error says, registers WordCraft anew (without the last sign-in's
+    // hints) and works.
+    *script.refuse.lock().unwrap() = None;
+    let next = SignIn::start(folder.path(), options(&endpoints)).unwrap();
+    assert_registration(next.url(), server.base(), &host_id);
+    drop(next);
+    assert!(sign_in_with(folder.path(), &script, &endpoints, "code=c&client_id=oaiapp_issued-2").unwrap().plan_usage);
+    assert_eq!(store::client(folder.path()).unwrap().client_id.as_deref(), Some("oaiapp_issued-2"));
+    assert_eq!(store::read_credentials(folder.path()).unwrap().client_id, "oaiapp_issued-2");
+    // A code exchange refused for the same reason (in OpenAI's shape) forgets it too.
+    *script.refuse.lock().unwrap() = Some((401, json!({"error": {"code": "invalid_client", "message": "unknown client"}})));
+    let e = sign_in_with(folder.path(), &script, &endpoints, "code=c3").unwrap_err();
+    assert!(e.to_string().contains("registration"), "{e}");
+    assert_eq!(store::client(folder.path()).unwrap().client_id, None);
+}
+
+#[test]
+fn a_refresh_whose_id_token_fails_its_checks_keeps_the_rotated_refresh_token() {
+    let (folder, script, server, endpoints) = signed_in(no_api);
+    let rotated = |claims: &Value| {
+        json!({"access_token": "access-r", "refresh_token": "refresh-r", "id_token": id_token(claims),
+               "token_type": "Bearer", "expires_in": 3600, "scope": SCOPES})
+    };
+    // A clock more than an hour ahead: the refresh's new id token looks expired. The server has
+    // spent refresh-0 all the same: the new tokens are kept, with the last id token.
+    let mut stale = claims("oaiapp_issued-1", None);
+    stale["exp"] = json!(now() - 3600);
+    *script.refuse.lock().unwrap() = Some((200, rotated(&stale)));
+    expire(folder.path());
+    assert_eq!(access_token(folder.path(), &endpoints, None).unwrap().access_token, "access-r");
+    let saved = store::read_credentials(folder.path()).unwrap();
+    assert_eq!((saved.refresh_token.as_str(), saved.subject.as_str(), saved.email.as_str()), ("refresh-r", "user-123", "writer@example.com"));
+    // The next refresh sends the rotated token, not the spent one.
+    *script.refuse.lock().unwrap() = None;
+    expire(folder.path());
+    access_token(folder.path(), &endpoints, None).unwrap();
+    assert_eq!(server.to("/oauth/token").last().and_then(|r| r.field("refresh_token")).as_deref(), Some("refresh-r"));
+    // Another account's tokens end the sign-in: neither used nor kept, but revoked.
+    let mut other = claims("oaiapp_issued-1", None);
+    other["sub"] = json!("someone-else");
+    *script.refuse.lock().unwrap() = Some((200, rotated(&other)));
+    expire(folder.path());
+    let e = access_token(folder.path(), &endpoints, None).unwrap_err();
+    assert!(e.to_string().contains("another account"), "{e}");
+    assert_eq!(super::account(folder.path()), None);
+    eventually("the other account's refresh token is revoked", || {
+        server.to("/oauth/revoke").iter().any(|r| r.field("token").as_deref() == Some("refresh-r"))
+    });
+}
+
+#[test]
+fn the_lock_waits_for_its_holder_is_never_taken_over_and_stays() {
+    let folder = Folder::new();
+    let path = folder.path().join(store::LOCK_FILE);
+    // The file is made by the first lock: empty, and only its owner's.
+    drop(store::Lock::within(folder.path(), WAIT).unwrap());
+    #[cfg(unix)]
+    assert_eq!(mode(&path), 0o600);
+    // Another process holds it longer than the wait: an error, and the holder keeps it.
+    let other = hold_lock(folder.path());
+    let Err(e) = store::Lock::within(folder.path(), Duration::from_millis(200)) else { panic!("the lock was taken over") };
+    assert!(e.contains("try again"), "{e}");
+    assert!(held(&path));
+    drop(other);
+    // Once it lets go, the lock is taken.
+    let lock = store::Lock::within(folder.path(), WAIT).unwrap();
+    assert!(held(&path));
+    drop(lock);
+    // Let go of, the file stays (deleting it would let two holders in), empty.
+    assert!(!held(&path));
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+}
+
+#[test]
+fn a_sign_out_waits_for_another_processs_refresh_and_revokes_the_token_it_saved() {
+    let (folder, _script, server, endpoints) = signed_in(no_api);
+    // Another WordCraft process with this settings folder is refreshing: it holds the lock.
+    let other = hold_lock(folder.path());
+    let (f, e) = (folder.path().to_path_buf(), endpoints.clone());
+    let out = std::thread::spawn(move || sign_out_with(&f, &e));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!out.is_finished(), "the sign-out waits for the other process's refresh");
+    // Its refresh comes back: it keeps the rotated token, then lets go.
+    let mut c = store::read_credentials(folder.path()).unwrap();
+    (c.access_token, c.refresh_token) = ("access-9".into(), "refresh-9".into());
+    store::write_credentials(folder.path(), &c).unwrap();
+    drop(other);
+    assert_eq!(out.join().unwrap(), Ok(SignedOut { revoked: true }));
+    // The newest refresh token is the one revoked, and nobody stays signed in.
+    let revoked: Vec<Option<String>> = server.to("/oauth/revoke").iter().map(|r| r.field("token")).collect();
+    assert_eq!(revoked, [Some("refresh-9".to_string())]);
+    assert_eq!(super::account(folder.path()), None);
+}
+
+#[test]
+fn a_refresh_waits_for_another_processs_and_uses_the_token_it_saved() {
+    let (folder, _script, server, endpoints) = signed_in(no_api);
+    expire(folder.path());
+    let other = hold_lock(folder.path());
+    let (f, e) = (folder.path().to_path_buf(), endpoints.clone());
+    let refreshing = std::thread::spawn(move || access_token(&f, &e, None));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!refreshing.is_finished(), "the refresh waits for the other process's");
+    // The other process's refresh saves the rotated tokens, and lets go.
+    let mut c = store::read_credentials(folder.path()).unwrap();
+    (c.access_token, c.refresh_token, c.expires_at) = ("access-9".into(), "refresh-9".into(), now() + 3600);
+    store::write_credentials(folder.path(), &c).unwrap();
+    drop(other);
+    assert_eq!(refreshing.join().unwrap().unwrap().access_token, "access-9");
+    assert_eq!(server.to("/oauth/token").len(), 1, "refresh-0 isn't sent a second time");
+}
+
+#[test]
+fn a_refresh_that_comes_back_after_a_sign_out_is_revoked_not_saved() {
+    let (folder, script, server, endpoints) = signed_in(no_api);
+    expire(folder.path());
+    *script.slow.lock().unwrap() = Duration::from_secs(1);
+    let (f, e) = (folder.path().to_path_buf(), endpoints.clone());
+    let refreshing = std::thread::spawn(move || access_token(&f, &e, None));
+    eventually("the refresh is sent", || server.to("/oauth/token").len() == 2);
+    // Signed out meanwhile, where the lock can't keep it out (a folder without file locks, or
+    // by hand).
+    store::delete_credentials(folder.path()).unwrap();
+    assert_eq!(refreshing.join().unwrap().unwrap_err(), AuthError::NotSignedIn);
+    assert!(store::read_credentials(folder.path()).is_none(), "the sign-out stays");
+    // The tokens nobody keeps are revoked.
+    eventually("the new refresh token is revoked", || server.to("/oauth/revoke").iter().any(|r| r.field("token").as_deref() == Some("refresh-1")));
+}
+
+#[test]
+fn a_new_sign_in_is_saved_after_a_refresh_in_flight_and_its_tokens_kept() {
+    let (folder, script, server, endpoints) = signed_in(no_api);
+    // Another WordCraft process is refreshing the last sign-in: it holds the lock.
+    let other = hold_lock(folder.path());
+    let mut s = SignIn::start(folder.path(), options(&endpoints)).unwrap();
+    let url = s.url().to_string();
+    *script.nonce.lock().unwrap() = param(&url, "nonce").unwrap();
+    let (redirect, state) = (s.redirect_uri().to_string(), param(&url, "state").unwrap());
+    let browser = std::thread::spawn(move || callback(&redirect, &format!("code=c2&state={state}")));
+    eventually("the code is exchanged", || server.to("/oauth/token").len() == 2);
+    assert!(s.wait(Duration::from_millis(300)).is_none(), "the new sign-in waits for the refresh");
+    // The other process's refresh comes back: it saves the last sign-in's rotated tokens, then
+    // lets go.
+    let mut last = store::read_credentials(folder.path()).unwrap();
+    (last.access_token, last.refresh_token) = ("access-old".into(), "refresh-old".into());
+    store::write_credentials(folder.path(), &last).unwrap();
+    drop(other);
+    assert!(s.wait(WAIT).unwrap().is_ok());
+    assert_eq!(browser.join().unwrap().0, 200);
+    // The new sign-in's tokens are the ones kept.
+    let saved = store::read_credentials(folder.path()).unwrap();
+    assert_eq!((saved.access_token.as_str(), saved.refresh_token.as_str()), ("access-1", "refresh-1"));
+}
+
+#[test]
 fn signing_out_revokes_the_refresh_token_and_deletes_the_credentials_but_keeps_the_client() {
     let (folder, script, server, endpoints) = signed_in(no_api);
     let host_id = store::client(folder.path()).unwrap().host_id;
@@ -509,7 +784,7 @@ fn signing_out_revokes_the_refresh_token_and_deletes_the_credentials_but_keeps_t
     assert_eq!(revoke.field("token").as_deref(), Some("refresh-0"));
     assert_eq!(revoke.field("token_type_hint").as_deref(), Some("refresh_token"));
     assert_eq!(revoke.field("client_id").as_deref(), Some("oaiapp_issued-1"));
-    assert_eq!(folder.files(), [CLIENT_FILE], "the tokens are gone");
+    assert_eq!(folder.files(), [CLIENT_FILE, store::LOCK_FILE], "the tokens are gone");
     let client = store::client(folder.path()).unwrap();
     assert_eq!((client.host_id, client.client_id.as_deref()), (host_id, Some("oaiapp_issued-1")));
     assert_eq!(super::account(folder.path()), None);
@@ -527,7 +802,7 @@ fn signing_out_revokes_the_refresh_token_and_deletes_the_credentials_but_keeps_t
     let mut out = SignOut::start(folder.path(), endpoints.clone()).unwrap();
     assert_eq!(out.wait(WAIT).cloned(), Some(Ok(SignedOut { revoked: false })));
     assert_eq!(server.to("/oauth/revoke").len(), 3);
-    assert_eq!(folder.files(), [CLIENT_FILE]);
+    assert_eq!(folder.files(), [CLIENT_FILE, store::LOCK_FILE]);
 }
 
 #[test]
@@ -666,6 +941,27 @@ fn the_models_list_keeps_listed_models_in_order_and_the_choice_is_kept() {
     choose_model(folder.path(), None).unwrap();
     assert_eq!(chosen_model(folder.path()), None);
     assert_eq!(store::client(folder.path()).unwrap().client_id.as_deref(), Some("oaiapp_issued-1"), "the client id stays");
+}
+
+#[test]
+fn a_models_list_that_turns_a_fresh_token_away_refreshes_it_once() {
+    let (folder, script, server, endpoints) = signed_in(no_api);
+    script.turned_away.lock().unwrap().push("access-0".into());
+    let models = models_with(folder.path(), &endpoints).unwrap();
+    assert_eq!(models[0].slug, "gpt-test");
+    let sent: Vec<Option<String>> = server.to("/v1/models").iter().map(|r| r.header("authorization").map(str::to_string)).collect();
+    assert_eq!(sent, [Some("Bearer access-0".to_string()), Some("Bearer access-1".to_string())]);
+    assert_eq!(server.to("/oauth/token").len(), 2, "the exchange, then one refresh");
+    // Turned away again after the refresh: one refresh, no loop, and the sign-in stays.
+    script.turned_away.lock().unwrap().extend(["access-1".to_string(), "access-2".to_string()]);
+    let e = models_with(folder.path(), &endpoints).unwrap_err();
+    assert!(matches!(&e, AuthError::Failed(why) if why.contains("didn't accept your sign-in")), "{e:?}");
+    assert_eq!(server.to("/oauth/token").len(), 3);
+    assert!(super::account(folder.path()).is_some(), "the sign-in stays");
+    // Only a refresh that says the sign-in has ended ends it.
+    *script.refuse.lock().unwrap() = Some((400, json!({"error": "invalid_grant"})));
+    assert_eq!(models_with(folder.path(), &endpoints).unwrap_err(), AuthError::SignInAgain);
+    assert_eq!(super::account(folder.path()), None);
 }
 
 #[test]

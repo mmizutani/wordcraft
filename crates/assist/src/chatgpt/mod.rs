@@ -7,7 +7,7 @@
 //!   registers WordCraft (`dynamic_agent_client`) and keeps the client id it is issued, with
 //!   this installation's host id ([`CLIENT_FILE`]), for every sign-in after it.
 //! - [`account`]: who is signed in, read from the file (no network).
-//! - [`SignOut`]: revokes the refresh token and deletes the credentials.
+//! - [`SignOut`]: deletes the credentials and revokes their refresh token.
 //! - [`models`], [`choose_model`]: the models the account may use, and the one chosen.
 //!
 //! Tokens never reach the document, the window's state, the control channel or the log, and
