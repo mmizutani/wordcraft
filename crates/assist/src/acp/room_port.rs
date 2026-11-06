@@ -206,12 +206,31 @@ fn next_request(reader: &mut BufReader<Deadline>, out: &mut TcpStream) -> Option
     }
 }
 
+/// One deadline covers the entire response, even when a peer reads a few bytes at a time.
+struct WriteDeadline<'a> {
+    stream: &'a mut TcpStream,
+    until: Instant,
+}
+
+impl Write for WriteDeadline<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let left = self.until.checked_duration_since(Instant::now()).filter(|left| !left.is_zero()).ok_or(std::io::ErrorKind::TimedOut)?;
+        self.stream.set_write_timeout(Some(left))?;
+        self.stream.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 /// Write reply `v` to request `id`; whether the connection is still there.
 fn send(out: &mut TcpStream, id: &Value, mut v: Value) -> bool {
     if let Some(o) = v.as_object_mut() {
         o.insert("id".into(), id.clone());
     }
-    writeln!(out, "{v}").is_ok()
+    let mut writer = WriteDeadline { stream: out, until: Instant::now() + Duration::from_secs(2) };
+    writeln!(writer, "{v}").is_ok()
 }
 
 /// Whether `given` is `key`, compared in a time that doesn't depend on where they differ. An
@@ -483,6 +502,55 @@ mod tests {
         c.send("\"method\":\"document.inspect\"}");
         let reply = c.recv();
         assert_eq!((reply["id"].clone(), reply["ok"].clone()), (json!(2), json!(true)));
+    }
+
+    #[test]
+    fn a_response_to_a_client_that_never_reads_is_bounded() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (finished, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let sent = super::send(&mut stream, &json!(1), json!({"text": "x".repeat(32 << 20)}));
+            let _ = finished.send(sent);
+        });
+        let client = TcpStream::connect(addr).unwrap();
+        let observed = result.recv_timeout(Duration::from_secs(5));
+        // Unblock and join the writer even when the regression fails.
+        drop(client);
+        worker.join().unwrap();
+        assert!(!observed.unwrap(), "an unread response must close its connection");
+    }
+
+    #[test]
+    fn slow_response_reads_do_not_extend_the_write_deadline() {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (finished, result) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = finished.send(super::send(&mut stream, &json!(1), json!({"text": "x".repeat(32 << 20)})));
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = [0; 4096];
+            while !stopped.load(Ordering::SeqCst) {
+                if matches!(client.read(&mut bytes), Ok(0)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let observed = result.recv_timeout(Duration::from_secs(5));
+        stop.store(true, Ordering::SeqCst);
+        reader.join().unwrap();
+        writer.join().unwrap();
+        assert!(!observed.unwrap(), "slow progress must not keep a response alive indefinitely");
     }
 
     #[test]

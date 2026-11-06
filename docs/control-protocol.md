@@ -277,7 +277,10 @@ doesn't know it, and no key file names the port), nor does any other key, and wh
 is shared no key does: the request gets `{"ok": false, "error": "unauthorized"}` and the
 connection closes. The limits are the control channel's: a line over 1 MiB, a line that isn't
 UTF-8 or JSON, or no request with an invite's key within 30 s of the connection being accepted
-closes it. At most 64 connections are served at once.
+closes it. At most 64 connections are served at once. Each response has a two-second total
+write deadline, including clients that read only a few bytes at a time. A failed write closes
+the connection; revocation and room closure also end idle authenticated reads. These limits
+bound resource use; a continuous local connection flood can still deny availability.
 
 ### Roles
 
