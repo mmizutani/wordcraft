@@ -327,8 +327,24 @@ fn a_turn_is_refused_while_one_runs_and_prompts_are_checked() {
 #[test]
 fn a_backend_that_fails_or_panics_ends_its_turn_with_an_error_and_the_conversation_goes_on() {
     let mut w = Window::new("one two three");
-    let fake = Fake::new().then(vec![Step::Fail("the model is away".into())]).then(vec![Step::Panic]).then(rewrite_two());
-    let mut a = w.start(fake, Options::default());
+    struct PanicOnSecondTurn {
+        fake: Fake,
+        turns: usize,
+    }
+    impl crate::Backend for PanicOnSecondTurn {
+        fn info(&self) -> crate::BackendInfo {
+            crate::Backend::info(&self.fake)
+        }
+        fn turn(&mut self, turn: &crate::Turn, ctx: &mut crate::TurnCtx<'_>) -> Result<StopReason, String> {
+            self.turns += 1;
+            if self.turns == 2 {
+                panic!("test backend failure");
+            }
+            crate::Backend::turn(&mut self.fake, turn, ctx)
+        }
+    }
+    let fake = Fake::new().then(vec![Step::Fail("the model is away".into())]).then(rewrite_two());
+    let mut a = Assistant::start(&w.room, Box::new(PanicOnSecondTurn { fake, turns: 0 }), Options::default()).unwrap();
     ask(&mut a, "one");
     assert!(a.transcript().entries().any(|e| matches!(e, Entry::Error { message } if message == "the model is away")));
     ask(&mut a, "two");

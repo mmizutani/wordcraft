@@ -37,8 +37,6 @@ pub enum Step {
     Fail(String),
     /// End the turn with this stop reason.
     Stop(StopReason),
-    /// Panic (to test that a backend's bug ends its turn, not the app).
-    Panic,
     /// Send this event as it is (to test what the conversation does with what a backend sends).
     Emit(Event),
 }
@@ -147,8 +145,6 @@ impl Backend for Fake {
                 }
                 Step::Fail(why) => return Err(why),
                 Step::Stop(stop) => return Ok(stop),
-                #[allow(clippy::panic)]
-                Step::Panic => panic!("the scripted assistant panics, as asked"),
                 Step::Emit(event) => ctx.emit(event),
             }
         }
