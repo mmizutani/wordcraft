@@ -2,7 +2,7 @@
 //! starts and ends in, the paragraphs around it and the outline, as text, held to hard caps
 //! however large the document or the selection is.
 
-use wordcraft_doc::{Document, Path, Pos, StoryRef};
+use wordcraft_doc::{Block, Blocks, Document, Paragraph, Path, Pos, para::OBJ};
 use wordcraft_engine::Session;
 
 use crate::backend::{cut, label};
@@ -78,8 +78,8 @@ impl Context {
         let (before, after) = around(doc, &a, &b, caps);
         let (outline, outline_cut) = outline(doc, caps);
         let title = doc.core.title.trim();
-        let title = if title.is_empty() { session.file_name.clone().unwrap_or_default() } else { title.to_string() };
-        let title = cut(label(&title), 200);
+        let title = if title.is_empty() { session.file_name.as_deref().unwrap_or_default() } else { title };
+        let title = cut(label(title), 200);
         Context { title, selection, selection_cut, lead, trail, before, after, outline, outline_cut, words: session.word_count() }
     }
 
@@ -253,9 +253,9 @@ fn tail(text: &str, max: usize) -> &str {
     text.get(start..).unwrap_or_default()
 }
 
-/// `text` on one line: its control characters (line breaks, tabs) as spaces.
-fn flat(text: &str) -> String {
-    text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+/// A control character (line break, tab) on one line, as a space.
+fn flat_char(c: char) -> char {
+    if c.is_control() { ' ' } else { c }
 }
 
 /// The selected text from `a` to `b`, read from at most `caps.selection_paragraphs`
@@ -274,10 +274,7 @@ fn selected(doc: &Document, a: &Pos, b: &Pos, caps: &Caps) -> (String, bool) {
         end = Pos { story: a.story, path: last.clone(), off: p.text.len() };
         cut_short = true;
     }
-    let text = doc.copy_range(a, &end).to_document().final_text(StoryRef::Body);
-    let was = text.len();
-    let text = cut(text, caps.selection_bytes);
-    let cut_here = text.len() < was;
+    let (text, cut_here) = prefix(&mut selection_chars(doc, a, &end).peekable(), caps.selection_bytes);
     (text, cut_short || cut_here)
 }
 
@@ -288,13 +285,15 @@ fn selected(doc: &Document, a: &Pos, b: &Pos, caps: &Caps) -> (String, bool) {
 fn edges(doc: &Document, a: &Pos, b: &Pos, caps: &Caps) -> (String, String) {
     // No more of a paragraph is read than this, however long it is.
     let span = caps.paragraph_bytes.saturating_mul(4);
-    let read = |from: &Pos, to: &Pos| flat(&doc.copy_range(from, to).to_document().final_text(StoryRef::Body));
     let lead = match doc.para(a.story, &a.path) {
         Some(p) if a.off > 0 && caps.paragraph_bytes > 0 => {
             let to = floor_boundary(&p.text, a.off.min(p.text.len()));
             let from = floor_boundary(&p.text, to.saturating_sub(span));
-            let text = read(&Pos { off: from, ..a.clone() }, &Pos { off: to, ..a.clone() });
-            tail(&text, caps.paragraph_bytes).trim_start().to_string()
+            // The source span bounds these references; field results stay borrowed and read backwards.
+            let parts: Vec<_> = final_parts(p, from, to).collect();
+            let chars = parts.iter().rev().flat_map(|part| part.chars().rev()).map(flat_char);
+            let text = prefix(&mut chars.peekable(), caps.paragraph_bytes).0;
+            text.chars().rev().collect::<String>().trim_start().to_string()
         }
         _ => String::new(),
     };
@@ -303,7 +302,7 @@ fn edges(doc: &Document, a: &Pos, b: &Pos, caps: &Caps) -> (String, String) {
         Some(p) if !ends_at_a_paragraph_start && b.off < p.text.len() && caps.paragraph_bytes > 0 => {
             let from = floor_boundary(&p.text, b.off);
             let to = ceil_boundary(&p.text, from.saturating_add(span).min(p.text.len()));
-            cut(read(&Pos { off: from, ..b.clone() }, &Pos { off: to, ..b.clone() }), caps.paragraph_bytes).trim_end().to_string()
+            prefix(&mut final_chars(p, from, to).map(flat_char).peekable(), caps.paragraph_bytes).0.trim_end().to_string()
         }
         _ => String::new(),
     };
@@ -333,7 +332,7 @@ fn ceil_boundary(text: &str, i: usize) -> usize {
 /// selection that ends at a paragraph's start leaves that paragraph out of it: it is the first
 /// one after.
 fn around(doc: &Document, a: &Pos, b: &Pos, caps: &Caps) -> (Vec<String>, Vec<String>) {
-    let text = |path: &Path| doc.para(a.story, path).map(|p| cut(p.final_text().trim().to_string(), caps.paragraph_bytes)).unwrap_or_default();
+    let text = |path: &Path| doc.para(a.story, path).and_then(|p| trimmed_prefix(p, caps.paragraph_bytes)).unwrap_or_default();
     let all = doc.para_paths(a.story);
     // Paragraphs with no text don't count, but only so many are looked at.
     let looked = caps.around.saturating_mul(8);
@@ -357,15 +356,256 @@ fn outline(doc: &Document, caps: &Caps) -> (Vec<(u8, String)>, bool) {
     for block in doc.body.iter() {
         let Some(p) = block.as_para() else { continue };
         let Some(level) = doc.styles.resolve_para(&p.props).outline_level else { continue };
-        let t = p.final_text();
-        let t = t.trim();
-        if t.is_empty() {
-            continue;
-        }
+        let Some(t) = trimmed_prefix(p, caps.heading_bytes) else { continue };
         if out.len() >= caps.headings {
             return (out, true);
         }
-        out.push((level.saturating_add(1), cut(t.to_string(), caps.heading_bytes)));
+        out.push((level.saturating_add(1), t));
     }
     (out, false)
+}
+
+/// Borrow visible characters, including inline results, without cloning text or objects.
+fn final_chars(p: &Paragraph, from: usize, to: usize) -> impl Iterator<Item = char> + '_ {
+    final_parts(p, from, to).flat_map(str::chars)
+}
+
+fn final_parts(p: &Paragraph, from: usize, to: usize) -> impl Iterator<Item = &str> {
+    let from = floor_boundary(&p.text, from);
+    let to = floor_boundary(&p.text, to).max(from);
+    let mut objects = p.objects.iter().skip(p.text.get(..from).unwrap_or_default().matches(OBJ).count());
+    let mut runs = p
+        .runs
+        .iter()
+        .scan(0usize, |start, run| {
+            let end = start.saturating_add(run.len);
+            let range = *start..end;
+            *start = end;
+            Some((range, &run.props))
+        })
+        .peekable();
+    p.text.get(from..to).unwrap_or_default().char_indices().filter_map(move |(i, c)| {
+        let i = from.saturating_add(i);
+        while runs.peek().is_some_and(|(range, _)| range.end <= i) {
+            runs.next();
+        }
+        let deleted = runs.peek().is_some_and(|(range, props)| range.contains(&i) && props.del.is_some());
+        let text = if c == OBJ {
+            objects.next().map(|o| o.plain_text()).unwrap_or_default()
+        } else {
+            p.text.get(i..i.saturating_add(c.len_utf8())).unwrap_or_default()
+        };
+        (!deleted).then_some(text)
+    })
+}
+
+/// Read a UTF-8 prefix, inspecting only the first character beyond the byte budget.
+fn prefix(chars: &mut std::iter::Peekable<impl Iterator<Item = char>>, max: usize) -> (String, bool) {
+    let mut text = String::new();
+    while let Some(&c) = chars.peek() {
+        if text.len().saturating_add(c.len_utf8()) > max {
+            return (text, true);
+        }
+        text.push(c);
+        chars.next();
+    }
+    (text, false)
+}
+
+/// Trim as before, but retain only the prefix (even for a huge inline field result).
+fn trimmed_prefix(p: &Paragraph, max: usize) -> Option<String> {
+    let mut chars = final_chars(p, 0, p.text.len()).skip_while(|c| c.is_whitespace()).peekable();
+    chars.peek()?;
+    let (mut text, shortened) = prefix(&mut chars, max);
+    if !shortened || (text.ends_with(char::is_whitespace) && !chars.any(|c| !c.is_whitespace())) {
+        text.truncate(text.trim_end().len());
+    }
+    Some(text)
+}
+
+/// Drop trailing newlines lazily, as plain-text table cells do.
+fn trim_newlines(chars: impl Iterator<Item = char>) -> impl Iterator<Item = char> {
+    let mut chars = chars.peekable();
+    let mut pending = 0usize;
+    std::iter::from_fn(move || {
+        if pending > 0 {
+            pending -= 1;
+            return Some('\n');
+        }
+        let c = chars.next()?;
+        if c == '\n' {
+            while chars.peek() == Some(&'\n') {
+                chars.next();
+                pending = pending.saturating_add(1);
+            }
+            if chars.peek().is_none() {
+                pending = 0;
+                return None;
+            }
+        }
+        Some(c)
+    })
+}
+
+/// The final text walk's table separators, with borrowed paragraphs and a bounded depth.
+fn block_chars(block: &Block, depth: usize) -> Box<dyn Iterator<Item = char> + '_> {
+    if depth > 16 {
+        return Box::new(std::iter::empty());
+    }
+    match block {
+        Block::Para(p) => Box::new(final_chars(p, 0, p.text.len()).chain(std::iter::once('\n'))),
+        Block::Table(table) => Box::new(table.rows.iter().flat_map(move |row| {
+            row.cells
+                .iter()
+                .enumerate()
+                .flat_map(move |(i, cell)| {
+                    (i > 0)
+                        .then_some('\t')
+                        .into_iter()
+                        .chain(trim_newlines(blocks_chars(&cell.blocks, depth + 1)).map(|c| if c == '\n' { ' ' } else { c }))
+                })
+                .chain(std::iter::once('\n'))
+        })),
+    }
+}
+
+fn blocks_chars(blocks: &Blocks, depth: usize) -> impl Iterator<Item = char> + '_ {
+    blocks.iter().flat_map(move |block| block_chars(block, depth))
+}
+
+/// Match copy_range's partial paragraphs and whole-table cases without copying a fragment.
+fn selection_chars<'a>(doc: &'a Document, a: &Pos, b: &Pos) -> impl Iterator<Item = char> + 'a {
+    let chars: Box<dyn Iterator<Item = char> + 'a> = if a.story != b.story {
+        Box::new(std::iter::empty())
+    } else if a.path.parent() == b.path.parent() {
+        let (first, last, from, to) = (a.path.last(), b.path.last(), a.off, b.off);
+        Box::new(doc.container(a.story, &a.path).into_iter().flat_map(move |blocks| {
+            blocks.iter().enumerate().skip(first).take(last.saturating_sub(first).saturating_add(1)).flat_map(move |(i, block)| match &**block {
+                Block::Para(p) => Box::new(
+                    final_chars(p, if i == first { from } else { 0 }, if i == last { to } else { p.text.len() }).chain(std::iter::once('\n')),
+                ) as Box<dyn Iterator<Item = char>>,
+                Block::Table(_) => block_chars(block, 0),
+            })
+        }))
+    } else if let Some(table) = doc.whole_table(a, b).and_then(|path| doc.block(a.story, &path)) {
+        block_chars(table, 0)
+    } else {
+        let (a, b) = (a.clone(), b.clone());
+        Box::new(doc.paths_between(&a, &b).into_iter().flat_map(move |path| {
+            let Some(p) = doc.para(a.story, &path) else { return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = char>> };
+            Box::new(
+                final_chars(p, if path == a.path { a.off } else { 0 }, if path == b.path { b.off } else { p.text.len() })
+                    .chain(std::iter::once('\n')),
+            ) as Box<dyn Iterator<Item = char>>
+        }))
+    };
+    // Document::final_text removes exactly the final paragraph/row separator.
+    let mut chars = chars.peekable();
+    std::iter::from_fn(move || {
+        let c = chars.next()?;
+        if c == '\n' && chars.peek().is_none() { None } else { Some(c) }
+    })
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use std::cell::Cell;
+    use wordcraft_doc::{Block, Paragraph, Run, StoryRef, Table, para_block, props::CharProps};
+
+    #[test]
+    fn prefix_stops_reading_when_the_utf8_budget_is_full() {
+        let reads = Cell::new(0);
+        let chars = "日本語".repeat(1000);
+        let chars = chars.chars().inspect(|_| reads.set(reads.get() + 1));
+        assert_eq!(prefix(&mut chars.peekable(), 7), ("日本".into(), true));
+        assert_eq!(reads.get(), 3, "read only the prefix and the first character that does not fit");
+        assert_eq!(prefix(&mut "日本".chars().peekable(), 6), ("日本".into(), false));
+        assert_eq!(prefix(&mut "日".chars().peekable(), 0), (String::new(), true));
+    }
+
+    #[test]
+    fn selected_prefix_matches_copying_for_ranges_deletions_and_tables() {
+        let mut doc = Document::from_text("Start日本\nSecond\nLast");
+        doc.para_mut(StoryRef::Body, &Path::top(1)).unwrap().format(1, 4, &|p| p.del = Some(1)).unwrap();
+        let mut table = Table::new(2, 2, 400.0);
+        for (i, row) in table.rows.iter_mut().enumerate() {
+            for (j, cell) in row.cells.iter_mut().enumerate() {
+                cell.blocks = vec![para_block(Paragraph::with_text(&format!("Cell {i} {j}"), CharProps::default()))];
+            }
+        }
+        doc.body.insert(2, std::sync::Arc::new(Block::Table(table)));
+        let a = Pos::body(0, 2);
+        let b = Pos::body(3, 2);
+        let all = doc.para_paths(StoryRef::Body);
+        let mut ranges = vec![(a, b), (Pos::body(0, 1), Pos::body(1, 0))];
+        let inside: Vec<_> = all.iter().filter(|p| p.0.len() > 1).collect();
+        let first = inside.first().unwrap();
+        let last = inside.last().unwrap();
+        ranges.push((Pos { story: StoryRef::Body, path: (*first).clone(), off: 0 }, Pos { story: StoryRef::Body, path: (*last).clone(), off: 8 }));
+        ranges.push((Pos { story: StoryRef::Body, path: (*first).clone(), off: 2 }, Pos { story: StoryRef::Body, path: (*last).clone(), off: 3 }));
+        for (a, b) in ranges {
+            let expected = doc.copy_range(&a, &b).to_document().final_text(StoryRef::Body);
+            for max in [0, 1, 7, 1000] {
+                let caps = Caps { selection_bytes: max, ..Caps::default() };
+                let (actual, shortened) = selected(&doc, &a, &b, &caps);
+                assert_eq!(actual, cut(expected.clone(), max), "{a:?}..{b:?}, cap {max}");
+                assert_eq!(shortened, actual.len() < expected.len());
+            }
+        }
+    }
+
+    #[test]
+    fn context_reads_inline_results_without_deletions_and_trims_neighbors() {
+        let mut doc = Document::from_text("before\nselected\nafter");
+        let p = doc.para_mut(StoryRef::Body, &Path::top(0)).unwrap();
+        p.text = "隠す\u{fffc} end  ".into();
+        p.runs = vec![
+            Run { len: 6, props: CharProps { del: Some(1), ..CharProps::default() } },
+            Run { len: p.text.len() - 6, props: CharProps::default() },
+        ];
+        p.objects = vec![wordcraft_doc::InlineObject::Field {
+            instr: String::new(),
+            result: "  日本語 ".repeat(1000),
+            locked: false,
+            dirty: false,
+            code: false,
+            form: String::new(),
+        }];
+        p.props.outline_level = Some(0);
+        let caps = Caps { paragraph_bytes: 7, heading_bytes: 7, ..Caps::default() };
+        let a = Pos::body(1, 0);
+        let b = Pos::body(1, 8);
+        assert_eq!(around(&doc, &a, &b, &caps).0, ["日本"]);
+        assert_eq!(outline(&doc, &caps).0, [(1, "日本".into())]);
+        let p = doc.para(StoryRef::Body, &Path::top(0)).unwrap();
+        let a = Pos::body(0, 6);
+        let b = Pos::body(0, 9);
+        let caps = Caps { selection_bytes: 7, ..caps };
+        assert_eq!(selected(&doc, &a, &b, &caps), (cut(p.objects[0].plain_text().to_string(), 7), true));
+        let expected_lead: String = p.objects[0].plain_text().chars().rev().take(7).collect();
+        let expected_lead: String = expected_lead.chars().rev().collect();
+        let (lead, _) = edges(&doc, &b, &b, &caps);
+        assert_eq!(lead, tail(&expected_lead, caps.paragraph_bytes).trim_start());
+        let (_, trail) = edges(&doc, &a, &a, &caps);
+        assert_eq!(trail, cut(p.objects[0].plain_text().to_string(), caps.paragraph_bytes).trim_end());
+    }
+
+    #[test]
+    fn paragraph_caps_preserve_marks_and_trimmed_prefixes_preserve_whitespace() {
+        let doc = Document::from_text("first\n日本語\nlast");
+        let a = Pos::body(0, 2);
+        let b = Pos::body(2, 0);
+        let caps = Caps { selection_paragraphs: 1, ..Caps::default() };
+        assert_eq!(selected(&doc, &a, &b, &caps), ("rst".into(), true));
+        let caps = Caps { selection_paragraphs: 2, ..caps };
+        assert_eq!(selected(&doc, &a, &b, &caps), ("rst\n日本語\n".into(), false));
+        for text in ["  a   ", "  a b  ", " 日本\t語\n ", "  ", ""] {
+            let p = Paragraph::with_text(text, CharProps::default());
+            for max in 0..15 {
+                let expected = (!text.trim().is_empty()).then(|| cut(text.trim().to_string(), max));
+                assert_eq!(trimmed_prefix(&p, max), expected, "{text:?}, cap {max}");
+            }
+        }
+    }
 }

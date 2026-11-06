@@ -96,7 +96,7 @@ pub struct Assistant {
     seat: Seat,
     room: Arc<Room>,
     jobs: Sender<Job>,
-    events: Receiver<Event>,
+    events: Option<Receiver<Event>>,
     cancel: Cancel,
     permissions: Permissions,
     transcript: Transcript,
@@ -144,7 +144,7 @@ impl Assistant {
             seat,
             room: room.clone(),
             jobs: jobs_tx,
-            events: events_rx,
+            events: Some(events_rx),
             cancel,
             permissions,
             transcript: Transcript::default(),
@@ -240,7 +240,8 @@ impl Assistant {
     pub fn poll(&mut self) -> usize {
         let mut n = 0;
         while n < MAX_EVENTS_PER_POLL {
-            match self.events.try_recv() {
+            let Some(events) = &self.events else { break };
+            match events.try_recv() {
                 Ok(e) => {
                     n += 1;
                     if e.ends_turn() {
@@ -287,7 +288,8 @@ impl Assistant {
 
     /// End the conversation: stop the turn, take the invite back (every copy that joined with
     /// it is out of the room, so nothing more of the assistant's reaches the document), and let
-    /// the thread end its backend. Never waits for the thread. Ending twice does nothing.
+    /// the thread end its backend. Pending events are dropped; the transcript is kept.
+    /// Never waits for the thread. Ending twice does nothing.
     pub fn end(&mut self) {
         if self.ended {
             return;
@@ -295,6 +297,9 @@ impl Assistant {
         self.ended = true;
         self.cancel.set();
         self.permissions.cancel();
+        // Disconnect retained conversations so a full queue cannot block backend cleanup.
+        self.events = None;
+        self.busy = false;
         self.room.revoke(&self.seat.key);
         let _ = self.jobs.send(Job::End);
         log::info!("assistant {} ({:?}) left the shared document", self.info.id, self.seat.name);

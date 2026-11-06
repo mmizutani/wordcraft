@@ -541,6 +541,43 @@ fn a_backend_can_t_end_its_turn_early_and_its_errors_don_t_end_it_either() {
 }
 
 #[test]
+fn ending_an_unpolled_conversation_releases_a_full_event_queue() {
+    struct Chatty(std::sync::mpsc::Sender<()>);
+    impl crate::Backend for Chatty {
+        fn info(&self) -> crate::BackendInfo {
+            crate::Backend::info(&Fake::new())
+        }
+        fn turn(&mut self, _: &crate::Turn, ctx: &mut crate::TurnCtx<'_>) -> Result<StopReason, String> {
+            for _ in 0..=crate::backend::MAX_QUEUED_EVENTS {
+                ctx.say("x");
+            }
+            Ok(StopReason::EndTurn)
+        }
+        fn end(&mut self) {
+            self.0.send(()).unwrap();
+        }
+    }
+    let w = Window::new("x");
+    let (full_tx, full_rx) = std::sync::mpsc::channel();
+    let wakes = AtomicUsize::new(0);
+    let wake = Arc::new(move || {
+        if wakes.fetch_add(1, Ordering::SeqCst) == crate::backend::MAX_QUEUED_EVENTS {
+            full_tx.send(()).unwrap();
+        }
+    });
+    let (ended_tx, ended_rx) = std::sync::mpsc::channel();
+    let mut a = Assistant::start(&w.room, Box::new(Chatty(ended_tx)), Options { wake: Some(wake), ..Options::default() }).unwrap();
+    a.ask("talk", None).unwrap();
+    // The wake on a full queue happens before its sender blocks; never poll or drop `a`.
+    full_rx.recv_timeout(WAIT).unwrap();
+    a.end();
+    ended_rx.recv_timeout(Duration::from_secs(2)).expect("the full queue kept the backend from ending");
+    assert!(a.has_ended());
+    assert!(!a.is_busy());
+    assert!(a.transcript().entries().any(|e| matches!(e, Entry::Asked { text } if text == "talk")));
+}
+
+#[test]
 fn a_chatty_backend_waits_for_the_window_instead_of_piling_up_events() {
     let w = Window::new("x");
     let steps: Vec<Step> = (0..3 * crate::backend::MAX_QUEUED_EVENTS).map(|_| Step::say("x")).collect();

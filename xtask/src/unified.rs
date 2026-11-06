@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Package (`name vX (source)`) → its features, as `cargo tree` resolves them for `edges`.
 fn features(edges: &str) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
     let out = crate::cargo()
-        .args(["tree", "--workspace", "--locked", "--prefix", "none", "-f", "{p}|{f}", "-e", edges])
+        .args(["tree", "--color", "never", "--workspace", "--locked", "--prefix", "none", "-f", "{p}|{f}", "-e", edges])
         .output()
         .map_err(|e| format!("cargo tree: {e}"))?;
     if !out.status.success() {

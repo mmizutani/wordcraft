@@ -534,6 +534,11 @@ impl Permissions {
         let until = Instant::now() + timeout;
         let mut a = self.lock();
         loop {
+            if cancel.is_set() {
+                a.waiting = None;
+                a.answer = None;
+                return Answer::Cancelled;
+            }
             if a.waiting == Some(id)
                 && let Some(answer) = a.answer.take()
             {
@@ -541,7 +546,7 @@ impl Permissions {
                 return answer;
             }
             let left = until.saturating_duration_since(Instant::now());
-            if cancel.is_set() || left.is_zero() || a.waiting != Some(id) {
+            if left.is_zero() || a.waiting != Some(id) {
                 a.waiting = None;
                 return Answer::Cancelled;
             }
@@ -655,16 +660,12 @@ impl TurnCtx<'_> {
                 self.permissions.wait(id, self.cancel, PERMISSION_TIMEOUT)
             }
             PermissionPolicy::Reject => {
-                let a = pick(false);
-                self.permissions.answer(id, a.clone());
-                self.permissions.wait(id, self.cancel, Duration::ZERO);
-                a
+                self.permissions.answer(id, pick(false));
+                self.permissions.wait(id, self.cancel, Duration::ZERO)
             }
             PermissionPolicy::Allow => {
-                let a = pick(true);
-                self.permissions.answer(id, a.clone());
-                self.permissions.wait(id, self.cancel, Duration::ZERO);
-                a
+                self.permissions.answer(id, pick(true));
+                self.permissions.wait(id, self.cancel, Duration::ZERO)
             }
         };
         if self.policy != PermissionPolicy::Ask {
@@ -700,4 +701,42 @@ pub trait Backend: Send {
     /// The conversation ended: stop what it started (kill the agent process, close
     /// connections). Called once, on the conversation's thread.
     fn end(&mut self) {}
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_wins_over_a_queued_permission_answer() {
+        let permissions = Permissions::default();
+        let cancel = Cancel::default();
+        let id = permissions.open();
+        assert!(permissions.answer(id, Answer::Selected { option: "allow".into() }));
+        cancel.set();
+        assert_eq!(permissions.wait(id, &cancel, Duration::ZERO), Answer::Cancelled);
+        assert_eq!(permissions.waiting(), None);
+    }
+
+    #[test]
+    fn automatic_permission_policies_honor_a_stopped_turn() {
+        for policy in [PermissionPolicy::Allow, PermissionPolicy::Reject] {
+            let permissions = Permissions::default();
+            let cancel = Cancel::default();
+            cancel.set();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(4);
+            let events = Events::new(tx, None);
+            let mut tools = NoTools;
+            let ctx = TurnCtx { tools: &mut tools, events: &events, cancel: &cancel, permissions: &permissions, policy, calls: 0 };
+            let request = PermissionRequest::bounded(
+                "Edit",
+                [
+                    PermissionOption { id: "allow".into(), name: "Allow".into(), kind: PermissionKind::AllowOnce },
+                    PermissionOption { id: "reject".into(), name: "Reject".into(), kind: PermissionKind::RejectOnce },
+                ],
+            );
+            assert_eq!(ctx.ask(request), Answer::Cancelled, "{policy:?}");
+            assert_eq!(permissions.waiting(), None);
+        }
+    }
 }
