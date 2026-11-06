@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use wordcraft_engine::room::{Lobby, Replica, hosted};
+use wordcraft_engine::room::{Lobby, ParticipantId, Replica, Room, hosted};
 use wordcraft_mcp::server::{BoundedLine, read_bounded_line};
 
 /// Longest request line; a longer one is refused and the connection closed.
@@ -132,18 +132,30 @@ fn accept(listener: &TcpListener, lobby: &Lobby, open: &AtomicBool, first: Durat
 
 /// The read side of a connection, with an overall deadline while it has one: each read waits
 /// only for the time left, so blank lines or a slow drip of bytes can't extend it.
+/// Authenticated reads keep partial lines while checking that the participant is still in.
 struct Deadline {
     stream: TcpStream,
     until: Option<Instant>,
+    participant: Option<(Arc<Room>, ParticipantId)>,
 }
 
 impl Read for Deadline {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(until) = self.until {
-            let left = until.checked_duration_since(Instant::now()).filter(|l| !l.is_zero()).ok_or(std::io::ErrorKind::TimedOut)?;
-            self.stream.set_read_timeout(Some(left))?;
+        loop {
+            let timeout = if let Some(until) = self.until {
+                until.checked_duration_since(Instant::now()).filter(|l| !l.is_zero()).ok_or(std::io::ErrorKind::TimedOut)?
+            } else {
+                if self.participant.as_ref().is_some_and(|(room, id)| room.is_closed() || !room.is_in(*id)) {
+                    return Ok(0);
+                }
+                Duration::from_millis(250)
+            };
+            self.stream.set_read_timeout(Some(timeout))?;
+            match self.stream.read(buf) {
+                Err(e) if self.until.is_none() && matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => continue,
+                result => return result,
+            }
         }
-        self.stream.read(buf)
     }
 }
 
@@ -215,7 +227,7 @@ fn serve(stream: TcpStream, lobby: &Lobby, first: Duration) {
     let _ = stream.set_nodelay(true);
     let Ok(read) = stream.try_clone() else { return };
     let mut out = stream;
-    let mut reader = BufReader::new(Deadline { stream: read, until: Some(Instant::now() + first) });
+    let mut reader = BufReader::new(Deadline { stream: read, until: Some(Instant::now() + first), participant: None });
     let Some(request) = next_request(&mut reader, &mut out) else { return };
     let key = request.key.clone().unwrap_or_default();
     let copy = match lobby.join_with(&key) {
@@ -227,7 +239,7 @@ fn serve(stream: TcpStream, lobby: &Lobby, first: Duration) {
     };
     let deadline = reader.get_mut();
     deadline.until = None;
-    let _ = deadline.stream.set_read_timeout(None);
+    deadline.participant = Some((copy.room().clone(), copy.id()));
     serve_copy(&mut reader, &mut out, copy, &key, request);
 }
 
@@ -416,8 +428,6 @@ mod tests {
         let mut c = Conn::open(&port);
         assert_eq!(c.call(&json!({"id": 1, "key": key, "method": "document.inspect"}).to_string())["ok"], json!(true));
         assert!(room.revoke(&key));
-        let reply = c.call(&json!({"id": 2, "method": "document.inspect"}).to_string());
-        assert_eq!(reply["ok"], json!(false), "{reply}");
         assert!(c.closed());
         // The key opens nothing any more.
         let mut c = Conn::open(&port);
@@ -427,8 +437,52 @@ mod tests {
         let mut c = Conn::open(&port);
         assert_eq!(c.call(&json!({"id": 4, "key": key, "method": "document.inspect"}).to_string())["ok"], json!(true));
         lobby.close();
-        assert_eq!(c.call(&json!({"id": 5, "method": "document.inspect"}).to_string())["ok"], json!(false));
         assert!(c.closed());
+    }
+
+    #[test]
+    fn idle_connections_release_their_slots_when_invites_or_rooms_end() {
+        let lobby = Lobby::default();
+        let port = RoomPort::open(&lobby).unwrap();
+        let (_session, room, _own) = share(&lobby);
+        for stop_sharing in [false, true] {
+            let key = room.invite(if stop_sharing { "Closing agent" } else { "Revoked agent" }, Role::Viewer).unwrap();
+            let mut connections = Vec::new();
+            for _ in 0..super::MAX_CONNECTIONS {
+                let mut c = Conn::open(&port);
+                assert_eq!(c.call(&json!({"key": key, "method": "auth"}).to_string())["ok"], json!(true));
+                c.0.get_ref().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                connections.push(c);
+            }
+            if stop_sharing {
+                lobby.close();
+            } else {
+                assert!(room.revoke(&key));
+            }
+            for mut c in connections {
+                assert_eq!(c.0.read_line(&mut String::new()).unwrap(), 0, "idle socket stayed open");
+            }
+        }
+        // A new room uses the listener after all the old connection slots were released.
+        let (_session, room, _own) = share(&lobby);
+        let key = room.invite("New agent", Role::Viewer).unwrap();
+        let mut c = Conn::open(&port);
+        assert_eq!(c.call(&json!({"key": key, "method": "auth"}).to_string())["ok"], json!(true));
+    }
+
+    #[test]
+    fn an_authenticated_partial_request_survives_idle_read_checks() {
+        let lobby = Lobby::default();
+        let port = RoomPort::open(&lobby).unwrap();
+        let (_session, room, _own) = share(&lobby);
+        let key = room.invite("Slow agent", Role::Viewer).unwrap();
+        let mut c = Conn::open(&port);
+        assert_eq!(c.call(&json!({"key": key, "method": "auth"}).to_string())["ok"], json!(true));
+        c.1.write_all(b"{\"id\":2,").unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        c.send("\"method\":\"document.inspect\"}");
+        let reply = c.recv();
+        assert_eq!((reply["id"].clone(), reply["ok"].clone()), (json!(2), json!(true)));
     }
 
     #[test]
