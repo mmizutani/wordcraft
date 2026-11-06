@@ -218,7 +218,7 @@ impl WordApp {
         };
         // The assistant's commands checked their params and asked the window: it does what they
         // ask now, and answers for them ([`crate::assist`]).
-        let r = if r.is_ok() && id.starts_with("assist.") { crate::assist::take_requests(self).unwrap_or(r) } else { r };
+        let r = crate::assist::after_command(self, id, r);
         if self.session.ime_body_epoch() != body_epoch {
             self.canvas.ime_interrupted_preedit |= composing_before;
             // The body (or the whole document) was replaced under the same id — setText, a
@@ -330,8 +330,11 @@ impl WordApp {
         let retry = (id == "file.open").then(|| params.clone());
         let retry_path = retry.clone();
         // The person asked for it: a turn of the assistant's it starts asks them its agent's
-        // permission requests ([`crate::assist`]). The origin is restored on every return.
-        let by_person = std::mem::replace(&mut self.assist.by_person, true);
+        // permission requests ([`crate::assist`]). A click or key the control channel made
+        // (MCP's `click` and `key`) is a program's, not theirs. The origin is restored on every
+        // return.
+        let person = !self.ctx.as_ref().map_or(self.synthetic_pending, |ctx| self.input_from_control(ctx));
+        let by_person = std::mem::replace(&mut self.assist.by_person, person);
         let r = self.execute(id, params);
         self.assist.by_person = by_person;
         if let (Err(e), Some(params)) = (&r, retry)

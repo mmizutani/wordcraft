@@ -111,8 +111,8 @@ fn the_assistant_s_tool_calls_are_tracked_changes_in_its_name_and_the_window_see
     let pieces = t.entries().filter(|e| matches!(e, Entry::Answer { .. })).count();
     assert_eq!(pieces, 2, "the text before the tool calls is one piece, merged from its chunks");
     assert_eq!(tool_rows(t), [("select_text".to_string(), ToolStatus::Completed), ("type_text".to_string(), ToolStatus::Completed)]);
-    let changed: Vec<Option<u64>> = t.entries().filter_map(|e| if let Entry::Tool(c) = e { Some(c.version) } else { None }).collect();
-    assert!(changed[1].is_some(), "the edit says which version it made: {changed:?}");
+    let changed: Vec<Option<crate::Versions>> = t.entries().filter_map(|e| if let Entry::Tool(c) = e { Some(c.changes) } else { None }).collect();
+    assert!(changed[0].is_none() && changed[1].is_some(), "the edit says which versions it made: {changed:?}");
     assert!(t.entries().any(|e| matches!(e, Entry::Model { name } if name == "scripted")));
     // The backend began with its seat and got the note on the first turn only.
     let seen = fake_seen.lock().unwrap().clone();
@@ -538,7 +538,7 @@ fn hostile_permission_requests_and_events_are_held_to_the_pane_s_limits() {
             kind: "edit".into(),
             status: ToolStatus::Completed,
             detail: "d".repeat(4000),
-            version: None,
+            changes: None,
         }));
     }
     assert!(t.len() <= crate::transcript::MAX_ENTRIES);
@@ -695,7 +695,8 @@ fn a_batch_stops_once_the_turn_is_stopped_and_holds_its_output_to_the_budget() {
     cancel.clear();
     let out = tools.call("batch", &three);
     assert!(out.ok, "{}", out.text);
-    assert!(out.version.is_some());
+    let changes = out.changes.map(|c| (c.first, c.last));
+    assert_eq!(changes, Some((1, 2)), "the batch's changes: one per command that changed the document");
     w.settle();
     assert_eq!(w.text(), "one two three four five");
     // An error stops it unless it keeps going, as the MCP server's batch does.

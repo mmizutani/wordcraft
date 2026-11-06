@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use wordcraft_assist::{Assistant, Backend, Caps, Context, Host, Offer, Options, PermissionPolicy, Readiness};
+use wordcraft_assist::{Answer, Assistant, Backend, Caps, Context, Host, Offer, Options, PermissionPolicy, Readiness};
 use wordcraft_engine::cmd::assist::AssistantStatus;
 use wordcraft_engine::room::Role;
 
@@ -57,8 +57,9 @@ pub(crate) struct AssistState {
     /// The command running now is the person's ([`WordApp::run`]: the pane, a menu, a
     /// shortcut), not a program's: a turn it asks for asks them its agent's permission requests.
     pub(crate) by_person: bool,
-    /// The permission request the pane last opened for: it opens once for each, so the person
-    /// sees what the turn waits for, and stays closed if they close it.
+    /// The permission request of the conversation the pane last opened for: it opens once for
+    /// each, so the person sees what the turn waits for; closed while it waits, the request is
+    /// answered cancelled. A new conversation numbers its requests from 1 again.
     opened_for: Option<u64>,
     /// How many changes the conversation's assistant has in the document, and for which
     /// (document, revision, name): Accept all and Reject all are greyed out without any.
@@ -142,18 +143,25 @@ fn status(app: &WordApp) -> AssistantStatus {
 /// Every frame: take what came back, end a conversation whose shared document closed, ask
 /// again what is offered now and then, and tell the session what the assistant can do.
 pub(crate) fn tick(app: &mut WordApp) {
+    sync_unattended(app);
     if let Some(c) = app.assist.conversation.as_mut() {
         c.assistant.poll();
         if c.assistant.room().is_closed() {
             c.assistant.end();
         }
     }
-    // A permission request waits for the person: the pane opens to ask them.
-    if let Some(id) = app.conversation().and_then(Assistant::pending_permission).map(|r| r.id)
-        && app.assist.opened_for != Some(id)
-    {
-        app.assist.opened_for = Some(id);
-        app.session.view.assistant_pane = true;
+    // A permission request waits for the person: the pane opens to ask them. Closed while it
+    // waits (Home › Assistant, the pane's close), the request is answered cancelled, so the
+    // turn doesn't wait, hidden, for an answer no one can give.
+    if let Some(id) = app.conversation().and_then(Assistant::pending_permission).map(|r| r.id) {
+        if app.assist.opened_for != Some(id) {
+            app.assist.opened_for = Some(id);
+            app.session.view.assistant_pane = true;
+        } else if !app.session.view.assistant_pane
+            && let Some(a) = app.conversation_mut()
+        {
+            a.answer(id, Answer::Cancelled);
+        }
     }
     let stale = match app.assist.offers_at {
         None => true,
@@ -163,6 +171,18 @@ pub(crate) fn tick(app: &mut WordApp) {
         refresh_offers(app);
     }
     app.session.assistant = status(app);
+}
+
+/// After command `id` ran in the window with result `r`: for an `assist.*` command, act on the
+/// requests it made (the last one's answer is the result), and tell the conversation the
+/// setting for requests no one can answer, which holds from a running turn's next request.
+pub(crate) fn after_command(app: &mut WordApp, id: &str, r: Result<Value, String>) -> Result<Value, String> {
+    if !id.starts_with("assist.") {
+        return r;
+    }
+    let r = if r.is_ok() { take_requests(app).unwrap_or(r) } else { r };
+    sync_unattended(app);
+    r
 }
 
 /// Act on the `assist` requests the command that just ran made, taking them out of the
@@ -217,7 +237,10 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
             Ok(json!({"switched": switched}))
         }
         "backend" => backend(app, req.get("id").and_then(Value::as_str)),
-        "show" => show_change(app, req.get("version").and_then(Value::as_u64).unwrap_or(0)),
+        "show" => {
+            let last = req.get("version").and_then(Value::as_u64).unwrap_or(0);
+            show_change(app, req.get("from").and_then(Value::as_u64).unwrap_or(last), last)
+        }
         other => Err(format!("`{}`: not an assistant request", other.chars().take(40).collect::<String>())),
     };
     app.session.assistant = status(app);
@@ -241,19 +264,27 @@ fn backend(app: &mut WordApp, id: Option<&str>) -> Result<Value, String> {
     Ok(json!({"chosen": chosen(app).map(|o| o.id.clone()), "offers": app.assist.offers}))
 }
 
-/// Select what the change that made `version` of the shared document put in or changed, as the
-/// document is now, and open the Review tab, where Accept and Reject act on the selection.
-fn show_change(app: &mut WordApp, version: u64) -> Result<Value, String> {
-    let r = show_change_inner(app, version);
+/// Select what the conversation's assistant put in or changed in versions `first` to `last` of
+/// the shared document (a tool call's), as the document is now, and open the Review tab, where
+/// Accept and Reject act on the selection. Others' changes among those versions are left out.
+fn show_change(app: &mut WordApp, first: u64, last: u64) -> Result<Value, String> {
+    let r = show_change_inner(app, first, last);
     app.assist.notice = r.as_ref().err().cloned();
     r
 }
 
-fn show_change_inner(app: &mut WordApp, version: u64) -> Result<Value, String> {
+fn show_change_inner(app: &mut WordApp, first: u64, last: u64) -> Result<Value, String> {
     let room = app.shared_room().filter(|_| app.shows_shared_document()).ok_or("the document the assistant changed isn't the one shown")?;
+    // The versions are the conversation's room's: once it closed, they mean nothing in the
+    // document shared since.
+    let (theirs, name) = app.conversation().map(|a| (a.room().clone(), a.name().to_string())).ok_or("no conversation made that change")?;
+    if theirs.is_closed() || !Arc::ptr_eq(&theirs, &room) {
+        return Err("that change was made while another sharing of the document was on: look for it in the Review tab".into());
+    }
     // What the room took since the last frame, the change among it.
     app.catch_up_share();
-    let (anchor, focus) = room.where_changed(version).ok_or("that change isn't in the document any more: look for it in the Review tab")?;
+    let (anchor, focus) =
+        room.where_changed(first..=last, Some(&name)).ok_or("that change isn't in the document any more: look for it in the Review tab")?;
     let doc = &app.session.doc;
     let (Some(anchor), Some(focus)) = (doc.pos_of(anchor, None), doc.pos_of(focus, None)) else {
         return Err("the text that change made isn't in the document any more".into());
@@ -261,13 +292,21 @@ fn show_change_inner(app: &mut WordApp, version: u64) -> Result<Value, String> {
     let range = json!({"anchor": wordcraft_engine::cmd::pos_json(&anchor), "focus": wordcraft_engine::cmd::pos_json(&focus)});
     app.execute("select.range", range)?;
     app.execute("ui.tab", json!({"tab": "Review"}))?;
-    Ok(json!({"version": version, "shown": true}))
+    Ok(json!({"version": last, "from": first, "shown": true}))
 }
 
 /// How a turn no one can answer (one a program asked for) answers its agent's permission
 /// requests: per the person's setting (`assist.allowUnattended`), refused unless they allowed it.
 fn unattended(app: &WordApp) -> PermissionPolicy {
     if app.session.prefs.assistant.allow_unattended { PermissionPolicy::Allow } else { PermissionPolicy::Reject }
+}
+
+/// Tell the conversation the person's setting for requests no one can answer: a program's turn
+/// reads it for each request, so turning it off holds from a running turn's next one.
+pub(crate) fn sync_unattended(app: &WordApp) {
+    if let Some(c) = &app.assist.conversation {
+        c.assistant.set_unattended(app.session.prefs.assistant.allow_unattended);
+    }
 }
 
 /// End the conversation there is, if any (its transcript stays for the pane).
@@ -380,6 +419,9 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
     };
     let assistant = Assistant::start(&room, backend, options).map_err(|e| e.to_string())?;
     app.assist.conversation = Some(Conversation { assistant, document: app.session.document_id() });
+    // Its requests are numbered from 1: the pane opens for each of them.
+    app.assist.opened_for = None;
+    sync_unattended(app);
     Ok(())
 }
 

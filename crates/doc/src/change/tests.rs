@@ -92,6 +92,24 @@ fn enter_splits_one_paragraph_into_two_and_positions_follow_their_text() {
     assert_same(&other, &after);
 }
 
+/// What a split put in is its paragraph break alone: from where it split to the start of the
+/// new paragraph. A place right where text was typed stays before it, or with `map_past`,
+/// moves past it.
+#[test]
+fn a_splice_says_where_the_text_it_put_in_is() {
+    let d = sample();
+    let (after, cs) = edit(&d, |d| {
+        d.split_paragraph(&Pos::body(2, 2)).unwrap();
+    });
+    let (three, new) = (d.body[2].id(), after.body[3].id());
+    assert_eq!(cs.splices[0].put_in(), Some((Mapped::At(Anchor { block: three, off: 2 }), Mapped::At(Anchor { block: new, off: 0 }))));
+    let (_, typed) = edit(&d, type_at(0, 1, "xyz"));
+    let one = d.body[0].id();
+    assert_eq!(typed.map(Anchor { block: one, off: 1 }), Mapped::At(Anchor { block: one, off: 1 }));
+    assert_eq!(typed.map_past(Anchor { block: one, off: 1 }), Mapped::At(Anchor { block: one, off: 4 }));
+    assert_eq!(typed.map_past(Anchor { block: one, off: 0 }), Mapped::At(Anchor { block: one, off: 0 }), "before it, it stays");
+}
+
 #[test]
 fn deleting_across_paragraphs_joins_them_and_maps_into_the_join() {
     let d = sample();

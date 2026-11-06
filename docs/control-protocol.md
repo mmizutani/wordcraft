@@ -104,7 +104,11 @@ Language packs (see [MCP](mcp.md#language-packs)) are commands like any other: `
 `proof.installPack {"locale": "nl"}` and `proof.removePack {"locale": "nl"}`. Through the control
 channel they act on the running app's packs, and install only while its downloading setting is on;
 they never turn it on, and neither does a `ui.click` or `ui.key` on the app's Install, Add a
-language… or Refresh buttons. An install or a refresh runs in the background
+language… or Refresh buttons. The assistant's consent is kept the same way: `ui.click` and
+`ui.key` never answer its permission or sign-in questions, never turn on File › Options ›
+Assistant › Allow what agents ask when no one can answer (`assist.allowUnattended` turns it off
+but not on), and a prompt they send from the Assistant pane is a program's, not the person's:
+its agent's requests are answered per that setting. An install or a refresh runs in the background
 (`"started": true`); `proof.packs` reports its progress, then the result.
 `ui.dialog {"name": "languageData"}` opens About › Language data.
 

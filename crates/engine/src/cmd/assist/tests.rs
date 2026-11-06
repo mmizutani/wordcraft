@@ -203,7 +203,8 @@ fn a_participants_copy_cant_run_the_assistant() {
 }
 
 /// What an agent asks in a turn no one can answer is refused unless the person allowed it: a
-/// preference of theirs, read back without a value.
+/// preference of theirs, read back without a value. Only the person turns it on, in File ›
+/// Options › Assistant: the command, which any script can run, turns it off but never on.
 #[test]
 fn requests_no_one_can_answer_are_refused_unless_allowed() {
     let mut s = Session::new(Document::new());
@@ -212,21 +213,30 @@ fn requests_no_one_can_answer_are_refused_unless_allowed() {
         assert!(matches!(s.run("assist.allowUnattended", &bad), Err(CmdError::Params(_))), "{bad}");
     }
     assert!(!s.prefs.assistant.allow_unattended);
-    assert_eq!(s.run("assist.allowUnattended", &json!({"value": true})).unwrap(), json!({"value": true}));
-    assert!(s.prefs.assistant.allow_unattended);
+    let e = s.run("assist.allowUnattended", &json!({"value": true})).unwrap_err();
+    assert!(e.to_string().contains("File › Options › Assistant"), "{e}");
+    assert!(!s.prefs.assistant.allow_unattended, "a script can't give the person's consent");
+    // The person ticked it in Options.
+    s.prefs.assistant.allow_unattended = true;
     assert_eq!(s.run("assist.allowUnattended", &json!({"value": null})).unwrap(), json!({"value": true}));
+    assert_eq!(s.run("assist.allowUnattended", &json!({"value": true})).unwrap(), json!({"value": true}), "already on");
     assert_eq!(s.run("assist.allowUnattended", &json!({"value": false})).unwrap(), json!({"value": false}));
+    assert!(!s.prefs.assistant.allow_unattended);
+    assert!(s.run("assist.allowUnattended", &json!({"value": true})).is_err(), "and off, it stays off");
     assert!(!s.can_undo(), "a preference, not an edit");
     assert_eq!(Scope::of("assist.allowUnattended"), Some(Scope::App));
 }
 
-/// Showing a tool call's change hands the window its version; anything but a version from 1 is
+/// Showing a tool call's change hands the window its versions (from its first, the last when
+/// only one is given); anything but versions from 1, the first no later than the last, is
 /// refused, and without a window there is nothing to show.
 #[test]
 fn showing_a_change_asks_the_window_for_its_version() {
     let mut s = in_window();
-    assert_eq!(s.run("assist.showChange", &json!({"version": 3})).unwrap(), json!({"version": 3}));
-    assert_eq!(requests(&mut s), [json!({"assist": "show", "version": 3})]);
+    assert_eq!(s.run("assist.showChange", &json!({"version": 3})).unwrap(), json!({"version": 3, "from": 3}));
+    assert_eq!(requests(&mut s), [json!({"assist": "show", "version": 3, "from": 3})]);
+    assert_eq!(s.run("assist.showChange", &json!({"version": 5, "from": 2})).unwrap(), json!({"version": 5, "from": 2}));
+    assert_eq!(requests(&mut s), [json!({"assist": "show", "version": 5, "from": 2})]);
     for bad in [
         json!({}),
         json!({"version": 0}),
@@ -234,6 +244,9 @@ fn showing_a_change_asks_the_window_for_its_version() {
         json!({"version": "3"}),
         json!({"version": 1.5}),
         json!({"version": u64::MAX as f64 * 2.0}),
+        json!({"version": 3, "from": 4}),
+        json!({"version": 3, "from": 0}),
+        json!({"version": 3, "from": "1"}),
     ] {
         assert!(matches!(s.run("assist.showChange", &bad), Err(CmdError::Params(_))), "{bad}");
     }

@@ -544,7 +544,8 @@ fn control_clicks_cannot_answer_an_assistant_permission() {
     let seen = fake.seen();
     a.assist_with(Box::new(fake));
     a.execute("assist.pane", json!({"value": true})).unwrap();
-    a.execute("assist.ask", json!({"prompt": "Ask permission"})).unwrap();
+    // The person's prompt: a program's turn wouldn't ask anyone.
+    a.run("assist.ask", json!({"prompt": "Ask permission"})).unwrap();
     let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
         |ui, app: &mut WordApp| {
             let ctx = ui.ctx().clone();
@@ -697,7 +698,9 @@ fn a_program_s_turn_answers_per_the_setting() {
             .count()
     };
     assert_eq!(refused(&a, "reject"), 1, "the conversation says how it was answered");
-    assert_eq!(a.execute("assist.allowUnattended", json!({"value": true})).unwrap(), json!({"value": true}));
+    assert!(a.execute("assist.allowUnattended", json!({"value": true})).is_err(), "only the person allows it");
+    // The person ticks it in File › Options › Assistant.
+    a.session.prefs.assistant.allow_unattended = true;
     ask(&mut a, "Again", None);
     assert_eq!(answers(&seen), [picked("reject"), picked("allow")]);
     // The person asks: the pane waits for them.
@@ -818,13 +821,13 @@ fn show_change_selects_what_a_tool_call_changed() {
         .transcript()
         .entries()
         .filter_map(|e| match e {
-            Entry::Tool(call) => call.version,
+            Entry::Tool(call) => call.changes.map(|c| c.last),
             _ => None,
         })
         .collect();
     assert_eq!(versions.len(), 1, "only type_text changed the document");
     let r = a.execute("assist.showChange", json!({"version": versions[0]})).unwrap();
-    assert_eq!(r, json!({"version": versions[0], "shown": true}));
+    assert_eq!(r, json!({"version": versions[0], "from": versions[0], "shown": true}));
     let (start, end) = a.session.sel.ordered();
     assert_eq!(a.session.doc.body.first().and_then(|b| b.as_para()).and_then(|p| p.text.get(start.off..end.off)), Some("2two"));
     assert!(a.assist.notice.is_none());
@@ -834,4 +837,276 @@ fn show_change_selects_what_a_tool_call_changed() {
     for bad in [json!({"version": 0}), json!({"version": "1"}), json!({})] {
         assert!(a.execute("assist.showChange", bad).is_err());
     }
+}
+
+/// What Show the change sends for each of the conversation's tool calls that changed the
+/// document, in order.
+fn shows(a: &WordApp) -> Vec<Value> {
+    a.conversation()
+        .unwrap()
+        .transcript()
+        .entries()
+        .filter_map(|e| match e {
+            Entry::Tool(call) => call.changes.map(|c| json!({"version": c.last, "from": c.first})),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The person's edits reach the room, and the window has all it took.
+fn shared(a: &mut WordApp) {
+    let ctx = egui::Context::default();
+    for _ in 0..4000 {
+        a.sync_share(&ctx);
+        super::tick(a);
+        if a.share_settled() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the window doesn't catch up");
+}
+
+/// A click or key the control channel made (MCP's `click`) isn't the person's: the turn it
+/// starts is a program's, whose requests are answered per the setting (refused), never shown
+/// to the person as their own.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_faked_click_starts_a_program_s_turn() {
+    use egui_kittest::kittest::Queryable;
+    let mut a = window("one");
+    let fake = Fake::new().then(vec![Step::Ask("Run a command?".into())]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.session.view.assistant_pane = true;
+    a.assist.prompt = "Go".into();
+    let mut h = harness(a);
+    let frame = |h: &mut egui_kittest::Harness<'_, WordApp>| {
+        let ctx = h.ctx.clone();
+        let mut raw = std::mem::take(h.input_mut());
+        h.state_mut().raw_input_hook(&ctx, &mut raw);
+        *h.input_mut() = raw;
+        h.step();
+    };
+    let pos = h.get_by_label("Send").rect().center();
+    let (req, _rx) = crate::control::ControlRequest::new("ui.click", json!({"x": pos.x, "y": pos.y}));
+    let ctx = h.ctx.clone();
+    assert!(matches!(crate::control::handle(h.state_mut(), &ctx, &req), crate::control::Outcome::Done(_)));
+    for _ in 0..4000 {
+        frame(&mut h);
+        let a = h.state();
+        if waiting(a) || (!answers(&seen).is_empty() && idle(a)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!waiting(h.state()), "a faked click doesn't ask the person");
+    assert_eq!(answers(&seen), [picked("reject")], "it is a program's turn, refused per the setting");
+    assert!(!h.state().assist.by_person);
+}
+
+/// A backend whose turn asks, waits for the test to go on, then asks again: the answers it got.
+#[cfg(not(target_arch = "wasm32"))]
+struct Gated {
+    go: std::sync::mpsc::Receiver<()>,
+    answers: std::sync::Arc<std::sync::Mutex<Vec<Answer>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl wordcraft_assist::Backend for Gated {
+    fn info(&self) -> wordcraft_assist::BackendInfo {
+        wordcraft_assist::BackendInfo { id: "gated".into(), label: "Gated".into(), author: "Gated".into(), in_process_tools: true }
+    }
+
+    fn turn(&mut self, _: &wordcraft_assist::Turn, ctx: &mut wordcraft_assist::TurnCtx<'_>) -> Result<StopReason, String> {
+        use wordcraft_assist::{PermissionKind, PermissionOption, PermissionRequest};
+        let options = || {
+            [
+                PermissionOption { id: "allow".into(), name: "Allow".into(), kind: PermissionKind::AllowOnce },
+                PermissionOption { id: "reject".into(), name: "Reject".into(), kind: PermissionKind::RejectOnce },
+            ]
+        };
+        let first = ctx.ask(PermissionRequest::bounded("First", options()));
+        self.answers.lock().unwrap().push(first);
+        let _ = self.go.recv_timeout(Duration::from_secs(30));
+        let second = ctx.ask(PermissionRequest::bounded("Second", options()));
+        self.answers.lock().unwrap().push(second);
+        Ok(StopReason::EndTurn)
+    }
+}
+
+/// Turning the setting off applies to a program's turn that is running: its next request is
+/// refused, though its first was allowed.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn turning_the_setting_off_refuses_a_running_turn_s_next_request() {
+    let mut a = window("one two three");
+    a.session.prefs.assistant.allow_unattended = true;
+    let (go, gate) = std::sync::mpsc::channel();
+    let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    a.assist_with(Box::new(Gated { go: gate, answers: got.clone() }));
+    a.execute("assist.ask", json!({"prompt": "Tidy every section"})).unwrap();
+    for _ in 0..4000 {
+        if !got.lock().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(*got.lock().unwrap(), [picked("allow")]);
+    // The person unticks it in Options while the turn goes on.
+    assert_eq!(a.execute("assist.allowUnattended", json!({"value": false})).unwrap(), json!({"value": false}));
+    go.send(()).unwrap();
+    settle(&mut a);
+    assert_eq!(*got.lock().unwrap(), [picked("allow"), picked("reject")]);
+}
+
+/// A new conversation numbers its requests from 1 again: the pane, closed meanwhile, still
+/// opens for its first, though it opened for the last conversation's first.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_pane_opens_for_a_new_conversation_s_first_request() {
+    let mut app = window("one two three");
+    app.assist_with(Box::new(Fake::new().then(vec![Step::Ask("First".into())])));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "One"})).unwrap();
+    until(&mut h, waiting);
+    let id = h.state().conversation().and_then(|c| c.pending_permission()).map(|r| r.id).unwrap();
+    assert!(h.state_mut().conversation_mut().unwrap().answer(id, picked("allow")));
+    until(&mut h, idle);
+    h.state_mut().assist_with(Box::new(Fake::new().then(vec![Step::Ask("Second".into())])));
+    h.state_mut().run("assist.ask", json!({"prompt": "Two"})).unwrap();
+    h.state_mut().session.view.assistant_pane = false;
+    until(&mut h, waiting);
+    assert_eq!(h.state().conversation().and_then(|c| c.pending_permission()).map(|r| r.id), Some(id), "numbered from 1 again");
+    assert!(h.state().session.view.assistant_pane, "the pane opens to ask");
+}
+
+/// Closing the pane while a request waits answers it cancelled: the turn doesn't wait, hidden,
+/// for an answer no one can give.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn closing_the_pane_cancels_the_waiting_request() {
+    let mut app = window("one two three");
+    let fake = Fake::new().then(vec![Step::Ask("Delete the old notes".into()), Step::say("Deleted.")]);
+    let seen = fake.seen();
+    app.assist_with(Box::new(fake));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Tidy up"})).unwrap();
+    until(&mut h, waiting);
+    h.state_mut().run("assist.pane", json!({"value": false})).unwrap();
+    until(&mut h, idle);
+    assert_eq!(answers(&seen), [Answer::Cancelled]);
+    assert!(!h.state().session.view.assistant_pane, "it stays closed");
+}
+
+/// A call that made several changes (a batch, one command at a time) shows them all: Show the
+/// change selects from the first to the last.
+#[test]
+fn show_change_selects_every_change_of_a_batch() {
+    let mut a = window("one two three");
+    let commands = json!({"commands": [
+        {"command": "caret.docStart"},
+        {"command": "text.insert", "params": {"text": "Intro. "}},
+        {"command": "caret.docEnd"},
+        {"command": "text.insert", "params": {"text": " The end."}},
+    ]});
+    a.assist_with(Box::new(Fake::new().then(vec![Step::tool("batch", commands)])));
+    ask(&mut a, "Frame it", None);
+    assert_eq!(accepted(&a), "Intro. one two three The end.");
+    let shows = shows(&a);
+    assert_eq!(shows.len(), 1, "one call");
+    a.execute("assist.showChange", shows[0].clone()).unwrap();
+    assert_eq!(a.session.selected_text(), "Intro. one two three The end.");
+}
+
+/// Show the change selects the text the change made, no more: not the paragraph a new one was
+/// put after, and not what the person typed right before it later.
+#[test]
+fn show_change_selects_exactly_the_text_the_change_made() {
+    let mut a = window("four");
+    a.execute("caret.docEnd", json!({})).unwrap();
+    a.assist_with(Box::new(Fake::new().then(vec![Step::tool("type_text", json!({"text": "\nSix\nSeven", "paragraphs": true}))])));
+    ask(&mut a, "Go on", None);
+    assert_eq!(accepted(&a), "four\nSix\nSeven");
+    let show = shows(&a)[0].clone();
+    a.execute("assist.showChange", show).unwrap();
+    let (start, _) = a.session.sel.ordered();
+    assert_eq!((start.path.0.clone(), start.off), (vec![0], 4), "from the end of the person's paragraph");
+    assert_eq!(a.session.selected_text().trim_start(), "Six\nSeven");
+
+    let mut a = window("Hello ");
+    a.execute("caret.docEnd", json!({})).unwrap();
+    a.assist_with(Box::new(Fake::new().then(vec![Step::tool("type_text", json!({"text": "World"}))])));
+    ask(&mut a, "Greet", None);
+    let show = shows(&a)[0].clone();
+    // The person types right before it.
+    let at = wordcraft_engine::cmd::pos_json(&wordcraft_doc::Pos::body(0, 6));
+    a.execute("select.range", json!({"anchor": at, "focus": at})).unwrap();
+    a.execute("text.insert", json!({"text": "big "})).unwrap();
+    shared(&mut a);
+    assert_eq!(accepted(&a), "Hello big World");
+    a.execute("assist.showChange", show).unwrap();
+    assert_eq!(a.session.selected_text(), "World");
+}
+
+/// A tool call's change is looked for in the conversation's shared document: once that closed,
+/// the version means nothing in the next one shared.
+#[test]
+fn show_change_looks_in_the_conversation_s_own_room() {
+    let mut a = window("one two three");
+    a.assist_with(Box::new(Fake::new().then(rewrite_two())));
+    ask(&mut a, "Use digits", None);
+    let show = shows(&a)[0].clone();
+    let version = show["version"].as_u64().unwrap();
+    a.stop_sharing();
+    super::tick(&mut a);
+    a.share_document(None).unwrap();
+    for _ in 0..version {
+        a.execute("caret.docEnd", json!({})).unwrap();
+        a.execute("text.insert", json!({"text": "!"})).unwrap();
+        shared(&mut a);
+    }
+    assert!(a.shared_room().unwrap().version() >= version);
+    assert!(a.execute("assist.showChange", show).is_err(), "nothing of the person's is shown as the assistant's");
+    assert_eq!(a.session.sel.ordered().0, a.session.sel.ordered().1);
+}
+
+/// A change whose text is gone (the person rejected it) isn't shown as a caret where it was:
+/// the pane says it isn't there any more.
+#[test]
+fn show_change_says_when_the_text_is_gone() {
+    let mut a = window("one two");
+    a.execute("caret.docEnd", json!({})).unwrap();
+    a.assist_with(Box::new(Fake::new().then(vec![Step::tool("type_text", json!({"text": " three"}))])));
+    ask(&mut a, "Count on", None);
+    let show = shows(&a)[0].clone();
+    a.execute("review.rejectAll", json!({})).unwrap();
+    shared(&mut a);
+    assert_eq!(accepted(&a), "one two");
+    let e = a.execute("assist.showChange", show).unwrap_err();
+    assert!(e.contains("isn't in the document any more"), "{e}");
+}
+
+/// A table a call put in is still selected whole after the person adds a row to it, not a
+/// caret in its first cell.
+#[test]
+fn show_change_selects_a_table_whose_rows_changed() {
+    let mut a = window("one");
+    a.execute("caret.docEnd", json!({})).unwrap();
+    a.execute("text.insert", json!({"text": "\n"})).unwrap();
+    let table = json!({"command": "insert.table", "params": {"rows": 2, "cols": 2}});
+    a.assist_with(Box::new(Fake::new().then(vec![Step::tool("execute", table)])));
+    ask(&mut a, "A table", Some("editor"));
+    let show = shows(&a)[0].clone();
+    let cells: Vec<_> = a.session.doc.para_paths(StoryRef::Body).into_iter().filter(|p| p.0.len() > 1).collect();
+    assert_eq!(cells.len(), 4, "a 2 by 2 table");
+    let first = wordcraft_engine::cmd::pos_json(&wordcraft_doc::Pos { story: StoryRef::Body, path: cells[0].clone(), off: 0 });
+    a.execute("select.range", json!({"anchor": first, "focus": first})).unwrap();
+    a.execute("table.insertRowBelow", json!({})).unwrap();
+    shared(&mut a);
+    a.execute("assist.showChange", show).unwrap();
+    let (start, end) = a.session.sel.ordered();
+    assert_ne!(start, end, "not a caret");
+    assert_eq!(start.path, cells[0], "from the first cell");
+    assert!(end.path.0.len() > 1 && end.path.0[0] == cells[0].0[0] && end.path != cells[0], "to the table's last cell: {end:?}");
 }

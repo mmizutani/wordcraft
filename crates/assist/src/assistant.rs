@@ -302,6 +302,13 @@ impl Assistant {
         n
     }
 
+    /// The person's setting for requests no one can answer (File › Options › Assistant): a
+    /// turn that asks no one answers its agent's next request per it, though the turn started
+    /// before it changed.
+    pub fn set_unattended(&self, allow: bool) {
+        self.permissions.set_unattended(allow);
+    }
+
     /// The permission request the turn waits on for the person's answer, if one does.
     pub fn pending_permission(&self) -> Option<&PermissionRequest> {
         let id = self.permissions.waiting()?;
@@ -399,7 +406,8 @@ struct Work {
 
 impl Work {
     fn run(mut self) {
-        let mut tools: Box<dyn ToolHost> = if self.backend.info().in_process_tools {
+        let in_process = self.backend.info().in_process_tools;
+        let mut tools: Box<dyn ToolHost> = if in_process {
             match CopyTools::join(&self.room, &self.seat.key) {
                 Ok(t) => Box::new(t.stopped_by(self.cancel.clone())),
                 Err(e) => {
@@ -428,8 +436,11 @@ impl Work {
             if let Some((anchor, focus)) = turn.selection {
                 let _ = tools.select(anchor, focus);
             }
+            // An agent that changes the document on its own (ACP) has its calls' changes looked
+            // for in the room, in the seat's name.
+            let room = (!in_process).then_some((&*self.room, self.seat.name.as_str()));
             let mut ctx =
-                TurnCtx { tools: tools.as_mut(), events: &self.events, cancel: &self.cancel, permissions: &self.permissions, policy, calls: 0 };
+                TurnCtx { tools: tools.as_mut(), events: &self.events, cancel: &self.cancel, permissions: &self.permissions, policy, calls: 0, room };
             let backend = &mut self.backend;
             let ended = guarded(|| backend.turn(&turn, &mut ctx));
             let stop = match ended {

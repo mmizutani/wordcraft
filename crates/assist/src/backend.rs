@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use wordcraft_doc::change::Anchor;
-use wordcraft_engine::room::Role;
+use wordcraft_engine::room::{Role, Room};
 
 /// Most bytes of text one event carries; more is cut at a character boundary.
 pub const MAX_EVENT_TEXT: usize = 64 << 10;
@@ -144,9 +144,20 @@ pub struct ToolCall {
     pub status: ToolStatus,
     /// A short account of what it did or why it failed.
     pub detail: String,
-    /// The version of the shared document once the call's change was in it, for a call that
-    /// changed the document in this process.
-    pub version: Option<u64>,
+    /// The versions of the shared document the call's changes made, for a call that changed it:
+    /// one of WordCraft's tools the backend called in this process, or an agent's call during
+    /// which the assistant changed the document through WordCraft (its MCP server, or
+    /// `wordcraft-cli call`).
+    pub changes: Option<Versions>,
+}
+
+/// The versions of the shared document from the first a tool call's changes made to the last.
+/// Others' changes may be among them (the person typing meanwhile): what shows the call's
+/// change leaves them out ([`wordcraft_engine::room::Room::where_changed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Versions {
+    pub first: u64,
+    pub last: u64,
 }
 
 /// How a plan entry stands.
@@ -371,15 +382,14 @@ pub struct ToolOutput {
     /// Its result as text (JSON for most tools), or why it failed; at most
     /// [`crate::tools::MAX_OUTPUT`] bytes.
     pub text: String,
-    /// The version of the shared document once the call's change was in it, when it changed
-    /// the document.
-    pub version: Option<u64>,
+    /// The versions of the shared document the call's changes made, when it changed it.
+    pub changes: Option<Versions>,
 }
 
 impl ToolOutput {
     /// A failed call, with why.
     pub fn error(why: impl Into<String>) -> ToolOutput {
-        ToolOutput { ok: false, text: why.into(), version: None }
+        ToolOutput { ok: false, text: why.into(), changes: None }
     }
 }
 
@@ -504,6 +514,9 @@ pub(crate) struct Asking {
     answer: Option<Answer>,
     /// The last request's number.
     last: u64,
+    /// The person's setting for requests no one can answer, as the window last said it: when
+    /// set, a turn that doesn't ask anyone answers each request per it, not per its own policy.
+    unattended: Option<bool>,
 }
 
 impl Permissions {
@@ -568,6 +581,22 @@ impl Permissions {
         }
     }
 
+    /// The person's setting for requests no one can answer is `allow` from now on: the next
+    /// request of a turn that asks no one is answered per it.
+    pub(crate) fn set_unattended(&self, allow: bool) {
+        self.lock().unattended = Some(allow);
+    }
+
+    /// How a request of a turn whose policy is `policy` is answered now: a turn that asks the
+    /// person asks them; one that doesn't follows the person's setting once the window said it.
+    fn policy(&self, policy: PermissionPolicy) -> PermissionPolicy {
+        match (policy, self.lock().unattended) {
+            (PermissionPolicy::Ask, _) | (_, None) => policy,
+            (_, Some(true)) => PermissionPolicy::Allow,
+            (_, Some(false)) => PermissionPolicy::Reject,
+        }
+    }
+
     /// The request waiting for an answer, if one is.
     pub(crate) fn waiting(&self) -> Option<u64> {
         let a = self.lock();
@@ -588,6 +617,9 @@ pub struct TurnCtx<'a> {
     pub(crate) policy: PermissionPolicy,
     /// Tool calls made in this turn, for ids of calls a backend didn't name.
     pub(crate) calls: u64,
+    /// The shared document and the name the assistant joined under, for what an agent that
+    /// changes it on its own changed during a call ([`TurnCtx::changes_since`]).
+    pub(crate) room: Option<(&'a Room, &'a str)>,
 }
 
 impl TurnCtx<'_> {
@@ -639,20 +671,34 @@ impl TurnCtx<'_> {
             kind: kind.clone(),
             status: ToolStatus::InProgress,
             detail: String::new(),
-            version: None,
+            changes: None,
         }));
         let out = if self.is_cancelled() { ToolOutput::error("stopped: the person stopped this turn") } else { self.tools.call(name, args) };
         let status = if out.ok { ToolStatus::Completed } else { ToolStatus::Failed };
         let detail = crate::tools::summary(&out);
-        self.emit(Event::Tool(ToolCall { id, title, kind, status, detail, version: out.version }));
+        self.emit(Event::Tool(ToolCall { id, title, kind, status, detail, changes: out.changes }));
         out
     }
 
-    /// Ask the person `request` and wait for the answer, per the conversation's policy: the
-    /// pane shows it ([`PermissionPolicy::Ask`]), or it is answered at once. The answer is
-    /// [`Answer::Cancelled`] when the turn is stopped or nobody answers in
-    /// [`PERMISSION_TIMEOUT`].
+    /// The shared document's version now, for a backend whose agent changes it on its own (an
+    /// ACP agent through WordCraft's MCP server): where a call that starts now begins.
+    pub fn document_version(&self) -> Option<u64> {
+        self.room.map(|(room, _)| room.version())
+    }
+
+    /// What the assistant changed in the shared document after `version`, through any copy that
+    /// joined as it: what a call that started then changed, when it changed anything.
+    pub fn changes_since(&self, version: u64) -> Option<Versions> {
+        let (room, name) = self.room?;
+        room.changes_by(version, name).map(|(first, last)| Versions { first, last })
+    }
+
+    /// Ask the person `request` and wait for the answer, per the turn's policy: the pane shows
+    /// it ([`PermissionPolicy::Ask`]), or it is answered at once, per the person's setting as it
+    /// is now when the window said it. The answer is [`Answer::Cancelled`] when the turn is
+    /// stopped or nobody answers in [`PERMISSION_TIMEOUT`].
     pub fn ask(&self, request: PermissionRequest) -> Answer {
+        let policy = self.permissions.policy(self.policy);
         let id = self.permissions.open();
         let request = PermissionRequest { id, ..PermissionRequest::bounded(&request.title, request.options) };
         let pick = |allow: bool| {
@@ -666,7 +712,7 @@ impl TurnCtx<'_> {
                 .find_map(|k| request.options.iter().find(|o| o.kind == *k))
                 .map_or(Answer::Cancelled, |o| Answer::Selected { option: o.id.clone() })
         };
-        let answer = match self.policy {
+        let answer = match policy {
             PermissionPolicy::Ask => {
                 self.emit(Event::Permission(request.clone()));
                 self.permissions.wait(id, self.cancel, PERMISSION_TIMEOUT)
@@ -680,9 +726,9 @@ impl TurnCtx<'_> {
                 self.permissions.wait(id, self.cancel, Duration::ZERO)
             }
         };
-        if self.policy != PermissionPolicy::Ask {
+        if policy != PermissionPolicy::Ask {
             // The request's title is the agent's text, which may quote the document: not logged.
-            log::info!("assistant: permission request {id} answered {answer:?} by the {:?} policy", self.policy);
+            log::info!("assistant: permission request {id} answered {answer:?} by the {policy:?} policy");
             self.emit(Event::Permission(request));
         }
         self.emit(Event::Answered { id, answer: answer.clone() });
@@ -740,7 +786,7 @@ mod cancellation_tests {
             );
             let permissions = Permissions::default();
             let mut tools = NoTools;
-            let ctx = TurnCtx { tools: &mut tools, events: &events, cancel: &cancel, permissions: &permissions, policy, calls: 0 };
+            let ctx = TurnCtx { tools: &mut tools, events: &events, cancel: &cancel, permissions: &permissions, policy, calls: 0, room: None };
             let options = [
                 PermissionOption { id: "allow".into(), name: "Allow".into(), kind: PermissionKind::AllowOnce },
                 PermissionOption { id: "reject".into(), name: "Reject".into(), kind: PermissionKind::RejectOnce },
@@ -758,7 +804,7 @@ mod cancellation_tests {
             }
             fn call(&mut self, _: &str, _: &Value) -> ToolOutput {
                 self.0 += 1;
-                ToolOutput { ok: true, text: String::new(), version: None }
+                ToolOutput { ok: true, text: String::new(), changes: None }
             }
         }
         for name in ["type_text", "execute"] {
@@ -783,6 +829,7 @@ mod cancellation_tests {
                 permissions: &permissions,
                 policy: PermissionPolicy::Reject,
                 calls: 0,
+                room: None,
             };
             let out = ctx.call_tool("call", name, &serde_json::json!({}));
             assert!(!out.ok, "{name} must be cancelled");
@@ -810,7 +857,7 @@ mod cancellation_tests {
             let (tx, _rx) = std::sync::mpsc::sync_channel(4);
             let events = Events::new(tx, None);
             let mut tools = NoTools;
-            let ctx = TurnCtx { tools: &mut tools, events: &events, cancel: &cancel, permissions: &permissions, policy, calls: 0 };
+            let ctx = TurnCtx { tools: &mut tools, events: &events, cancel: &cancel, permissions: &permissions, policy, calls: 0, room: None };
             let request = PermissionRequest::bounded(
                 "Edit",
                 [

@@ -92,10 +92,10 @@ pub fn specs() -> Vec<CommandSpec> {
             .params(r#"{"value"?: "viewer|commenter|suggester|editor" (omit to read it; never owner)}"#)
             .pure(),
         CommandSpec::new("assist.allowUnattended", "Allow Requests No One Can Answer", "File › Options › Assistant", allow_unattended)
-            .params(r#"{"value"?: bool (omit to read it)} → whether an assistant goes ahead when its agent asks permission in a turn a program asked for (control channel, MCP), which no one is there to answer; false (the default): the request is refused, and the answer logged"#)
+            .params(r#"{"value"?: bool (omit to read it; true only while it is on: the person turns it on in File › Options › Assistant)} → whether an assistant goes ahead when its agent asks permission in a turn a program asked for (control channel, MCP), which no one is there to answer; false (the default): the request is refused, and the answer logged. Turning it off holds from a running turn's next request"#)
             .pure(),
         CommandSpec::new("assist.showChange", "Show the Change", "Home › Assistant", show_change)
-            .params(r#"{"version": number (a tool call's: the shared document's version once its change was in)} → the text that change put in or changed is selected, and the Review tab opens"#)
+            .params(r#"{"version": number (a tool call's last: the shared document's version once its changes were in), "from"?: number (its first; omit for one change)} → the text the conversation's assistant put in or changed in those versions is selected (others' changes among them left out), and the Review tab opens"#)
             .when(in_window)
             .pure(),
         CommandSpec::new("assist.draft", "Draft with the Assistant", "Home › Assistant", draft)
@@ -275,11 +275,17 @@ fn default_role(s: &mut Session, v: &Value) -> CmdResult {
 }
 
 /// Whether an assistant goes ahead when its agent asks permission in a turn no one can answer
-/// (File › Options › Assistant).
+/// (File › Options › Assistant). It is the person's consent: a command, which any script can
+/// run, reads it and turns it off, never on; the window's checkbox turns it on for the person's
+/// own click.
 fn allow_unattended(s: &mut Session, v: &Value) -> CmdResult {
     match v.get("value") {
         None | Some(Value::Null) => {}
-        Some(Value::Bool(b)) => s.prefs.assistant.allow_unattended = *b,
+        Some(Value::Bool(false)) => s.prefs.assistant.allow_unattended = false,
+        Some(Value::Bool(true)) if s.prefs.assistant.allow_unattended => {}
+        Some(Value::Bool(true)) => {
+            return Err(CmdError::Failed("only you can allow what agents ask when no one can answer: File › Options › Assistant".into()));
+        }
         Some(_) => return Err(CmdError::Params("`value` must be true or false".into())),
     }
     Ok(json!({"value": s.prefs.assistant.allow_unattended}))
@@ -293,8 +299,15 @@ fn show_change(s: &mut Session, v: &Value) -> CmdResult {
         Some(_) => None,
     };
     let version = version.ok_or_else(|| CmdError::Params("`version`: a tool call's, a whole number from 1".into()))?;
-    s.push_ui_request(json!({"assist": "show", "version": version}));
-    Ok(json!({"version": version}))
+    let from = match v.get("from") {
+        None | Some(Value::Null) => version,
+        Some(f) => f
+            .as_u64()
+            .filter(|f| (1..=version).contains(f))
+            .ok_or_else(|| CmdError::Params("`from`: a tool call's first version, from 1 to `version`".into()))?,
+    };
+    s.push_ui_request(json!({"assist": "show", "version": version, "from": from}));
+    Ok(json!({"version": version, "from": from}))
 }
 
 /// What the writing actions ask the assistant (#18): our own words, in one place. The window

@@ -268,10 +268,10 @@ fn tool_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, call: &ToolCal
         if !call.detail.is_empty() && (failed || !call.detail.trim_start().starts_with(['{', '['])) {
             wrapped(ui, RichText::new(&call.detail).small().color(if failed { t.red } else { t.text_dim }));
         }
-        if let Some(version) = call.version
+        if let Some(changes) = call.changes
             && ui.link(RichText::new(tl!("Show the change")).small()).on_hover_text(tl!("Select what this call changed, with Review open")).clicked()
         {
-            let _ = app.run("assist.showChange", json!({"version": version}));
+            let _ = app.run("assist.showChange", json!({"version": changes.last, "from": changes.first}));
         }
     });
 }

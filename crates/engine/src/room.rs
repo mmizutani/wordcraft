@@ -39,12 +39,13 @@
 //! Next in milestone A1: presence.
 
 use std::net::SocketAddr;
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use wordcraft_doc::change::{Anchor, Mapped};
-use wordcraft_doc::{ChangeSet, Document, Pos, StoryRef};
+use wordcraft_doc::{ChangeSet, Document, StoryRef};
 
 use crate::scope::Scope;
 use crate::{Registry, Session};
@@ -268,49 +269,71 @@ impl Room {
         (hub.version(), hub.document().clone())
     }
 
-    /// Where the change that made version `version` is in the latest version, as anchors moved
-    /// past the changes accepted after it: from the start of the first text it put in or
-    /// changed to the end of the last ([`touched`]), in the body when it changed text there,
-    /// else in the story it changed first; where it only took text out, the place that text
-    /// was. `None` when the hub no longer keeps that change, or none of the text it changed is
-    /// there any more (or it changed none: styles or settings alone). What shows a
-    /// participant's change, such as the one an assistant's tool call made.
-    pub fn where_changed(&self, version: u64) -> Option<(Anchor, Anchor)> {
-        let (changes, doc) = {
-            let hub = self.hub();
-            (hub.since(version.checked_sub(1)?).ok()?, hub.document().clone())
-        };
-        let (made, after) = changes.split_first()?;
-        if made.version != version {
+    /// Where the changes that made versions `versions` are in the latest version, as anchors
+    /// moved past the changes accepted after each: from the start of the first text they put in
+    /// or changed to the end of the last ([`touched`]), in the body when they changed text
+    /// there, else in the story changed first; where one only took text out, the place that
+    /// text was. With `by`, only the changes of the participant of that name count (every copy
+    /// that joined with their invite has it): a tool call's, with the person's edits made
+    /// meanwhile left out. `None` when the hub no longer keeps the first of them, none was
+    /// `by`'s, or none of the text they changed is there any more (or they changed none:
+    /// styles or settings alone). What shows a participant's change, such as the one an
+    /// assistant's tool call made.
+    pub fn where_changed(&self, versions: RangeInclusive<u64>, by: Option<&str>) -> Option<(Anchor, Anchor)> {
+        let (first, last) = (*versions.start(), *versions.end());
+        if first == 0 || first > last {
             return None;
         }
-        let mut anchors = touched(&made.change);
-        // A change across many paragraphs is shown by the first and the last it touched: each
-        // place is looked for in the whole document.
-        if anchors.len() > MOST_PLACES {
-            anchors.drain(MOST_PLACES / 2..anchors.len().saturating_sub(MOST_PLACES / 2));
+        let (changes, theirs, doc) = {
+            let hub = self.hub();
+            let changes = hub.since(first.saturating_sub(1)).ok()?;
+            let theirs: Vec<bool> = changes.iter().map(|a| a.version <= last && by.is_none_or(|name| hub.name_of(a.by) == Some(name))).collect();
+            (changes, theirs, hub.document().clone())
+        };
+        if changes.first()?.version != first {
+            return None;
         }
-        let places: Vec<Pos> = anchors
-            .into_iter()
-            .filter_map(|a| {
-                let mut m = Mapped::At(a);
-                for later in after {
-                    let a = match m {
-                        Mapped::At(a) => a,
-                        Mapped::Before(block) => Anchor { block, off: 0 },
-                        Mapped::After(block) => Anchor { block, off: usize::MAX },
-                        Mapped::Gone => return None,
-                    };
-                    m = later.change.map(a);
-                }
-                doc.place(m, None)
-            })
+        let mut spans: Vec<(usize, (Anchor, Anchor))> = theirs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| **t)
+            .filter_map(|(i, _)| changes.get(i).map(|a| (i, a)))
+            .flat_map(|(i, a)| touched(&a.change).into_iter().map(move |s| (i, s)))
             .collect();
+        // Changes across many paragraphs are shown by the first and the last places they
+        // touched: each place is looked for in the whole document.
+        if spans.len() > MOST_PLACES / 2 {
+            spans.drain(MOST_PLACES / 4..spans.len().saturating_sub(MOST_PLACES / 4));
+        }
+        let mut places = Vec::new();
+        for (i, (start, end)) in spans {
+            let after = changes.get(i.saturating_add(1)..).unwrap_or_default();
+            // Text put in right before the change's own isn't part of it: its start moves past
+            // that text, its end stays before text put in right after it.
+            let put_in = start != end;
+            let (Some(s), Some(e)) = (carry(start, after, put_in), carry(end, after, false)) else { continue };
+            if put_in && s == e {
+                // The text it put in or changed is gone (rejected, deleted).
+                continue;
+            }
+            places.extend([doc.place(s, None), doc.place(e, None)].into_iter().flatten());
+        }
         let story = if places.iter().any(|p| p.story == StoryRef::Body) { StoryRef::Body } else { places.first()?.story };
         let mut there = places.iter().filter(|p| p.story == story);
         let first = there.next()?;
         let (start, end) = there.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p)));
         Some((doc.anchor_at(start)?, doc.anchor_at(end)?))
+    }
+
+    /// The first and the last version after `version` that participant `name` made (any copy
+    /// that joined with their invite), if they made any: what a tool call that started then
+    /// changed. `None` too when the hub no longer keeps the changes after `version`.
+    pub fn changes_by(&self, version: u64, name: &str) -> Option<(u64, u64)> {
+        let hub = self.hub();
+        let changes = hub.since(version).ok()?;
+        let mut theirs = changes.iter().filter(|a| hub.name_of(a.by) == Some(name)).map(|a| a.version);
+        let first = theirs.next()?;
+        Some((first, theirs.next_back().unwrap_or(first)))
     }
 
     /// Join the room as a new participant called `name` (the author of their comments and
@@ -453,23 +476,50 @@ impl std::fmt::Debug for Lobby {
 /// Most places of a change [`Room::where_changed`] looks for.
 const MOST_PLACES: usize = 256;
 
-/// The places change `cs` put in or changed text, as anchors in the document right after it:
-/// the ends of the characters it put in each paragraph it edited in place (the whole paragraph
-/// when only its properties changed), the start of the first and the end of the last of each run
-/// of blocks it put in, and where it only took blocks out, the block after them (or before them,
-/// at the end of their list). Parts it added or removed whole, and fields, have no place.
-fn touched(cs: &ChangeSet) -> Vec<Anchor> {
+/// Where anchor `a` is once `after` (the changes accepted after it, in order) are in: `past`
+/// moves it past text put in right at it. `None` when its part is gone.
+fn carry(a: Anchor, after: &[hub::Accepted], past: bool) -> Option<Mapped> {
+    let mut m = Mapped::At(a);
+    for later in after {
+        let a = anchor(m)?;
+        m = if past { later.change.map_past(a) } else { later.change.map(a) };
+    }
+    anchor(m).map(Mapped::At)
+}
+
+/// Mapped place `m` as an anchor: the start or the end of a block it is before or after.
+fn anchor(m: Mapped) -> Option<Anchor> {
+    match m {
+        Mapped::At(a) => Some(a),
+        Mapped::Before(block) => Some(Anchor { block, off: 0 }),
+        Mapped::After(block) => Some(Anchor { block, off: usize::MAX }),
+        Mapped::Gone => None,
+    }
+}
+
+/// The places change `cs` put in or changed text, as the start and the end of each, as anchors
+/// in the document right after it: the characters it put in each paragraph it edited in place
+/// (the whole paragraph when only its properties changed); the text it put in the blocks it put
+/// in ([`wordcraft_doc::change::Splice::put_in`]: a table from the start of its first paragraph
+/// to the end of its last); and where it only took blocks out, the block after them (or before
+/// them, at the end of their list), both ends the same. Parts it added or removed whole, and
+/// fields, have no place.
+fn touched(cs: &ChangeSet) -> Vec<(Anchor, Anchor)> {
     let mut out = Vec::new();
     for e in &cs.edits {
         let (from, to) = e.chars.as_ref().map_or((0, usize::MAX), |c| (c.at, c.at.saturating_add(c.inserted.text.len())));
-        out.extend([Anchor { block: e.id, off: from }, Anchor { block: e.id, off: to }]);
+        out.push((Anchor { block: e.id, off: from }, Anchor { block: e.id, off: to }));
     }
     for s in &cs.splices {
-        match (s.inserted.first(), s.inserted.last()) {
-            (Some(first), Some(last)) => out.extend([Anchor { block: first.0.id(), off: 0 }, Anchor { block: last.0.id(), off: usize::MAX }]),
-            _ => match (s.before, s.after) {
-                (Some(block), _) => out.push(Anchor { block, off: 0 }),
-                (None, Some(block)) => out.push(Anchor { block, off: usize::MAX }),
+        match s.put_in() {
+            Some((from, to)) => {
+                if let (Some(from), Some(to)) = (anchor(from), anchor(to)) {
+                    out.push((from, to));
+                }
+            }
+            None => match (s.before, s.after) {
+                (Some(block), _) => out.push((Anchor { block, off: 0 }, Anchor { block, off: 0 })),
+                (None, Some(block)) => out.push((Anchor { block, off: usize::MAX }, Anchor { block, off: usize::MAX })),
                 (None, None) => {}
             },
         }

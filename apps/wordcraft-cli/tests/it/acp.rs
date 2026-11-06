@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use wordcraft_assist::acp::fake_agent::{Call, SCRIPT_VAR, Script, Step};
 use wordcraft_assist::acp::presets::{AgentPrefs, AgentSettings};
 use wordcraft_assist::acp::{Acp, AgentSpec, Launch, Reach, RoomPort};
-use wordcraft_assist::{Answer, Assistant, Host, Options, PermissionPolicy, Readiness};
+use wordcraft_assist::{Answer, Assistant, Entry, Host, Options, PermissionPolicy, Readiness, ToolCall};
 use wordcraft_doc::{Document, StoryRef};
 use wordcraft_engine::Session;
 use wordcraft_engine::room::{Lobby, Replica, Role, Room};
@@ -144,6 +144,33 @@ fn an_agents_edit_through_wordcrafts_mcp_server_is_a_tracked_change_in_its_name(
     );
     assert_eq!(report["env"], json!({}));
     assert_eq!(report["cwdEmpty"], json!(true));
+    a.end();
+}
+
+/// #23: the row of an agent's tool call that changed the document through WordCraft's MCP
+/// server links to that change (its versions), as an in-process call's does; a call that
+/// changed nothing has none.
+#[test]
+fn an_agents_tool_call_row_links_to_the_change_it_made() {
+    let mut w = Window::new();
+    let tool = |id: &str, kind: &str| Step::Tool { id: id.into(), title: id.into(), kind: kind.into() };
+    let done = |id: &str| Step::Update { id: id.into(), status: "completed".into(), text: String::new() };
+    let script = Script {
+        turns: vec![[vec![tool("rewrite", "edit")], rewrite_two(), vec![done("rewrite"), tool("look", "read"), done("look")]].concat()],
+        ..Script::default()
+    };
+    let mut a = w.start(&script, None);
+    ask(&mut a, "Write two as a digit");
+    w.settle();
+    let calls: Vec<ToolCall> = a.transcript().entries().filter_map(|e| if let Entry::Tool(c) = e { Some(c.clone()) } else { None }).collect();
+    let rewrite = calls.iter().find(|c| c.id == "rewrite").unwrap();
+    let changes = rewrite.changes.expect("the call that changed the document links to its change");
+    let (start, end) = w.room.where_changed(changes.first..=changes.last, Some(a.name())).unwrap();
+    let doc = &w.session.doc;
+    let (start, end) = (doc.pos_of(start, None).unwrap(), doc.pos_of(end, None).unwrap());
+    let para = doc.body.first().and_then(|b| b.as_para()).unwrap();
+    assert_eq!(para.text.get(start.off..end.off), Some("2two"), "the tracked insertion and deletion");
+    assert_eq!(calls.iter().find(|c| c.id == "look").unwrap().changes, None, "a call that changed nothing");
     a.end();
 }
 

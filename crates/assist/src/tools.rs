@@ -10,7 +10,7 @@ use wordcraft_doc::change::Anchor;
 use wordcraft_engine::room::{Replica, Room, RoomError, hosted};
 use wordcraft_mcp::tools::{ToolResult, call_tool, tool_definitions};
 
-use crate::backend::{Cancel, ToolHost, ToolOutput, ToolSpec, cut};
+use crate::backend::{Cancel, ToolHost, ToolOutput, ToolSpec, Versions, cut};
 
 /// The MCP tools an assistant's model gets: those that read and edit one document. Not the
 /// ones that open, save or switch documents, drive the window or share the document.
@@ -138,7 +138,9 @@ impl ToolHost for CopyTools {
             Value::Null => json!({}),
             _ => return ToolOutput::error("the arguments must be an object"),
         };
-        let sent = self.copy.stats().sent;
+        // What the copy had before: the call's changes are the ones after it in its name (a
+        // batch makes one per command; the person's may come between).
+        let (sent, had) = (self.copy.stats().sent, self.copy.received());
         let out = if name == "batch" {
             self.batch(&args)
         } else {
@@ -146,7 +148,8 @@ impl ToolHost for CopyTools {
             output(&result)
         };
         let changed = self.copy.stats().sent > sent;
-        ToolOutput { version: changed.then(|| self.copy.received()), ..out }
+        let changes = changed.then(|| Versions { first: had.saturating_add(1), last: self.copy.received() });
+        ToolOutput { changes, ..out }
     }
 
     fn select(&mut self, anchor: Anchor, focus: Anchor) -> bool {
@@ -198,7 +201,7 @@ impl CopyTools {
                 break;
             }
         }
-        ToolOutput { ok, text: Value::Array(out).to_string(), version: None }
+        ToolOutput { ok, text: Value::Array(out).to_string(), changes: None }
     }
 }
 
@@ -253,7 +256,7 @@ fn output(result: &ToolResult) -> ToolOutput {
         let left = total.saturating_sub(text.len());
         text.push_str(&format!("\n…[cut: {left} more bytes; ask for less, e.g. get_text, document.paragraph or a narrower list_commands query]"));
     }
-    ToolOutput { ok: !result.is_error, text, version: None }
+    ToolOutput { ok: !result.is_error, text, changes: None }
 }
 
 /// What a call does, for its row in the pane: the tool, and the command it runs.

@@ -16,9 +16,11 @@
 //! next assistant conversation use the scripted assistant, one list of steps per turn: `{"say":
 //! text}`, `{"think": text}`, `{"tool": name, "args": {…}}`, `{"plan": [text, …]}` (an entry
 //! may be `{"content": text, "status": "completed|in_progress|pending"}`) or `{"ask": title}` (a
-//! permission request: the pane asks it when the prompt came from the pane itself, e.g. typed
-//! with `ui.text` and sent with `ui.key` Enter, and answers it per `assist.allowUnattended` when
-//! it came from `engine.execute`).
+//! permission request: the pane asks it in a turn the person asked for, such as one started with
+//! `{"run": "assist.ask", "params": {"prompt": …}}`, and answers it per `assist.allowUnattended`
+//! in a program's: one from `engine.execute`, or typed with `ui.text` and sent with `ui.key`,
+//! which the window doesn't take as the person's). `{"run": id, "params": {…}}` runs command `id`
+//! as the person's own click does.
 
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{ControlRequest, Services, WordApp};
@@ -90,6 +92,10 @@ fn main() -> Result<(), String> {
             }
         } else if let Some(turns) = l.get("assistScript").and_then(|v| v.as_array()) {
             harness.state_mut().assist_with(Box::new(scripted_assistant(turns)?));
+            step_n(&mut harness, 2);
+        } else if let Some(id) = l.get("run").and_then(|v| v.as_str()) {
+            let r = harness.state_mut().run(id, l.get("params").cloned().unwrap_or_else(|| serde_json::json!({})));
+            println!("{id}: {r:?}");
             step_n(&mut harness, 2);
         } else if let Some(n) = l.get("steps").and_then(|v| v.as_u64()) {
             step_n(&mut harness, n as usize);

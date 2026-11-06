@@ -730,10 +730,19 @@ fn assistant(app: &mut WordApp, ui: &mut Ui) {
         "An assistant works in the document like a person you share it with: its role says what it may do. Each conversation in the Assistant pane may choose another.",
     );
     ui.add_space(8.0);
-    // What an agent asks when no one is there to answer (#23): refused unless allowed.
+    // What an agent asks when no one is there to answer (#23): refused unless allowed. Allowing
+    // it is the person's consent: a click the control channel made (an agent's `click`) leaves
+    // it off and says why; no command turns it on.
     let mut allow = app.session.prefs.assistant.allow_unattended;
     if ui.checkbox(&mut allow, tl!("Allow what agents ask when no one can answer")).changed() {
-        let _ = app.run("assist.allowUnattended", json!({"value": allow}));
+        if !allow {
+            let _ = app.run("assist.allowUnattended", json!({"value": false}));
+        } else if app.input_from_control(ui.ctx()) {
+            app.status(tl!("Only you can allow what agents ask when no one can answer: click it yourself."));
+        } else {
+            app.session.prefs.assistant.allow_unattended = true;
+            crate::assist::sync_unattended(app);
+        }
     }
     note(
         ui,

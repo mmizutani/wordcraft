@@ -254,12 +254,15 @@ pub struct Acp {
     note: Option<String>,
     /// Its tool calls in the current turn, to merge their updates into.
     calls: HashMap<String, ToolCall>,
+    /// The shared document's version when each call that is still running was first seen: its
+    /// changes are the assistant's after it.
+    started: HashMap<String, u64>,
 }
 
 impl Acp {
     /// A backend that runs the agent `spec` sets up.
     pub fn new(spec: AgentSpec) -> Acp {
-        Acp { spec, seat: None, running: None, note: None, calls: HashMap::new() }
+        Acp { spec, seat: None, running: None, note: None, calls: HashMap::new(), started: HashMap::new() }
     }
 
     /// The agent's name, for messages.
@@ -287,7 +290,7 @@ impl Acp {
             kind: "other".into(),
             status: ToolStatus::InProgress,
             detail: String::new(),
-            version: None,
+            changes: None,
         };
         ctx.emit(Event::Tool(row.clone()));
         let started = self.start(ctx);
@@ -445,7 +448,7 @@ impl Acp {
             kind: "other".into(),
             status: ToolStatus::Pending,
             detail: String::new(),
-            version: None,
+            changes: None,
         });
         if let Some(title) = update.get("title").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
             call.title = title.to_string();
@@ -461,6 +464,26 @@ impl Acp {
         }
         if call.title.is_empty() {
             call.title = "Tool call".into();
+        }
+        // What the assistant changed in the document while the call ran (through WordCraft's MCP
+        // server or `wordcraft-cli call`) is the call's: its row links to it. Kinds that change
+        // nothing are left out, so a change made beside them isn't put on them.
+        if call.changes.is_none() && !matches!(call.kind.as_str(), "read" | "search" | "think" | "fetch") {
+            match call.status {
+                ToolStatus::Pending | ToolStatus::InProgress => {
+                    if self.started.len() < MAX_CALLS
+                        && !self.started.contains_key(&call.id)
+                        && let Some(v) = ctx.document_version()
+                    {
+                        self.started.insert(call.id.clone(), v);
+                    }
+                }
+                ToolStatus::Completed | ToolStatus::Failed => {
+                    if let Some(v) = self.started.remove(&call.id) {
+                        call.changes = ctx.changes_since(v);
+                    }
+                }
+            }
         }
         let Event::Tool(call) = Event::Tool(call).bounded() else { return };
         if self.calls.len() < MAX_CALLS || self.calls.contains_key(&call.id) {
@@ -591,6 +614,7 @@ impl Backend for Acp {
 
     fn turn(&mut self, turn: &Turn, ctx: &mut TurnCtx<'_>) -> Result<StopReason, String> {
         self.calls.clear();
+        self.started.clear();
         if let Some(note) = &turn.note {
             self.note = Some(match self.spec.reach.note() {
                 Some(more) => format!("{note}\n\n{more}"),

@@ -40,10 +40,15 @@ theirs.
 The pane shows each turn as it goes: your prompt, the answer as it comes, the assistant's
 thoughts folded away, and a row for each tool call, folded to its title with a mark for how it
 stands (waiting, running, done, failed). Opened, a row says what kind of call it was and how it
-went, why it failed if it did, and for a call of WordCraft's own tools that changed the document,
-**Show the change** selects that change with Review open, where Accept and Reject act on it
-(`assist.showChange {version}`, the version of the shared document the call made). The agent's
-plan is a checklist that counts what is done. A permission request waits in a frame of its own,
+went, why it failed if it did, and for a call that changed the document, **Show the change**
+selects exactly the text it put in or changed with Review open, where Accept and Reject act on it
+(`assist.showChange {from, version}`, the versions of the shared document the call's changes
+made: a batch makes several). It leaves out what anyone else changed meanwhile and text typed
+right before it later, and says so when that text is gone. A call of WordCraft's own tools has
+its versions as it ends; an agent's call (ACP) has those of the changes the assistant made
+through WordCraft (its MCP server or `wordcraft-cli call`) while the call ran, so two calls
+that ran at the same time both show what changed meanwhile. The agent's plan is a checklist that
+counts what is done. A permission request waits in a frame of its own,
 with the agent's answers (at most 16, their names cut to fit and whole on hover). A turn that
 stopped other than by finishing says why, plainly: the answer was cut off at the most the model
 writes at once, the assistant stopped after the most steps one request may take, or it declined
@@ -147,12 +152,15 @@ Through WordCraft, **the shared document and nothing else**:
 The agent itself is a program you run, with your permissions. Its own tools may read files or
 run commands; when an agent asks permission first, the pane shows you the question in the turns
 you asked for (from the pane, a menu or a shortcut), with the agent's answers as buttons, and
-the turn waits for yours; Stop answers it cancelled. Only the person answers permission and
-sign-in questions in the pane: control-channel or MCP clicks and keys leave the question
-waiting. A turn a script asked for (the control channel, MCP, the command line) has no one to
-ask and never shows a prompt: the agent's requests are refused, unless you turn on File ›
-Options › Assistant › Allow what agents ask when no one can answer (`assist.allowUnattended`),
-and each answer is logged. Use agents you trust, as you would in a terminal.
+the turn waits for yours; Stop answers it cancelled, and so does closing the pane while it waits.
+Only the person answers permission and sign-in questions in the pane: control-channel or MCP
+clicks and keys leave the question waiting. A turn a script asked for (the control channel,
+MCP, the command line), or one a control-channel or MCP click or key started in the pane, has no
+one to ask and never shows a prompt: the agent's requests are refused, unless you turn on File ›
+Options › Assistant › Allow what agents ask when no one can answer, and each answer is logged.
+Only you turn that on, with your own click: `assist.allowUnattended` reads it and turns it off
+but refuses to turn it on, and a faked click on the checkbox is ignored. Turned off, it holds
+from a running turn's next request. Use agents you trust, as you would in a terminal.
 
 ### Pi
 
