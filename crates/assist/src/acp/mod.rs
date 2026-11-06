@@ -621,6 +621,8 @@ impl Folder {
             getrandom::fill(&mut bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
             let name: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
             let path = base.join(format!("wordcraft-agent-{name}"));
+            // Only Unix sets the folder's mode, so elsewhere the builder isn't changed.
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
             std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
