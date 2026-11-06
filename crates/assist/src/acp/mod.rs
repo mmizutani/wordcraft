@@ -194,7 +194,7 @@ impl Acp {
                 format!("{name} couldn't start: {e}")
             }
         })?;
-        let until = Instant::now() + self.spec.start_timeout;
+        let mut until = Instant::now() + self.spec.start_timeout;
         let init = json!({
             "protocolVersion": PROTOCOL_VERSION,
             "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false},
@@ -226,6 +226,8 @@ impl Acp {
                         return Ok(None);
                     }
                     signed_in = true;
+                    // Time spent signing in leaves the session a full startup budget.
+                    until = Instant::now() + self.spec.start_timeout;
                 }
                 Err(e) if e.code == AUTH_REQUIRED => return Err(format!("{name} still needs you to sign in: {}", e.message)),
                 Err(e) => return Err(format!("{name} couldn't start a session: {}", e.message)),

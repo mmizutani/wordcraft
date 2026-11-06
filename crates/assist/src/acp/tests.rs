@@ -408,6 +408,23 @@ fn an_agent_that_needs_a_sign_in_asks_in_the_window_and_names_its_ways_elsewhere
 }
 
 #[test]
+fn waiting_to_sign_in_does_not_use_up_the_session_start_timeout() {
+    let script = Script { needs_auth: true, auth_methods: vec!["browser".into()], turns: vec![vec![say("signed in")]], ..Script::default() };
+    let mut spec = spec(&script);
+    let start_timeout = Duration::from_secs(5);
+    spec.start_timeout = start_timeout;
+    let mut c = Chat::new(spec, PermissionPolicy::Ask);
+    c.a.ask("Hello", None).unwrap();
+    c.until("the sign-in question", |c| c.a.pending_permission().is_some());
+    let id = c.a.pending_permission().unwrap().id;
+    // The question arrives after startup began: this wait necessarily outlasts its deadline.
+    std::thread::sleep(start_timeout);
+    assert!(c.a.answer(id, Answer::Selected { option: "browser".into() }));
+    assert!(c.a.wait_idle(WAIT));
+    assert_eq!((c.answer().as_str(), c.error()), ("signed in", None));
+}
+
+#[test]
 fn ending_a_conversation_whose_agent_is_stuck_kills_it() {
     let mut script = Script::default();
     script.replies.insert("Hang".into(), vec![Step::Report, Step::Hang]);
