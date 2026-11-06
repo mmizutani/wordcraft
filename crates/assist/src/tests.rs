@@ -696,6 +696,54 @@ fn the_tools_are_the_mcp_server_s_for_one_document() {
 }
 
 #[test]
+fn oversized_document_reads_are_refused_before_tool_materialization() {
+    let mut w = Window::new("small");
+    let key = w.room.invite("Reader", Role::Viewer).unwrap();
+    let mut tools = CopyTools::join(&w.room, &key).unwrap();
+    assert!(tools.call("get_text", &json!({})).ok);
+    let large = format!("small\n{}", "x".repeat(MAX_OUTPUT));
+    w.own
+        .lend(&mut w.session, |copy| {
+            copy.run("document.setText", &json!({"text": large})).unwrap();
+            copy.send();
+        })
+        .unwrap();
+    // The guard must see this update, not the small snapshot the reader joined with.
+    assert!(tools.call("execute", &json!({"command": "select.all"})).ok);
+    for (name, args) in [
+        ("get_text", json!({})),
+        ("inspect_document", json!({})),
+        ("get_changes", json!({"since": 0, "full": true})),
+        ("get_changes", json!({"since": 0})),
+        ("execute", json!({"command": "document.selection"})),
+        ("execute", json!({"command": "document.text", "params": {"maxInputBytes": u64::MAX}})),
+        ("execute", json!({"command": "document.inspect", "params": []})),
+        ("batch", json!({"commands": [{"command": "document.text"}]})),
+        ("batch", json!({"commands": [{"command": "document.inspect"}]})),
+    ] {
+        let out = tools.call(name, &args);
+        assert!(!out.ok, "{name} unexpectedly materialized a full result");
+        assert!(out.text.contains("document.paragraph"), "{name}: {}", out.text);
+    }
+    // Supported narrower reads still work, and ordinary command callers keep full output.
+    assert!(tools.call("execute", &json!({"command": "select.text", "params": {"text": "small"}})).ok);
+    assert!(tools.call("execute", &json!({"command": "document.selection"})).ok);
+    assert!(tools.call("execute", &json!({"command": "document.paragraph", "params": {"path": [0]}})).ok);
+    assert!(w.session.run("document.text", &json!({})).unwrap()["text"].as_str().unwrap().len() > MAX_OUTPUT);
+}
+
+#[test]
+fn document_text_budget_ignores_unrelated_metadata_and_inspection_checks_it() {
+    let mut session = Session::new(Document::from_text("small"));
+    session.doc.core.title = "x".repeat(MAX_OUTPUT);
+    let (room, _own) = Room::host(&mut session, "Minoru").unwrap();
+    let key = room.invite("Reader", Role::Viewer).unwrap();
+    let mut tools = CopyTools::join(&room, &key).unwrap();
+    assert!(tools.call("get_text", &json!({})).ok);
+    assert!(!tools.call("inspect_document", &json!({})).ok);
+}
+
+#[test]
 fn junk_tool_arguments_never_panic() {
     let w = Window::new("one two three");
     let key = w.room.invite("Fuzzer", Role::Suggester).unwrap();

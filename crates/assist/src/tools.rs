@@ -97,7 +97,22 @@ impl CopyTools {
 struct Hosted<'a>(&'a mut Replica);
 
 impl wordcraft_mcp::Backend for Hosted<'_> {
-    fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+    fn call(&mut self, method: &str, mut params: Value) -> Result<Value, String> {
+        let command = params.get("command").and_then(Value::as_str).unwrap_or(method);
+        if matches!(command, "document.text" | "document.inspect" | "document.paragraph" | "document.selection" | "document.changes") {
+            let args = if method == "engine.execute" {
+                let request = params.as_object_mut().ok_or("command arguments must be an object")?;
+                request.entry("params").or_insert_with(|| json!({}))
+            } else {
+                &mut params
+            };
+            if !args.is_object() {
+                *args = json!({});
+            }
+            if let Some(args) = args.as_object_mut() {
+                args.insert("maxInputBytes".into(), json!(MAX_OUTPUT));
+            }
+        }
         hosted::call(self.0, method, &params)
     }
     fn has_ui(&self) -> bool {
@@ -209,20 +224,27 @@ fn fitted(text: String, room: usize) -> Option<Value> {
 /// A tool result as the model gets it: its text, at most [`MAX_OUTPUT`] bytes.
 fn output(result: &ToolResult) -> ToolOutput {
     let mut text = String::new();
+    let mut total = 0usize;
     for c in &result.content {
-        match c.get("type").and_then(Value::as_str) {
-            Some("text") => text.push_str(c.get("text").and_then(Value::as_str).unwrap_or_default()),
-            Some(other) => text.push_str(&format!("[{other} left out]")),
-            None => {}
+        let omitted;
+        let chunk = match c.get("type").and_then(Value::as_str) {
+            Some("text") => c.get("text").and_then(Value::as_str).unwrap_or_default(),
+            Some(other) => {
+                omitted = format!("[{} left out]", crate::backend::label(other));
+                &omitted
+            }
+            None => continue,
+        };
+        total = total.saturating_add(chunk.len());
+        let mut end = MAX_OUTPUT.saturating_sub(text.len()).min(chunk.len());
+        while !chunk.is_char_boundary(end) {
+            end -= 1;
         }
+        text.push_str(chunk.get(..end).unwrap_or_default());
     }
-    if text.len() > MAX_OUTPUT {
-        let total = text.len();
-        text = cut(text, MAX_OUTPUT);
-        text.push_str(&format!(
-            "\n…[cut: {} more bytes; ask for less, e.g. get_text, document.paragraph or a narrower list_commands query]",
-            total.saturating_sub(text.len())
-        ));
+    if total > text.len() {
+        let left = total.saturating_sub(text.len());
+        text.push_str(&format!("\n…[cut: {left} more bytes; ask for less, e.g. get_text, document.paragraph or a narrower list_commands query]"));
     }
     ToolOutput { ok: !result.is_error, text, version: None }
 }
