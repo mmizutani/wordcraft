@@ -5,11 +5,16 @@
 //! Built-in groups aren't editable: a built-in tab only gains custom groups after its own. The
 //! layout is saved with the front end's preferences; reading a saved layout never fails: junk,
 //! duplicates and commands this version doesn't have are dropped.
+//!
+//! Signing in to ChatGPT or out of it goes on neither ([`person_only`]): a button or keytip
+//! someone else put there would run it as the person's own click or key.
 
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::cmd::assist::person_only;
 
 use crate::Registry;
 
@@ -128,7 +133,7 @@ impl RibbonLayout {
                 }
                 let mut commands: Vec<String> = Vec::new();
                 for id in g.get("commands").and_then(Value::as_array).into_iter().flatten().take(MAX_COMMANDS).filter_map(Value::as_str) {
-                    if !id.is_empty() && id.len() <= MAX_ID && !commands.iter().any(|c| c == id) {
+                    if !id.is_empty() && id.len() <= MAX_ID && !person_only(id) && !commands.iter().any(|c| c == id) {
                         commands.push(id.to_string());
                     }
                 }
@@ -139,7 +144,7 @@ impl RibbonLayout {
         if let Some(q) = v.get("qat").and_then(Value::as_array) {
             let mut ids: Vec<String> = Vec::new();
             for id in q.iter().take(MAX_COMMANDS).filter_map(Value::as_str) {
-                if !id.is_empty() && id.len() <= MAX_ID && !ids.iter().any(|c| c == id) {
+                if !id.is_empty() && id.len() <= MAX_ID && !person_only(id) && !ids.iter().any(|c| c == id) {
                     ids.push(id.to_string());
                 }
             }
@@ -184,23 +189,26 @@ impl RibbonLayout {
         self.tabs.is_empty()
     }
 
-    /// The Quick Access Toolbar's commands.
+    /// The Quick Access Toolbar's commands (never one that is the person's alone, whoever set
+    /// the layout).
     pub fn qat(&self) -> Vec<&str> {
         match &self.qat {
-            Some(q) => q.iter().map(String::as_str).collect(),
+            Some(q) => q.iter().map(String::as_str).filter(|id| !person_only(id)).collect(),
             None => DEFAULT_QAT.to_vec(),
         }
     }
 
-    /// Drop commands that don't exist (saved by another version, or junk).
+    /// Drop commands that don't exist (saved by another version, or junk), and ones that are the
+    /// person's alone.
     pub fn retain_known(&mut self, reg: &Registry) {
+        let keep = |id: &String| reg.get(id).is_some() && !person_only(id);
         for t in &mut self.tabs {
             for g in &mut t.groups {
-                g.commands.retain(|id| reg.get(id).is_some());
+                g.commands.retain(keep);
             }
         }
         if let Some(q) = &mut self.qat {
-            q.retain(|id| reg.get(id).is_some());
+            q.retain(keep);
         }
     }
 
@@ -273,9 +281,7 @@ impl RibbonLayout {
 
     /// Add a command to a custom group (after `after`, or at the end). False when it's already there.
     pub fn add(&mut self, reg: &Registry, tab: &str, group: &str, id: &str, after: Option<&str>) -> Result<bool, String> {
-        if reg.get(id).is_none() {
-            return Err(format!("unknown command `{id}`"));
-        }
+        allowed(reg, id)?;
         self.edit(|tabs| {
             let i = Self::tab_index(tabs, tab)?;
             let t = tabs.get_mut(i).ok_or("no such tab")?;
@@ -389,9 +395,7 @@ impl RibbonLayout {
     /// Put a command on the Quick Access Toolbar (after `after`, or at the end). False when it's
     /// already there.
     pub fn qat_add(&mut self, reg: &Registry, id: &str, after: Option<&str>) -> Result<bool, String> {
-        if reg.get(id).is_none() {
-            return Err(format!("unknown command `{id}`"));
-        }
+        allowed(reg, id)?;
         let mut q: Vec<String> = self.qat().into_iter().map(str::to_string).collect();
         if q.iter().any(|c| c == id) {
             return Ok(false);
@@ -422,6 +426,18 @@ impl RibbonLayout {
         self.qat = Some(q);
         Ok(())
     }
+}
+
+/// Whether command `id` may go on the ribbon or the Quick Access Toolbar: one that exists, and
+/// not one that is the person's alone.
+fn allowed(reg: &Registry, id: &str) -> Result<(), String> {
+    if reg.get(id).is_none() {
+        return Err(format!("unknown command `{id}`"));
+    }
+    if person_only(id) {
+        return Err(format!("`{id}` goes on no ribbon or toolbar: only you run it, from its button (File › Options › Account)"));
+    }
+    Ok(())
 }
 
 impl<'de> Deserialize<'de> for RibbonLayout {
@@ -467,6 +483,30 @@ mod tests {
         assert_eq!(s.ribbon, RibbonLayout::default());
         s.run("tools.customizeRibbon", &json!({})).unwrap();
         assert_eq!(s.ui_requests.last(), Some(&json!({"open": "customizeRibbon"})));
+    }
+
+    /// Signing in to ChatGPT or out of it goes on no ribbon or toolbar, whoever asks, and a
+    /// layout that has it there (an agent's, or an older settings file's) shows none.
+    #[test]
+    fn signing_in_or_out_goes_on_no_ribbon_or_toolbar() {
+        let mut s = crate::Session::new(wordcraft_doc::Document::new());
+        for id in ["assist.chatgpt.signIn", "assist.chatgpt.signOut", "assist.chatgpt.cancelSignIn"] {
+            let e = s.run("tools.customizeRibbon", &json!({"qatAdd": id})).unwrap_err().to_string();
+            assert!(e.contains("only you run it"), "{e}");
+            s.run("tools.customizeRibbon", &json!({"newGroup": {"tab": "Home", "name": "Mine"}})).ok();
+            let e = s.run("tools.customizeRibbon", &json!({"add": {"tab": "Home", "group": "Mine", "command": id}})).unwrap_err().to_string();
+            assert!(e.contains("only you run it"), "{e}");
+        }
+        let layout = json!({"qat": ["assist.chatgpt.signOut", "file.save"], "tabs": [{"name": "Home", "groups": [{"name": "Mine", "commands": ["assist.chatgpt.signIn", "format.bold"]}]}]});
+        s.run("tools.customizeRibbon", &json!({"layout": layout})).unwrap();
+        assert_eq!(s.ribbon.qat(), ["file.save"]);
+        let home = s.ribbon.tabs().into_owned().into_iter().find(|t| t.name == "Home").unwrap();
+        assert_eq!(home.groups[0].commands, ["format.bold"]);
+        // Set some other way, the toolbar still shows none, and the next check drops it.
+        s.ribbon.qat = Some(vec!["assist.chatgpt.signOut".into(), "file.save".into()]);
+        assert_eq!(s.ribbon.qat(), ["file.save"]);
+        s.ribbon.retain_known(&crate::cmd::registry());
+        assert_eq!(s.ribbon.qat, Some(vec!["file.save".to_string()]));
     }
 
     #[test]

@@ -9,8 +9,9 @@
 //! On the desktop the picker lists ChatGPT first ([`crate::chatgpt`]), then, for a host that
 //! gives agents a way to the document (`wordcraft-cli`, the room's port), the ACP agents
 //! ([`crate::acp::presets`]: Claude Code, Codex, Pi, a custom one), each ready, or with what to
-//! install or set up first, and the fake last. The web build offers no backend but the fake:
-//! the ones that sign in or start agent processes are desktop only.
+//! install or set up first, and the fake last. The web build offers no backend but the fake
+//! ([`DESKTOP`]): the ones that sign in or start agent processes are desktop only, and
+//! [`offers_in`] answers for the web on any build.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -60,17 +61,30 @@ pub struct Offer {
     pub readiness: Readiness,
 }
 
+/// Whether this build has the backends that sign in or start agent processes: the desktop app
+/// does; the web app doesn't, since a web page can't listen on a loopback port for a sign-in,
+/// keep its credentials out of browser storage, or start a program (#26).
+pub const DESKTOP: bool = cfg!(not(target_arch = "wasm32"));
+
 /// The backends the host can offer, in the picker's order: ChatGPT, the ACP agents, then the
 /// fake.
 pub fn offers(host: &Host) -> Vec<Offer> {
+    offers_in(host, DESKTOP)
+}
+
+/// [`offers`] in a desktop build (`desktop`) or a web one, which offers only the fake (when the
+/// host asks for it). A desktop build answers either; a web build has no desktop backend to offer.
+pub fn offers_in(host: &Host, desktop: bool) -> Vec<Offer> {
     let mut all = Vec::new();
     #[cfg(not(target_arch = "wasm32"))]
-    {
+    if desktop {
         all.push(crate::chatgpt::offer(host));
         if host.cli.is_some() || host.room.is_some() {
             all.extend(crate::acp::presets::offers(host));
         }
     }
+    #[cfg(target_arch = "wasm32")]
+    let _ = desktop;
     if host.fake {
         let info = crate::backend::Backend::info(&Fake::new());
         all.push(Offer { id: info.id, label: info.label, readiness: Readiness::Ready });
@@ -136,6 +150,28 @@ mod tests {
         assert!(refused(&"x".repeat(100_000), &host).len() < 200);
     }
 
+    /// The web build (#26) offers nothing, however much its host has: no ChatGPT, no agent,
+    /// and the fake only when asked for. It reads no file (the host's paths needn't exist), so
+    /// it holds on every target, the web's included.
+    #[test]
+    fn the_web_offers_no_backend() {
+        let room = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9));
+        let host = Host {
+            settings: Some(std::path::PathBuf::from("no-such-settings-folder")),
+            room: Some(room),
+            cli: Some(std::path::PathBuf::from("no-such-folder").join("wordcraft-cli")),
+            fake: false,
+        };
+        assert!(super::offers_in(&host, false).is_empty());
+        assert!(super::offers_in(&Host::default(), false).is_empty());
+        let ids: Vec<String> = super::offers_in(&Host { fake: true, ..host.clone() }, false).into_iter().map(|o| o.id).collect();
+        assert_eq!(ids, ["fake"]);
+        // This build offers what its kind does.
+        assert_eq!(offers(&host), super::offers_in(&host, super::DESKTOP));
+        assert_eq!(super::DESKTOP, !cfg!(target_arch = "wasm32"));
+    }
+
+    /// Desktop only: the web build has no ChatGPT or agent to list.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn the_picker_lists_chatgpt_then_the_agents_then_the_fake() {

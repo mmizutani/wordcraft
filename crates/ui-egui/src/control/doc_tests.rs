@@ -120,3 +120,19 @@ fn closing_an_addressed_document_keeps_unsaved_work_unless_forced() {
     assert!(!a.session.is_open(clean) && a.session.is_open(second));
     assert_eq!(a.session.document_id(), active);
 }
+
+/// #19: signing in to ChatGPT or out of it is the person's alone, addressed to another document
+/// too: an error, never a "signingIn" answer for a request the window then refuses.
+#[test]
+fn chatgpt_sign_in_addressed_to_another_document_is_an_error() {
+    let mut a = app();
+    let (first, second) = two_documents(&mut a);
+    for command in ["assist.chatgpt.signIn", "assist.chatgpt.cancelSignIn", "assist.chatgpt.signOut"] {
+        let r = send(&mut a, "engine.execute", json!({"command": command, "doc": first}));
+        assert_eq!(r["ok"], false, "{command}: {r}");
+        assert!(r["error"].as_str().is_some_and(|e| e.contains("Only you")), "{command}: {r}");
+    }
+    assert!(a.canvas.open_url.is_none(), "no browser opened");
+    assert!(a.session.ui_requests.iter().all(|q| q.get("assist").is_none()), "nothing queued");
+    assert_eq!(a.session.document_id(), second);
+}

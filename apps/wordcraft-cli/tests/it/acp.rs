@@ -21,7 +21,7 @@ use wordcraft_engine::room::{Lobby, Replica, Role, Room};
 const WAIT: Duration = Duration::from_secs(120);
 
 /// How this executable runs as the fake agent.
-const AS_AGENT: [&str; 6] = ["--exact", "acp::fake_agent", "--nocapture", "--test-threads", "1", "-q"];
+pub(crate) const AS_AGENT: [&str; 6] = ["--exact", "acp::fake_agent", "--nocapture", "--test-threads", "1", "-q"];
 
 /// The fake agent: when this executable runs again with a script in [`SCRIPT_VAR`], this test
 /// is the agent, and the process ends with it.

@@ -1,7 +1,7 @@
 //! The Assistant pane (#15, #17): a conversation with the built-in assistant.
 //!
-//! At the top, the assistant new conversations use (whether it is ready, and if not what to do)
-//! and who it is in the document: its name and role, which the person can change for the
+//! At the top, the assistant new conversations use (whether it is ready, and if not what to do:
+//! for ChatGPT, Continue with ChatGPT, #19) and who it is in the document: its name and role, which the person can change for the
 //! conversation. Then the conversation: the prompts, the answers, thoughts folded away, a row per
 //! tool call folded to how it went (open: what it said, and the way to the change it made, #23),
 //! the plan as a checklist, permission requests with their options while they wait, errors, and
@@ -32,7 +32,10 @@ pub(super) fn assistant(app: &mut WordApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     picker(app, ui, &t);
     ui.add_space(4.0);
-    who(app, ui, &t);
+    // The web app runs no assistant (#26): there is no role to choose for one.
+    if crate::assist::desktop(app) || !app.assist.offers.is_empty() {
+        who(app, ui, &t);
+    }
     if app.has_document() && app.shared_room().is_some() && !app.shows_shared_document() {
         ui.label(
             RichText::new(tl!("Another document is shared. Switching ends its conversation and disconnects its participants."))
@@ -70,8 +73,21 @@ fn picker(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     let offers = app.assist.offers.clone();
     let current = chosen(app).cloned();
     if offers.is_empty() {
-        ui.label(RichText::new(tl!("No assistant is available yet.")).font(semibold(12.5)));
-        ui.label(RichText::new(tl!("This version of WordCraft offers no assistant to sign in to or set up.")).small().color(t.text_dim));
+        if crate::assist::desktop(app) {
+            ui.label(RichText::new(tl!("No assistant is available yet.")).font(semibold(12.5)));
+            ui.label(RichText::new(tl!("This version of WordCraft offers no assistant to sign in to or set up.")).small().color(t.text_dim));
+        } else {
+            // The web app (#26): its backends would sign in or start agents.
+            ui.label(RichText::new(tl!("The assistant needs the desktop app")).font(semibold(12.5)));
+            wrapped(
+                ui,
+                RichText::new(tl!(
+                    "Signing in to ChatGPT and starting an agent such as Claude Code or Codex take WordCraft's desktop app: a web page can't keep a sign-in safe or start a program."
+                ))
+                .small()
+                .color(t.text_dim),
+            );
+        }
         return;
     }
     ui.horizontal(|ui| {
@@ -96,11 +112,22 @@ fn picker(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     if let Some(o) = &current {
         let text = match &o.readiness {
             Readiness::Ready => return,
-            Readiness::SignIn { how } => fmt(tl!("Sign in: {how}"), &[("how", how)]),
+            // A backend's sign-in hint already says what to do ("Sign in with …"), with the
+            // button for it right under it for ChatGPT (#19): no "Sign in:" before it.
+            Readiness::SignIn { how } => how.clone(),
             Readiness::Install { how } => fmt(tl!("Install: {how}"), &[("how", how)]),
             Readiness::Unavailable { why } => fmt(tl!("Unavailable: {why}"), &[("why", why)]),
         };
         wrapped(ui, RichText::new(text).small().color(t.orange));
+        // ChatGPT signs in from here too, without a trip to File › Options › Account (#19).
+        #[cfg(not(target_arch = "wasm32"))]
+        if o.id == wordcraft_assist::chatgpt::ID
+            && matches!(o.readiness, Readiness::SignIn { .. })
+            && crate::assist::desktop(app)
+            && app.services.settings_dir.is_some()
+        {
+            crate::assist::chatgpt::controls(app, ui, true);
+        }
     }
 }
 

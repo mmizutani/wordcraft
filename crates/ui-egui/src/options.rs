@@ -130,6 +130,7 @@ fn pane_label(id: &str) -> &'static str {
         "accessibility" => "Accessibility",
         "advanced" => "Advanced",
         "agents" => "Agents",
+        "account" => "Account",
         "assistant" => "Assistant",
         _ => "General",
     }
@@ -183,6 +184,7 @@ pub fn page(app: &mut WordApp, ui: &mut Ui) {
                 "accessibility" => accessibility(app, ui),
                 "advanced" => advanced(app, ui),
                 "agents" => agents(ui),
+                "account" => account(app, ui),
                 "assistant" => assistant(app, ui),
                 _ => general(app, ui),
             }
@@ -704,15 +706,45 @@ fn agents(ui: &mut Ui) {
     ui.label(tl!("Every command is available to scripts and AI agents: run `wordcraft-cli mcp` for an MCP server, or start the app with `--control <port>` for the JSON control channel."));
 }
 
+/// The accounts the assistant signs in with (#19): ChatGPT's, with who is signed in, whether
+/// they let WordCraft use their plan, and Continue with ChatGPT or Sign Out. Desktop only, as
+/// the sign-in is (#26).
+fn account(app: &mut WordApp, ui: &mut Ui) {
+    section(ui, "ChatGPT");
+    if !crate::assist::desktop(app) {
+        note(ui, "Signing in to ChatGPT takes the WordCraft desktop app: a web page can't keep a sign-in safe.");
+        return;
+    }
+    if app.services.settings_dir.is_none() {
+        note(ui, "WordCraft has no settings folder here to keep a sign-in in.");
+        return;
+    }
+    crate::assist::chatgpt::controls(app, ui, false);
+    ui.add_space(8.0);
+    note(
+        ui,
+        "WordCraft keeps your sign-in in a file in its settings folder that only you can read, never in a document. Signing out deletes it and asks ChatGPT to end it.",
+    );
+}
+
 /// The built-in assistant (#15): the role assistants join a shared document with
 /// (`assist.defaultRole`); a conversation may choose its own in the Assistant pane. Whether an
 /// agent goes ahead when it asks permission in a turn no one can answer
 /// (`assist.allowUnattended`, off by default, #23). And the agents, each with the command,
-/// arguments and environment it starts with (`agent_setup`, #24).
+/// arguments and environment it starts with (`agent_setup`, #24). The web app runs no
+/// assistant (#26), so there the page has none of these, only why.
 fn assistant(app: &mut WordApp, ui: &mut Ui) {
     use crate::assist::{role_label, role_note};
     use wordcraft_engine::AssistantPrefs;
     section(ui, "Assistant");
+    // On the web there is no assistant to give a role or a permission to, as its pane has no
+    // role to choose: the page says what the pane says (#26).
+    if !crate::assist::desktop(app) {
+        note(ui, "The assistant needs the desktop app");
+        section(ui, "Agents");
+        note(ui, "Agents are programs WordCraft starts on your computer, so they are set up in the desktop app.");
+        return;
+    }
     let role = app.session.prefs.assistant.default_role();
     ui.horizontal(|ui| {
         let label = ui.label(tl!("Assistants join as:"));
@@ -750,14 +782,9 @@ fn assistant(app: &mut WordApp, ui: &mut Ui) {
         "When you ask, the Assistant pane asks you before an agent goes ahead. A script or another app that asks the assistant (the control channel, MCP) has no one to ask: its agent's requests are refused unless this is on. Each answer is logged.",
     );
     ui.add_space(8.0);
-    // The agents and what each starts with (#24): desktop only, as agents are programs.
+    // The agents and what each starts with (#24): desktop only, as agents are programs (#26).
     #[cfg(not(target_arch = "wasm32"))]
     agent_setup::show(app, ui);
-    #[cfg(target_arch = "wasm32")]
-    {
-        section(ui, "Agents");
-        note(ui, "Agents are programs WordCraft starts on your computer, so they are set up in the desktop app.");
-    }
 }
 
 /// Interface theme: Light, Dark, or follow the system's appearance (#115).

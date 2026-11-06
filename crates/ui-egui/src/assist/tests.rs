@@ -1110,3 +1110,217 @@ fn show_change_selects_a_table_whose_rows_changed() {
     assert_eq!(start.path, cells[0], "from the first cell");
     assert!(end.path.0.len() > 1 && end.path.0[0] == cells[0].0[0] && end.path != cells[0], "to the table's last cell: {end:?}");
 }
+
+/// The web app (#26): the pane and the commands are there, but no assistant is offered, and the
+/// pane, the writing actions and File › Options › Assistant say it takes the desktop app.
+#[test]
+fn on_the_web_the_pane_says_the_assistant_needs_the_desktop_app() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_engine::cmd::assist::NEEDS_DESKTOP;
+    let mut a = window("one two three");
+    a.run("assist.pane", json!({"value": true})).unwrap();
+    let mut h = harness(a);
+    assert!(h.query_by_label("Role:").is_some(), "the desktop pane has a role to choose");
+    h.state_mut().assist_as_web();
+    h.run_steps(3);
+    assert!(h.state().assist.offers.is_empty(), "no backend on the web");
+    // Asking again what is offered (the pane does now and then) still finds none.
+    super::refresh_offers(h.state_mut());
+    h.run_steps(3);
+    assert!(h.state().assist.offers.is_empty());
+    assert!(h.query_by_label("The assistant needs the desktop app").is_some(), "the pane says so");
+    assert!(h.query_by_label_contains("a web page can't keep a sign-in safe or start a program").is_some());
+    assert!(h.query_by_label("Role:").is_none(), "no role to choose for no assistant");
+    // The prompt and the writing actions are off, and say why.
+    h.state_mut().run("select.all", json!({})).unwrap();
+    h.run_steps(2);
+    for id in ["assist.ask", "assist.draft", "assist.rewrite", "assist.shorten", "assist.expand", "assist.proofread", "assist.summarize"] {
+        assert_eq!(h.state().session.why_disabled(id), Some(NEEDS_DESKTOP), "{id}");
+    }
+    let e = h.state_mut().run("assist.ask", json!({"prompt": "Hi"})).unwrap_err();
+    assert!(e.contains("desktop app"), "{e}");
+    assert!(h.state().conversation().is_none(), "nothing started");
+    // And File › Options › Assistant sets no agent up.
+    h.state_mut().run("file.options", json!({"pane": "assistant"})).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label("Agents are programs WordCraft starts on your computer, so they are set up in the desktop app.").is_some());
+    assert!(h.query_by_label_contains("Claude Code").is_none());
+}
+
+/// File › Options › Assistant on the web (#26): no role or unattended permission to set for an
+/// assistant the web can't run, and nothing that points at a role the pane doesn't offer.
+#[test]
+fn on_the_web_options_sets_no_role_or_permission() {
+    use egui_kittest::kittest::Queryable;
+    let mut a = window("one two three");
+    a.run("file.options", json!({"pane": "assistant"})).unwrap();
+    let mut h = harness(a);
+    h.run_steps(3);
+    assert!(h.query_by_label("Assistants join as:").is_some(), "the desktop page sets the role");
+    assert!(h.query_by_label("Allow what agents ask when no one can answer").is_some());
+    h.state_mut().assist_as_web();
+    h.run_steps(3);
+    assert!(h.query_by_label("Assistants join as:").is_none(), "no role on the web");
+    assert!(h.query_by_label_contains("Each conversation in the Assistant pane may choose another").is_none());
+    assert!(h.query_by_label("Allow what agents ask when no one can answer").is_none());
+    assert!(h.query_by_label("The assistant needs the desktop app").is_some(), "it says why");
+    assert!(h.query_by_label("Agents are programs WordCraft starts on your computer, so they are set up in the desktop app.").is_some());
+}
+
+/// A scripted assistant given before the window offers what the web does (#26) doesn't survive
+/// it, and one given after isn't run: the web window runs no assistant, and asking starts nothing.
+#[test]
+fn the_web_runs_no_scripted_assistant() {
+    use wordcraft_engine::cmd::assist::NEEDS_DESKTOP;
+    for given_first in [true, false] {
+        let mut a = window("one two three");
+        super::tick(&mut a);
+        if given_first {
+            a.assist_with(Box::new(Fake::new().then(vec![Step::say("Hi.")])));
+            assert_eq!(a.session.why_disabled("assist.ask"), None, "the scripted assistant is ready on the desktop");
+            a.assist_as_web();
+        } else {
+            a.assist_as_web();
+            a.assist_with(Box::new(Fake::new().then(vec![Step::say("Hi.")])));
+        }
+        super::tick(&mut a);
+        assert!(a.assist.offers.is_empty());
+        assert_eq!(a.session.why_disabled("assist.ask"), Some(NEEDS_DESKTOP), "given first: {given_first}");
+        let e = a.run("assist.ask", json!({"prompt": "Hi"})).unwrap_err();
+        assert!(e.contains("desktop app"), "{e}");
+        assert!(a.conversation().is_none(), "nothing started");
+        assert!(a.shared_room().is_none(), "nothing shared");
+    }
+}
+
+/// The web window never asks the backends for the scripted one (#26), though a test build
+/// offers it on the desktop.
+#[test]
+fn on_the_web_the_window_never_asks_for_the_fake() {
+    let mut a = window("one");
+    assert!(super::host(&a).fake, "test builds offer the fake on the desktop");
+    a.assist_as_web();
+    assert!(!super::host(&a).fake);
+    assert!(wordcraft_assist::offers::offers_in(&super::host(&a), super::desktop(&a)).is_empty());
+}
+
+/// #27: the window never waits for an assistant. The pane's assistant holds its turn after its
+/// edit, another assistant in the shared document holds its own, and the person types into the
+/// page with the keyboard meanwhile, every frame timed; the pane's Stop and the other's don't
+/// wait either. Each edit is in, in its author's name; the pane accepts its assistant's, Review
+/// rejects the other's, and the person's typing stays.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_window_never_waits_for_its_assistants() {
+    use std::time::Instant;
+
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::{Assistant, Backend, BackendInfo, Options, Seat, Turn, TurnCtx};
+    use wordcraft_engine::cmd::review::changes_by;
+
+    /// A frame that waited for an assistant would take as long as it holds (until it's stopped),
+    /// or as long as it takes to stop.
+    const BUDGET: Duration = Duration::from_secs(1);
+    /// How long each assistant takes to stop: well over a frame's budget.
+    const STOPPING: Duration = Duration::from_secs(3);
+
+    /// An assistant slow to stop, as an agent in the middle of a tool call is: its fake's turn,
+    /// then, once stopped, [`STOPPING`] more before the turn ends.
+    struct SlowToStop(Fake);
+
+    impl Backend for SlowToStop {
+        fn info(&self) -> BackendInfo {
+            self.0.info()
+        }
+
+        fn begin(&mut self, seat: &Seat) -> Result<(), String> {
+            self.0.begin(seat)
+        }
+
+        fn turn(&mut self, turn: &Turn, ctx: &mut TurnCtx<'_>) -> Result<StopReason, String> {
+            let stop = self.0.turn(turn, ctx);
+            if ctx.is_cancelled() {
+                std::thread::sleep(STOPPING);
+            }
+            stop
+        }
+    }
+
+    let mut app = window("one two three");
+    let pane = vec![Step::tool("select_text", json!({"text": "two"})), Step::tool("type_text", json!({"text": "2"})), Step::Hold];
+    app.assist_with(Box::new(SlowToStop(Fake::named("Pane Assistant").then(pane))));
+    let mut h = harness(app);
+    h.state_mut().execute("assist.ask", json!({"prompt": "Use digits"})).unwrap();
+    let room = h.state().shared_room().unwrap();
+    let steps = vec![Step::tool("execute", json!({"command": "caret.docEnd"})), Step::tool("type_text", json!({"text": " four"})), Step::Hold];
+    let mut other = Assistant::start(&room, Box::new(SlowToStop(Fake::named("Other Assistant").then(steps))), Options::default()).unwrap();
+    other.ask("Count on", None).unwrap();
+    // The page has the keyboard, the caret at the start.
+    h.state_mut().execute("caret.docStart", json!({})).unwrap();
+    h.state_mut().canvas.want_focus = true;
+    h.run_steps(2);
+
+    let mut keys = "Zero, ".chars().peekable();
+    let mut frames = 0usize;
+    let mut frame = |h: &mut egui_kittest::Harness<'static, WordApp>, other: &mut Assistant| {
+        if frames.is_multiple_of(4)
+            && let Some(key) = keys.next()
+        {
+            h.event(egui::Event::Text(key.to_string()));
+        }
+        let started = Instant::now();
+        h.step();
+        other.poll();
+        assert!(started.elapsed() < BUDGET, "frame {frames} took {:?}: the window waited", started.elapsed());
+        frames += 1;
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // Frames, at least two seconds of them, until both assistants made their edits and hold, and
+    // the person typed everything.
+    let held_from = Instant::now();
+    let deadline = held_from + Duration::from_secs(60);
+    loop {
+        frame(&mut h, &mut other);
+        let s = &h.state().session;
+        let edited = changes_by(s, "Pane Assistant") >= 2 && changes_by(s, "Other Assistant") >= 1;
+        if edited && held_from.elapsed() >= Duration::from_secs(2) && s.doc.plain_text(StoryRef::Body).starts_with("Zero, ") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the edits never came in");
+    }
+    assert!(h.state().conversation().is_some_and(|c| c.is_busy()) && other.is_busy(), "both hold their turns");
+    // Stop in the pane, then the other's Stop: neither waits for its assistant, which takes
+    // seconds to stop; frames go on meanwhile, and both turns end.
+    let stopped_at = Instant::now();
+    h.get_by_label("Stop").click();
+    let started = Instant::now();
+    other.cancel();
+    assert!(started.elapsed() < BUDGET);
+    while h.state().conversation().is_some_and(|c| c.is_busy()) || other.is_busy() || !h.state().share_settled() {
+        frame(&mut h, &mut other);
+        assert!(Instant::now() < deadline, "the turns never ended");
+    }
+    assert!(stopped_at.elapsed() >= STOPPING, "the turns ended {:?} after Stop", stopped_at.elapsed());
+    let stopped = |a: &Assistant| a.transcript().entries().any(|e| matches!(e, Entry::Stopped { stop: StopReason::Cancelled }));
+    assert!(stopped(h.state().conversation().unwrap()) && stopped(&other));
+    assert_eq!(accepted(h.state()), "Zero, one 2 three four");
+    assert_eq!(changes_by(&h.state().session, "Minoru"), 0, "the person's typing isn't tracked");
+    assert_eq!(h.state().session.doc, room.document().1);
+
+    // The pane's Accept all takes its assistant's changes; Review's Reject All by author the
+    // other's.
+    h.get_by_label("Accept all").click();
+    h.run_steps(3);
+    h.state_mut().execute("review.rejectAll", json!({"author": "Other Assistant"})).unwrap();
+    while !h.state().share_settled() {
+        frame(&mut h, &mut other);
+        assert!(Instant::now() < deadline, "the window never caught up");
+    }
+    let s = &h.state().session;
+    assert_eq!(s.doc.final_text(StoryRef::Body), "Zero, one 2 three");
+    assert_eq!((changes_by(s, "Pane Assistant"), changes_by(s, "Other Assistant")), (0, 0));
+    assert_eq!(s.doc, room.document().1);
+    let started = Instant::now();
+    other.end();
+    assert!(started.elapsed() < BUDGET);
+}

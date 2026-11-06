@@ -17,6 +17,13 @@
 //! channel, MCP) has no one to ask: it answers per the person's setting
 //! (`assist.allowUnattended`), refusing unless they allowed it, and the answer is logged. A tool
 //! call's row links to the change it made in the shared document (`assist.showChange`).
+//!
+//! The web app (#26) has the pane and the commands but no assistant: its backends would sign in
+//! through a loopback port or start agents, which take the desktop app ([`desktop`]). The pane
+//! says so, and the buttons' tooltips too.
+//!
+//! Signing in to ChatGPT (#19) is [`chatgpt`]'s: File › Options › Account and the pane start it,
+//! and [`tick`] takes how it ended, so ChatGPT is offered ready at once.
 
 use std::sync::Arc;
 
@@ -26,6 +33,8 @@ use wordcraft_engine::cmd::assist::AssistantStatus;
 use wordcraft_engine::room::Role;
 
 use crate::WordApp;
+
+pub(crate) mod chatgpt;
 
 /// Seconds between two askings of what is offered while the pane is open (a sign-in or an
 /// install done meanwhile shows up).
@@ -67,10 +76,15 @@ pub(crate) struct AssistState {
     /// The backend the next conversation starts with, in place of the chosen one: tests and
     /// headless screenshots with a scripted assistant.
     next: Option<Box<dyn Backend>>,
+    /// Offer what the web app offers, which is no assistant (#26): the web build always does;
+    /// tests and headless screenshots of its pane on the desktop ([`WordApp::assist_as_web`]).
+    pub(crate) web: bool,
     /// File › Options › Assistant's agents while the page shows them (#24): saved only through
     /// the agents' settings file, never logged.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) setup: Option<crate::options::agent_setup::AgentSetup>,
+    /// The ChatGPT sign-in (#19): who is signed in, and a sign-in or sign-out under way.
+    pub(crate) chatgpt: chatgpt::ChatGptState,
 }
 
 /// One conversation, and the document it is about.
@@ -83,10 +97,22 @@ pub(crate) struct Conversation {
 impl WordApp {
     /// Start the next conversation with `backend` instead of the assistant chosen in the pane:
     /// for tests and headless screenshots with a scripted assistant ([`wordcraft_assist::Fake`]).
-    /// The conversation there is ends, so the next prompt starts one.
+    /// The conversation there is ends, so the next prompt starts one. A window that offers what
+    /// the web app does ([`WordApp::assist_as_web`]) runs no assistant, this one included.
     pub fn assist_with(&mut self, backend: Box<dyn Backend>) {
         end(self);
         self.assist.next = Some(backend);
+        self.session.assistant = status(self);
+    }
+
+    /// Offer what the web app offers, which is no assistant, as the web build does (#26): for
+    /// tests and headless screenshots of the web's pane on the desktop. The conversation there is
+    /// ends.
+    pub fn assist_as_web(&mut self) {
+        end(self);
+        self.assist.next = None;
+        self.assist.web = true;
+        refresh_offers(self);
         self.session.assistant = status(self);
     }
 
@@ -105,7 +131,13 @@ impl WordApp {
 /// document through the room's own port, which takes only invites' keys (the lobby's address,
 /// set when the app opened it), never through the control channel's.
 pub(crate) fn host(app: &WordApp) -> Host {
-    Host { settings: app.services.settings_dir.clone(), room: app.lobby.addr(), cli: cli(), fake: fake_offered() }
+    Host { settings: app.services.settings_dir.clone(), room: app.lobby.addr(), cli: cli(), fake: fake_offered() && desktop(app) }
+}
+
+/// Whether the window offers the backends that sign in or start agent processes: the desktop
+/// app's does; the web app's offers none (#26).
+pub(crate) fn desktop(app: &WordApp) -> bool {
+    wordcraft_assist::offers::DESKTOP && !app.assist.web
 }
 
 /// `wordcraft-cli` beside the app's executable, which an agent's MCP server runs; `None` when
@@ -126,7 +158,7 @@ fn fake_offered() -> bool {
 
 /// Ask what is offered now.
 pub(crate) fn refresh_offers(app: &mut WordApp) {
-    app.assist.offers = wordcraft_assist::offers::offers(&host(app));
+    app.assist.offers = wordcraft_assist::offers::offers_in(&host(app), desktop(app));
     app.assist.offers_at = Some(crate::clock::now_ms());
 }
 
@@ -140,8 +172,9 @@ pub(crate) fn chosen(app: &WordApp) -> Option<&Offer> {
 /// What the assistant can do now, for the session.
 fn status(app: &WordApp) -> AssistantStatus {
     let live = app.conversation().filter(|a| !a.has_ended());
-    let ready = app.has_document() && (app.assist.next.is_some() || live.is_some() || chosen(app).is_some_and(|o| o.readiness == Readiness::Ready));
-    AssistantStatus { window: true, ready, busy: live.is_some_and(Assistant::is_busy) }
+    let scripted = app.assist.next.is_some() && desktop(app);
+    let ready = app.has_document() && (scripted || live.is_some() || chosen(app).is_some_and(|o| o.readiness == Readiness::Ready));
+    AssistantStatus { window: true, ready, busy: live.is_some_and(Assistant::is_busy), desktop_only: !desktop(app), chatgpt: chatgpt::status(app) }
 }
 
 /// Every frame: take what came back, end a conversation whose shared document closed, ask
@@ -167,10 +200,13 @@ pub(crate) fn tick(app: &mut WordApp) {
             a.answer(id, Answer::Cancelled);
         }
     }
-    let stale = match app.assist.offers_at {
-        None => true,
-        Some(at) => app.session.view.assistant_pane && crate::clock::now_ms() - at > OFFERS_EVERY * 1000.0,
-    };
+    // A sign-in or a sign-out that ended changes what ChatGPT's offer says: ask again now.
+    let account_changed = chatgpt::tick(app);
+    let stale = account_changed
+        || match app.assist.offers_at {
+            None => true,
+            Some(at) => app.session.view.assistant_pane && crate::clock::now_ms() - at > OFFERS_EVERY * 1000.0,
+        };
     if stale {
         refresh_offers(app);
     }
@@ -245,6 +281,9 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
             let last = req.get("version").and_then(Value::as_u64).unwrap_or(0);
             show_change(app, req.get("from").and_then(Value::as_u64).unwrap_or(last), last)
         }
+        "chatgptSignIn" => chatgpt::sign_in(app),
+        "chatgptCancel" => chatgpt::cancel(app),
+        "chatgptSignOut" => chatgpt::sign_out(app),
         other => Err(format!("`{}`: not an assistant request", other.chars().take(40).collect::<String>())),
     };
     app.session.assistant = status(app);
@@ -397,7 +436,8 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
     if app.shared_room().is_some() && !app.shows_shared_document() {
         return Err("another open document is shared: choose Use this document in the Assistant pane to switch".into());
     }
-    let backend = match app.assist.next.take() {
+    // The web runs no assistant (#26), not even a scripted one given before or after.
+    let backend = match app.assist.next.take().filter(|_| desktop(app)) {
         Some(b) => b,
         None => {
             if app.assist.offers_at.is_none() {

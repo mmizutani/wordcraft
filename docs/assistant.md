@@ -58,19 +58,50 @@ to go on.
 
 | Id | Backend | What runs it |
 |---|---|---|
+| `chatgpt` | ChatGPT | OpenAI's Responses API on your ChatGPT Plus or Pro plan, through Sign in with ChatGPT (no API key): see [Signing in to ChatGPT](#signing-in-to-chatgpt) |
 | `acp:claude-code` | Claude Code | its ACP adapter, `claude-agent-acp`, with your Claude sign-in |
 | `acp:codex` | Codex | its ACP adapter, `codex-acp`, with your ChatGPT sign-in or an API key |
 | `acp:pi` | Pi | its ACP adapter, `pi-acp`, which runs `pi` with the model providers you signed it in to |
 | `acp:custom` | Custom agent | any agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com) on stdio |
 
 The pane lists them with what each needs first; `assist.backend {"id": "acp:claude-code"}` picks
-one from a script. Each conversation gets the backend picked when it starts.
+one from a script. Each conversation gets the backend picked when it starts. The web app offers
+none of them: see [On the web](#on-the-web).
+
+ChatGPT runs in WordCraft: each turn sends the conversation to the Responses API, streamed, with
+WordCraft's tools as function tools, and runs the calls the model makes on the conversation's
+copy of the document.
 
 An ACP agent is a program on your computer that WordCraft starts for the conversation (on its
 first turn: the pane shows "Start Claude Code" while it starts) and speaks the Agent Client
 Protocol with over its standard input and output. The agent runs its own model loop with its own
 account; WordCraft gives it the document through its MCP server (Pi: through its shell, see
 [Pi](#pi)) and shows what it says, thinks, plans and does in the pane.
+
+### Signing in to ChatGPT
+
+File › Options › Account has **Continue with ChatGPT**, and so does the Assistant pane while
+ChatGPT waits for a sign-in. Your browser opens at ChatGPT's sign-in; WordCraft waits for it on
+a port of its own on `127.0.0.1` ("Waiting for your browser…", with Open the Browser Again and
+Cancel) and never holds up the window meanwhile. Once you have signed in, the page shows who is
+signed in and whether you let WordCraft use your plan, and ChatGPT is ready in the pane at once.
+Plan usage takes ChatGPT Plus or Pro: if you didn't allow it, the page says so, and **Sign In
+Again** asks you again. **Sign Out** deletes the sign-in and asks ChatGPT to end it; if ChatGPT
+can't be reached, the sign-in is deleted here anyway and the page says you can disconnect
+WordCraft in ChatGPT's settings.
+
+The sign-in is kept in `chatgpt-credentials.json` in the settings folder, which only you may
+read (mode 0600 on Unix), never in a document, a recovery copy or the log. Signing in and out
+are yours alone: `assist.chatgpt.signIn`, `assist.chatgpt.cancelSignIn` and
+`assist.chatgpt.signOut` run from the buttons or Search. From a script or an agent (the control
+channel, MCP, also addressed to another document) they are an error, as is a click or key the
+control channel made and a step of a macro, whoever wrote it; and they take no key and go on no
+ribbon or Quick Access Toolbar, so no one can arrange for a key you press or a button you click
+to sign you in or out. The address the browser
+opens may carry your last sign-in as a hint, so no command's answer holds it, and the log leaves
+out the browser opener's command line. Cancel stops a sign-in unless it is already finishing
+what the browser sent: then you are signed in, and the page says so at once; until it has, Sign
+Out and a new sign-in ask you to try again in a moment.
 
 ### Setting up an agent
 
@@ -239,15 +270,142 @@ outline, held to 32 KiB in all; the first turn adds a note that says which docum
 on, its name and role, and how to use the `wordcraft` tools (for Pi, `wordcraft-cli call`).
 Through those it can read the whole shared document.
 
+## On the web
+
+The web app has the Assistant pane and every `assist.*` command, but no assistant to run them.
+The pane says the assistant needs the desktop app, without a role to choose; the prompt box's
+Send and the writing actions stay greyed out, their tooltips saying the same, and a script's
+`assist.ask` is refused with that reason. File › Options › Assistant has no role, permission or
+agent to set there, only the same reason, and
+File › Options › Account says signing in to ChatGPT takes the desktop app.
+Both kinds of backend are desktop only (`wordcraft_assist::offers::DESKTOP`: the web build
+compiles them out):
+
+- **Sign in with ChatGPT** signs in the way OpenAI documents for apps on a computer: the system
+  browser, a loopback port for the redirect, and a credentials file of WordCraft's own, which
+  keeps the tokens out of browser storage. OpenAI documents no flow for an app that runs in a
+  browser (its endpoints answering a web page, a redirect to a web origin).
+- **ACP agents** are programs WordCraft starts and speaks the protocol with over their standard
+  input and output; a web page can't start a program.
+
+What would unblock the web:
+
+- a browser sign-in OpenAI documents for apps (CORS on its endpoints and a redirect to a web
+  origin), with the tokens still kept out of browser storage; or
+- ACP's remote transport (HTTP or WebSocket, a work in progress in the protocol) reached through
+  a bridge the person runs on their computer, which starts the agent there and gives the page a
+  connection to it on a loopback port, with a key the page is given, as the room's own port
+  takes invites today.
+
+Until then the web build offers nothing. `offers_in(host, false)` offers no ChatGPT and no agent
+whatever the host has, only the scripted fake when the host asks for it, and the window never
+asks for it on the web (`host()` asks only when `desktop(app)`); a scripted assistant a test
+gives the window isn't run there either. `cargo test -p wordcraft-assist offers` checks the
+first on any build (`the_web_offers_no_backend` reads no file), and the pane's tests
+(`on_the_web_the_pane_says_the_assistant_needs_the_desktop_app` and the ones after it) check the
+window on the desktop, by having it offer what the web does.
+
+## The gate test
+
+`cargo test -p wordcraft-cli --test it gate` is the assistant's gate (#27): a person, ChatGPT
+and an ACP agent edit one document at once, with fakes only (no network, no real agent):
+
+- **The person** is the window: its session, lent to the room's owner copy each frame as the
+  app does, typing a key every few frames at the end of the first paragraph.
+- **ChatGPT** is the ChatGPT backend, signed in (a first sign-in, which registers WordCraft) at a
+  fake of ChatGPT's sign-in and Responses API on `127.0.0.1`, whose answers rewrite the second
+  paragraph with `select_text` and `type_text`.
+- **The agent** is the ACP backend running the scripted fake agent
+  (`crates/assist/src/acp/fake_agent.rs`), which adds a section, a heading and a paragraph,
+  through WordCraft's MCP server (`wordcraft-cli mcp --connect`, at the room's own port).
+
+It checks that:
+
+- the window ends with what the room's hub has, and so does each assistant's copy (each reads
+  the document at the end); every key the person typed is in, once;
+- each assistant's edits are tracked changes in its name, and the person's aren't tracked;
+  accepting ChatGPT's and rejecting the agent's keeps the rewrite and the person's typing and
+  takes the section out;
+- the person's Undo takes back their typing, a step at a time (what they typed after an
+  assistant's change came in is a step of its own), and nothing of the assistants'; Redo puts
+  it back;
+- stopping ChatGPT mid-answer ends its turn at once while the agent's goes on, and ChatGPT's next
+  turn works; killing the agent's process mid-turn ends its turn ("Fake Agent stopped…") while
+  ChatGPT's goes on, the heading it added before stays, and its next turn starts it again; the
+  window and the hub hold the same document throughout;
+- stopping the agent while it doesn't read what WordCraft sends (it sleeps, as an agent busy
+  with a tool call may, and says it stopped seconds later) returns at once, the window's frames go
+  on while the agent is still stopping, and its turn ends stopped with nothing more done;
+- no frame of the window takes as long as a second while the assistants hold their turns for
+  seconds, and asking, ending a conversation and Stop don't wait either, even for an agent that
+  takes seconds to stop.
+
+`the_window_never_waits_for_its_assistants` (`cargo test -p wordcraft-ui-egui
+the_window_never_waits`) checks the last with the app's own window: its frames timed while the
+pane's assistant and another one hold their turns and the person types into the page, then Stop
+in the pane and the other's Stop, while both take seconds to stop, the pane's Accept all and
+Review's Reject All by author.
+
 ## Checking by hand
 
 `cargo test -p wordcraft-assist acp` and `cargo test -p wordcraft-cli --test it acp` run the
-scripted fake agent (`crates/assist/src/acp/fake_agent.rs`) through all of this, as Claude Code,
-Codex, Pi and a custom agent would; `cargo test -p wordcraft-cli --test it call` tries
-`wordcraft-cli call`. With a real agent installed:
+scripted fake agent through all of this, as Claude Code, Codex, Pi and a custom agent would;
+`cargo test -p wordcraft-cli --test it call` tries `wordcraft-cli call`, and
+`cargo test -p wordcraft-assist chatgpt` signs in to fake servers and runs ChatGPT's turns
+against them.
 
-1. Start WordCraft, open a document and the assistant pane, and pick the agent.
-2. Ask it to rewrite a sentence: the rewrite appears as a tracked change in the agent's name.
-3. Ask it to save the document somewhere, or to read a file: it says it can't.
-4. End the conversation: the agent's processes are gone, and so is its `wordcraft-agent-…`
-   folder.
+Before #15 closes, run this once on a desktop build with the real assistants, and note in #15
+the date, the WordCraft commit, the system, each agent's version and how each step went.
+
+**Setting up.** Build WordCraft and its command line tool, which WordCraft looks for beside its
+own program and agents reach the document through (without it, every agent says it's
+unavailable): `cargo build --release -p wordcraft -p wordcraft-cli`. Start WordCraft with a
+document and the control channel: `target/release/wordcraft --sample --control 7981` (on
+Windows, `target\release\wordcraft.exe`). Install the agents you check, as
+File › Options › Assistant › Agents says for each one missing (Claude Code's and Codex's ACP
+adapters, or Node.js so WordCraft runs them with npx; Pi and `pi-acp`), and sign each in to its
+own account the way it documents.
+
+**ChatGPT** (a Plus or Pro account):
+
+1. In File › Options › Account, click Continue with ChatGPT: your browser opens ChatGPT's
+   sign-in; sign in and allow WordCraft to use your plan. Back in WordCraft, the page shows who
+   is signed in and that WordCraft may use your plan, and the settings folder has
+   `chatgpt-credentials.json`, which on Unix only you may read.
+2. In the assistant pane pick ChatGPT and ask it to rewrite the first sentence in a friendlier
+   tone: the answer streams in, the rewrite is a tracked change by "ChatGPT", and its tool rows
+   open to the change.
+3. Ask for something long, and press Stop while it answers: it stops at once and says so. Ask
+   again: it answers.
+4. Sign Out on the same page: `chatgpt-credentials.json` is gone, and the pane says to sign in,
+   with Continue with ChatGPT under it.
+
+**Each agent** (Claude Code, Codex, Pi):
+
+1. File › Options › Assistant › Agents says the agent is ready.
+2. Pick it in the pane and ask it to add a short section at the end: the first turn shows
+   "Start" and the agent's name while it starts, and asks you to sign the agent in if it needs
+   to; the section comes in as tracked changes in the agent's name, with its plan and tool calls
+   in the pane. A permission request the agent makes waits in the pane for your answer.
+3. Ask it to save the document somewhere, or to read a file on your computer: it says it can't.
+4. Ask it to rewrite the whole document and press Stop: it stops, and the next prompt goes on.
+5. Pi only: its tool calls are `wordcraft-cli call` commands in its shell (see [Pi](#pi)).
+6. Note the agent's process ids and its `wordcraft-agent-…` folder, in
+   `~/Library/Caches/WordCraft/agents` on macOS, `~/.cache/wordcraft/agents` on Linux and BSD,
+   and the temporary folder (`%TEMP%`) on Windows. Choose another role in the pane and send a
+   prompt: a new conversation starts, the agent started again in a new folder, and the processes
+   and the folder you noted are gone. Close the window: the new conversation's processes and
+   folder are gone too.
+
+**All at once.** With ChatGPT in the pane, give an agent outside the pane its own seat: get an
+invite with the `room` tool or `room.invite {"name": "Codex"}` on the control channel, and start
+Claude Code or Codex in a terminal with WordCraft's MCP server and that key
+(`WORDCRAFT_CONTROL_KEY=<key> target/release/wordcraft-cli mcp --connect 127.0.0.1:7981`, see
+[Shared documents](mcp.md#shared-documents)).
+
+1. Type in the first paragraph while ChatGPT rewrites the second and the agent adds a section at
+   the end: nothing you type is lost, and the window never stalls.
+2. Review lists each one's changes under its name. Undo takes back only your typing.
+3. Accept ChatGPT's changes in the pane (Accept all) and reject the agent's in Review: the
+   rewrite stays, the section goes, your typing stays.
+4. Stop ChatGPT mid-answer while the agent works: the agent goes on.
