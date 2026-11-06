@@ -137,6 +137,9 @@ impl AgentSettings {
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        if bytes.len() as u64 > MAX_SETTINGS {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "agent settings exceed the 1 MiB file limit"));
+        }
         let path = dir.join(SETTINGS_FILE);
         let tmp = dir.join(format!(".{SETTINGS_FILE}.{}.tmp", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
@@ -185,7 +188,7 @@ pub fn find_program(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     }
     let as_given = Path::new(name);
     if as_given.components().count() > 1 || as_given.is_absolute() {
-        return runnable(as_given).then(|| as_given.to_path_buf());
+        return runnable(as_given).then(|| std::path::absolute(as_given).ok()).flatten();
     }
     let dirs: Vec<PathBuf> = path.map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
     dirs.iter().filter(|d| d.is_absolute()).find_map(|dir| candidates(dir, name).into_iter().find(|p| runnable(p)))
@@ -407,6 +410,34 @@ mod tests {
         settings.agents.remove("codex");
         settings.save(&dir).unwrap();
         assert_eq!(AgentSettings::load(&dir), settings);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_settings_do_not_replace_the_previous_file() {
+        let dir = folder("too-large");
+        let original = AgentSettings::default();
+        original.save(&dir).unwrap();
+        let previous = std::fs::read(dir.join(SETTINGS_FILE)).unwrap();
+        let mut settings = AgentSettings::default();
+        settings.agents.insert(
+            "custom".into(),
+            AgentPrefs { env: (0..33).map(|i| (format!("TOKEN_{i}"), "x".repeat(super::MAX_TEXT))).collect(), ..AgentPrefs::default() },
+        );
+        assert!(settings.save(&dir).is_err());
+        assert_eq!(std::fs::read(dir.join(SETTINGS_FILE)).unwrap(), previous);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relative_program_paths_are_absolute_before_the_agent_changes_directory() {
+        let dir = std::env::current_dir().unwrap().join(format!("target/relative-agent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent = program(&dir, "agent");
+        let relative = agent.strip_prefix(std::env::current_dir().unwrap()).unwrap();
+        let found = find_program(&relative.to_string_lossy(), None).unwrap();
+        assert!(found.is_absolute(), "{found:?}");
+        assert_eq!(found, agent);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
