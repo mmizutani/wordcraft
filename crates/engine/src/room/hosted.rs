@@ -16,7 +16,9 @@ const MAX_SENDS: usize = 4;
 /// copy (`"as": "participant"`), whose name and role. A bridge serving agents on other machines
 /// can tell from it that it isn't holding the window's key, which acts as the person.
 pub fn auth_reply(copy: &Replica) -> Value {
-    let who = copy.participant();
+    // The room's, not the copy's: the owner may have changed the role since the copy last
+    // received changes (`room.role`), and `auth` brings none in.
+    let who = copy.room().participants().into_iter().find(|p| p.id == copy.id()).unwrap_or_else(|| copy.participant().clone());
     json!({"as": "participant", "name": who.name, "role": who.role})
 }
 

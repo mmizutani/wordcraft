@@ -156,6 +156,9 @@ fn auth_says_a_participant_s_copy_and_whose() {
     let key = room.invite_on("Copy editor", Role::Suggester, Terms { remote: true, ..Terms::default() }).unwrap();
     let copy = lobby.join_with(&key).unwrap();
     assert_eq!(hosted::auth_reply(&copy), json!({"as": "participant", "name": "Copy editor", "role": "suggester"}));
+    // The role as it is now, though the copy hasn't received anything since it changed.
+    room.set_role("Copy editor", Role::Viewer).unwrap();
+    assert_eq!(hosted::auth_reply(&copy)["role"], "viewer");
 }
 
 #[test]
