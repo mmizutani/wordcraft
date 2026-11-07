@@ -387,6 +387,34 @@ fn a_key_taken_back_loses_its_place_even_asking_only_for_the_tool_list() {
     assert_eq!(e.keys(), 0, "its place went");
 }
 
+/// A refused request closes its connection, so a client without a key can't hold one of the
+/// endpoint's connections by sending a request now and then; a served one keeps it open.
+#[test]
+fn refused_requests_close_their_connection() {
+    let (e, app) = endpoint(Options::default());
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+    let mut wrong_host = post(Some("ana"), &list, &[]);
+    wrong_host.headers.retain(|(n, _)| n != "Host");
+    wrong_host.headers.push(("Host".into(), "evil.example".into()));
+    let mut get = post(Some("ana"), &list, &[]);
+    get.method = "GET".into();
+    let mut elsewhere = post(Some("ana"), &list, &[]);
+    elsewhere.target = "/other".into();
+    app.revoked.lock().unwrap().push("gone".into());
+    for (what, req, status) in [
+        ("no key", post(None, &list, &[]), 401),
+        ("a key taken back", post(Some("gone"), &list, &[]), 401),
+        ("the wrong Host", wrong_host, 403),
+        ("GET", get, 405),
+        ("another path", elsewhere, 404),
+    ] {
+        let r = e.handle(&req);
+        assert_eq!((r.status, r.close), (status, true), "{what}");
+    }
+    let r = e.handle(&post(Some("ana"), &list, &[]));
+    assert_eq!((r.status, r.close), (200, false));
+}
+
 /// Asking the app again whether it still takes a key can take a while: a request whose caller
 /// gave up meanwhile is dropped, never run late.
 #[test]

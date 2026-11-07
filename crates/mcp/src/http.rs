@@ -186,8 +186,15 @@ impl Endpoint {
         self.seats.lock().map(|s| s.len()).unwrap_or(0)
     }
 
-    /// Answer one request to `/mcp`.
+    /// Answer one request to `/mcp`. Anything but a success closes the connection: a client
+    /// sending requests that are refused (no key, a key taken back, the wrong Host) can't keep
+    /// one of the endpoint's connections by sending another now and then.
     pub fn handle(&self, req: &Request) -> Response {
+        let resp = self.answer(req);
+        if (200..300).contains(&resp.status) { resp } else { resp.closing() }
+    }
+
+    fn answer(&self, req: &Request) -> Response {
         if req.path() != "/mcp" {
             return Response::text(404, "not found: the MCP endpoint is /mcp\n");
         }
