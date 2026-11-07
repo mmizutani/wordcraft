@@ -630,6 +630,35 @@ fn a_tokens_desktop_bodies_arriving_at_once_are_capped() {
     assert_eq!(answered(&mut head("/host/rooms", TOKEN)), None);
 }
 
+/// An agent's request that is refused, by the relay or by the desktop's endpoint, closes the
+/// agent's connection, as the endpoint itself does: a caller who knows a room's URL but holds no
+/// working key can't keep the relay's connections by sending refused requests now and then.
+#[test]
+fn refused_agent_requests_close_their_connection() {
+    let (base, relay) = relay(|_| {});
+    let desktop: wordcraft_http::Handler =
+        Arc::new(|req: &Request| if req.header("Authorization").is_some() { Response::json(200, "{}") } else { Response::json(401, "{}").closing() });
+    let hosting = Hosting::start(&base, TOKEN, None, desktop).unwrap();
+    let (room, _) = hosting.claim();
+    let ask = |auth: bool| {
+        let headers = if auth { vec![("Authorization".to_string(), "Bearer k".to_string())] } else { Vec::new() };
+        relay.handle(&Request { method: "POST".into(), target: format!("/r/{room}/mcp"), headers, body: b"{}".to_vec(), peer: None })
+    };
+    let refused = ask(false);
+    assert_eq!((refused.status, refused.close), (401, true));
+    let served = ask(true);
+    assert_eq!((served.status, served.close), (200, false));
+    let missing = relay.handle(&Request {
+        method: "POST".into(),
+        target: format!("/r/{}/mcp", "f".repeat(32)),
+        headers: Vec::new(),
+        body: b"{}".to_vec(),
+        peer: None,
+    });
+    assert_eq!((missing.status, missing.close), (404, true));
+    drop(hosting);
+}
+
 /// A large answer whose upload breaks off gives its place back at once, not when its time would
 /// have run out: two broken uploads don't keep the token's next large answers out.
 #[test]

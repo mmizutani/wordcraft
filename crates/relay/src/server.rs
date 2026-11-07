@@ -344,7 +344,10 @@ impl Relay {
             ("DELETE", ["host", "r", id]) => self.close(req, id),
             (_, ["r", id, rest @ ..]) if !rest.is_empty() => {
                 let target = format!("/{}{}", rest.join("/"), req.target.find('?').and_then(|i| req.target.get(i..)).unwrap_or_default());
-                self.forward(req, id, &target)
+                // As at the desktop's endpoint, anything but a success closes the agent's
+                // connection: a caller whose requests are refused can't keep one open.
+                let resp = self.forward(req, id, &target);
+                if (200..300).contains(&resp.status) { resp } else { resp.closing() }
             }
             _ => Response::text(404, "not found\n"),
         }
