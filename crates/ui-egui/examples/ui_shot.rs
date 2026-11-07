@@ -24,7 +24,11 @@
 //! signing in to ChatGPT (`assist.chatgpt.signIn`, #19; no browser opens here).
 //! `{"settingsDir": "/abs/dir"}` gives the window a settings folder (the agents' settings in
 //! File › Options › Assistant read and save there, and a ChatGPT sign-in is kept there), and
-//! `{"web": true}` has it offer what the web app does: no assistant.
+//! `{"web": true}` has it offer what the web app does: no assistant. `{"room": "127.0.0.1:7982"}`
+//! gives the window a lobby whose room port says it listens there (nothing listens), so a shared
+//! document can be joined: `{"join": {"name", "role"?, "files"?, "copies"?}}` invites a participant
+//! and joins with their key (`copies` times, once by default), and `{"inviteOnPage": {…}}` invites
+//! as File › Share's Invite does, showing the key on the page (#33).
 
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{ControlRequest, Services, WordApp};
@@ -66,6 +70,14 @@ fn main() -> Result<(), String> {
     // the agents' settings (#24); none otherwise, as in tests.
     let settings_dir = lines.iter().find_map(|l| l.get("settingsDir").and_then(|v| v.as_str())).map(std::path::PathBuf::from);
     let mut app = WordApp::new(Session::new(doc), Services { settings_dir, ..Services::default() }).with_control(rx);
+    // `{"room": addr}`: a lobby for the shared document, where `{"join": …}` lines join it.
+    let lobby = wordcraft_engine::room::Lobby::default();
+    if let Some(addr) = lines.iter().find_map(|l| l.get("room").and_then(|v| v.as_str())) {
+        lobby.set_addr(Some(addr.parse().map_err(|e| format!("room {addr}: {e}"))?));
+        app = app.with_lobby(lobby.clone());
+    }
+    // The participants' copies, kept in the room till the script ends.
+    let mut copies = Vec::new();
     app.integrated_titlebar = true;
     if lines.first().is_some_and(|l| l.get("startScreen").is_some()) {
         app.start_screen();
@@ -109,6 +121,20 @@ fn main() -> Result<(), String> {
             // permission requests the pane asks (#23), Continue with ChatGPT (#19).
             let r = harness.state_mut().run(id, l.get("params").cloned().unwrap_or_else(|| serde_json::json!({})));
             println!("{id}: {}", r.map_or_else(|e| e, |v| v.to_string()));
+            step_n(&mut harness, 2);
+        } else if let Some(j) = l.get("join") {
+            let room = lobby.room().ok_or("join: share the document first (room.share)")?;
+            let name = j.get("name").and_then(|v| v.as_str()).ok_or("join: a name")?;
+            let role =
+                j.get("role").and_then(|v| v.as_str()).map_or(Some(wordcraft_engine::room::Role::Suggester), wordcraft_engine::room::Role::named);
+            let files = j.get("files").and_then(|v| v.as_str()).and_then(wordcraft_engine::agent_files::AgentFiles::named);
+            let key = room.invite_with(name, role.ok_or("join: an unknown role")?, files).map_err(|e| e.to_string())?;
+            for _ in 0..j.get("copies").and_then(|v| v.as_u64()).unwrap_or(1) {
+                copies.push(lobby.join_with(&key).map_err(|e| e.to_string())?);
+            }
+            step_n(&mut harness, 2);
+        } else if let Some(p) = l.get("inviteOnPage") {
+            println!("inviteOnPage: {:?}", harness.state_mut().invite_on_share_page(p.clone()));
             step_n(&mut harness, 2);
         } else if let Some(n) = l.get("steps").and_then(|v| v.as_u64()) {
             step_n(&mut harness, n as usize);

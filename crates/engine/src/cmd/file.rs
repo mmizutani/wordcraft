@@ -449,6 +449,46 @@ pub fn export_options(s: &Session, v: &Value) -> crate::io::ExportOptions {
     }
 }
 
+/// Most bytes [`export_bytes`] hands back: a reply carries them as base64, a third more.
+pub const MAX_EXPORT_BYTES: usize = 32 << 20;
+
+/// `file.exportPdf` or `file.exportPng` (`id`) with `v` but no `path`, for a participant with
+/// no window to ask where to save and maybe no file to write to (an agent on another machine):
+/// the file's bytes in the reply, as base64 (`pdf` or `png`), with `bytes` (and a page's `width`,
+/// `height` and `pages`). Refused past [`MAX_EXPORT_BYTES`]: export to a file, or a page at a
+/// time.
+pub fn export_bytes(s: &Session, id: &str, v: &Value) -> Result<Value, String> {
+    let opts = export_options(s, v);
+    let (kind, bytes, mut reply) = match id {
+        "file.exportPdf" => {
+            let bytes = crate::io::save_bytes_with("export.pdf", &s.doc, None, &opts)?;
+            ("pdf", bytes, json!({"markup": opts.markup}))
+        }
+        "file.exportPng" => {
+            let page = crate::p::page_index(p::u64(v, "page").unwrap_or(1));
+            let scale = p::f32(v, "scale").unwrap_or(2.0).clamp(0.1, 8.0);
+            let l = s.export_layout_with(opts.markup);
+            let pg = l.pages.get(page).ok_or_else(|| format!("no page {}", page.saturating_add(1)))?;
+            let mut render = wordcraft_render::RenderOptions::default();
+            render.display.dim_header = false;
+            let img = wordcraft_render::render_page(&s.doc, pg, scale, &render);
+            let reply = json!({"width": img.width, "height": img.height, "pages": l.pages.len(), "markup": opts.markup});
+            ("png", img.to_png(), reply)
+        }
+        other => return Err(format!("{other} doesn't hand back bytes: give it a `path`")),
+    };
+    if bytes.len() > MAX_EXPORT_BYTES {
+        return Err(format!(
+            "{id}: the export is {} MB, more than the {} MB a reply carries: export it to a file instead",
+            bytes.len() >> 20,
+            MAX_EXPORT_BYTES >> 20
+        ));
+    }
+    reply["bytes"] = json!(bytes.len());
+    reply[kind] = json!(super::insert::base64_encode(&bytes));
+    Ok(reply)
+}
+
 fn export_png(s: &mut Session, v: &Value) -> CmdResult {
     // No path: the app asks where to save, as file.exportPdf does (#2313).
     let Some(path) = p::str(v, "path") else {

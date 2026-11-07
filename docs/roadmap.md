@@ -74,9 +74,9 @@ milestone's gate are in [collaboration.md](collaboration.md).
 | Milestone | Status | Gate |
 |---|---|---|
 | A0 Foundations: block ids, changes any copy applies, command scopes, hub spike, design doc | done | A second copy follows a person's edits exactly |
-| A1 Shared instance, in one process (#29) | rooms, roles and keys, agents' copies, agents' file setting, undo per participant done; presence (#32), File › Share (#33) and the gate test (#34) left | Two agents and a person edit at once, with no stalls |
+| A1 Shared instance, in one process (#29) | rooms, roles and keys, agents' copies, agents' file setting, undo per participant, File › Share (#33) done; presence (#32) and the gate test (#34) left | Two agents and a person edit at once, with no stalls |
 | A2 Agent API (#35) | not started | Scenario steps 1 to 4 with scripted agents |
-| A3 Network rooms, offline editing (#36) | not started | Hub killed or a laptop offline for an hour: nothing lost |
+| A3 Network rooms, offline editing (#36) | remote-safe invites done (#74); MCP over HTTP (#75) and an outbound relay (#76) next | Hub killed or a laptop offline for an hour: nothing lost |
 | A4 Hardening (#37) | not started | Simulation clean, latency targets met |
 | A5 Word interop (#38) | not started | The scenario's output round-trips through Word |
 | A6 Peer-to-peer, only if needed (#39) | not started | Two laptops edit offline and converge |

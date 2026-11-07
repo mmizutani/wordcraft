@@ -60,7 +60,8 @@ impl Scope {
             "file" => Scope::File,
             // The assistant is the person's: a conversation is started and driven from their window.
             "font" | "proof" | "tools" | "assist" => Scope::App,
-            "ui" => Scope::Ui,
+            // Sharing the document is the app window's (#33).
+            "ui" | "room" => Scope::Ui,
             "arrange" | "canvas" | "chart" | "design" | "developer" | "document" | "draw" | "edit" | "equation" | "fields" | "format" | "hf"
             | "insert" | "layout" | "link" | "list" | "mailings" | "object" | "outline" | "para" | "picture" | "references" | "review" | "shape"
             | "smartArt" | "styles" | "table" | "text" | "wordArt" => Scope::Document,

@@ -12,6 +12,58 @@ use crate::agent_files::AgentFiles;
 /// participant's change accepted meanwhile, and the copy makes them again after that change.
 const MAX_SENDS: usize = 4;
 
+/// What `auth` answers a connection whose key is an invite's: that it reaches a participant's
+/// copy (`"as": "participant"`), whose name and role. A bridge serving agents on other machines
+/// can tell from it that it isn't holding the window's key, which acts as the person.
+pub fn auth_reply(copy: &Replica) -> Value {
+    // The room's, not the copy's: the owner may have changed the role since the copy last
+    // received changes (`room.role`), and `auth` brings none in.
+    let who = copy.room().participants().into_iter().find(|p| p.id == copy.id()).unwrap_or_else(|| copy.participant().clone());
+    json!({"as": "participant", "name": who.name, "role": who.role})
+}
+
+/// Wrong keys a port was given lately, to slow down whoever tries them ([`Refusals::refused`]).
+/// A key is 128 or 256 random bits, so guessing one is hopeless anyway; this keeps a flood of
+/// tries (through a tunnel, from anywhere) from costing the app much, and tells the log.
+#[derive(Debug, Default)]
+pub struct Refusals {
+    lately: std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
+}
+
+/// Wrong keys in [`REFUSALS_WINDOW`] before replies to them slow down: a client with a stale key
+/// tries again once, and shouldn't wait for it.
+const REFUSALS_FREE: usize = 3;
+/// How long a wrong key counts.
+const REFUSALS_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// The wait added for each wrong key past [`REFUSALS_FREE`], and the most it adds up to.
+const REFUSAL_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+const MAX_REFUSAL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Wrong keys in [`REFUSALS_WINDOW`] at which the log hears of them.
+const REFUSALS_LOGGED: usize = 10;
+
+impl Refusals {
+    /// Count a wrong key now: how long to wait before refusing it. Nothing for the first few in
+    /// a minute, then a tenth of a second more for each, at most two seconds. Native only: the
+    /// web build has no port.
+    pub fn refused(&self) -> std::time::Duration {
+        let now = std::time::Instant::now();
+        let mut lately = self.lately.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        while lately.front().is_some_and(|t| now.saturating_duration_since(*t) > REFUSALS_WINDOW) {
+            lately.pop_front();
+        }
+        // Bounded: past this many, the wait is the most anyway.
+        if lately.len() < 1024 {
+            lately.push_back(now);
+        }
+        let n = lately.len();
+        if n == REFUSALS_LOGGED {
+            log::warn!("{n} wrong keys in the last minute at the shared document's port: replies to them are slowed down");
+        }
+        let extra = u32::try_from(n.saturating_sub(REFUSALS_FREE)).unwrap_or(u32::MAX);
+        REFUSAL_WAIT.saturating_mul(extra).min(MAX_REFUSAL_WAIT)
+    }
+}
+
 /// Why `copy` doesn't answer any more, if it doesn't: the room closed, or its participant is
 /// out of it (the copy left, or the invite they joined with was taken back). Their connection
 /// ends.
@@ -42,6 +94,9 @@ pub fn ended(copy: &Replica) -> Option<String> {
 ///   it now.
 /// - `ui.render`: a page as base64 PNG ([`crate::Session::page_png`]); `path` is refused
 ///   (`file.exportPng` writes a page to a file).
+/// - `file.exportPdf` and `file.exportPng` without a `path`: the PDF or the page in the reply,
+///   as base64 `pdf` or `png` ([`crate::cmd::file::export_bytes`]), up to 32 MB; with a `path`,
+///   to a new file where the participant may write.
 /// - `ui.parity`: the feature catalog's parity, as the window gives it.
 /// - `room.participants`: who is in the room (`participants`), who the caller is (`you`), the
 ///   version of the document the copy has (`version`), and which files the caller's commands
@@ -135,7 +190,7 @@ fn answer(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, Str
             }
             Ok(reply)
         }
-        "room.share" | "room.invite" | "room.revoke" | "room.stop" => {
+        "room.share" | "room.invite" | "room.revoke" | "room.role" | "room.stop" => {
             Err(format!("`{method}` is the owner's: {} joined the shared document as a {}", copy.participant().name, copy.participant().role))
         }
         "app.quit" => Err(no_window(method)),
@@ -151,8 +206,14 @@ fn answer(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, Str
 /// when the hub sent the edit back and another participant's change took its text away, or when
 /// the hub hasn't taken all of it.
 fn execute(copy: &mut Replica, id: &str, params: &Value) -> Result<Value, String> {
-    // Without a path, an export asks the window where to save, and a copy has none.
+    // Without a path, an export asks the window where to save, and a copy has none: a PDF or a
+    // page comes back in the reply instead, so a participant with no file to write to (one on
+    // another machine) still gets it.
     if crate::scope::EXPORTS.contains(&id) && params.get("path").and_then(Value::as_str).is_none() {
+        if matches!(id, "file.exportPdf" | "file.exportPng") {
+            catch_up(copy, id, true)?;
+            return crate::cmd::file::export_bytes(copy.session(), id, params);
+        }
         return Err(format!("{id} needs a `path` here: there's no window to ask where to save"));
     }
     catch_up(copy, id, true)?;

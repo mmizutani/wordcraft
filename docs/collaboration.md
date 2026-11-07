@@ -1,6 +1,6 @@
 # Co-editing: people and agents edit one document at once
 
-> **Last reviewed:** 2026-11-07 · **Last updated:** 2026-11-07 · **Change:** minor (the built-in assistant in the Assistant pane as a co-editor: who takes part, how a conversation joins and leaves, roles in the pane, tracked changes in its name, editing at the same time as the person and other agents, what comes next for it); previously major (first version: the design as built on `main` through A1.4 and the agents' file setting, what comes next by milestone, and the decisions; presence is a placeholder until A1.5 lands, #40) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+> **Last reviewed:** 2026-11-07 · **Last updated:** 2026-11-07 · **Change:** minor (File › Share (#33) and remote-safe invites (#74) as built: the page, `room.role`, revoking by name, invites that expire, join a set number of times or are for another machine; known limits and milestones follow); previously minor (the built-in assistant in the Assistant pane as a co-editor: who takes part, how a conversation joins and leaves, roles in the pane, tracked changes in its name, editing at the same time as the person and other agents, what comes next for it); previously major (first version: the design as built on `main` through A1.4 and the agents' file setting, what comes next by milestone, and the decisions; presence is a placeholder until A1.5 lands, #40) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
 
 This is the design of co-editing in WordCraft: several people and AI agents edit one document at
 the same time, each change carries its author, and nothing is lost or corrupted. The agents are
@@ -19,9 +19,9 @@ built-in assistant, which joins as a participant).
 
 | Participant | How it joins | Its copy | Its role |
 |---|---|---|---|
-| The person, in the app's window | The window shares the document it shows (`room.share`, or the Assistant pane's first prompt) | The window's own session, lent to the room's owner copy | Owner |
+| The person, in the app's window | The window shares the document it shows (File › Share, `room.share`, or the Assistant pane's first prompt) | The window's own session, lent to the room's owner copy | Owner |
 | The built-in assistant, in the Assistant pane (ChatGPT, Claude Code, Codex, Pi or a custom ACP agent) | Each conversation takes an invite of its own from the window's room, under its backend's name | A hosted copy the conversation holds (ChatGPT), or one its agent process reaches through the room's port (ACP) | Suggester by default; viewer, commenter or editor when the person picks one in the pane or in File › Options › Assistant; never owner |
-| Outside agents (any MCP client, or a program on the control channel) | An invite's key from the owner (`room.invite`), then `wordcraft-cli mcp --connect` or the control port | A hosted copy on their connection's thread | The invite's: suggester unless the owner chose another |
+| Outside agents (any MCP client, or a program on the control channel) | An invite's key from the owner (File › Share › Invite, or `room.invite`), then `wordcraft-cli mcp --connect` or the control port | A hosted copy on their connection's thread | The invite's: suggester unless the owner chose another |
 
 All three go through the same room, hub and rules: the assistant is not a special path. What
 differs is only where its copy runs and who starts it.
@@ -183,7 +183,21 @@ The room's own process joins people and agents under a name and a role (`Room::j
 else joins with a key the room handed out for one name and role (`Room::invite`,
 `Room::join_with`), so they can't claim another's name. A name is someone's in the room for good,
 compared without case, since their comments and tracked changes keep it. Revoking a key
-(`Room::revoke`) takes its participants out: the hub refuses their changes.
+(`Room::revoke`, by key or by the name it was for) takes its participants out: the hub refuses
+their changes.
+
+An invite can also limit itself (#74): `expiresIn` stops the key working after a while (a minute
+to 30 days), as if taken back; `uses` lets it join a set number of times. A **remote** invite, for
+an agent on another machine, is never owner and can't be made one, reaches no file unless it
+names some, lasts a day unless it says otherwise, and gets its exports back as bytes in the reply.
+Only an invite's key ever leaves the computer: the window's key acts as the person.
+
+The owner can change an invited participant's role later (`room.role`, `Hub::set_role`): the
+invite takes the new role, so a copy that joins with its key later has it, and the hub holds the
+participant's next change to it; their copies take it with the next changes they receive. The
+window keeps the role it joined with, and the built-in assistant's role is chosen in its pane.
+`room.participants` lists the invites not taken back (never their keys), with how many copies
+joined with each and when it expires.
 
 Roles are held twice (`room/rules.rs`). The copy undoes a command that changes more than the
 role allows (`Session::role`), and holds Repeat, a macro, Undo and Redo to the role as a whole.
@@ -195,6 +209,19 @@ change touched, so a check takes as long as the change, whatever the document's 
 A copy runs only commands whose scope its role allows (`Role::allows`): document, selection and
 view for everyone, app settings for the owner, files and windows for no copy (the shared
 document is the room's). Exports (`scope::EXPORTS`) are every role's.
+
+### File › Share (A1.5, #33, #70)
+
+File › Share is a page of the backstage after Print (keytip Alt, F, Z), which the Share button
+on the tab strip opens too (`crates/ui-egui/src/share_page.rs`). It has Share this document and
+Stop sharing; Invite, with a name, a role (each explained) and, for an agent, which files it may
+use, never more than File › Options › Agents allows; the new key shown once, with the
+`WORDCRAFT_CONTROL_KEY=… wordcraft-cli mcp --connect …` line an MCP client runs; and the list of
+who is in the document and who is invited, each with their role, files and whether they are
+connected, a role to change and Remove access. Every control runs a command (`room.share`,
+`room.invite`, `room.role`, `room.revoke`, `room.stop`; the six `room.*` commands are registered,
+scoped to the window and refused by a session without one), the same the control channel and
+MCP run, so a program can do whatever the page does; the page only reads the room's state.
 
 ### The window's room and agents' copies (A1.3, #13 and #45)
 
@@ -334,6 +361,8 @@ where everyone is from `room.participants`. Presence sends no document text.
 | An edit that clashes is made again from the same places, not lost | `crates/engine/src/tests/room.rs` |
 | Roles hold in the copy and at the hub | `crates/engine/src/tests/room_roles.rs` |
 | Agents' copies, keys and revocation | `crates/engine/src/tests/room_host.rs`; `crates/ui-egui/src/share.rs` tests |
+| Invites that expire, join a set number of times or are remote; `room.role` | `crates/engine/src/tests/room_remote.rs`, `crates/engine/src/tests/room_host.rs` |
+| File › Share runs the room's commands and shows its state | `crates/ui-egui/src/share_page/tests.rs` |
 | Agents reach only the files the setting allows | `crates/engine/src/tests/room_files.rs` |
 | Undo takes back only one's own steps | `crates/engine/src/tests/room_undo.rs` |
 | A person, ChatGPT and an ACP agent edit at once (fakes) | `apps/wordcraft-cli/tests/it/gate.rs` |
@@ -342,7 +371,9 @@ where everyone is from `room.participants`. Presence sends no document text.
 ## Known limits today
 
 - **One process.** The room lives in the app or a headless `wordcraft-cli`; there is no network
-  hub, durable log or offline editing yet (A3).
+  hub, durable log or offline editing yet (A3). Remote invites (#74) set the rules for agents on
+  other machines, but the way in for them, MCP over HTTP (#75) through an outbound relay (#76),
+  isn't built: until then only a developer's SSH tunnel reaches the room's port.
 - **Tracked edits at the same moment take turns.** Any two changes that both change the
   document's tracked-change list (`Document.revisions`) clash, so two participants' tracked
   edits made at the same moment go one after the other: the second is made again after the
@@ -356,8 +387,6 @@ where everyone is from `room.participants`. Presence sends no document text.
   person's typing only from the changes, not from where the person is.
 - **The assistant doesn't wake on its own.** It works when the person asks in the pane (or a
   script asks through `assist.*`); a comment that mentions it doesn't reach it until A2.
-- **No File › Share yet.** Sharing starts from the control channel or MCP (`room.share`); the
-  app's menu comes with #33.
 
 ## What comes next
 
@@ -367,9 +396,9 @@ agents. Issues: #28 (parent) and one sub-issue per milestone.
 | Milestone | Scope | Gate |
 |---|---|---|
 | **A0 Foundations** (done) | Block ids (#2), changes that apply to any copy (#3), command scopes (#4), the hub spike (#5, kept open as a reference, never merged), this design doc (#40) | A second copy follows a person's edits exactly |
-| **A1 Shared instance** (#29) | In one process: in-app hub, agents' copies on their own threads, keys and roles, undo per participant (done: #7, #9, #12, #13, #14, #45, #64); left: presence (#32), File › Share (#33), the gate test (#34) | Two agents and a person edit at once, with no stalls |
+| **A1 Shared instance** (#29) | In one process: in-app hub, agents' copies on their own threads, keys and roles, undo per participant (done: #7, #9, #12, #13, #14, #45, #64, and File › Share #33 in #70); left: presence (#32), the gate test (#34) | Two agents and a person edit at once, with no stalls |
 | **A2 Agent API** (#35) | On one machine: content-addressed reads, guarded edits, rewrites as word-level tracked changes, room chat, leases (Review › Block Authors), people first (an agent's direct edit to a paragraph a person just typed in is refused as busy), MCP Events push and poll | Scenario steps 1 to 4 pass with scripted agents |
-| **A3 Network rooms** (#36) | Hub over TLS with keys, durable write-ahead log, snapshots that keep source XML, app and browser copies, offline editing in Merge and Suggest modes, version history, agent drafts (fork and merge), signed webhooks | With the hub killed or a laptop offline for an hour, nothing is lost |
+| **A3 Network rooms** (#36) | Agents in remote sandboxes join the person's desktop room (design #73): remote-safe invites (done, #74), MCP over Streamable HTTP (#75), an outbound relay so no tunnel is needed (#76). Then the hub over TLS with keys, durable write-ahead log, snapshots that keep source XML, app and browser copies, offline editing in Merge and Suggest modes, version history, agent drafts (fork and merge), signed webhooks | With the hub killed or a laptop offline for an hour, nothing is lost |
 | **A4 Hardening** (#37) | Seeded simulation over a lossy network, protocol fuzzing, text-level undo, 10 people on 188 pages | Simulation clean, latency targets met |
 | **A5 Interop** (#38) | Block ids saved as Word's paragraph ids (`w14:paraId`); edits made in Word merged back through Compare as tracked changes | The scenario's output round-trips through Word |
 | **A6 Peer-to-peer** (#39), only if needed | Copies merge each other's logs with no hub | Two laptops edit offline and converge |
@@ -453,11 +482,12 @@ ids included.
 | Rooms, roles, lobby | `crates/engine/src/room.rs` |
 | Hub, copy, role rules, hosted copies | `crates/engine/src/room/{hub,replica,rules,hosted}.rs` |
 | Files agents can use | `crates/engine/src/agent_files.rs` |
-| The window's room | `crates/ui-egui/src/share.rs` |
+| The window's room; File › Share | `crates/ui-egui/src/share.rs`, `crates/ui-egui/src/share_page.rs` |
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-07 | minor | File › Share (#33, #70) and remote-safe invites (#74) as built: the page, `room.role`, revoking by name, invites that expire, join a set number of times or are remote; "No File › Share yet" dropped from known limits; A1 and A3 rows updated |
 | 2026-11-07 | minor | The built-in assistant as a co-editor: a "Who edits together" table (the person, the pane's assistant, outside agents), and how the pane's assistant joins and leaves, its roles, where its copy runs, a turn while the person types, tracked changes in its name, Stop, several assistants at once, its known limits and what comes next for it (Minoru's review of #68) |
 | 2026-11-07 | major | First version (#40): the design as built on `main` (block ids, changes, rebasing and mapping, scopes, rooms, roles and keys, agents' copies, the agents' file setting, undo per participant, the assistant), presence as a placeholder (#32), known limits, milestones A0–A6, the scenario, events and the decisions |

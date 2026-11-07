@@ -70,6 +70,7 @@ pub mod rtl;
 pub mod ruler_tabs;
 pub mod scroll;
 mod share;
+mod share_page;
 pub mod system_clipboard;
 pub mod table_mouse;
 pub mod table_pen;
@@ -660,6 +661,8 @@ pub struct WordApp {
     lobby: wordcraft_engine::room::Lobby,
     /// The document this window shares, if it shares one ([`share`]).
     share: Option<share::Share>,
+    /// File › Share's invite form and the key it just gave ([`share_page`]).
+    share_form: share_page::Form,
     /// The built-in assistant: its conversation, the assistants offered, the prompt being
     /// typed ([`assist`], #15).
     pub(crate) assist: assist::AssistState,

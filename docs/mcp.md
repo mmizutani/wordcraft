@@ -170,7 +170,7 @@ test source in File › Options › Language and on the bar's Install.
 | `render_page` | a page as PNG |
 | `parity` | feature coverage |
 | `screenshot`, `click`, `key`, `ui_inspect` | app only (`--connect`) |
-| `room` | share the document the app's window shows with other agents, and hand out their keys: `{action: "share" \| "invite" \| "revoke" \| "participants" \| "stop", name?, role?, files?, key?}` (app only; see [Shared documents](#shared-documents)) |
+| `room` | share the document the app's window shows with other agents, and hand out their keys: `{action: "share" \| "invite" \| "revoke" \| "role" \| "participants" \| "stop", name?, role?, files?, key?, remote?, expiresIn?, uses?}` (app only; see [Shared documents](#shared-documents)) |
 
 ### Several documents
 
@@ -309,7 +309,17 @@ everyone else's edits in; when someone changed what the step changed since, they
 who. `get_changes` shows the window's changes and other agents' alike. Files,
 other documents and the window (`open_document`, `save_document`, `list_documents`,
 `screenshot`, `click`, `key`, `ui_inspect`) and the room's other actions are the owner's, but
-`save_document` with a `.pdf` or `.png` path exports a copy of the shared document.
+`save_document` with a `.pdf` or `.png` path exports a copy of the shared document. `execute`
+with `file.exportPdf` or `file.exportPng` and no `path` hands the PDF or page back in the reply
+(base64 `pdf` or `png`, up to 32 MB), for an agent with no file to write to.
+
+An agent on another machine (a sandbox) is invited with
+`{"action": "invite", "name": "Sandbox", "remote": true}`: never the owner, no file unless
+`files` names some, and a key that stops working after a day unless `expiresIn` (seconds) says
+otherwise; `uses: 1` lets it join once. It will reach the room through a relay this computer
+dials out to, with no tunnel to run (#75, #76); see
+[Agents on other machines](control-protocol.md#agents-on-other-machines). Only an invite's key
+goes to a sandbox, never the window's.
 
 Which files the agent's commands can use is the person's choice, in the app's File › Options ›
 Agents: none (the default), only the folders listed there, each read-only or read and write, or
@@ -324,8 +334,11 @@ agent which files it can use (`files`, and `folders` with `folders`); no agent c
 setting, since `file.options` is refused in its copy (see
 [Files participants can use](control-protocol.md#files-participants-can-use)).
 
-Revoking the key or stopping sharing ends the agent's connection: its next call is an error
-that says why. See [Shared documents](control-protocol.md#shared-documents) for the control
+The owner changes an invited agent's role with `{"action": "role", "name": "Fact checker",
+"role": "editor"}`: its next call is held to the new one. Revoking the key (`{"action": "revoke",
+"key": …}`, or `"name"` for the name it was invited under) or stopping sharing ends the agent's
+connection: its next call is an error that says why. The app's File › Share page does all of this
+with the same commands. See [Shared documents](control-protocol.md#shared-documents) for the control
 channel's side.
 
 ## Character and paragraph properties

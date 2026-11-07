@@ -192,14 +192,17 @@ pub fn tool_definitions() -> Value {
         tool(
             "room",
             "Shared document",
-            "Share the document the app shows with other agents and people, each editing a copy of their own at once (desktop app only). With the app's own key, as its owner: `share` shares the active document; `invite` {name, role, files} gives a key for a participant (role: viewer, commenter, suggester (the default; their edits are tracked changes in their name), editor or owner), who joins by connecting with it (WORDCRAFT_CONTROL_KEY=<key> wordcraft-cli mcp --connect 127.0.0.1:<port>) and then works on the shared document only, with their role, and with the files the app's File › Options › Agents allows (none unless the person chose some), or fewer when `files` says so; `revoke` {key} takes a key back, ending the copies that joined with it; `stop` stops sharing. `participants`, for anyone: who is in the shared document, who you are, and which files your commands can use.",
+            "Share the document the app shows with other agents and people, each editing a copy of their own at once (desktop app only). With the app's own key, as its owner: `share` shares the active document; `invite` {name, role, files} gives a key for a participant (role: viewer, commenter, suggester (the default; their edits are tracked changes in their name), editor or owner), who joins by connecting with it (WORDCRAFT_CONTROL_KEY=<key> wordcraft-cli mcp --connect 127.0.0.1:<port>) and then works on the shared document only, with their role, and with the files the app's File › Options › Agents allows (none unless the person chose some), or fewer when `files` says so; for an agent on another machine (a sandbox), `remote: true`: never the owner, no files unless `files` names some, and the key stops working after a day unless `expiresIn` (seconds, 60 to 30 days) says otherwise; `uses` limits how many times the key joins; `revoke` {key} or {name} takes an invite back, ending the copies that joined with it; `role` {name, role} gives an invited participant another role from now on; `stop` stops sharing. `participants`, for anyone: who is in the shared document, who you are, and which files your commands can use.",
             obj(
                 json!({
-                    "action": {"type": "string", "enum": ["share", "invite", "revoke", "participants", "stop"]},
-                    "name": s("invite: the participant's name, which their comments and tracked changes carry; share: yours (the author name when left out)"),
-                    "role": s("invite: viewer, commenter, suggester (default), editor or owner"),
+                    "action": {"type": "string", "enum": ["share", "invite", "revoke", "role", "participants", "stop"]},
+                    "name": s("invite: the participant's name, which their comments and tracked changes carry; share: yours (the author name when left out); revoke, role: the invited participant's"),
+                    "role": s("invite, role: viewer, commenter, suggester (invite's default), editor or owner"),
                     "files": {"type": "string", "enum": ["none", "folders", "all"], "description": "invite: which files the participant's commands can use: none, folders (the folders of the app's File › Options › Agents) or all; never more than that setting allows, which they follow when this is left out"},
-                    "key": s("revoke: the key invite gave")
+                    "key": s("revoke: the key invite gave"),
+                    "remote": {"type": "boolean", "description": "invite: the participant is on another machine (never the owner; no files unless `files` names some; the key works for a day unless `expiresIn` says otherwise)"},
+                    "expiresIn": {"type": "integer", "minimum": 60, "maximum": 2592000, "description": "invite: seconds until the key stops working and the copies that joined with it are out"},
+                    "uses": {"type": "integer", "minimum": 1, "description": "invite: how many times the key joins (each copy is a join)"}
                 }),
                 &["action"]
             ),
@@ -362,14 +365,14 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
         "key" => wrap(b.call("ui.key", a.clone())),
         "ui_inspect" => wrap(b.call("ui.inspect", json!({}))),
         "room" => match st("action") {
-            Some(action @ ("share" | "invite" | "revoke" | "participants" | "stop")) => {
-                let params: serde_json::Map<String, Value> = ["name", "role", "key", "files"]
+            Some(action @ ("share" | "invite" | "revoke" | "role" | "participants" | "stop")) => {
+                let params: serde_json::Map<String, Value> = ["name", "role", "key", "files", "remote", "expiresIn", "uses"]
                     .iter()
                     .filter_map(|k| a.get(*k).filter(|v| !v.is_null()).map(|v| (k.to_string(), v.clone())))
                     .collect();
                 wrap(b.call(&format!("room.{action}"), Value::Object(params)))
             }
-            Some(other) => ToolResult::error(format!("unknown action {other:?}: share, invite, revoke, participants or stop")),
+            Some(other) => ToolResult::error(format!("unknown action {other:?}: share, invite, revoke, role, participants or stop")),
             None => ToolResult::error("missing `action`"),
         },
         other => ToolResult::error(format!("unknown tool `{other}`")),
