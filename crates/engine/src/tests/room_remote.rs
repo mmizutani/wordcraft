@@ -155,7 +155,10 @@ fn auth_says_a_participant_s_copy_and_whose() {
     let (_win, _own, room, lobby) = shared();
     let key = room.invite_on("Copy editor", Role::Suggester, Terms { remote: true, ..Terms::default() }).unwrap();
     let copy = lobby.join_with(&key).unwrap();
-    assert_eq!(hosted::auth_reply(&copy), json!({"as": "participant", "name": "Copy editor", "role": "suggester"}));
+    assert_eq!(hosted::auth_reply(&copy), json!({"as": "participant", "name": "Copy editor", "role": "suggester", "remote": true}));
+    // An invite for this computer says so: a bridge for agents elsewhere refuses its key.
+    let here = room.invite("Here", Role::Editor).unwrap();
+    assert_eq!(hosted::auth_reply(&lobby.join_with(&here).unwrap())["remote"], false);
     // The role as it is now, though the copy hasn't received anything since it changed.
     room.set_role("Copy editor", Role::Viewer).unwrap();
     assert_eq!(hosted::auth_reply(&copy)["role"], "viewer");

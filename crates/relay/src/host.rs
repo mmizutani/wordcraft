@@ -18,6 +18,9 @@ const AT_ONCE: usize = 16;
 /// The longest answer the relay sends: its own refusals, and a poll's requests.
 const MAX_FROM_RELAY: u64 = 64 << 20;
 
+/// Why the relay refuses to open a room again: it holds a room with that id for someone else.
+const TAKEN: &str = "the relay gave this room to someone else";
+
 /// Whether the room can be reached now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -95,7 +98,7 @@ fn open_room(agent: &ureq::Agent, relay: &str, token: &str, claim: Option<(&str,
     match status {
         200 => {}
         401 => return Err(Status::Refused("the relay doesn't take this token".into())),
-        409 => return Err(Status::Refused("the relay gave this room to someone else".into())),
+        409 => return Err(Status::Refused(TAKEN.into())),
         s => return Err(Status::Retrying(format!("the relay answered {s}: {}", text.trim()))),
     }
     let v: Value = serde_json::from_str(&text).map_err(|_| Status::Retrying("the relay's answer isn't JSON".into()))?;
@@ -111,16 +114,28 @@ impl Hosting {
     /// `handler` from now on. `claim` is a room this computer opened before (its id and secret),
     /// to keep its URL. Fails when the relay can't be reached or refuses the token.
     pub fn start(relay: &str, token: &str, claim: Option<(String, String)>, handler: Handler) -> Result<Hosting, String> {
-        let relay = relay_url(relay)?;
-        let token = token.trim();
-        if token.is_empty() {
-            return Err("the relay needs a token (from whoever runs it)".into());
-        }
-        let opener = agent(&relay, Duration::from_secs(30));
-        let (room, secret, url) = open_room(&opener, &relay, token, claim.as_ref().map(|(r, s)| (r.as_str(), s.as_str()))).map_err(|s| match s {
+        Hosting::open(relay, token, claim, handler).map_err(|s| match s {
             Status::Retrying(why) | Status::Refused(why) => why,
             other => format!("{other:?}"),
-        })?;
+        })
+    }
+
+    /// [`Hosting::start`], saying whether trying again may help: [`Status::Retrying`] when the
+    /// relay couldn't be reached, [`Status::Refused`] when it refused (the token, the address).
+    /// A room claimed that the relay gave to someone else is given up for a new one.
+    pub fn open(relay: &str, token: &str, claim: Option<(String, String)>, handler: Handler) -> Result<Hosting, Status> {
+        let relay = relay_url(relay).map_err(Status::Refused)?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(Status::Refused("the relay needs a token (from whoever runs it)".into()));
+        }
+        let opener = agent(&relay, Duration::from_secs(30));
+        let opened = match open_room(&opener, &relay, token, claim.as_ref().map(|(r, s)| (r.as_str(), s.as_str()))) {
+            // Agents' old URL can't come back: a new room, with a new URL.
+            Err(Status::Refused(why)) if why == TAKEN => open_room(&opener, &relay, token, None),
+            other => other,
+        };
+        let (room, secret, url) = opened?;
         let shared = Arc::new(Shared {
             relay: relay.clone(),
             token: token.to_string(),
@@ -133,14 +148,16 @@ impl Hosting {
             busy: AtomicUsize::new(0),
             handler,
         });
+        let hosting = Hosting { shared };
         for _ in 0..POLLERS {
-            let s = shared.clone();
+            let s = hosting.shared.clone();
+            // Without its threads the room is closed again (dropping `hosting` stops it).
             std::thread::Builder::new()
                 .name("relay poll".into())
                 .spawn(move || poll_loop(&s))
-                .map_err(|e| format!("no thread for the relay: {e}"))?;
+                .map_err(|e| Status::Retrying(format!("no thread for the relay: {e}")))?;
         }
-        Ok(Hosting { shared })
+        Ok(hosting)
     }
 
     /// The URL agents use: the relay's, for this room (`https://<relay>/r/<room>/mcp`).

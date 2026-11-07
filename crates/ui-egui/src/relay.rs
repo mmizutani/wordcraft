@@ -49,8 +49,17 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Where the shared document's room is on the relay now.
 enum Link {
     Connecting,
+    /// The relay couldn't be reached: trying again.
+    Retrying(String),
     Up(Hosted),
+    /// The relay refused (the token): nothing more is tried until the setting changes.
     Failed(String),
+}
+
+/// Why the room couldn't be opened, and whether trying again may help.
+struct NotOpened {
+    why: String,
+    retry: bool,
 }
 
 /// One connection to the relay, for one shared document.
@@ -201,6 +210,7 @@ impl WordApp {
         };
         let (status, why, url) = match &*lock(&c.link) {
             Link::Connecting => ("connecting", None, None),
+            Link::Retrying(why) => ("retrying", Some(why.clone()), None),
             Link::Failed(why) => ("failed", Some(why.clone()), None),
             Link::Up(h) => {
                 let (status, why) = h.status();
@@ -239,7 +249,27 @@ impl WordApp {
         let (l, s, shared, ctx) = (link.clone(), stopped.clone(), self.relay.settings.clone(), self.ctx.clone());
         let path = settings_path(self.services.settings_dir.as_deref());
         let spawned = std::thread::Builder::new().name("relay connect".into()).spawn(move || {
-            let result = Hosted::start(&settings, &room_port.to_string());
+            // Until it opens, the relay refuses, or sharing stops: the computer may be offline.
+            let mut wait = std::time::Duration::from_secs(2);
+            let result = loop {
+                match Hosted::start(&settings, &room_port.to_string()) {
+                    Err(NotOpened { why, retry: true }) if !s.load(Ordering::SeqCst) => {
+                        log::warn!("relay: {why}; trying again in {} s", wait.as_secs());
+                        *lock(&l) = Link::Retrying(why);
+                        if let Some(ctx) = &ctx {
+                            ctx.request_repaint();
+                        }
+                        for _ in 0..wait.as_millis() / 100 {
+                            if s.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        wait = (wait * 2).min(std::time::Duration::from_secs(60));
+                    }
+                    other => break other,
+                }
+            };
             let mut link = lock(&l);
             // Stopped while it connected: close the room again, here, once the window can look
             // at the link again.
@@ -265,7 +295,7 @@ impl WordApp {
                     }
                     Link::Up(hosted)
                 }
-                Err(why) => {
+                Err(NotOpened { why, .. }) => {
                     log::warn!("relay: {why}");
                     Link::Failed(why)
                 }
@@ -317,13 +347,20 @@ struct Hosted(Arc<wordcraft_relay::host::Hosting>);
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Hosted {
-    fn start(settings: &Settings, room_port: &str) -> Result<Hosted, String> {
+    fn start(settings: &Settings, room_port: &str) -> Result<Hosted, NotOpened> {
         use wordcraft_mcp::http::{Endpoint, Options};
+        use wordcraft_relay::host::Status;
         // Behind the relay, requests come with the relay's name in `Host`; the relay passes
         // `Origin` on, so a web page is still refused.
         let endpoint = Arc::new(Endpoint::connecting(Options { hosts: None, ..Options::default() }, room_port));
         let handler: wordcraft_http::Handler = Arc::new(move |req| endpoint.handle(req));
-        wordcraft_relay::host::Hosting::start(&settings.relay, &settings.token, settings.claim(), handler).map(|h| Hosted(Arc::new(h)))
+        wordcraft_relay::host::Hosting::open(&settings.relay, &settings.token, settings.claim(), handler).map(|h| Hosted(Arc::new(h))).map_err(|s| {
+            match s {
+                Status::Retrying(why) => NotOpened { why, retry: true },
+                Status::Refused(why) => NotOpened { why, retry: false },
+                other => NotOpened { why: format!("{other:?}"), retry: false },
+            }
+        })
     }
 
     fn url(&self) -> String {
@@ -363,8 +400,8 @@ struct Hosted;
 
 #[cfg(target_arch = "wasm32")]
 impl Hosted {
-    fn start(_: &Settings, _: &str) -> Result<Hosted, String> {
-        Err("the web app can't open a room on a relay".into())
+    fn start(_: &Settings, _: &str) -> Result<Hosted, NotOpened> {
+        Err(NotOpened { why: "the web app can't open a room on a relay".into(), retry: false })
     }
     fn url(&self) -> String {
         String::new()

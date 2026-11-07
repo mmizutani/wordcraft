@@ -30,8 +30,9 @@ wordcraft-cli mcp --http 127.0.0.1:8765 --connect 127.0.0.1:<room port>
 ```
 
 `--connect` is the shared document's room port, as File › Share's line shows it. Every request
-carries an invite's key (`room.invite`, with `remote: true` for a sandbox) in
-`Authorization: Bearer`; the key opens one connection to the app, and so one copy of the
+carries a remote invite's key (`room.invite` with `remote: true`) in `Authorization: Bearer`; a
+key from an invite for this computer is refused (403), since it may be the owner and use the
+files File › Options › Agents allows; the key opens one connection to the app, and so one copy of the
 document, held to the invite's role and files, for as long as requests keep coming (30 minutes
 without one closes it). The window's key is refused (403): it acts as the person. A key taken
 back, or past its time, is refused (401), and the request that finds it out says so.

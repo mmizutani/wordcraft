@@ -546,7 +546,7 @@ mod tests {
         let lobby = Lobby::default();
         let port = RoomPort::open(&lobby).unwrap();
         let (mut session, room, mut own) = share(&lobby);
-        let key = room.invite("Sandbox", Role::Suggester).unwrap();
+        let key = room.invite_on("Sandbox", Role::Suggester, wordcraft_engine::room::Terms { remote: true, ..Default::default() }).unwrap();
         let endpoint = Endpoint::connecting(Options { hosts: None, ..Options::default() }, &port.addr().to_string());
         let post = |key: &str, body: Value, headers: &[(&str, &str)]| {
             let mut h = vec![("Content-Type".to_string(), "application/json".to_string()), ("Authorization".to_string(), format!("Bearer {key}"))];

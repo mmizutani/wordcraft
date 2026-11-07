@@ -150,3 +150,40 @@ fn a_slow_drip_of_bytes_is_cut_off_at_the_request_deadline() {
         assert!(started.elapsed() < Duration::from_millis(3000), "{:?}", started.elapsed());
     }
 }
+
+/// Connections turned away at the cap that keep trickling bytes don't hold up the accept loop:
+/// once a place is free, the next request is answered at once.
+#[test]
+fn turned_away_connections_dont_hold_up_the_next_one() {
+    use std::time::{Duration, Instant};
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config = Config { max_connections: 1, ..Config::default() };
+    std::thread::spawn(move || serve(listener, config, Arc::new(|_: &Request| Response::text(200, "ok"))));
+    let first = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    // Three turned away, each sending a byte every 100 ms for two seconds.
+    let tricklers: Vec<_> = (0..3)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else { return };
+                for _ in 0..20 {
+                    if s.write_all(b"x").is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    drop(first);
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    let out = exchange(port, b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(started.elapsed() < Duration::from_millis(700), "waited {:?}", started.elapsed());
+    for t in tricklers {
+        t.join().unwrap();
+    }
+}

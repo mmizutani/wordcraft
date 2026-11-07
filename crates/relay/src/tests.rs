@@ -197,6 +197,13 @@ fn a_forgotten_room_is_opened_again_with_the_same_url() {
     hosting.stop();
     let again = Hosting::start(&base, TOKEN, Some((room.clone(), secret.clone())), echo()).unwrap();
     assert_eq!(again.url(), url);
+    // A desktop whose room is someone else's now (a copied settings file) gets a new one.
+    let other = Hosting::start(&base, TOKEN, Some((room.clone(), "e".repeat(64))), echo()).unwrap();
+    assert_ne!(other.url(), url);
+    assert_eq!(http(other.url(), "POST", &[], "{}").0, 200);
+    // Refusals that trying again won't help say so.
+    assert!(matches!(Hosting::open(&base, "wrong-token-wrong-token-wrong-token", None, echo()), Err(Status::Refused(_))));
+    assert!(matches!(Hosting::open("http://127.0.0.1:9", TOKEN, None, echo()), Err(Status::Retrying(_))));
 }
 
 /// Agents waiting when the person stops sharing hear so at once.

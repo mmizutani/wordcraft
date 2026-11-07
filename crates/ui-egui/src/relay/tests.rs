@@ -43,8 +43,11 @@ fn error(a: &mut WordApp, method: &str, params: Value) -> String {
 
 /// A relay on this computer: its address.
 fn relay() -> String {
+    relay_on(TcpListener::bind(("127.0.0.1", 0)).unwrap())
+}
+
+fn relay_on(listener: TcpListener) -> String {
     use wordcraft_relay::server::{Config, Relay, serve};
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let relay = Arc::new(Relay::new(Config { public_url: base.clone(), tokens: vec![TOKEN.into()], ..Config::default() }));
     std::thread::spawn(move || serve(listener, relay, 64));
@@ -197,4 +200,27 @@ fn the_relay_setting_is_checked_kept_and_turned_off() {
     assert_eq!((invite["key"].is_string(), &invite["url"], &invite["mcpConfig"]), (true, &Value::Null, &Value::Null));
     result(&mut a, "room.stop", json!({}));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A relay that can't be reached when the document is shared (the computer is offline, the
+/// relay is restarting) is tried again until it can: the agents' URL then works.
+#[test]
+fn a_relay_out_of_reach_is_tried_again() {
+    let lobby = Lobby::default();
+    let _port = wordcraft_assist::acp::RoomPort::open(&lobby).unwrap();
+    // A port nothing listens on yet.
+    let port = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+    let mut a = window(&lobby, None);
+    result(&mut a, "room.relay", json!({"relay": format!("http://127.0.0.1:{port}"), "token": TOKEN}));
+    result(&mut a, "room.share", json!({}));
+    let retrying = relay_becomes(&mut a, "retrying");
+    assert!(retrying["why"].as_str().is_some_and(|w| w.contains("reached")), "{retrying}");
+    relay_on(TcpListener::bind(("127.0.0.1", port)).unwrap());
+    let up = relay_becomes(&mut a, "connected");
+    assert!(up["url"].as_str().is_some_and(|u| u.starts_with(&format!("http://127.0.0.1:{port}/r/"))), "{up}");
+    // A token the relay refuses isn't tried again.
+    result(&mut a, "room.relay", json!({"relay": format!("http://127.0.0.1:{port}"), "token": "not-this-relay-s-token-not-this-one"}));
+    let refused = relay_becomes(&mut a, "failed");
+    assert!(refused["why"].as_str().is_some_and(|w| w.contains("token")), "{refused}");
+    result(&mut a, "room.stop", json!({}));
 }

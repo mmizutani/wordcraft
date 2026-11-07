@@ -39,7 +39,8 @@ impl Backend for Fake {
         }
         match method {
             "auth" if self.key == "window" => Ok(json!({"as": "window"})),
-            "auth" => Ok(json!({"as": "participant", "name": self.key, "role": "suggester"})),
+            "auth" if self.key == "local" => Ok(json!({"as": "participant", "name": self.key, "role": "owner", "remote": false})),
+            "auth" => Ok(json!({"as": "participant", "name": self.key, "role": "suggester", "remote": true})),
             "engine.execute" => Ok(json!({"ran": params["command"], "by": self.key})),
             "document.inspect" => Ok(json!({"text": "one two three"})),
             _ => Ok(json!({})),
@@ -208,6 +209,11 @@ fn requests_without_an_invites_key_or_from_elsewhere_are_refused() {
     assert!(r.header("WWW-Authenticate").is_some_and(|h| h.starts_with("Bearer")));
     let r = e.handle(&post(Some("window"), &list, &[]));
     assert_eq!(r.status, 403, "the window's key acts as the person: {:?}", body(&r));
+    // An invite for an agent on this computer may be the owner and use this computer's files:
+    // it isn't one to hand to an agent elsewhere.
+    let r = e.handle(&post(Some("local"), &list, &[]));
+    assert_eq!(r.status, 403, "{:?}", body(&r));
+    assert!(body(&r).to_string().contains("remote: true"), "{:?}", body(&r));
     let r = e.handle(&post(Some("stranger"), &list, &[]));
     assert_eq!(r.status, 401);
     assert_eq!(e.keys(), 0, "no connection kept for refused keys");
@@ -240,7 +246,10 @@ fn requests_without_an_invites_key_or_from_elsewhere_are_refused() {
     r.body = vec![b' '; crate::server::MAX_REQUEST_LINE + 1];
     assert_eq!(e.handle(&r).status, 413);
     let calls = app.calls.lock().unwrap();
-    assert!(calls.iter().all(|(k, m)| m == "auth" && (k == "window" || k == "stranger")), "only the key checks reached the app: {calls:?}");
+    assert!(
+        calls.iter().all(|(k, m)| m == "auth" && (k == "window" || k == "stranger" || k == "local")),
+        "only the key checks reached the app: {calls:?}"
+    );
 }
 
 #[test]

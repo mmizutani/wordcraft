@@ -22,7 +22,9 @@ or use one whose operator gives you a token.
    token from whoever runs it, then Use this relay. Or, from the control channel or a script:
    `room.relay {"relay": "https://relay.example.org", "token": "…"}`.
 2. Share the document. The app opens a room for it on the relay, and the page shows the URL
-   agents use.
+   agents use. While the relay can't be reached (the computer is offline, the relay is
+   restarting), the app tries again, from every 2 seconds to every minute; a token the relay
+   refuses isn't tried again.
 3. Invite the agent with On another computer ticked (`room.invite` with `remote: true`). Its key
    shows once, with an MCP client configuration to give the agent:
 
