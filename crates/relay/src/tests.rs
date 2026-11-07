@@ -304,8 +304,8 @@ fn the_relay_holds_back_floods_and_large_bodies() {
     // (A large one only while an agent waits for it: large_answers_arriving_at_once_are_capped_per_token.)
     let limit = |r: &Request| relay.body_limit(r).map(|(n, _)| n).map_err(|resp| resp.status);
     assert_eq!(limit(&req(&format!("/host/r/{room}/reply"), Some(&secret))), Err(404), "no agent waits");
-    assert_eq!(limit(&req(&format!("/host/r/{room}/reply"), Some("nope"))), Ok(MAX_REQUEST));
-    assert_eq!(limit(&req(&format!("/host/r/{room}/reply"), None)), Ok(MAX_REQUEST));
+    assert_eq!(limit(&req(&format!("/host/r/{room}/reply"), Some("nope"))), Err(404));
+    assert_eq!(limit(&req(&format!("/host/r/{room}/reply"), None)), Err(404));
     assert_eq!(limit(&req(&format!("/r/{room}/mcp"), Some(&secret))), Ok(MAX_REQUEST));
     let big = "x".repeat(MAX_REQUEST + 1);
     let (status, _, _) = http(&format!("{base}/r/{room}/mcp"), "POST", &[], &big);
@@ -556,6 +556,44 @@ fn large_answers_arriving_at_once_are_capped_per_token() {
     let _ = third.read_to_string(&mut out);
     assert!(out.starts_with("HTTP/1.1 503") && started.elapsed() < Duration::from_secs(2), "{out}");
     drop(agent);
+}
+
+/// A client that sends a head and holds back its body is answered from the head alone unless it
+/// could make the request at all: without a room that exists, a token or a room's secret it is
+/// turned away at once, and one address may have only a few agents' bodies arriving at once.
+#[test]
+fn heads_without_their_bodies_are_turned_away_unless_the_request_could_be_made() {
+    let (base, _relay) = relay(|_| {});
+    let hosting = Hosting::start(&base, TOKEN, None, echo()).unwrap();
+    let (room, _) = hosting.claim();
+    let port = base.rsplit(':').next().unwrap().to_string();
+    let head = |path: &str| {
+        let mut s = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        s.write_all(format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {MAX_REQUEST}\r\n\r\n").as_bytes()).unwrap();
+        s
+    };
+    // The status it is answered with at once, or None while the relay waits for its body.
+    let answered = |s: &mut TcpStream| {
+        s.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut out = [0u8; 12];
+        s.read(&mut out).ok().filter(|n| *n >= 12).and_then(|_| std::str::from_utf8(&out[9..12]).ok().and_then(|c| c.parse::<u16>().ok()))
+    };
+    let missing = "f".repeat(32);
+    for (path, status) in
+        [(format!("/r/{missing}/mcp"), 404), ("/host/rooms".to_string(), 401), (format!("/host/r/{room}/poll"), 404), ("/healthz".to_string(), 413)]
+    {
+        assert_eq!(answered(&mut head(&path)), Some(status), "{path}");
+    }
+    // An agent's room: 16 bodies may be arriving from one address, then 429 until one is done.
+    let mut waiting: Vec<TcpStream> = (0..16).map(|_| head(&format!("/r/{room}/mcp"))).collect();
+    for s in &mut waiting {
+        assert_eq!(answered(s), None);
+    }
+    assert_eq!(answered(&mut head(&format!("/r/{room}/mcp"))), Some(429));
+    drop(waiting.pop());
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(answered(&mut head(&format!("/r/{room}/mcp"))), None);
+    drop(hosting);
 }
 
 /// A large answer whose upload breaks off gives its place back at once, not when its time would

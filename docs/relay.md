@@ -104,7 +104,7 @@ answers 503 with `Retry-After`.
 | Answers waiting for agents to read them | 192 MiB from one token's rooms, 1 GiB in all: past that, new requests get 503 before they reach the desktop, and an answer that arrives past it gets 503 too: the desktop keeps it and sends it again (never runs it again) until its agent stops waiting |
 | Requests waiting for one desktop | 64 (else 503), and 128 in all the rooms of one token (else 503); a desktop may have 4 polls waiting at once (else 429) |
 | Rate | 20 requests a second from one address (bursts of 40), 50 a second to one room (bursts of 100); more get 429 |
-| A request's head and body | must arrive within 60 seconds of its start, and a connection may sit idle 60 seconds between requests |
+| A request's head and body | must arrive within 60 seconds of its start, and a connection may sit idle 60 seconds between requests. A body is read only when its head could make the request: a desktop's calls need the room's secret (or a relay token to open a room), an agent's request needs a room that exists, and 16 agents' bodies may be arriving at once from one address (else 429); anything else is answered from its head |
 
 ## The protocol
 

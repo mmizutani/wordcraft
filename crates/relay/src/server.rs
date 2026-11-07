@@ -29,6 +29,9 @@ const ID_MASK: u64 = (1 << 53) - 1;
 /// Polls one room's desktop may have waiting at once: the app has two. More would only hold
 /// connections that the relay's other rooms need.
 const MAX_POLLS: usize = 4;
+/// Agents' request bodies that may be arriving at once from one address: each holds a
+/// connection until it has arrived.
+const ARRIVING_PER_SOURCE: usize = 16;
 /// Requests a desktop takes in one poll.
 const PER_POLL: usize = 16;
 
@@ -161,6 +164,8 @@ pub struct Relay {
     /// Large answers being received, by the token of their room: each place goes back once its
     /// request is done, however it ends.
     large: Arc<Mutex<HashMap<String, usize>>>,
+    /// Agents' request bodies being received, by the address they come from.
+    arriving: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 /// Answers' bytes waiting for agents to read them, in all and by token.
@@ -191,21 +196,21 @@ impl Drop for Unsent {
     }
 }
 
-/// One place in a count by token (agents' requests waiting, large answers arriving), given back
-/// when dropped, however the request it belongs to ends.
+/// One place in a count by token or by address (agents' requests waiting, bodies arriving),
+/// given back when dropped, however the request it belongs to ends.
 struct Place {
     counts: Arc<Mutex<HashMap<String, usize>>>,
-    token: String,
+    key: String,
 }
 
 impl Drop for Place {
     fn drop(&mut self) {
         if let Ok(mut c) = self.counts.lock()
-            && let Some(n) = c.get_mut(&self.token)
+            && let Some(n) = c.get_mut(&self.key)
         {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                c.remove(&self.token);
+                c.remove(&self.key);
             }
         }
     }
@@ -224,6 +229,7 @@ impl Relay {
             sources: Mutex::new(HashMap::new()),
             waiting: Arc::new(Mutex::new(HashMap::new())),
             large: Arc::new(Mutex::new(HashMap::new())),
+            arriving: Arc::new(Mutex::new(HashMap::new())),
             sending: Arc::new(Mutex::new(Sending::default())),
         }
     }
@@ -238,16 +244,54 @@ impl Relay {
         bearer(req).is_some_and(|s| same_secret(s, &room.secret)).then_some(room)
     }
 
-    /// How much body `req` may have: a desktop's answer may be large, when it comes with its
-    /// room's secret, an agent waits for one, and few large answers are arriving (from this
-    /// token's desktops, and in all); everything else is an MCP request's size. A large answer
-    /// that can't be taken now is refused before it is read: 404 when nobody waits for it, 503
-    /// (send it again) when too many are arriving.
+    /// How much body `req` may have, decided from its head before any of its body is read, so
+    /// a client that sends a head and holds back the body can't hold a connection unless it
+    /// could make the request at all:
+    ///
+    /// - a desktop's calls need its room's secret (or, to open a room, a relay token);
+    /// - an agent's request needs a room that exists, and only a few may be arriving at once
+    ///   from one address;
+    /// - anything else has no body.
+    ///
+    /// A desktop's answer may be large while an agent waits for one and few large answers are
+    /// arriving (from this token's desktops, and in all): 404 when nobody waits for it, 503 (send
+    /// it again) when too many are arriving.
     pub fn body_limit(&self, req: &Request) -> Result<(usize, Hold), Response> {
-        let path = req.path();
-        let Some(room) = path.strip_prefix("/host/r/").and_then(|r| r.strip_suffix("/reply")).and_then(|id| self.hosts(req, id)) else {
-            return Ok((MAX_REQUEST, Hold::default()));
-        };
+        let path = req.path().to_string();
+        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        match parts.as_slice() {
+            ["host", "rooms"] => {
+                if bearer(req).is_some_and(|t| self.config.tokens.iter().any(|k| same_secret(t, k))) {
+                    Ok((MAX_REQUEST, Hold::default()))
+                } else {
+                    Err(Response::text(401, "a relay token goes in Authorization: Bearer\n")
+                        .with_header("WWW-Authenticate", "Bearer realm=\"wordcraft-relay\""))
+                }
+            }
+            ["host", "r", id, rest @ ..] => match self.hosts(req, id) {
+                None => Err(Response::text(404, "no such room (or not its secret)\n")),
+                Some(room) if rest == ["reply"] => self.answer_limit(req, &room),
+                Some(_) => Ok((MAX_REQUEST, Hold::default())),
+            },
+            ["r", id, rest @ ..] if !rest.is_empty() => {
+                if self.room(id).is_none() {
+                    return Err(refusal(404, "no such room: the link is wrong, or the document isn't shared any more"));
+                }
+                let from = self.source(req).map(|ip| ip.to_string()).unwrap_or_default();
+                let Ok(mut arriving) = self.arriving.lock() else { return Err(refusal(500, "internal error")) };
+                let n = arriving.entry(from.clone()).or_insert(0);
+                if *n >= ARRIVING_PER_SOURCE {
+                    return Err(refusal(429, "too many requests from this address").with_header("Retry-After", "1"));
+                }
+                *n += 1;
+                Ok((MAX_REQUEST, Hold::new(Place { counts: self.arriving.clone(), key: from })))
+            }
+            _ => Ok((0, Hold::default())),
+        }
+    }
+
+    /// How much body a desktop's answer to `room` may have (see [`Relay::body_limit`]).
+    fn answer_limit(&self, req: &Request, room: &Room) -> Result<(usize, Hold), Response> {
         let size = req.header("Content-Length").and_then(|n| n.trim().parse::<usize>().ok());
         if size.is_some_and(|n| n <= MAX_REQUEST) {
             return Ok((MAX_REQUEST, Hold::default()));
@@ -260,7 +304,7 @@ impl Relay {
             return Err(Response::text(503, "too many large answers are arriving: send it again\n").with_header("Retry-After", "1"));
         }
         *large.entry(room.token.clone()).or_insert(0) += 1;
-        Ok((MAX_REPLY, Hold::new(Place { counts: self.large.clone(), token: room.token.clone() })))
+        Ok((MAX_REPLY, Hold::new(Place { counts: self.large.clone(), key: room.token.clone() })))
     }
 
     pub fn handle(&self, req: &Request) -> Response {
@@ -495,7 +539,7 @@ impl Relay {
                 return refusal(503, "too many requests are waiting for this relay user's documents").with_header("Retry-After", "1");
             }
             *n += 1;
-            Place { counts: self.waiting.clone(), token: room.token.clone() }
+            Place { counts: self.waiting.clone(), key: room.token.clone() }
         };
         let (tx, rx) = mpsc::channel();
         let n = {
