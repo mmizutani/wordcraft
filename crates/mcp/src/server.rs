@@ -91,6 +91,69 @@ pub fn read_bounded_line(reader: &mut impl BufRead, max: usize) -> std::io::Resu
 pub struct Server {
     backend: Box<dyn Backend>,
     initialized: bool,
+    /// The longest reply line this server builds ([`Server::limit_replies`]).
+    max_reply: usize,
+}
+
+std::thread_local! {
+    /// The longest text a reply being built on this thread may carry: what [`Server::handle_line`]
+    /// is limited to while it runs, so a tool's answer stops growing at the limit instead of
+    /// being built whole and thrown away.
+    static REPLY_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// The longest text a reply being built on this thread may carry.
+pub(crate) fn reply_cap() -> usize {
+    REPLY_CAP.with(std::cell::Cell::get)
+}
+
+/// Sets [`REPLY_CAP`] while it lives, and puts the one before back.
+struct CapFor(usize);
+
+impl CapFor {
+    fn set(max: usize) -> Self {
+        CapFor(REPLY_CAP.with(|c| c.replace(max)))
+    }
+}
+
+impl Drop for CapFor {
+    fn drop(&mut self) {
+        REPLY_CAP.with(|c| c.set(self.0));
+    }
+}
+
+/// A buffer that refuses to grow past `max` bytes.
+struct Capped {
+    buf: Vec<u8>,
+    max: usize,
+}
+
+impl Write for Capped {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len().saturating_add(b.len()) > self.max {
+            return Err(std::io::Error::other("larger than the limit"));
+        }
+        self.buf.extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `v` as JSON text (indented when `pretty`), or `None` once it would pass `max` bytes: writing
+/// stops there, so nothing larger is ever built.
+pub(crate) fn capped_json(v: &Value, pretty: bool, max: usize) -> Option<String> {
+    let mut out = Capped { buf: Vec::new(), max };
+    let written = if pretty { serde_json::to_writer_pretty(&mut out, v) } else { serde_json::to_writer(&mut out, v) };
+    written.ok()?;
+    String::from_utf8(out.buf).ok()
+}
+
+/// What a tool or resource says when its answer would pass [`reply_cap`].
+pub(crate) fn too_large_note(max: usize) -> String {
+    let size = if max >= 1 << 20 { format!("{} MiB", max >> 20) } else { format!("{} KiB", (max >> 10).max(1)) };
+    format!("the answer is larger than this connection sends at once ({size}): ask for less")
 }
 
 fn response(id: Value, result: Value) -> Value {
@@ -117,7 +180,15 @@ const STATIC_TTL_MS: u64 = 60 * 60 * 1000;
 
 impl Server {
     pub fn new(backend: Box<dyn Backend>) -> Self {
-        Self { backend, initialized: false }
+        Self { backend, initialized: false, max_reply: usize::MAX }
+    }
+
+    /// Build no reply line longer than `max` bytes, and read none longer from the backend: an
+    /// answer that would pass it becomes an error saying so, and stops growing at the limit
+    /// rather than being built whole first (`http::Endpoint`, whose answers are budgeted).
+    pub fn limit_replies(&mut self, max: usize) {
+        self.max_reply = max;
+        self.backend.limit_replies(max);
     }
 
     pub fn backend(&mut self) -> &mut dyn Backend {
@@ -153,6 +224,8 @@ impl Server {
         if line.is_empty() {
             return None;
         }
+        let max = self.max_reply;
+        let _cap = CapFor::set(max);
         let reply = match serde_json::from_str::<Value>(line) {
             Ok(Value::Array(batch)) => {
                 // Batches were removed in 2025-06-18; still answer older clients sensibly.
@@ -166,7 +239,10 @@ impl Server {
             Ok(msg) => self.handle(msg),
             Err(e) => Some(error(Value::Null, PARSE_ERROR, format!("parse error: {e}"))),
         };
-        reply.map(|r| r.to_string())
+        reply.map(|r| match capped_json(&r, false, max) {
+            Some(text) => text,
+            None => error(r.get("id").cloned().unwrap_or(Value::Null), INTERNAL_ERROR, too_large_note(max)).to_string(),
+        })
     }
 
     /// Handle one JSON-RPC message; `None` for notifications and responses.
@@ -234,7 +310,11 @@ impl Server {
             COMMANDS_URI => self.backend.call("engine.commands", json!({})),
             _ => return None,
         };
-        Some(v.map(|v| json!([{"uri": uri, "mimeType": "application/json", "text": serde_json::to_string_pretty(&v).unwrap_or_default()}])))
+        let max = reply_cap();
+        Some(v.and_then(|v| {
+            let text = capped_json(&v, true, max).ok_or_else(|| too_large_note(max))?;
+            Ok(json!([{"uri": uri, "mimeType": "application/json", "text": text}]))
+        }))
     }
 
     /// A 2026-07-28 request: no handshake before it, and nothing kept from one request to the

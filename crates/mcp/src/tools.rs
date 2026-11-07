@@ -22,8 +22,14 @@ impl ToolResult {
     pub fn text(t: impl Into<String>) -> Self {
         Self { content: vec![json!({"type": "text", "text": t.into()})], is_error: false }
     }
+    /// `v`, indented, as the tool's text; an error instead when it would pass what the reply
+    /// may carry (`Server::limit_replies`), built no further than that.
     pub fn json(v: &Value) -> Self {
-        Self::text(serde_json::to_string_pretty(v).unwrap_or_default())
+        let max = crate::server::reply_cap();
+        match crate::server::capped_json(v, true, max) {
+            Some(text) => Self::text(text),
+            None => Self::error(crate::server::too_large_note(max)),
+        }
     }
     pub fn error(t: impl Into<String>) -> Self {
         Self { content: vec![json!({"type": "text", "text": t.into()})], is_error: true }
@@ -301,11 +307,13 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
                     Ok(v) => json!({"command": id, "ok": true, "result": v}),
                     Err(e) => json!({"command": id, "ok": false, "error": e}),
                 };
-                let size = serde_json::to_string_pretty(&one).map_or(0, |t| t.len());
-                if kept.saturating_add(size) > MAX_BATCH_ANSWER {
-                    one = json!({"command": id, "ok": !failed, "leftOut": "the batch's results passed 8 MiB: run this command on its own for its result"});
-                } else {
+                // Measured no further than the room left, so a huge result is never printed whole.
+                let room = MAX_BATCH_ANSWER.saturating_sub(kept);
+                let size = crate::server::capped_json(&one, true, room).map(|t| t.len());
+                if let Some(size) = size {
                     kept += size;
+                } else {
+                    one = json!({"command": id, "ok": !failed, "leftOut": "the batch's results passed 8 MiB: run this command on its own for its result"});
                 }
                 out.push(one);
                 if failed && !keep {

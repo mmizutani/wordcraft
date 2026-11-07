@@ -444,7 +444,9 @@ impl Endpoint {
                 }
             }
             let _ = ready_tx.send(Ok(()));
-            serve_key(Server::new(backend), &inbox, idle, recheck, &budget, max_answer);
+            let mut server = Server::new(backend);
+            server.limit_replies(max_answer);
+            serve_key(server, &inbox, idle, recheck, &budget, max_answer);
         });
         if spawned.is_err() {
             return Err(refusal(503, -32603, "no thread for this participant"));
