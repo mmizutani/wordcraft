@@ -15,9 +15,10 @@
 //!   - a formatter, an editor, centres the headings of the first copies, the third copy's first,
 //!     at the same moment as the copy editor rewrites that heading.
 //!
-//! The person types a key only once an agent edit came in since their last one, until the
-//! agents are done, so their typing and the agents' edits meet in the same frames on a runner of
-//! any speed. Every call an agent makes is timed too.
+//! Typing and the agents' edits take turns, so they meet in the same frames on a runner of any
+//! speed: the person types a key once an agent edit came in since their last one, and an agent
+//! goes on after an edit only once the person has typed two more keys (the second one's frame
+//! began after the edit, so it brought the edit in). Every call an agent makes is timed too.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -157,21 +158,47 @@ impl Agent {
     }
 }
 
-/// How the agents start together, and how many edits they made: each agent counts an edit once
-/// the room has it (an agent's call answers after its copy sent the change).
+/// How the agents and the person take turns: the agents start together; each counts an edit
+/// once the room has it (an agent's call answers after its copy sent the change), then waits for
+/// the person's next two keys; the person counts each key once its frame is done.
 #[derive(Clone)]
 struct Cue {
     start: Arc<Barrier>,
     edits: Arc<AtomicUsize>,
+    keys: Arc<AtomicUsize>,
+    waiting: Arc<AtomicUsize>,
 }
 
 impl Cue {
+    fn new() -> Cue {
+        let count = || Arc::new(AtomicUsize::new(0));
+        Cue { start: Arc::new(Barrier::new(4)), edits: count(), keys: count(), waiting: count() }
+    }
+
+    /// After an agent's edit: until two more keys' frames are done, or the person has typed
+    /// everything, so the agent's next edit comes in on another frame than this one.
     fn edited(&self) {
+        let keys = self.keys();
+        self.waiting.fetch_add(1, Ordering::SeqCst);
         self.edits.fetch_add(1, Ordering::SeqCst);
+        let began = Instant::now();
+        while self.keys() < keys + 2 && self.keys() < TYPED.chars().count() {
+            assert!(began.elapsed() < Duration::from_secs(120), "the person stopped typing");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn edits(&self) -> usize {
         self.edits.load(Ordering::SeqCst)
+    }
+
+    fn keys(&self) -> usize {
+        self.keys.load(Ordering::SeqCst)
+    }
+
+    fn waiting(&self) -> bool {
+        self.waiting.load(Ordering::SeqCst) > 0
     }
 }
 
@@ -309,10 +336,10 @@ fn caret_stays(h: &Window, opening: BlockId, typed: usize, frame: usize) {
 
 /// The agents start together, and the person types [`TYPED`] at the end of paragraph `opening`,
 /// a key a frame, until they and the agents are done. While the agents work, each key waits for
-/// an agent edit made since the last key, so the frame that types it brings that edit in too.
-/// Each frame is timed, and the caret checked.
+/// an agent edit made since the last key, or for an agent waiting on their keys ([`Cue`]). Each
+/// frame is timed, and the caret checked.
 fn type_while_agents_work(h: &mut Window, opening: BlockId, agents: [Agent; 3]) -> Vec<Agent> {
-    let cue = Cue { start: Arc::new(Barrier::new(4)), edits: Arc::new(AtomicUsize::new(0)) };
+    let cue = Cue::new();
     let [ce, fc, fm] = agents;
     let threads = [
         std::thread::spawn({
@@ -336,7 +363,7 @@ fn type_while_agents_work(h: &mut Window, opening: BlockId, agents: [Agent; 3]) 
     let theirs = |h: &Window| h.state().share.as_ref().map(|s| s.copy.stats().received);
     while typed < TYPED.chars().count() || threads.iter().any(|t| !t.is_finished()) {
         assert!(began.elapsed() < Duration::from_secs(300), "the agents never finished");
-        while cue.edits() == seen && threads.iter().any(|t| !t.is_finished()) {
+        while cue.edits() == seen && !cue.waiting() && threads.iter().any(|t| !t.is_finished()) {
             assert!(began.elapsed() < Duration::from_secs(300), "the agents stopped editing");
             std::thread::sleep(FRAME_GAP);
         }
@@ -352,6 +379,7 @@ fn type_while_agents_work(h: &mut Window, opening: BlockId, agents: [Agent; 3]) 
         slowest = slowest.max(took);
         assert!(took < FRAME_BUDGET, "frame {frames} took {took:?}: the person's typing waited");
         typed += usize::from(key.is_some());
+        cue.keys.store(typed, Ordering::SeqCst);
         came_in += usize::from(key.is_some() && theirs(h) != before);
         caret_stays(h, opening, typed, frames);
         frames += 1;
@@ -359,7 +387,8 @@ fn type_while_agents_work(h: &mut Window, opening: BlockId, agents: [Agent; 3]) 
     }
     let agents: Vec<Agent> = threads.into_iter().map(|t| t.join().unwrap()).collect();
     eprintln!("gate: {frames} frames, slowest {slowest:?}, {came_in} typed a key and brought agents' changes in, {:?} in all", began.elapsed());
-    assert!(came_in >= 6, "agents' changes came in with the person's keys ({came_in} frames)");
+    // The formatter's eight edits each come in on a frame of their own that types a key.
+    assert!(came_in >= CENTRED.len(), "agents' changes came in with the person's keys ({came_in} frames)");
     for a in &agents {
         let (method, took) = a.slowest();
         eprintln!("gate: {}'s slowest call: {method} {took:?}", a.name);
