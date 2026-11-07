@@ -80,19 +80,57 @@ fn click_events(app: &mut WordApp, pos: egui::Pos2, button: egui::PointerButton,
 /// Programmatic calls never open the Save prompt, so closing unsaved work must be explicit:
 /// save first, or pass `"force": true` (only a real boolean true counts) to discard it (#1268).
 pub(crate) fn close_refused(app: &WordApp, id: &str, params: &Value) -> Option<&'static str> {
+    // `file.close` closes only the drawn window when another window shows the same document:
+    // the document and its work stay open, so nothing is lost and nothing is refused (the
+    // interactive path asks nothing either) (#3274).
+    if app.closes_only_its_window(id, params) {
+        return None;
+    }
+    // The document the command closes: `file.close` the shown one, `file.closeDocument` the one
+    // its `id` names (the active one by default) (#3274).
+    let target = match id {
+        "file.close" => app.session.document_id(),
+        "file.closeDocument" => match params.get("id") {
+            None | Some(Value::Null) => app.session.document_id(),
+            // An `id` that isn't a document is the engine's error to give.
+            Some(v) => v.as_u64()?,
+        },
+        _ => return None,
+    };
+    close_refused_for(app, target, params)
+}
+
+/// The refusal for closing the document `target` with unsaved work in it: the same work the
+/// Save Changes prompt asks about, so the prompt and the refusal cover the same ground
+/// (#1268, #3274).
+pub(crate) fn close_refused_for(app: &WordApp, target: u64, params: &Value) -> Option<&'static str> {
     let force = params.get("force").and_then(Value::as_bool) == Some(true);
     if force {
         return None;
     }
-    if id == "file.close" && app.session.dirty {
+    if app.document_unsaved_by_id(target) {
         return Some(UNSAVED);
     }
-    // Comment text still being typed is unsaved work too (#1348): replacing the document would drop it.
-    (crate::discards_document(id, params) && crate::panes::has_comment_drafts(app))
-        .then_some("a comment is still being edited: finish it first, or pass {\"force\": true} to discard it")
+    // Comment text still being typed is unsaved work too (#1348): closing the document would
+    // drop it.
+    app.document_has_comment_drafts(target).then_some(COMMENT_UNSAVED)
 }
 
 const UNSAVED: &str = "the document has unsaved changes: save it first, or pass {\"force\": true} to discard them and close";
+const COMMENT_UNSAVED: &str = "a comment is still being edited: finish it first, or pass {\"force\": true} to discard it";
+
+/// Quitting closes every open document, so unsaved work needs the same explicit `force` as
+/// `file.close` rather than going silently (#1268, #3274). The interactive path asks about
+/// each document in turn; a programmatic call never prompts, so it refuses.
+fn quit_refused(app: &WordApp, params: &Value) -> Option<&'static str> {
+    let force = params.get("force").and_then(Value::as_bool) == Some(true);
+    if force {
+        return None;
+    }
+    app.has_unsaved_documents().then_some(UNSAVED_QUIT)
+}
+
+const UNSAVED_QUIT: &str = "a document has unsaved changes: save it first, or pass {\"force\": true} to quit without saving";
 
 /// The reply to a request that needs a document while none is open (#1129).
 const NO_DOCUMENT: &str = "no document is open; create one (file.new) or open one (file.open) first";
@@ -156,9 +194,8 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
             // the shared document stops sharing first, and checks what the room took last.
             if id == "file.close" {
                 app.stop_sharing_to_close(doc, &params);
-                let force = params.get("force").and_then(Value::as_bool) == Some(true);
-                if !force && app.session.documents().iter().any(|d| d.id == doc && d.dirty) {
-                    return err(UNSAVED);
+                if let Some(e) = close_refused_for(app, doc, &params) {
+                    return err(e);
                 }
                 return match app.session.close_document(doc) {
                     Ok(()) => ok(json!({"closed": true, "id": doc, "documents": app.session.documents()})),
@@ -166,7 +203,19 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
                 };
             }
             if id == "file.closeDocument" {
-                app.stop_sharing_to_close_document(doc, &params);
+                // The document it names, or the one the request addresses.
+                let target = match params.get("id") {
+                    None | Some(Value::Null) => doc,
+                    // An `id` that isn't a document is the engine's error to give.
+                    Some(v) => match v.as_u64() {
+                        Some(id) => id,
+                        None => return err("`id` must be an open document's id"),
+                    },
+                };
+                app.stop_sharing_to_close(target, &params);
+                if let Some(e) = close_refused_for(app, target, &params) {
+                    return err(e);
+                }
             }
             // In the shared document, through its copy, as the window's own commands go: its
             // edits reach the room at once, and a save has what others changed.
@@ -375,9 +424,21 @@ pub fn handle(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) -> O
             ok(json!({}))
         }
         "app.quit" => {
+            // Quitting closes every open document, so unsaved work needs the same explicit
+            // `force` as `file.close` rather than going silently (#3274). What agents changed in
+            // a shared document counts: the window gets it first.
+            app.catch_up_share();
+            if let Some(e) = quit_refused(app, p) {
+                return err(e);
+            }
             // The app quits at once, unasked: sharing stops first, so the participants'
-            // connections end with the room, and the window has every change it took.
-            app.stop_sharing();
+            // connections end with the room, and the window has every change it took, which is
+            // checked again.
+            if app.stop_sharing()
+                && let Some(e) = quit_refused(app, p)
+            {
+                return err(e);
+            }
             app.quit_requested = true;
             ok(json!({}))
         }

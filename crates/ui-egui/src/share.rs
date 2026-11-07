@@ -141,8 +141,8 @@ impl WordApp {
             return;
         }
         self.catch_up_share();
-        let force = params.get("force").and_then(Value::as_bool) == Some(true);
-        if force || !self.session.documents().iter().any(|d| d.id == doc && d.dirty) {
+        // The same unsaved work the close itself refuses on (#3274).
+        if crate::control::close_refused_for(self, doc, params).is_none() {
             self.stop_sharing();
         }
     }

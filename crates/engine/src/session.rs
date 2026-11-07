@@ -77,6 +77,9 @@ pub struct Session {
     /// HTML for the system clipboard beside [`Self::clipboard_text`]: the copy's formatting for
     /// programs that read HTML, equations as MathML (#816); empty when nothing was copied.
     pub clipboard_html: String,
+    /// RTF for the system clipboard beside [`Self::clipboard_html`], for programs that read RTF
+    /// rather than HTML; empty when nothing was copied.
+    pub clipboard_rtf: String,
     /// Items collected by Copy and Cut this session, for the Clipboard pane.
     pub clip_history: crate::cmd::edit::ClipHistory,
     pub find: FindState,
@@ -232,6 +235,10 @@ pub struct Session {
     /// A room's copy of a shared document: commands on files, other documents and windows are
     /// refused, also when another command runs them (a macro's steps, Repeat).
     pub(crate) confined: bool,
+    /// The member of the selected Drawing Canvas picked on its own (#2637), which Shape Format,
+    /// Delete, Copy and the frame act on; see [`crate::cmd::canvas::selected_member`]. Cleared by
+    /// any selection change, caret movement or undo.
+    pub member: Option<crate::cmd::canvas::CanvasMember>,
     /// Column (block) selection, if one was made (see [`Session::column_segments`]).
     pub column: Option<ColumnBlock>,
     /// Column selection mode (Ctrl+Shift+F8): caret movement extends the block.

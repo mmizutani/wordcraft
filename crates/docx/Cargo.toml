@@ -31,6 +31,7 @@ zeroize = { workspace = true }
 getrandom = { workspace = true, features = ["wasm_js"] }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 proptest = { workspace = true }
 image = { workspace = true }
 zip = { workspace = true }

@@ -30,7 +30,7 @@ mod handler;
 mod screenshots;
 
 pub(crate) use geometry::{CaptureGeometry, SurfaceGeometry};
-pub(crate) use handler::close_refused;
+pub(crate) use handler::{close_refused, close_refused_for};
 pub use handler::{Outcome, handle, inspect};
 pub use screenshots::save_screenshot;
 #[cfg(test)]
