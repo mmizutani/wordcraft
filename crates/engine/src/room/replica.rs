@@ -656,8 +656,10 @@ impl Replica {
     }
 
     fn run_as(&mut self, id: &str, params: &Value, how: Runner) -> Result<Value, CmdError> {
-        let Some(scope) = Scope::of(id) else { return Err(CmdError::Unknown(id.to_string())) };
-        if let Some(why) = self.who.role.refuses(scope) {
+        if Scope::of(id).is_none() {
+            return Err(CmdError::Unknown(id.to_string()));
+        }
+        if let Some(why) = self.who.role.refuses_command(id) {
             return Err(CmdError::Disabled(format!("{id}: {why}")));
         }
         // Repeat runs the command it repeats as the copy's own, so that it keeps its places and
@@ -1069,7 +1071,16 @@ impl Replica {
                 went_on = Some(after);
                 let comments_before: Vec<u32> = self.session.doc.comments.keys().copied().collect();
                 let units = self.pending.len();
-                match self.run_made(&id, &params, tries, Session::run) {
+                // Made again within the files the participant can use now, when nothing on this
+                // thread decided that already: an edit that read a file is made again by
+                // reading it again, which their copy may do only while the setting allows it
+                // (#31). Within a request ([`super::hosted::call`]), its reach holds.
+                let reach = (!crate::file_access::scoped() && self.room.held_to(self.who.id).is_some()).then(|| self.room.reach(self.who.id));
+                let made = match &reach {
+                    Some(reach) => reach.confine(|| self.run_made(&id, &params, tries, Session::run)),
+                    None => self.run_made(&id, &params, tries, Session::run),
+                };
+                match made {
                     Ok(_) => {
                         self.stats.made_again = self.stats.made_again.saturating_add(1);
                         // Its new comments in the order they were made in, as their ids go up.

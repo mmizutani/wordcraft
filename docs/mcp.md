@@ -170,7 +170,7 @@ test source in File › Options › Language and on the bar's Install.
 | `render_page` | a page as PNG |
 | `parity` | feature coverage |
 | `screenshot`, `click`, `key`, `ui_inspect` | app only (`--connect`) |
-| `room` | share the document the app's window shows with other agents, and hand out their keys: `{action: "share" \| "invite" \| "revoke" \| "participants" \| "stop", name?, role?, key?}` (app only; see [Shared documents](#shared-documents)) |
+| `room` | share the document the app's window shows with other agents, and hand out their keys: `{action: "share" \| "invite" \| "revoke" \| "participants" \| "stop", name?, role?, files?, key?}` (app only; see [Shared documents](#shared-documents)) |
 
 ### Several documents
 
@@ -260,9 +260,12 @@ A scope covers everything the command can do: a `selection` or `view` command ne
 document (a test runs each one to check), and one that can make or switch to another document is
 `file`, even when it usually works on this one. In a shared document, every participant's copy
 runs `document`, `selection` and `view` commands (what a `document` command changes is held to
-their role), only the owner's runs `app` commands too, and none runs `file` or `ui` commands:
-those work on the app's files, other documents and windows (see
-[Shared documents](#shared-documents)). Paths are limited apart from scopes, by the roots above.
+their role) and the exports (`file.exportPdf`, `file.exportPng`, `file.printPdf`, to new files
+only), only the owner's runs `app` commands too, but never `file.options`, and none runs the other
+`file` commands or `ui` commands: those work on the app's files, other documents and windows (see
+[Shared documents](#shared-documents)). Paths are limited apart from scopes, by the roots above
+and, in a shared document, by the files the person lets agents use
+([Files participants can use](control-protocol.md#files-participants-can-use)).
 `list_commands {"scope": "document"}` lists one scope's commands.
 
 `positions` gives each param that names a place in the document, and its form: `pos` (a position,
@@ -280,9 +283,10 @@ for a name and a role:
 ```json
 {"name": "room", "arguments": {"action": "share"}}
 {"name": "room", "arguments": {"action": "invite", "name": "Fact checker", "role": "suggester"}}
+{"name": "room", "arguments": {"action": "invite", "name": "Proofreader", "role": "suggester", "files": "none"}}
 ```
 
-The invite answers `{"key": "…", "name": "Fact checker", "role": "suggester"}`. Another agent
+The invite answers `{"key": "…", "name": "Fact checker", "role": "suggester", "files": null}`. Another agent
 joins with that key in place of the window's:
 
 ```sh
@@ -304,9 +308,22 @@ so the agent can make it again. `edit.undo` and `edit.redo` take back the agent'
 everyone else's edits in; when someone changed what the step changed since, they fail and say
 who. `get_changes` shows the window's changes and other agents' alike. Files,
 other documents and the window (`open_document`, `save_document`, `list_documents`,
-`screenshot`, `click`, `key`, `ui_inspect`) and the room's other actions are the owner's, and
-its commands reach none of the computer's files: one that reads or writes a file it names (mail
-merge's recipients `path`, a picture's) is refused.
+`screenshot`, `click`, `key`, `ui_inspect`) and the room's other actions are the owner's, but
+`save_document` with a `.pdf` or `.png` path exports a copy of the shared document.
+
+Which files the agent's commands can use is the person's choice, in the app's File › Options ›
+Agents: none (the default), only the folders listed there, each read-only or read and write, or
+any file on this computer. An invite's `files` (`none`, `folders` or `all`) gives its
+agent fewer, never more, so None there stops every agent at once. A command that reads or writes
+a file outside that (mail merge's recipients `path`, a picture's, an export's) is refused with an
+error that says why; paths must be full ones, never on another computer, and WordCraft's own settings
+folder is never in reach. An export makes a new file in a folder the agent may write in, never
+replacing one. A change to the setting holds from the agent's next call on, and when it narrows,
+a call running then reaches no file from then on. `room {"action": "participants"}` tells the
+agent which files it can use (`files`, and `folders` with `folders`); no agent changes the
+setting, since `file.options` is refused in its copy (see
+[Files participants can use](control-protocol.md#files-participants-can-use)).
+
 Revoking the key or stopping sharing ends the agent's connection: its next call is an error
 that says why. See [Shared documents](control-protocol.md#shared-documents) for the control
 channel's side.

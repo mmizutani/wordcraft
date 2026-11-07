@@ -104,6 +104,7 @@ fn picker(dialog: rfd::AsyncFileDialog, req: &FileDialogRequest) -> Picking {
             }
             Box::pin(async move { dialog.save_file().await.into_iter().collect() })
         }
+        FileDialogRequest::Folder => Box::pin(async move { dialog.pick_folder().await.into_iter().collect() }),
     }
 }
 

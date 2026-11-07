@@ -28,6 +28,8 @@ pub enum FileDialogRequest {
     /// Pick a path to save to, given a suggested file name and, if it matters, the folder to
     /// start in (Save as Word Template starts in the user templates folder, #2852).
     Save { name: String, dir: Option<String> },
+    /// Pick a folder (File › Options › Agents: a folder agents can use, #31).
+    Folder,
 }
 
 /// The host's answer to a [`FileDialogRequest`]: the picked paths (one for everything but
@@ -80,6 +82,9 @@ pub(crate) enum AfterPick {
     ForDialog,
     /// Put the picked document into the Compare dialog (original or revised, #412).
     ComparePath { revised: bool },
+    /// Add the picked folder to the folders agents can use, read-only (File › Options › Agents,
+    /// #31).
+    AgentFolder,
 }
 
 /// What to do once Save As has written the document.
@@ -148,6 +153,8 @@ impl WordApp {
                 self.services.pick_open.as_ref().and_then(|f| f(purpose))
             }
             FileDialogRequest::Save { name, .. } => self.services.pick_save.as_ref().and_then(|f| f(name)),
+            // No host here picks folders without a window of its own: the folder is typed.
+            FileDialogRequest::Folder => None,
         };
         Asked::Done(self.finish_pick(after, picked))
     }
@@ -290,6 +297,10 @@ impl WordApp {
                 let Some(path) = picked else { return Ok(json!({"cancelled": true})) };
                 crate::dialogs_review::set_compare_path(self, revised, path);
                 Ok(json!({"picked": true}))
+            }
+            AfterPick::AgentFolder => {
+                let Some(path) = picked else { return Ok(json!({"cancelled": true})) };
+                crate::options::add_agent_folder(self, &path)
             }
             AfterPick::Export { ext } => {
                 let Some(path) = picked else { return Ok(json!({"cancelled": true})) };

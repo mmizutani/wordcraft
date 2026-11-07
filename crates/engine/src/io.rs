@@ -118,6 +118,19 @@ pub fn is_empty_file(_path: &std::path::Path) -> bool {
     false
 }
 
+/// Whether anything is at `path`: a file, a folder, or a link (even one that leads nowhere). The
+/// caller checks that `path` is in reach first.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn entry_exists(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// [`entry_exists`]: on the web files come through the browser, never by path.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn entry_exists(_path: &std::path::Path) -> bool {
+    false
+}
+
 /// The canonical form of `path` (symbolic links and `.`/`..` resolved), for telling whether two
 /// spellings name one file; `None` when it can't be resolved or is outside the readable roots.
 #[cfg(not(target_arch = "wasm32"))]

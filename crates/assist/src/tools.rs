@@ -1,7 +1,8 @@
 //! The tools an assistant's model calls: the MCP server's own ([`wordcraft_mcp::tools`]), for
 //! the one shared document the assistant holds a copy of. They run in that copy through the
 //! control channel's methods for a participant's copy ([`hosted::call`]), so the assistant is
-//! held to its role like any participant with a key, and reaches no file.
+//! held to its role like any participant with a key, and to the files File › Options › Agents lets
+//! agents use.
 
 use std::sync::{Arc, OnceLock};
 
@@ -153,9 +154,14 @@ impl ToolHost for CopyTools {
     }
 
     fn select(&mut self, anchor: Anchor, focus: Anchor) -> bool {
-        // What the hub took since, the person's edits among it, first.
-        self.copy.receive();
-        self.copy.run("select.range", &json!({"anchor": anchor, "focus": focus})).is_ok()
+        // What the hub took since, the person's edits among it, first: within the files the
+        // assistant can use now, as its tool calls are, since an edit of its own made again
+        // runs its command again (#31).
+        let reach = self.copy.room().reach(self.copy.id());
+        reach.confine(|| {
+            self.copy.receive();
+            self.copy.run("select.range", &json!({"anchor": anchor, "focus": focus})).is_ok()
+        })
     }
 }
 

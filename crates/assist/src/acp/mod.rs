@@ -97,7 +97,8 @@ pub enum Reach {
     Nothing,
     /// Through WordCraft's MCP server, which `session/new` gives it: `cli mcp --connect room`
     /// (the room's own port, [`RoomPort`]), with the invite's key in the server's environment.
-    /// It joins as the conversation's participant, with its role, and reaches no file.
+    /// It joins as the conversation's participant, with its role, and reaches only the files File ›
+    /// Options › Agents lets agents use.
     Mcp {
         /// `wordcraft-cli`, an absolute path.
         cli: PathBuf,

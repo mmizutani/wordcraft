@@ -111,6 +111,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 return Ok(json!({"exported": false}));
             };
             let path = if path.to_ascii_lowercase().ends_with(".pdf") { path.to_string() } else { format!("{path}.pdf") };
+            s.exports_to_new_file(&path)?;
             let opts = export_options(s, v);
             crate::io::save_path_with(std::path::Path::new(&path), &s.doc, None, &opts).map_err(CmdError::Failed)?;
             Ok(json!({"path": path, "markup": opts.markup}))
@@ -459,6 +460,7 @@ fn export_png(s: &mut Session, v: &Value) -> CmdResult {
     if !path.to_ascii_lowercase().ends_with(".png") {
         return Err(CmdError::Params("path must end in .png".into()));
     }
+    s.exports_to_new_file(path)?;
     let img = wordcraft_render::render_page(&s.doc, pg, scale, &opts);
     let png = img.to_png();
     crate::io::write_file(path, &png).map_err(CmdError::Failed)?;
