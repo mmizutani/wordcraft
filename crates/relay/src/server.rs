@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use wordcraft_http::{Request, Response, bearer, same_secret};
 
-use crate::{is_hex, random_hex, wire};
+use crate::{is_hex, random_hex, room_of, wire};
 
-/// A room's id: 128 random bits as hex, in its URL.
+/// A room's id, in its URL: 128 bits of a hash of its secret, as hex ([`room_of`]).
 const ROOM_HEX: usize = 32;
 /// A room's secret, which only its desktop holds: 256 random bits as hex.
 const SECRET_HEX: usize = 64;
@@ -22,6 +22,9 @@ pub const MAX_REQUEST: usize = 1 << 20;
 pub const MAX_REPLY: usize = 96 << 20;
 /// Request ids stay below 2^53, a whole number in any JSON reader.
 const ID_MASK: u64 = (1 << 53) - 1;
+/// Polls one room's desktop may have waiting at once: the app has two. More would only hold
+/// connections that the relay's other rooms need.
+const MAX_POLLS: usize = 4;
 /// Requests a desktop takes in one poll.
 const PER_POLL: usize = 16;
 
@@ -201,6 +204,9 @@ impl Relay {
         let forget = self.config.forget_after;
         rooms.retain(|_, r| r.lock().is_some_and(|w| !w.closed && (w.polling > 0 || w.seen.elapsed() < forget)));
         let (id, secret) = match claim {
+            // Only the secret a room's id was made from opens it, whether the relay still holds
+            // the room or not.
+            Some((id, secret)) if room_of(&secret) != id => return Response::text(409, "that room is someone else's\n"),
             Some((id, secret)) => {
                 if let Some(room) = rooms.get(&id) {
                     if !same_secret(&secret, &room.secret) {
@@ -216,9 +222,9 @@ impl Relay {
                 }
                 (id, secret)
             }
-            None => match (random_hex(ROOM_HEX / 2), random_hex(SECRET_HEX / 2)) {
-                (Ok(id), Ok(secret)) => (id, secret),
-                _ => return Response::text(503, "no room could be made\n"),
+            None => match random_hex(SECRET_HEX / 2) {
+                Ok(secret) => (room_of(&secret), secret),
+                Err(_) => return Response::text(503, "no room could be made\n"),
             },
         };
         if rooms.len() >= self.config.max_rooms {
@@ -255,6 +261,9 @@ impl Relay {
     fn poll(&self, req: &Request, id: &str) -> Response {
         let Some(room) = self.hosts(req, id) else { return Response::text(404, "no such room (or not its secret)\n") };
         let Some(mut w) = room.lock() else { return Response::text(500, "internal error\n") };
+        if w.polling >= MAX_POLLS {
+            return Response::text(429, "this room's desktop is already waiting for requests as often as it may\n").with_header("Retry-After", "1");
+        }
         w.polling += 1;
         w.seen = Instant::now();
         let until = Instant::now() + self.config.poll_wait;

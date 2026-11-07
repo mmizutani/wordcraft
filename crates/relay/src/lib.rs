@@ -33,6 +33,15 @@ pub fn random_hex(len: usize) -> Result<String, String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// A room's id, from its secret: the first 128 bits of a SHA-256 of it, as hex. The relay keeps
+/// nothing on disk, so this is what ties a room's URL to the desktop that holds its secret: after
+/// a restart, or once the relay has forgotten the room, only that desktop can open it again.
+pub fn room_of(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::new().chain_update(b"wordcraft-relay room\0").chain_update(secret.as_bytes()).finalize();
+    hash.iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
 /// Whether `s` is `len` lowercase hex digits.
 pub fn is_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

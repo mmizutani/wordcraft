@@ -398,3 +398,46 @@ fn a_request_whose_agent_gave_up_is_never_run_late() {
     assert!(!replied.lock().unwrap().iter().any(|id| *id > 17));
     drop(hosting);
 }
+
+/// A room's id comes from its secret: once the relay has forgotten a room (it restarted, or the
+/// room was closed), a token holder who knows its URL still can't open it with a secret of their
+/// own and take its agents' requests. Its own desktop can.
+#[test]
+fn only_a_rooms_own_secret_opens_it_again_after_the_relay_forgot_it() {
+    let (base, _relay) = relay(|_| {});
+    let auth = format!("Bearer {TOKEN}");
+    let (status, _, body) = http(&format!("{base}/host/rooms"), "POST", &[("Authorization", &auth)], "{}");
+    assert_eq!(status, 200, "{body}");
+    let opened: Value = serde_json::from_str(&body).unwrap();
+    let (room, secret) = (opened["room"].as_str().unwrap().to_string(), opened["secret"].as_str().unwrap().to_string());
+    assert_eq!(room, crate::room_of(&secret));
+    let (status, _, _) = http(&format!("{base}/host/r/{room}"), "DELETE", &[("Authorization", &format!("Bearer {secret}"))], "");
+    assert_eq!(status, 204);
+    let theirs = json!({"room": room, "secret": "a".repeat(64)}).to_string();
+    let (status, _, body) = http(&format!("{base}/host/rooms"), "POST", &[("Authorization", &auth)], &theirs);
+    assert_eq!(status, 409, "{body}");
+    let own = json!({"room": room, "secret": secret}).to_string();
+    let (status, _, body) = http(&format!("{base}/host/rooms"), "POST", &[("Authorization", &auth)], &own);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["url"], opened["url"]);
+}
+
+/// One room's desktop can't hold the relay's connections by asking for requests again and again
+/// at once: past a few waiting polls, more are refused.
+#[test]
+fn a_rooms_waiting_polls_are_capped() {
+    let (base, _relay) = relay(|c| c.poll_wait = Duration::from_millis(1500));
+    let (status, _, body) = http(&format!("{base}/host/rooms"), "POST", &[("Authorization", &format!("Bearer {TOKEN}"))], "{}");
+    assert_eq!(status, 200, "{body}");
+    let opened: Value = serde_json::from_str(&body).unwrap();
+    let (room, secret) = (opened["room"].as_str().unwrap().to_string(), opened["secret"].as_str().unwrap().to_string());
+    let polls: Vec<_> = (0..8)
+        .map(|_| {
+            let (url, auth) = (format!("{base}/host/r/{room}/poll"), format!("Bearer {secret}"));
+            std::thread::spawn(move || http(&url, "POST", &[("Authorization", &auth)], "").0)
+        })
+        .collect();
+    let mut statuses: Vec<u16> = polls.into_iter().map(|p| p.join().unwrap()).collect();
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 200, 200, 200, 429, 429, 429, 429]);
+}

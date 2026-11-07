@@ -48,9 +48,10 @@ it.
 - **It does see the requests and answers.** TLS ends at the relay, as at any tunnel service. An
   agent's requests and the document text in the answers pass through it. Whoever runs the relay
   is trusted with what the agents do, so run your own or use one you trust.
-- **A room's URL is not a secret that lets anyone in.** It has 128 random bits, and each request
-  still needs an invite's key. Only the desktop that opened a room holds its secret, which it needs
-  to take requests and answer them.
+- **A room's URL is not a secret that lets anyone in.** Its 128 bits come from a hash of the
+  room's secret, and each request still needs an invite's key. Only the desktop that opened a room
+  holds its secret, which it needs to take requests and answer them, and to open the room again
+  after the relay restarts: nobody else can take a room over by its URL.
 
 ## Running a relay
 
@@ -100,7 +101,7 @@ answers 503 with `Retry-After`.
 | Rooms | 1,024 in all, 16 a token. A room whose desktop hasn't asked for 40 seconds is offline to agents; after 24 hours it is forgotten |
 | An agent's request | 1 MiB, an answer within 180 seconds (else 504) |
 | A desktop's answer | 96 MiB (a 32 MB PDF as base64) |
-| Requests waiting for one desktop | 64 (else 503) |
+| Requests waiting for one desktop | 64 (else 503); a desktop may have 4 polls waiting at once (else 429) |
 | Rate | 20 requests a second from one address (bursts of 40), 50 a second to one room (bursts of 100); more get 429 |
 | A request's head and body | must arrive within 60 seconds of its start, and a connection may sit idle 60 seconds between requests |
 
@@ -111,7 +112,7 @@ carries a relay token:
 
 | Request | Answer |
 |---|---|
-| `POST /host/rooms` `{}`, or `{"room", "secret"}` to open a room again (after the relay restarted) | `{"room", "secret", "url"}`; 401 for a wrong token, 409 for a room someone else holds |
+| `POST /host/rooms` `{}`, or `{"room", "secret"}` to open a room again (after the relay restarted) | `{"room", "secret", "url"}`; 401 for a wrong token, 409 for a room whose id isn't from that secret, or that another desktop is using |
 | `POST /host/r/<room>/poll` | `{"requests": [{"id", "method", "target", "headers", "body", "ttlMs"}]}`, waiting up to 25 seconds for one; 404 once the relay has forgotten the room. `ttlMs` is how long the agent still waits: the app doesn't start a request after that, as its agent has been told it timed out |
 | `POST /host/r/<room>/reply` `{"id", "status", "headers", "body"}` | 204 |
 | `DELETE /host/r/<room>` | closes the room |

@@ -17,6 +17,8 @@ wordcraft-http = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 getrandom = { workspace = true }
+# A room's id is a hash of its secret, so only its secret opens it again, even after a restart.
+sha2 = { workspace = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 # Random room ids and secrets; the relay itself never runs in a browser, but its crate is checked there.

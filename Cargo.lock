@@ -7100,6 +7100,7 @@ dependencies = [
  "getrandom 0.3.4",
  "log",
  "serde_json",
+ "sha2 0.11.1",
  "ureq",
  "wordcraft-http",
 ]
