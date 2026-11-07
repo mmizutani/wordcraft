@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use wordcraft_engine::CmdError;
 use wordcraft_engine::room::{Lobby, Replica, Role, Room};
 use wordcraft_engine::scope::Scope;
+use wordcraft_engine::{CmdError, Session};
 
 use crate::WordApp;
 
@@ -27,6 +27,27 @@ pub(crate) struct Share {
 /// The name the owner joins under when the window has no author name.
 const OWNER: &str = "Owner";
 
+impl Share {
+    /// Run command `id` through the copy, on `session`, when its active document is the shared
+    /// one and the command is one a copy runs. Others (files and windows) get what others
+    /// changed first, so a save has it, and run on the session: `None` then, and when the
+    /// session's active document is another one.
+    pub(crate) fn run(&mut self, session: &mut Session, id: &str, params: &Value, ime: bool) -> Option<Result<Value, CmdError>> {
+        let copy_s = Scope::of(id).is_some_and(|s| Role::Owner.allows(s)) && session.registry.get(id).is_some();
+        self.copy
+            .lend(session, |c| {
+                if !copy_s {
+                    c.sync();
+                    return None;
+                }
+                let r = if ime { c.run_ime(id, params) } else { c.run(id, params) };
+                c.send();
+                Some(r)
+            })
+            .flatten()
+    }
+}
+
 impl WordApp {
     /// Let participants with a key find the document this window shares in `lobby` (the control
     /// server's).
@@ -39,31 +60,25 @@ impl WordApp {
     /// and the command is one a copy runs (not files and windows, which get what others
     /// changed first: a save has it). `None` when it isn't the copy's to run.
     pub(crate) fn run_shared(&mut self, id: &str, params: &Value, ime: bool) -> Option<Result<Value, CmdError>> {
-        let share = self.share.as_mut()?;
-        let copy_s = Scope::of(id).is_some_and(|s| Role::Owner.allows(s)) && self.session.registry.get(id).is_some();
-        share
-            .copy
-            .lend(&mut self.session, |c| {
-                if !copy_s {
-                    c.sync();
-                    return None;
-                }
-                let r = if ime { c.run_ime(id, params) } else { c.run(id, params) };
-                c.send();
-                Some(r)
-            })
-            .flatten()
+        self.share.as_mut()?.run(&mut self.session, id, params, ime)
+    }
+
+    /// The document the window shares, if it shares one.
+    pub(crate) fn shared_document(&self) -> Option<u64> {
+        self.share.as_ref().map(|s| s.copy.document())
     }
 
     /// Every frame: the shared document's copy gets what others changed and sends what the
-    /// window changed. Sharing stops when the window no longer has the document open.
+    /// window changed, also while the window shows another document, so that one is up to date
+    /// whenever it is saved, closed or shown. Sharing stops when the window no longer has the
+    /// document open.
     pub(crate) fn sync_share(&mut self, ctx: &egui::Context) {
         let Some(share) = self.share.as_mut() else { return };
         if share.room.is_closed() || !self.session.is_open(share.copy.document()) {
             self.stop_sharing();
             return;
         }
-        let _ = share.copy.lend(&mut self.session, Replica::sync);
+        let _ = share.copy.lend_document(&mut self.session, Replica::sync);
         // Its own come back with the next change the room takes (which asks for a frame); a
         // change sent back is sent again a little later.
         if share.copy.has_unconfirmed() {
@@ -108,16 +123,51 @@ impl WordApp {
     }
 
     /// Get what others changed in the shared document since the last frame, whichever document
-    /// the window shows: before a close asks whether the document has unsaved changes.
+    /// the window shows: before a close asks whether the document has unsaved changes, and
+    /// before a control request reads, saves or closes it.
     pub(crate) fn catch_up_share(&mut self) {
         if let Some(share) = self.share.as_mut() {
             let _ = share.copy.lend_document(&mut self.session, Replica::receive);
         }
     }
 
+    /// Before open document `doc` closes on a request with `params`: when it is the shared one
+    /// and the close goes ahead (nothing unsaved, or `force`), sharing stops, so the room takes
+    /// nothing more, and what it took last is in the document when the close checks it for
+    /// unsaved changes again. A change an agent was told went through is never dropped unasked.
+    pub(crate) fn stop_sharing_to_close(&mut self, doc: u64, params: &Value) {
+        if self.shared_document() != Some(doc) {
+            return;
+        }
+        self.catch_up_share();
+        let force = params.get("force").and_then(Value::as_bool) == Some(true);
+        if force || !self.session.documents().iter().any(|d| d.id == doc && d.dirty) {
+            self.stop_sharing();
+        }
+    }
+
+    /// [`WordApp::stop_sharing_to_close`] before `file.closeDocument` with `params` runs while
+    /// document `active` is the active one: for the document its `id` names, else `active`. The
+    /// engine then checks what the room took last for unsaved changes.
+    pub(crate) fn stop_sharing_to_close_document(&mut self, active: u64, params: &Value) {
+        let doc = match params.get("id").filter(|v| !v.is_null()) {
+            None => Some(active),
+            Some(v) => v.as_u64(),
+        };
+        if let Some(doc) = doc {
+            self.stop_sharing_to_close(doc, params);
+        }
+    }
+
+    /// Before the app quits with nothing unsaved: sharing stops, so the room takes nothing more.
+    /// Whether what it took last left a document with unsaved changes, to ask about first.
+    pub(crate) fn stop_sharing_to_quit(&mut self) -> bool {
+        self.stop_sharing() && self.has_unsaved_documents()
+    }
+
     /// Whether the document the window shows is the one it shares.
     pub(crate) fn shows_shared_document(&self) -> bool {
-        self.share.as_ref().is_some_and(|s| s.copy.document() == self.session.document_id())
+        self.shared_document() == Some(self.session.document_id())
     }
 
     /// The room of the document the window shares, if it shares one: the assistant joins it
@@ -424,6 +474,296 @@ mod tests {
         // Closed with `force`, sharing stops; the agent's copy stops answering.
         a.execute("file.close", json!({"force": true})).unwrap();
         assert!(a.share.is_none());
+        assert!(hosted::call(&mut agent, "document.inspect", &json!({})).unwrap_err().contains("isn't shared"));
+    }
+
+    /// The shared document's text, whichever document the window shows.
+    fn shared_text(a: &mut WordApp, shared: u64) -> String {
+        a.session.with_document(shared, |s| s.doc.plain_text(StoryRef::Body)).unwrap()
+    }
+
+    fn is_dirty(a: &WordApp, doc: u64) -> bool {
+        a.session.documents().iter().any(|d| d.id == doc && d.dirty)
+    }
+
+    #[test]
+    fn the_shared_document_keeps_up_while_the_window_shows_another() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let ctx = egui::Context::default();
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        let dir = std::env::temp_dir().join(format!("wordcraft-share-keeps-up-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The person works on another document; each frame brings the agent's edit into the
+        // shared one all the same, as unsaved work.
+        a.execute("file.new", json!({})).unwrap();
+        a.session.with_document(shared, |s| s.dirty = false).unwrap();
+        agent_runs(&mut agent, "caret.docStart", json!({}));
+        agent_runs(&mut agent, "text.insert", json!({"text": "zero "}));
+        a.sync_share(&ctx);
+        assert_eq!(shared_text(&mut a, shared), "zero one two three");
+        assert!(is_dirty(&a, shared), "the agent's edit is unsaved work");
+        assert_eq!(text(&a), "", "the shown document stays as it was");
+        // Requests addressed to it see what the agent changed since the last frame too: an
+        // inspection, and a save.
+        agent_runs(&mut agent, "caret.docEnd", json!({}));
+        agent_runs(&mut agent, "text.insert", json!({"text": " four"}));
+        let seen = result(&mut a, "document.inspect", json!({"doc": shared, "text": true}));
+        assert!(seen.to_string().contains("zero one two three four"), "{seen}");
+        agent_runs(&mut agent, "text.insert", json!({"text": " five"}));
+        let path = dir.join("shared.txt");
+        result(&mut a, "engine.execute", json!({"command": "file.saveAs", "params": {"path": path}, "doc": shared}));
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim_end(), "zero one two three four five");
+        // Edits addressed to it go through the window's copy: the room has them before the reply.
+        result(&mut a, "engine.execute", json!({"command": "caret.docEnd", "params": {}, "doc": shared}));
+        result(&mut a, "engine.execute", json!({"command": "text.insert", "params": {"text": "!"}, "doc": shared}));
+        let (_, hub) = a.share.as_ref().unwrap().room.document();
+        assert_eq!(hub.plain_text(StoryRef::Body), "zero one two three four five!");
+        assert_eq!(text(&a), "");
+        // Saved, then edited by the agent: closing it without `force` is refused, and sharing
+        // goes on. With `force` it closes, and sharing stops before it does.
+        a.session.with_document(shared, |s| s.dirty = false).unwrap();
+        agent_runs(&mut agent, "text.insert", json!({"text": "?"}));
+        let refused = call(&mut a, "engine.execute", json!({"command": "file.close", "params": {}, "doc": shared}));
+        assert!(refused["error"].as_str().is_some_and(|e| e.contains("unsaved changes")), "{refused}");
+        assert!(a.share.is_some() && a.session.is_open(shared));
+        result(&mut a, "engine.execute", json!({"command": "file.close", "params": {"force": true}, "doc": shared}));
+        assert!(a.share.is_none(), "sharing stopped with the close");
+        assert!(!a.session.is_open(shared));
+        assert!(hosted::call(&mut agent, "document.inspect", &json!({})).unwrap_err().contains("isn't shared"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_the_shared_document_by_id_sees_and_stops_what_agents_change() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        a.execute("file.new", json!({})).unwrap();
+        a.session.with_document(shared, |s| s.dirty = false).unwrap();
+        // The agent's edit since the last frame is unsaved work: Close Document refuses it.
+        agent_runs(&mut agent, "text.insert", json!({"text": "zero "}));
+        let refused = call(&mut a, "file.closeDocument", json!({"id": shared}));
+        assert!(refused["error"].as_str().is_some_and(|e| e.contains("unsaved changes")), "{refused}");
+        assert!(a.share.is_some() && a.session.is_open(shared));
+        // With `force` it closes, and sharing stops before it does.
+        result(&mut a, "file.closeDocument", json!({"id": shared, "force": true}));
+        assert!(a.share.is_none() && !a.session.is_open(shared));
+        assert!(hosted::call(&mut agent, "document.inspect", &json!({})).unwrap_err().contains("isn't shared"));
+        // So does Close Document addressed to the shared document with `doc`.
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        a.execute("file.new", json!({})).unwrap();
+        a.session.with_document(shared, |s| s.dirty = false).unwrap();
+        agent_runs(&mut agent, "text.insert", json!({"text": "one "}));
+        let close = |force: bool| json!({"command": "file.closeDocument", "params": {"force": force}, "doc": shared});
+        let refused = call(&mut a, "engine.execute", close(false));
+        assert!(refused["error"].as_str().is_some_and(|e| e.contains("unsaved changes")), "{refused}");
+        assert!(a.share.is_some() && a.session.is_open(shared));
+        result(&mut a, "engine.execute", close(true));
+        assert!(a.share.is_none() && !a.session.is_open(shared));
+        assert!(hosted::call(&mut agent, "document.inspect", &json!({})).unwrap_err().contains("isn't shared"));
+    }
+
+    #[test]
+    fn quitting_asks_about_what_agents_change_and_stops_sharing() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        result(&mut a, "room.share", json!({}));
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        // Saved, then edited by the agent since the last frame: quitting asks to save it, and
+        // sharing goes on while it asks.
+        a.session.dirty = false;
+        agent_runs(&mut agent, "caret.docEnd", json!({}));
+        agent_runs(&mut agent, "text.insert", json!({"text": " four"}));
+        assert!(!a.close_requested());
+        assert_eq!(a.dialog.as_ref().map(|d| d.name()), Some("saveChanges"));
+        assert_eq!(text(&a), "one two three four");
+        a.run("ui.saveChanges", json!({"answer": "cancel"})).unwrap();
+        assert!(a.share.is_some() && !a.quit_requested);
+        // With nothing unsaved, sharing stops before the app quits: the agent's copy stops
+        // answering.
+        a.session.dirty = false;
+        assert!(a.close_requested());
+        assert!(a.share.is_none());
+        assert!(hosted::call(&mut agent, "document.inspect", &json!({})).unwrap_err().contains("isn't shared"));
+    }
+
+    #[test]
+    fn quitting_after_asking_about_another_document_stops_sharing() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        a.session.dirty = false;
+        // Another document has unsaved work; the shared one has none.
+        a.execute("file.new", json!({})).unwrap();
+        a.execute("text.insert", json!({"text": "notes"})).unwrap();
+        assert!(!a.close_requested());
+        assert!(a.share.is_some(), "sharing goes on while the app asks");
+        // Don't Save: nothing is left to ask about, so sharing stops and the app quits.
+        a.run("ui.saveChanges", json!({"answer": "dontSave"})).unwrap();
+        assert!(a.quit_requested);
+        assert!(a.share.is_none());
+        assert!(a.session.is_open(shared));
+        assert!(hosted::call(&mut agent, "document.inspect", &json!({})).unwrap_err().contains("isn't shared"));
+    }
+
+    #[test]
+    fn keeping_the_shared_document_up_to_date_in_the_background_leaves_the_input_method_alone() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let ctx = egui::Context::default();
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        // The person types in another document, and the input method has looked since.
+        a.execute("file.new", json!({})).unwrap();
+        a.execute("text.insert", json!({"text": "notes"})).unwrap();
+        let _ = a.session.take_pending_ime_application_change();
+        let revision = a.session.ime_state_revision();
+        // The agent's edits come into the shared document with a frame and before a control
+        // request: nothing the input method is told of.
+        agent_runs(&mut agent, "caret.docEnd", json!({}));
+        agent_runs(&mut agent, "text.insert", json!({"text": " four"}));
+        a.sync_share(&ctx);
+        agent_runs(&mut agent, "text.insert", json!({"text": " five"}));
+        result(&mut a, "room.participants", json!({}));
+        assert_eq!(shared_text(&mut a, shared), "one two three four five");
+        assert!(!a.session.take_pending_ime_application_change(), "the agent's edits aren't in the document typed in");
+        assert_eq!(a.session.ime_state_revision(), revision);
+        // While the window shows the shared document, the input method hears of them.
+        a.show_document(shared).unwrap();
+        let _ = a.session.take_pending_ime_application_change();
+        agent_runs(&mut agent, "text.insert", json!({"text": " six"}));
+        a.sync_share(&ctx);
+        assert!(a.session.take_pending_ime_application_change());
+        assert_eq!(text(&a), "one two three four five six");
+    }
+
+    #[test]
+    fn a_file_opened_over_a_blank_shared_document_opens_beside_it() {
+        let lobby = Lobby::default();
+        let mut a = WordApp::new(Session::new(Document::new()), Services::default()).with_lobby(lobby.clone());
+        let ctx = egui::Context::default();
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        let dir = std::env::temp_dir().join(format!("wordcraft-share-open-over-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("other.txt");
+        std::fs::write(&file, "Other").unwrap();
+        // The shared document stays open, and shared, beside the file.
+        result(&mut a, "engine.execute", json!({"command": "file.open", "params": {"path": file}}));
+        assert_eq!(text(&a), "Other");
+        assert!(a.session.is_open(shared));
+        assert!(a.share.is_some(), "sharing goes on");
+        agent_runs(&mut agent, "text.insert", json!({"text": "kept"}));
+        a.sync_share(&ctx);
+        assert_eq!(shared_text(&mut a, shared), "kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quitting_over_the_control_channel_stops_sharing_first() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        result(&mut a, "room.share", json!({}));
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        agent_runs(&mut agent, "caret.docEnd", json!({}));
+        agent_runs(&mut agent, "text.insert", json!({"text": " four"}));
+        // `app.quit` quits unasked, and sharing stops first: the agent's copy stops answering.
+        // (The agent's edit is in the window already: every control request first gets what the
+        // room took.)
+        result(&mut a, "app.quit", json!({}));
+        assert!(a.quit_requested);
+        assert!(a.share.is_none());
+        assert_eq!(text(&a), "one two three four");
+        assert!(hosted::call(&mut agent, "document.inspect", &json!({})).unwrap_err().contains("isn't shared"));
+    }
+
+    #[test]
+    fn a_macro_s_close_closes_the_shown_document_and_never_quits() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        a.execute("tools.macros", json!({"define": {"name": "close", "steps": [{"command": "file.close"}]}})).unwrap();
+        // The window shows another document, with unsaved work: the macro's Close keeps it open
+        // and says why.
+        a.execute("file.new", json!({})).unwrap();
+        a.execute("text.insert", json!({"text": "draft"})).unwrap();
+        let draft = a.session.document_id();
+        a.run("tools.macros", json!({"run": "close"})).unwrap();
+        assert!(!a.quit_requested && a.session.is_open(draft));
+        assert!(a.status_msg.as_ref().is_some_and(|(m, _)| m.contains("unsaved changes")), "{:?}", a.status_msg);
+        // Without it, the document closes; the app and the shared document stay.
+        a.session.dirty = false;
+        a.run("tools.macros", json!({"run": "close"})).unwrap();
+        assert!(!a.quit_requested && !a.session.is_open(draft));
+        assert!(a.share.is_some() && a.session.is_open(shared));
+        agent_runs(&mut agent, "text.insert", json!({"text": "zero "}));
+        // In the shared document, the macro runs in the window's copy, which closes nothing.
+        assert_eq!(a.session.document_id(), shared);
+        assert!(a.run("tools.macros", json!({"run": "close"})).is_err());
+        assert!(!a.quit_requested && a.share.is_some() && a.session.is_open(shared));
+        a.catch_up_share();
+        assert_eq!(text(&a), "zero one two three");
+    }
+
+    #[test]
+    fn a_macro_can_t_close_the_shared_document_while_it_is_shared() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        a.execute("file.new", json!({})).unwrap();
+        let step = json!({"command": "file.closeDocument", "params": {"id": shared, "force": true}});
+        a.execute("tools.macros", json!({"define": {"name": "close", "steps": [step]}})).unwrap();
+        // An agent's edit since the window's last frame: closing would drop it, and what the
+        // room took after.
+        agent_runs(&mut agent, "text.insert", json!({"text": "zero "}));
+        let why = a.run("tools.macros", json!({"run": "close"})).unwrap_err();
+        assert!(why.contains("stop sharing it first"), "{why}");
+        assert!(a.share.is_some() && a.session.is_open(shared));
+        a.catch_up_share();
+        assert_eq!(shared_text(&mut a, shared), "zero one two three");
+        agent_runs(&mut agent, "text.insert", json!({"text": "and "}));
+        // Once sharing stops, the macro closes it.
+        result(&mut a, "room.stop", json!({}));
+        a.run("tools.macros", json!({"run": "close"})).unwrap();
+        assert!(!a.session.is_open(shared));
+    }
+
+    #[test]
+    fn a_close_made_for_the_shared_document_in_the_background_stops_sharing_first() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        a.execute("file.new", json!({})).unwrap();
+        a.session.with_document(shared, |s| s.dirty = false).unwrap();
+        // Close, as a command run on the shared document while another is shown asks for it.
+        // An agent's edit since the last frame is unsaved work: the document stays, shared.
+        agent_runs(&mut agent, "text.insert", json!({"text": "zero "}));
+        a.handle_request(&json!({"close": true, "document": shared}));
+        assert!(a.share.is_some() && a.session.is_open(shared));
+        assert_eq!(shared_text(&mut a, shared), "zero one two three");
+        // With nothing unsaved, sharing stops before it closes.
+        a.session.with_document(shared, |s| s.dirty = false).unwrap();
+        a.handle_request(&json!({"close": true, "document": shared}));
+        assert!(a.share.is_none() && !a.session.is_open(shared));
         assert!(hosted::call(&mut agent, "document.inspect", &json!({})).unwrap_err().contains("isn't shared"));
     }
 

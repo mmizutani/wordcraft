@@ -101,8 +101,8 @@ impl Session {
         }
     }
     /// A restored copy opens as another document, or replaces the untouched blank document that
-    /// asked for it once that document is active, so no work is ever replaced. The restored
-    /// document keeps its copy in the record it came from.
+    /// asked for it once that document is active (beside it, if a room shares it by then), so no
+    /// work is ever replaced. The restored document keeps its copy in the record it came from.
     #[cfg(not(target_arch = "wasm32"))]
     fn open_held_restore(&mut self, r: &mut Recovery) {
         let Some((_, request)) = &r.held else { return };
@@ -112,7 +112,9 @@ impl Session {
         }
         let Some((snapshot, _)) = r.held.take() else { return };
         let id = snapshot.info.id.clone();
-        if !request.replace {
+        // Shared since it asked: a room's document is never replaced, the copy opens beside it.
+        let shared = request.document == self.document_id() && self.is_shared();
+        if !request.replace || shared {
             self.add_document(snapshot.document);
         } else if request.document == self.document_id() && request.revision == self.rev() && self.password.is_none() {
             self.set_document(snapshot.document);

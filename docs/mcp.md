@@ -295,9 +295,12 @@ Its tools then work on a copy of the shared document of its own, inside the app:
 `render_page`, `list_commands`, `parity` and `room {"action": "participants"}`. Its caret and
 selection are its own, and its commands are held to its role (see
 [Roles](control-protocol.md#roles)): a suggester's edits are tracked changes in its name. Each
-call first brings in what the others changed since, and returns once the room took the agent's
-edit; an edit whose text another participant took away meanwhile comes back as an error that
-names the command. `edit.undo` and `edit.redo` take back the agent's own steps and leave
+call first brings in what the others changed since, and returns once the room took all of the
+agent's edit, a long macro's too; an edit whose text another participant took away meanwhile
+comes back as an error that names the command, and so does one the room still hasn't taken
+after others' changes sent it back four times in a row (it stays in the agent's copy and goes
+first with its next call). A call that finds such an edit lost does nothing else and says so,
+so the agent can make it again. `edit.undo` and `edit.redo` take back the agent's own steps and leave
 everyone else's edits in; when someone changed what the step changed since, they fail and say
 who. `get_changes` shows the window's changes and other agents' alike. Files,
 other documents and the window (`open_document`, `save_document`, `list_documents`,

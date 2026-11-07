@@ -152,8 +152,10 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
             if wordcraft_engine::cmd::assist::person_only(id) {
                 return err(crate::assist::chatgpt::YOURS);
             }
-            // Close, with the same guard as the window's: unsaved changes need `force`.
+            // Close, with the same guard as the window's: unsaved changes need `force`. Closing
+            // the shared document stops sharing first, and checks what the room took last.
             if id == "file.close" {
+                app.stop_sharing_to_close(doc, &params);
                 let force = params.get("force").and_then(Value::as_bool) == Some(true);
                 if !force && app.session.documents().iter().any(|d| d.id == doc && d.dirty) {
                     return err(UNSAVED);
@@ -163,7 +165,16 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
                     Err(e) => err(e),
                 };
             }
-            let r = app.session.with_document(doc, |s| s.run(id, &params));
+            if id == "file.closeDocument" {
+                app.stop_sharing_to_close_document(doc, &params);
+            }
+            // In the shared document, through its copy, as the window's own commands go: its
+            // edits reach the room at once, and a save has what others changed.
+            let share = app.share.as_mut();
+            let r = app.session.with_document(doc, |s| match share.and_then(|share| share.run(s, id, &params, false)) {
+                Some(r) => r,
+                None => s.run(id, &params),
+            });
             // UI requests the command made carry `document`, so the window can tell they aren't
             // about the document it shows.
             for req in std::mem::take(&mut app.session.ui_requests) {
@@ -179,6 +190,9 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
 /// ids as commands. It refuses closing unsaved work and document operations without a document.
 pub fn handle(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
     let p = &req.params;
+    // What others changed in the shared document since the last frame, whichever document the
+    // window shows: a request reads, saves or closes it as the room has it.
+    app.catch_up_share();
     if DOC_METHODS.contains(&req.method.as_str()) {
         match addressed(app, p) {
             Ok(Some(doc)) => return handle_in(app, doc, &req.method, p),
@@ -361,6 +375,9 @@ pub fn handle(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) -> O
             ok(json!({}))
         }
         "app.quit" => {
+            // The app quits at once, unasked: sharing stops first, so the participants'
+            // connections end with the room, and the window has every change it took.
+            app.stop_sharing();
             app.quit_requested = true;
             ok(json!({}))
         }

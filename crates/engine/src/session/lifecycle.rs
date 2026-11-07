@@ -173,6 +173,7 @@ impl Session {
             others: Vec::new(),
             order: vec![document_id],
             untitled_count: 1,
+            room: None,
         }
     }
 }

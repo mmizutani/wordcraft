@@ -289,6 +289,8 @@ impl Session {
             others: _,
             order: _,
             untitled_count: _,
+            // Which open document a room shares, by its id.
+            room: _,
             #[cfg(not(target_arch = "wasm32"))]
                 recovery: _,
         } = self;
@@ -571,15 +573,17 @@ impl Session {
     }
 
     /// Whether the active document is a blank one nobody has used: no file and no name, never
-    /// changed, nothing to undo or redo and no text. Opening a file replaces such a document
-    /// rather than opening beside it.
+    /// changed, nothing to undo or redo and no text, and no open room shares it. Opening a file
+    /// replaces such a document rather than opening beside it.
     pub fn is_untouched_blank(&self) -> bool {
         self.used_because().is_none()
     }
 
     /// Why the active document doesn't count as an untouched blank one, if it doesn't.
     pub(crate) fn used_because(&self) -> Option<&'static str> {
-        if self.path.is_some() {
+        if self.is_shared() {
+            Some("it is shared")
+        } else if self.path.is_some() {
             Some("it has a file")
         } else if self.file_name.is_some() {
             Some("it has a name")
@@ -603,6 +607,11 @@ impl Session {
     /// document that was active. An id that isn't open is an error and `f` doesn't run.
     pub fn with_document<R>(&mut self, id: u64, f: impl FnOnce(&mut Session) -> R) -> Result<R, CmdError> {
         let home = self.document_id;
+        // The input method works on the document the window shows: what `f` changes in another
+        // one is nothing it composes in, so what it was told of the shown one stays as it was,
+        // unless `f` changed that one too (a macro step can switch to it).
+        let shown = |s: &Session| (s.rev, s.ime_body_epoch, s.current_ime_caret_state());
+        let ime = (id != home).then(|| (shown(self), self.ime_state_revision, self.ime_state_seen.clone(), self.pending_ime_application_change));
         self.switch_to(id)?;
         // The queue drops its oldest entries when full, so `f`'s requests are told apart by
         // collecting them on their own rather than by position.
@@ -620,7 +629,37 @@ impl Session {
         if self.document_id != home && self.is_open(home) {
             self.switch_to(home)?;
         }
+        if let Some((before, revision, seen, pending)) = ime
+            && self.document_id == home
+        {
+            if shown(self) == before {
+                self.ime_state_revision = revision;
+                self.ime_state_seen = seen;
+                self.pending_ime_application_change = pending;
+            } else {
+                // What `f` left is new, so no revision is used twice; the input method is told.
+                self.pending_ime_application_change = true;
+            }
+        }
         Ok(r)
+    }
+
+    /// From now on the active document is shared through `room`, until the room closes: it
+    /// counts as used ([`Session::is_untouched_blank`]).
+    pub(crate) fn shared_through(&mut self, room: &std::sync::Arc<crate::room::Room>) {
+        self.room = Some((self.document_id, std::sync::Arc::downgrade(room)));
+    }
+
+    /// The open document shared through a room that is still open, by id, and that room
+    /// ([`Session::shared_through`]), whichever document is active.
+    pub(crate) fn shared_room(&self) -> Option<(u64, std::sync::Arc<crate::room::Room>)> {
+        let (id, room) = self.room.as_ref()?;
+        room.upgrade().filter(|r| !r.is_closed()).map(|r| (*id, r))
+    }
+
+    /// Whether the active document is shared through a room that is still open.
+    pub(crate) fn is_shared(&self) -> bool {
+        self.shared_room().is_some_and(|(id, _)| id == self.document_id)
     }
 
     /// The open document saved at `path`, if any: the same file reached by another spelling

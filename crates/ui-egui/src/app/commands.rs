@@ -130,6 +130,9 @@ impl WordApp {
         if id == "file.close" {
             return self.close_document(&params);
         }
+        if id == "file.closeDocument" {
+            self.stop_sharing_to_close_document(self.session.document_id(), &params);
+        }
         if id == "file.autosave" {
             return self.set_autosave(&params);
         }
@@ -499,15 +502,22 @@ impl WordApp {
                 other => self.dialog = dialogs::Dialog::open(other, self),
             }
         }
-        if req.get("close").is_some() {
-            self.quit_requested = true;
+        // Close made by a command run inside another (a macro's step: the window's own Close
+        // doesn't ask this way): File › Close of the shown document, which keeps unsaved work
+        // and stops sharing first. It never quits the app unasked.
+        if req.get("close").is_some()
+            && let Err(e) = self.close_document(&json!({}))
+        {
+            // Engine messages are English; the catalog translates the ones it knows.
+            self.status(tl!(&e).to_string());
         }
     }
 
     /// A request made for document `document`, which isn't shown and which no other window
     /// handles: the interface theme is the app's and changes; Close closes that document if it
-    /// has nothing unsaved; the rest (dialogs, panes, focus, scrolling) are about a window's page
-    /// and are dropped, as no window shows the document.
+    /// has nothing unsaved, stopping sharing first when it is the shared one; the rest (dialogs,
+    /// panes, focus, scrolling) are about a window's page and are dropped, as no window shows
+    /// the document.
     fn handle_request_for(&mut self, document: u64, req: &Value) {
         let theme_only = req.get("interfaceTheme").is_some() || req.get("toggle").and_then(Value::as_str) == Some("interfaceTheme");
         if theme_only {
@@ -519,6 +529,7 @@ impl WordApp {
             return;
         }
         if req.get("close").is_some() {
+            self.stop_sharing_to_close(document, &json!({}));
             let dirty = self.session.documents().iter().any(|d| d.id == document && d.dirty);
             if dirty {
                 log::warn!("not closing document {document}: it has unsaved changes");
