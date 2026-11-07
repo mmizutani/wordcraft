@@ -302,3 +302,19 @@ fn a_body_limits_hold_lasts_until_the_request_is_handled() {
     assert!(out.ends_with("held"), "{out:?}");
     assert!(released.load(Ordering::SeqCst), "given back once handled");
 }
+
+/// A chunked body where none is allowed is refused before any of it is read: a client that
+/// never sends the first chunk's size can't hold the connection.
+#[test]
+fn a_chunked_body_where_none_is_allowed_is_refused_unread() {
+    struct Never;
+    impl Read for Never {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("the body was read")
+        }
+    }
+    let mut req = Request { method: "POST".into(), target: "/healthz".into(), ..Request::default() };
+    req.headers.push(("Transfer-Encoding".into(), "chunked".into()));
+    let e = read_body(&mut BufReader::new(Never), &mut req, &Limits { head: 512, headers: 8, body: 0 }).unwrap_err();
+    assert_eq!(e.response().status, 413);
+}

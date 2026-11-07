@@ -235,6 +235,9 @@ pub fn read_body(reader: &mut impl BufRead, req: &mut Request, limits: &Limits) 
     let cl = req.header("Content-Length").map(str::to_string);
     match (te, cl) {
         (Some(_), Some(_)) => Err(refused(400, "both Transfer-Encoding and Content-Length")),
+        // A request that may have no body is refused from its head: reading even the first
+        // chunk's size would let a client that never sends it hold the connection.
+        (Some(te), None) if te == "chunked" && limits.body == 0 => Err(refused(413, "this request takes no body")),
         (Some(te), None) if te == "chunked" => read_chunked(reader, &mut req.body, limits.body),
         (Some(_), None) => Err(refused(501, "only chunked transfer encoding")),
         (None, Some(cl)) => {

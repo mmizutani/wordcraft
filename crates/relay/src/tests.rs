@@ -584,6 +584,10 @@ fn heads_without_their_bodies_are_turned_away_unless_the_request_could_be_made()
     {
         assert_eq!(answered(&mut head(&path)), Some(status), "{path}");
     }
+    // A chunked body where none belongs is turned away before its first chunk.
+    let mut chunked = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    chunked.write_all(b"POST /healthz HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+    assert_eq!(answered(&mut chunked), Some(413));
     // An agent's room: 32 requests may be arriving or waiting from one address, then 429 until
     // one is done.
     let mut waiting: Vec<TcpStream> = (0..32).map(|_| head(&format!("/r/{room}/mcp"))).collect();
