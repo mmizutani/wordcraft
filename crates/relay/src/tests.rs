@@ -514,3 +514,23 @@ fn large_answers_arriving_at_once_are_capped_per_token() {
     assert!(out.starts_with("HTTP/1.1 413") && started.elapsed() < Duration::from_secs(2), "{out}");
     drop(agent);
 }
+
+/// Answers waiting for agents to read them count against a budget, by token: while it is spent,
+/// new requests are refused before they reach the desktop, until earlier answers have been read.
+#[test]
+fn answers_waiting_for_slow_agents_are_bounded() {
+    let (base, relay) = relay(|c| c.sending_per_token = 10);
+    let hosting = Hosting::start(&base, TOKEN, None, echo()).unwrap();
+    let (room, _) = hosting.claim();
+    let ask =
+        || relay.handle(&Request { method: "POST".into(), target: format!("/r/{room}/mcp"), headers: Vec::new(), body: b"{}".to_vec(), peer: None });
+    // An agent that hasn't read its answer (over 10 bytes) yet.
+    let unread = ask();
+    assert_eq!(unread.status, 200);
+    assert!(unread.body.len() > 10);
+    let r = ask();
+    assert_eq!(r.status, 503, "{}", String::from_utf8_lossy(&r.body));
+    // Once it has been read, requests go through again.
+    drop(unread);
+    assert_eq!(ask().status, 200);
+}

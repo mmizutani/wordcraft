@@ -57,6 +57,10 @@ pub struct Config {
     /// Agents' requests waiting for an answer, in all the rooms of one token: queued or being
     /// answered. One token can't hold every connection the relay has.
     pub waiting_per_token: usize,
+    /// Answers' bytes waiting for agents to read them, from one token's rooms and in all: while
+    /// either is spent, new requests are refused (503) before they reach the desktop.
+    pub sending_per_token: usize,
+    pub max_sending: usize,
     /// Requests per second (and burst) from one address, and to one room.
     pub per_source: (f64, f64),
     pub per_room: (f64, f64),
@@ -76,6 +80,8 @@ impl Default for Config {
             forget_after: Duration::from_secs(24 * 60 * 60),
             max_waiting: 64,
             waiting_per_token: 128,
+            sending_per_token: 192 << 20,
+            max_sending: 1 << 30,
             per_source: (20.0, 40.0),
             per_room: (50.0, 100.0),
         }
@@ -149,9 +155,39 @@ pub struct Relay {
     sources: Mutex<HashMap<IpAddr, Bucket>>,
     /// Agents' requests waiting for an answer, by the token of their room.
     waiting: Arc<Mutex<HashMap<String, usize>>>,
+    /// Answers' bytes waiting for agents to read them.
+    sending: Arc<Mutex<Sending>>,
     /// Large answers being received: the token of their room, and when the HTTP server gives up
     /// on each (the time it gives the body), when its place goes back if it hasn't before.
     large: Mutex<Vec<(String, Instant)>>,
+}
+
+/// Answers' bytes waiting for agents to read them, in all and by token.
+#[derive(Default)]
+struct Sending {
+    total: usize,
+    by_token: HashMap<String, usize>,
+}
+
+/// One answer's bytes in [`Sending`], given back once it has been sent (or given up on).
+struct Unsent {
+    sending: Arc<Mutex<Sending>>,
+    token: String,
+    bytes: usize,
+}
+
+impl Drop for Unsent {
+    fn drop(&mut self) {
+        if let Ok(mut s) = self.sending.lock() {
+            s.total = s.total.saturating_sub(self.bytes);
+            if let Some(n) = s.by_token.get_mut(&self.token) {
+                *n = n.saturating_sub(self.bytes);
+                if *n == 0 {
+                    s.by_token.remove(&self.token);
+                }
+            }
+        }
+    }
 }
 
 /// One request's place in its token's count, given back however its wait ends.
@@ -186,6 +222,7 @@ impl Relay {
             sources: Mutex::new(HashMap::new()),
             waiting: Arc::new(Mutex::new(HashMap::new())),
             large: Mutex::new(Vec::new()),
+            sending: Arc::new(Mutex::new(Sending::default())),
         }
     }
 
@@ -428,7 +465,15 @@ impl Relay {
         }
         let Some(room) = self.room(id) else { return refusal(404, "no such room: the link is wrong, or the document isn't shared any more") };
         let Ok(body) = std::str::from_utf8(&req.body) else { return refusal(400, "the body is not UTF-8") };
-        let _waits = {
+        // While agents are slow to read answers already given, nothing new goes to the desktop:
+        // refused before it runs, a request is safe to send again.
+        if let Ok(s) = self.sending.lock()
+            && (s.total >= self.config.max_sending || s.by_token.get(&room.token).is_some_and(|n| *n >= self.config.sending_per_token))
+        {
+            return refusal(503, "the relay is still sending earlier answers for this relay user's documents: try again")
+                .with_header("Retry-After", "1");
+        }
+        let waits = {
             let Ok(mut c) = self.waiting.lock() else { return refusal(500, "internal error") };
             let n = c.entry(room.token.clone()).or_insert(0);
             if *n >= self.config.waiting_per_token {
@@ -464,7 +509,16 @@ impl Relay {
         };
         room.wake.notify_all();
         match rx.recv_timeout(self.config.answer_wait) {
-            Ok(resp) => resp,
+            Ok(resp) => {
+                // Counted until the agent has read it: the request's place, and its bytes.
+                let bytes = resp.body.len();
+                if let Ok(mut s) = self.sending.lock() {
+                    s.total = s.total.saturating_add(bytes);
+                    *s.by_token.entry(room.token.clone()).or_insert(0) += bytes;
+                }
+                let unsent = Unsent { sending: self.sending.clone(), token: room.token.clone(), bytes };
+                resp.holding((waits, unsent))
+            }
             Err(e) => {
                 if let Some(mut w) = room.lock() {
                     w.answers.remove(&n);
