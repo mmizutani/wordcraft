@@ -301,7 +301,7 @@ impl Hub {
         // Another copy of theirs has the colour they have; back after they left, they have the
         // one they had, unless someone in the room took it meanwhile.
         let theirs = |m: &&Member| same_name(&m.who.name, name);
-        let had = self.participants.iter().filter(theirs).map(|m| m.color).last();
+        let had = self.participants.iter().filter(theirs).map(|m| m.color).next_back();
         let taken = |c: u8| self.participants.iter().any(|m| m.here && m.color == c && !same_name(&m.who.name, name));
         let color = match self.participants.iter().filter(|m| m.here).find(theirs) {
             Some(m) => m.color,
