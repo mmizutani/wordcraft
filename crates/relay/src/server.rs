@@ -340,6 +340,12 @@ impl Relay {
         Ok((MAX_REPLY, Hold::new(Place { counts: self.large.clone(), key: room.token.clone() })))
     }
 
+    /// The polls waiting for requests in room `id` now.
+    #[doc(hidden)]
+    pub fn polls_waiting(&self, id: &str) -> usize {
+        self.room(id).and_then(|r| r.lock().map(|w| w.polling)).unwrap_or(0)
+    }
+
     pub fn handle(&self, req: &Request) -> Response {
         let path = req.path().to_string();
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();

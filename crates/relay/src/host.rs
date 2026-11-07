@@ -57,6 +57,12 @@ struct Shared {
     /// Large answers being written out and offered to the relay now, and the most there have been.
     large: Mutex<usize>,
     large_peak: AtomicUsize,
+    /// How many times a poller has opened the room again. The pollers find out the relay forgot
+    /// the room together, and the relay takes the room back only once (a second ask finds it in
+    /// use): the one that opens it says so here, and its sibling simply polls again.
+    reopened: Mutex<u64>,
+    /// Pollers running now.
+    pollers: AtomicUsize,
     handler: Handler,
 }
 
@@ -162,6 +168,8 @@ impl Hosting {
             busy: AtomicUsize::new(0),
             large: Mutex::new(0),
             large_peak: AtomicUsize::new(0),
+            reopened: Mutex::new(0),
+            pollers: AtomicUsize::new(0),
             handler,
         });
         let hosting = Hosting { shared };
@@ -179,6 +187,12 @@ impl Hosting {
     /// The URL agents use: the relay's, for this room (`https://<relay>/r/<room>/mcp`).
     pub fn url(&self) -> &str {
         &self.shared.url
+    }
+
+    /// How many of the room's pollers are running.
+    #[doc(hidden)]
+    pub fn pollers_running(&self) -> usize {
+        self.shared.pollers.load(Ordering::SeqCst)
     }
 
     /// The most large answers that have been written out and offered to the relay at once.
@@ -235,9 +249,16 @@ fn pause(s: &Shared, d: Duration) {
 
 /// Ask the relay for requests until the room stops, answering each one.
 fn poll_loop(s: &Arc<Shared>) {
+    s.pollers.fetch_add(1, Ordering::SeqCst);
+    poll_until_stopped(s);
+    s.pollers.fetch_sub(1, Ordering::SeqCst);
+}
+
+fn poll_until_stopped(s: &Arc<Shared>) {
     let mut backoff = Duration::from_secs(1);
     while !s.stop.load(Ordering::SeqCst) {
         let url = format!("{}/host/r/{}/poll", s.relay, s.room);
+        let seen_reopened = s.reopened.lock().map(|n| *n).unwrap_or_default();
         let asked = Instant::now();
         let polled = read(s.agent.post(&url).header("Authorization", &format!("Bearer {}", s.secret)).send(&b""[..]));
         let failure = match polled {
@@ -265,14 +286,23 @@ fn poll_loop(s: &Arc<Shared>) {
             }
             // Stopped meanwhile: the room was closed on purpose.
             _ if s.stop.load(Ordering::SeqCst) => return,
-            // The relay forgot the room (it restarted): open it again, with the same URL.
-            Ok((404, _)) => match open_room(&s.agent, &s.relay, &s.token, Some((&s.room, &s.secret))) {
-                Ok(_) => None,
-                Err(Status::Refused(why)) => {
-                    set(s, Status::Refused(why));
-                    return;
-                }
-                Err(Status::Retrying(why)) => Some(why),
+            // The relay forgot the room (it restarted): open it again, with the same URL, unless
+            // the other poller already has since this poll began.
+            Ok((404, _)) => match s.reopened.lock() {
+                Ok(n) if *n != seen_reopened => None,
+                Ok(mut n) => match open_room(&s.agent, &s.relay, &s.token, Some((&s.room, &s.secret))) {
+                    Ok(_) => {
+                        *n = n.wrapping_add(1);
+                        None
+                    }
+                    Err(Status::Refused(why)) => {
+                        drop(n);
+                        set(s, Status::Refused(why));
+                        return;
+                    }
+                    Err(Status::Retrying(why)) => Some(why),
+                    Err(_) => Some("the room couldn't be opened again".into()),
+                },
                 Err(_) => Some("the room couldn't be opened again".into()),
             },
             Ok((status, text)) => Some(format!("the relay answered {status}: {}", text.trim())),

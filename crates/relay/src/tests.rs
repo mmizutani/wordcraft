@@ -178,13 +178,19 @@ fn an_offline_host_is_said_at_once() {
 /// same): the desktop opens it again with its id and secret, so its URL keeps working.
 #[test]
 fn a_forgotten_room_is_opened_again_with_the_same_url() {
-    let (base, _relay) = relay(|_| {});
+    let (base, relay) = relay(|_| {});
     let hosting = Hosting::start(&base, TOKEN, None, echo()).unwrap();
     let url = hosting.url().to_string();
     let (room, secret) = hosting.claim();
+    wait_for("both pollers wait", || relay.polls_waiting(&room) == 2);
     let (status, _, _) = http(&format!("{base}/host/r/{room}"), "DELETE", &[("Authorization", &format!("Bearer {secret}"))], "");
     assert_eq!(status, 204);
     wait_for("the room comes back", || http(&url, "POST", &[], "{}").0 == 200);
+    // Both pollers heard the room was gone; one opened it again and the other polls on, rather
+    // than taking the room in use (by its sibling) as someone else's.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(hosting.pollers_running(), 2);
+    assert_eq!(hosting.status(), Status::Connected);
     // Someone else can't take a room by its id without its secret.
     let claim = json!({"room": room, "secret": "f".repeat(64)}).to_string();
     let (status, _, _) = http(&format!("{base}/host/rooms"), "POST", &[("Authorization", &format!("Bearer {TOKEN}"))], &claim);
