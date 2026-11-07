@@ -335,3 +335,66 @@ fn hostile_frames_never_panic() {
         let _ = crate::wire::request_from(&v);
     }
 }
+
+/// The desktop is answering as many requests as it runs at once, so a batch it took waits its
+/// turn here. A request whose agent stopped waiting meanwhile (and may be sending it again) is
+/// dropped, not run late: a timed-out edit never lands twice.
+#[test]
+fn a_request_whose_agent_gave_up_is_never_run_late() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // A relay as a stand-in, which hands the desktop one batch: 16 requests that keep every
+    // answering thread busy, one more that the poller answers itself, and five whose agents wait
+    // only 400 ms.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let room = "0123456789abcdef0123456789abcdef";
+    let replied = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let sent = Arc::new(AtomicBool::new(false));
+    let (b, r, s) = (base.clone(), replied.clone(), sent.clone());
+    let fake: wordcraft_http::Handler = Arc::new(move |req: &Request| {
+        if req.target == "/host/rooms" {
+            return Response::json(200, json!({"room": room, "secret": "s3cret", "url": format!("{b}/r/{room}/mcp")}).to_string());
+        }
+        if req.target.ends_with("/poll") {
+            if s.swap(true, Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(100));
+                return Response::json(200, json!({"requests": []}).to_string());
+            }
+            let one =
+                |id: u64, body: &str, ttl: u64| json!({"id": id, "method": "POST", "target": "/mcp", "headers": [], "body": body, "ttlMs": ttl});
+            let mut batch: Vec<Value> = (1..=16).map(|id| one(id, "hold", 10_000)).collect();
+            batch.push(one(17, "slow", 10_000));
+            batch.extend((18..=22).map(|id| one(id, "quick", 400)));
+            return Response::json(200, json!({"requests": batch}).to_string());
+        }
+        if req.target.ends_with("/reply") {
+            if let Some(id) = serde_json::from_slice::<Value>(&req.body).ok().and_then(|v| v["id"].as_u64()) {
+                r.lock().unwrap().push(id);
+            }
+            return Response::new(204);
+        }
+        Response::new(204)
+    });
+    std::thread::spawn(move || wordcraft_http::serve(listener, wordcraft_http::Config::default(), fake));
+    let ran = Arc::new(Mutex::new(Vec::<String>::new()));
+    let r = ran.clone();
+    let desktop: wordcraft_http::Handler = Arc::new(move |req: &Request| {
+        let body = String::from_utf8_lossy(&req.body).to_string();
+        r.lock().unwrap().push(body.clone());
+        std::thread::sleep(Duration::from_millis(match body.as_str() {
+            "hold" => 1500,
+            "slow" => 800,
+            _ => 0,
+        }));
+        Response::json(200, "{}")
+    });
+    let hosting = Hosting::start(&base, TOKEN, None, desktop).unwrap();
+    wait_for("the busy requests are answered", || (1..=17).all(|id| replied.lock().unwrap().contains(&id)));
+    std::thread::sleep(Duration::from_millis(300));
+    let ran = ran.lock().unwrap().clone();
+    assert!(!ran.iter().any(|b| b == "quick"), "ran after their agents gave up: {ran:?}");
+    assert_eq!(ran.len(), 17, "{ran:?}");
+    assert!(!replied.lock().unwrap().iter().any(|id| *id > 17));
+    drop(hosting);
+}

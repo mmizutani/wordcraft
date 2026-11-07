@@ -47,6 +47,12 @@ pub fn request_from(v: &Value) -> Option<(u64, Request)> {
     Some((id, Request { method, target, headers: headers_from(v.get("headers").unwrap_or(&Value::Null), REQUEST_HEADERS), body, peer: None }))
 }
 
+/// How long the agent still waits for its answer, from when the relay handed the request on
+/// (`ttlMs`). None from a relay that doesn't say.
+pub fn ttl(v: &Value) -> Option<std::time::Duration> {
+    v.get("ttlMs").and_then(Value::as_u64).map(std::time::Duration::from_millis)
+}
+
 /// The desktop's answer to request `id`. A body that isn't UTF-8 (MCP's are JSON) is refused
 /// rather than mangled.
 pub fn reply(id: u64, resp: &Response) -> Value {

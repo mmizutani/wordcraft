@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use wordcraft_http::{Handler, Request};
@@ -223,9 +223,12 @@ fn poll_loop(s: &Arc<Shared>) {
                 backoff = Duration::from_secs(1);
                 let requests =
                     serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("requests").and_then(Value::as_array).cloned()).unwrap_or_default();
+                let now = Instant::now();
                 for r in requests {
                     if let Some((id, req)) = wire::request_from(&r) {
-                        answer(s, id, req);
+                        // A tenth less than the relay says, for the time its answer took to get here.
+                        let until = wire::ttl(&r).map(|t| now + t.saturating_sub((t / 10).min(Duration::from_secs(2))));
+                        answer(s, id, req, until);
                     }
                 }
                 None
@@ -258,9 +261,14 @@ fn poll_loop(s: &Arc<Shared>) {
 }
 
 /// Answer one request on a thread of its own (or on this one, when [`AT_ONCE`] are running),
-/// and send the answer to the relay.
-fn answer(s: &Arc<Shared>, id: u64, req: Request) {
+/// and send the answer to the relay. A request whose agent has stopped waiting by `until` is
+/// dropped unrun: its agent was told it timed out, and may already have sent it again.
+fn answer(s: &Arc<Shared>, id: u64, req: Request, until: Option<Instant>) {
     let run = move |s: &Shared| {
+        if until.is_some_and(|u| Instant::now() >= u) {
+            log::debug!("relay: a request waited too long here and wasn't run");
+            return;
+        }
         let resp = (s.handler)(&req);
         let body = wire::reply(id, &resp).to_string();
         let url = format!("{}/host/r/{}/reply", s.relay, s.room);

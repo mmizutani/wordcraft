@@ -96,8 +96,14 @@ impl Bucket {
     }
 }
 
+/// An agent's request waiting for the desktop, and when its agent stops waiting.
+struct Queued {
+    request: Value,
+    until: Instant,
+}
+
 struct Waiting {
-    queue: VecDeque<Value>,
+    queue: VecDeque<Queued>,
     answers: HashMap<u64, Sender<Response>>,
     next: u64,
     /// When the desktop last asked for requests, or finished asking.
@@ -267,8 +273,20 @@ impl Relay {
         if w.closed {
             return Response::text(404, "the room was closed\n");
         }
+        // Each says how long its agent still waits, so the desktop never starts one whose agent
+        // has given up (and may already be asking again).
+        let now = Instant::now();
         let n = w.queue.len().min(PER_POLL);
-        let requests: Vec<Value> = w.queue.drain(..n).collect();
+        let requests: Vec<Value> = w
+            .queue
+            .drain(..n)
+            .filter_map(|q| {
+                let left = q.until.saturating_duration_since(now);
+                let mut r = q.request;
+                r["ttlMs"] = json!(u64::try_from(left.as_millis()).unwrap_or(u64::MAX));
+                (!left.is_zero()).then_some(r)
+            })
+            .collect();
         Response::json(200, json!({"requests": requests}).to_string())
     }
 
@@ -359,7 +377,7 @@ impl Relay {
             }
             let n = w.next;
             w.next = w.next.wrapping_add(1) & ID_MASK;
-            w.queue.push_back(wire::forward(n, req, target, body));
+            w.queue.push_back(Queued { request: wire::forward(n, req, target, body), until: Instant::now() + self.config.answer_wait });
             w.answers.insert(n, tx);
             n
         };
@@ -369,7 +387,7 @@ impl Relay {
             Err(e) => {
                 if let Some(mut w) = room.lock() {
                     w.answers.remove(&n);
-                    w.queue.retain(|r| r.get("id").and_then(Value::as_u64) != Some(n));
+                    w.queue.retain(|q| q.request.get("id").and_then(Value::as_u64) != Some(n));
                 }
                 match e {
                     mpsc::RecvTimeoutError::Timeout => refusal(504, "the room's host took too long to answer"),

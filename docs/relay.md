@@ -112,7 +112,7 @@ carries a relay token:
 | Request | Answer |
 |---|---|
 | `POST /host/rooms` `{}`, or `{"room", "secret"}` to open a room again (after the relay restarted) | `{"room", "secret", "url"}`; 401 for a wrong token, 409 for a room someone else holds |
-| `POST /host/r/<room>/poll` | `{"requests": [{"id", "method", "target", "headers", "body"}]}`, waiting up to 25 seconds for one; 404 once the relay has forgotten the room |
+| `POST /host/r/<room>/poll` | `{"requests": [{"id", "method", "target", "headers", "body", "ttlMs"}]}`, waiting up to 25 seconds for one; 404 once the relay has forgotten the room. `ttlMs` is how long the agent still waits: the app doesn't start a request after that, as its agent has been told it timed out |
 | `POST /host/r/<room>/reply` `{"id", "status", "headers", "body"}` | 204 |
 | `DELETE /host/r/<room>` | closes the room |
 
