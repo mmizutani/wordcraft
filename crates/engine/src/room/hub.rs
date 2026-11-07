@@ -38,6 +38,26 @@ pub const MAX_PRESENCES: usize = 64;
 /// How many colours tell participants apart ([`Seen::color`]).
 pub const COLORS: u8 = 8;
 
+/// What an invite allows besides its participant's name and role ([`Hub::invite_on`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Terms {
+    /// Which files its participant's commands can use, at most what the room's setting allows
+    /// ([`Hub::files_for`]); `None`: what the setting says.
+    pub files: Option<AgentFiles>,
+    /// When its key stops working, in seconds since 1970 ([`Hub::expire`]): no one joins with it
+    /// from then on, and the copies that joined with it are out of the room, as when it is
+    /// taken back. `None`: until it is taken back.
+    pub expires: Option<u64>,
+    /// How many times its key joins (each copy of the participant's is a join); `None`: as
+    /// often as it is used. The copies that joined stay.
+    pub uses: Option<u32>,
+    /// For a participant on another machine (an agent in a sandbox, through a tunnel or a
+    /// relay): never the owner, who may change the application's settings, and no file unless
+    /// `files` names some, whatever the room's setting allows: their paths aren't this
+    /// computer's.
+    pub remote: bool,
+}
+
 /// A change the hub accepted.
 #[derive(Clone, Debug)]
 pub struct Accepted {
@@ -94,13 +114,46 @@ struct Invite {
     /// Which files its participant's commands can use, when the invite chose for them (never
     /// more than the room's setting); `None`: what the setting says ([`crate::room::Room::reach`]).
     files: Option<AgentFiles>,
+    /// When its key stops working ([`Terms::expires`]).
+    expires: Option<u64>,
+    /// How many more times its key joins ([`Terms::uses`]); `None`: as often as it is used.
+    uses_left: Option<u32>,
+    /// For a participant on another machine ([`Terms::remote`]).
+    remote: bool,
 }
 
 impl std::fmt::Debug for Invite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The key stays out of logs.
-        f.debug_struct("Invite").field("name", &self.name).field("role", &self.role).field("files", &self.files).finish_non_exhaustive()
+        f.debug_struct("Invite")
+            .field("name", &self.name)
+            .field("role", &self.role)
+            .field("files", &self.files)
+            .field("expires", &self.expires)
+            .field("uses_left", &self.uses_left)
+            .field("remote", &self.remote)
+            .finish_non_exhaustive()
     }
+}
+
+/// An invite as the room's owner sees it ([`Hub::invites`]): who it is for, never its key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invited {
+    /// The participant's name.
+    pub name: String,
+    /// Their role.
+    pub role: Role,
+    /// Which files their commands can use, when the invite chose for them; `None`: what the
+    /// room's setting says.
+    pub files: Option<AgentFiles>,
+    /// How many copies are in the room with its key now: none until they join.
+    pub joined: usize,
+    /// When its key stops working, in seconds since 1970; `None`: until it is taken back.
+    pub expires: Option<u64>,
+    /// How many more times its key joins; `None`: as often as it is used.
+    pub uses_left: Option<u32>,
+    /// Whether it is for a participant on another machine ([`Terms::remote`]).
+    pub remote: bool,
 }
 
 /// A participant, with how they joined and whether they're still in the room.
@@ -146,6 +199,9 @@ pub struct Hub {
     invites: Vec<Invite>,
     /// How many invites were handed out: the next one's number.
     invited: u64,
+    /// The soonest an invite expires, if one does: [`Hub::expire`] looks at the invites only
+    /// from then on, so a room whose invites don't expire spends nothing on it.
+    next_expiry: Option<u64>,
     /// Whether the room was closed ([`Hub::close`]).
     closed: bool,
     /// How many places participants' copies told the hub ([`Hub::set_presence`]).
@@ -167,6 +223,7 @@ impl Hub {
             participants: Vec::new(),
             invites: Vec::new(),
             invited: 0,
+            next_expiry: None,
             closed: false,
             told: 0,
         }
@@ -200,7 +257,24 @@ impl Hub {
     /// [`Hub::invite`], choosing which files its participant's commands can use, at most what the
     /// room's setting allows ([`Hub::files_for`]); `None`: what the setting says.
     pub fn invite_with(&mut self, name: &str, role: Role, files: Option<AgentFiles>) -> Result<String, RoomError> {
+        self.invite_on(name, role, Terms { files, ..Terms::default() })
+    }
+
+    /// [`Hub::invite`] on `terms`: which files, until when, how many joins, and whether the
+    /// participant is on another machine. Refused like [`Hub::invite`], and when a remote invite
+    /// is for the owner, or `uses` is 0.
+    pub fn invite_on(&mut self, name: &str, role: Role, terms: Terms) -> Result<String, RoomError> {
         self.open()?;
+        if terms.remote && role == Role::Owner {
+            return Err(RoomError::NotAllowed(
+                "a participant on another machine can't be the owner: the owner may change this computer's settings".into(),
+            ));
+        }
+        if terms.uses == Some(0) {
+            return Err(RoomError::NotAllowed("`uses`: at least 1".into()));
+        }
+        // A remote participant's paths aren't this computer's: no file unless the invite names some.
+        let files = if terms.remote { Some(terms.files.unwrap_or(AgentFiles::None)) } else { terms.files };
         let name = valid_name(name)?;
         if self.invites.iter().any(|i| same_name(&i.name, name)) || self.participants.iter().any(|m| same_name(&m.who.name, name)) {
             return Err(RoomError::Name(format!("{name} is someone's name in this room already")));
@@ -213,7 +287,19 @@ impl Hub {
         let key: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let number = self.invited;
         self.invited = self.invited.saturating_add(1);
-        self.invites.push(Invite { key: key.clone(), name: name.to_string(), role, number, files });
+        self.invites.push(Invite {
+            key: key.clone(),
+            name: name.to_string(),
+            role,
+            number,
+            files,
+            expires: terms.expires,
+            uses_left: terms.uses,
+            remote: terms.remote,
+        });
+        if let Some(at) = terms.expires {
+            self.next_expiry = Some(self.next_expiry.map_or(at, |t| t.min(at)));
+        }
         Ok(key)
     }
 
@@ -282,14 +368,89 @@ impl Hub {
         !gone.is_empty()
     }
 
+    /// The invites handed out and not taken back, in the order they were, as the room's owner
+    /// sees them: never their keys.
+    pub fn invites(&self) -> Vec<Invited> {
+        self.invites
+            .iter()
+            .map(|i| Invited {
+                name: i.name.clone(),
+                role: i.role,
+                files: i.files,
+                joined: self.participants.iter().filter(|m| m.here && m.via == Some(i.number)).count(),
+                expires: i.expires,
+                uses_left: i.uses_left,
+                remote: i.remote,
+            })
+            .collect()
+    }
+
+    /// [`Hub::revoke`] the invite for the participant called `name` (compared without case), for
+    /// an owner who no longer has the key: the key shows once. Whether there was one.
+    pub fn revoke_named(&mut self, name: &str) -> bool {
+        let Some(key) = self.invites.iter().find(|i| same_name(&i.name, name.trim())).map(|i| i.key.clone()) else { return false };
+        self.revoke(&key)
+    }
+
+    /// Give the participant called `name` (compared without case) `role` from now on: their
+    /// invite, so a copy that joins with its key later has it too, and every copy that joined
+    /// with it, whose next change the hub holds to it (and which takes it with the next changes
+    /// it receives, [`super::Replica::receive`]). Whether it changed. Only invited participants
+    /// change role: the room's own process (the window, its owner) keeps the one it joined with.
+    pub fn set_role(&mut self, name: &str, role: Role) -> Result<bool, RoomError> {
+        self.open()?;
+        let name = name.trim();
+        let Some(invite) = self.invites.iter_mut().find(|i| same_name(&i.name, name)) else {
+            return Err(RoomError::Name(format!("{name} has no invite: only participants invited with a key change role")));
+        };
+        if invite.remote && role == Role::Owner {
+            return Err(RoomError::NotAllowed(format!(
+                "{} is on another machine and can't be the owner: the owner may change this computer's settings",
+                invite.name
+            )));
+        }
+        if invite.role == role {
+            return Ok(false);
+        }
+        invite.role = role;
+        let number = invite.number;
+        for m in self.participants.iter_mut().filter(|m| m.via == Some(number)) {
+            m.who.role = role;
+        }
+        Ok(true)
+    }
+
     /// Admit the participant the invite with `key` names, with its role. The same key admits
     /// them again (another copy of theirs) until it is revoked. Refused when the room is closed.
     pub fn admit_with(&mut self, key: &str) -> Result<Participant, RoomError> {
         self.open()?;
         // Every invite is compared, so how long it takes says nothing about the key.
-        let found = self.invites.iter().fold(None, |found, i| if same_key(&i.key, key) { Some(i) } else { found });
-        let Invite { name, role, number, .. } = found.cloned().ok_or(RoomError::UnknownKey)?;
-        self.add(&name, role, Some(number))
+        let found = self.invites.iter().enumerate().fold(None, |found, (n, i)| if same_key(&i.key, key) { Some(n) } else { found });
+        let at = found.ok_or(RoomError::UnknownKey)?;
+        let invite = self.invites.get(at).cloned().ok_or(RoomError::UnknownKey)?;
+        if invite.uses_left == Some(0) {
+            return Err(RoomError::NotAllowed(format!("this key has joined as many times as {}'s invite allows", invite.name)));
+        }
+        let who = self.add(&invite.name, invite.role, Some(invite.number))?;
+        if let Some(left) = self.invites.get_mut(at).and_then(|i| i.uses_left.as_mut()) {
+            *left = left.saturating_sub(1);
+        }
+        Ok(who)
+    }
+
+    /// Take back every invite whose time is up at `now` (seconds since 1970, [`Terms::expires`]),
+    /// as [`Hub::revoke`] does. Whether one was. Costs nothing until the soonest is due.
+    pub fn expire(&mut self, now: u64) -> bool {
+        if self.next_expiry.is_none_or(|t| t > now) {
+            return false;
+        }
+        let due: Vec<String> = self.invites.iter().filter(|i| i.expires.is_some_and(|t| t <= now)).map(|i| i.key.clone()).collect();
+        let mut any = false;
+        for key in &due {
+            any |= self.revoke(key);
+        }
+        self.next_expiry = self.invites.iter().filter_map(|i| i.expires).min();
+        any
     }
 
     fn add(&mut self, name: &str, role: Role, via: Option<u64>) -> Result<Participant, RoomError> {

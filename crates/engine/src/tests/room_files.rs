@@ -276,7 +276,9 @@ fn every_role_exports_where_it_may_write_and_saves_nowhere() {
     let print = f.path("write/print.pdf");
     execute(&mut viewer, "file.printPdf", json!({"path": print})).unwrap();
     assert!(Path::new(&print).is_file());
-    let e = execute(&mut viewer, "file.exportPdf", json!({})).unwrap_err();
+    // Without a path the PDF comes back in the reply (#74); printing still needs one.
+    assert!(execute(&mut viewer, "file.exportPdf", json!({})).unwrap()["pdf"].is_string());
+    let e = execute(&mut viewer, "file.printPdf", json!({})).unwrap_err();
     assert!(e.contains("needs a `path`"), "{e}");
     for (id, params) in [
         ("file.saveAs", json!({"path": f.path("write/copy.docx")})),

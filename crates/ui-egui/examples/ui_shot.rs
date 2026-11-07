@@ -24,12 +24,17 @@
 //! signing in to ChatGPT (`assist.chatgpt.signIn`, #19; no browser opens here).
 //! `{"settingsDir": "/abs/dir"}` gives the window a settings folder (the agents' settings in
 //! File › Options › Assistant read and save there, and a ChatGPT sign-in is kept there), and
-//! `{"web": true}` has it offer what the web app does: no assistant. Once the document is shared
-//! (`{"method": "room.share"}`), `{"agent": name, "role"?: role, "run": [[command, params], …]}`
-//! invites a participant called `name` (an editor unless `role` says otherwise), joins with the
-//! key in a copy of their own, as an agent does over the control channel, and runs the commands
-//! there (`select.text`, `caret.set`, `text.insert`…), so the window shows their caret, selection
-//! and name (#32); the next line naming the same agent runs more commands in the same copy.
+//! `{"web": true}` has it offer what the web app does: no assistant. `{"room": "127.0.0.1:7982"}`
+//! gives the window a lobby whose room port says it listens there (nothing listens), so a shared
+//! document can be joined: `{"join": {"name", "role"?, "files"?, "copies"?}}` invites a participant
+//! and joins with their key (`copies` times, once by default), and `{"inviteOnPage": {…}}` invites
+//! as File › Share's Invite does, showing the key on the page (#33).
+//! Once the document is shared (`{"method": "room.share"}`), `{"agent": name, "role"?: role,
+//! "run": [[command, params], …]}` invites a participant called `name` (an editor unless `role`
+//! says otherwise), joins with the key in a copy of their own, as an agent does over the control
+//! channel, and runs the commands there (`select.text`, `caret.set`, `text.insert`…), so the window
+//! shows their caret, selection and name (#32); the next line naming the same agent runs more
+//! commands in the same copy.
 
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{ControlRequest, Services, WordApp};
@@ -70,9 +75,17 @@ fn main() -> Result<(), String> {
     // `{"settingsDir": "/abs/dir"}`: the settings folder, where File › Options › Assistant keeps
     // the agents' settings (#24); none otherwise, as in tests.
     let settings_dir = lines.iter().find_map(|l| l.get("settingsDir").and_then(|v| v.as_str())).map(std::path::PathBuf::from);
+    let mut app = WordApp::new(Session::new(doc), Services { settings_dir, ..Services::default() }).with_control(rx);
+    // `{"room": addr}`: a lobby for the shared document, where `{"join": …}` lines join it; the
+    // lobby is there without it too, for `{"agent": …}` lines.
     let lobby = wordcraft_engine::room::Lobby::default();
+    if let Some(addr) = lines.iter().find_map(|l| l.get("room").and_then(|v| v.as_str())) {
+        lobby.set_addr(Some(addr.parse().map_err(|e| format!("room {addr}: {e}"))?));
+    }
+    app = app.with_lobby(lobby.clone());
+    // The participants' copies, kept in the room till the script ends.
+    let mut copies = Vec::new();
     let mut agents: Vec<(String, wordcraft_engine::room::Replica)> = Vec::new();
-    let mut app = WordApp::new(Session::new(doc), Services { settings_dir, ..Services::default() }).with_control(rx).with_lobby(lobby.clone());
     app.integrated_titlebar = true;
     if lines.first().is_some_and(|l| l.get("startScreen").is_some()) {
         app.start_screen();
@@ -118,38 +131,21 @@ fn main() -> Result<(), String> {
             println!("{id}: {}", r.map_or_else(|e| e, |v| v.to_string()));
             step_n(&mut harness, 2);
         } else if let Some(name) = l.get("agent").and_then(|v| v.as_str()) {
-            if !agents.iter().any(|(n, _)| n == name) {
-                let role = l.get("role").and_then(|v| v.as_str()).unwrap_or("editor");
-                let (req, reply) = ControlRequest::new("room.invite", serde_json::json!({"name": name, "role": role}));
-                tx.send(req).expect("send");
-                let mut key = None;
-                for _ in 0..60 {
-                    step(&mut harness);
-                    if let Ok(r) = reply.try_recv() {
-                        key = r.pointer("/result/key").and_then(|k| k.as_str()).map(str::to_string);
-                        if key.is_none() {
-                            eprintln!("room.invite {name}: {r}");
-                        }
-                        break;
-                    }
-                }
-                let Some(key) = key else { continue };
-                match lobby.join_with(&key) {
-                    Ok(copy) => agents.push((name.to_string(), copy)),
-                    Err(e) => {
-                        eprintln!("{name} joins: {e}");
-                        continue;
-                    }
-                }
+            agent_line(&mut harness, &tx, &lobby, &mut agents, name, &l);
+        } else if let Some(j) = l.get("join") {
+            let room = lobby.room().ok_or("join: share the document first (room.share)")?;
+            let name = j.get("name").and_then(|v| v.as_str()).ok_or("join: a name")?;
+            let role =
+                j.get("role").and_then(|v| v.as_str()).map_or(Some(wordcraft_engine::room::Role::Suggester), wordcraft_engine::room::Role::named);
+            let files = j.get("files").and_then(|v| v.as_str()).and_then(wordcraft_engine::agent_files::AgentFiles::named);
+            let key = room.invite_with(name, role.ok_or("join: an unknown role")?, files).map_err(|e| e.to_string())?;
+            for _ in 0..j.get("copies").and_then(|v| v.as_u64()).unwrap_or(1) {
+                copies.push(lobby.join_with(&key).map_err(|e| e.to_string())?);
             }
-            if let Some((_, copy)) = agents.iter_mut().find(|(n, _)| n == name) {
-                for c in l.get("run").and_then(|v| v.as_array()).into_iter().flatten() {
-                    let (id, params) = (c.get(0).and_then(|v| v.as_str()).unwrap_or_default(), c.get(1).cloned().unwrap_or_default());
-                    let r = wordcraft_engine::room::hosted::call(copy, "engine.execute", &serde_json::json!({"command": id, "params": params}));
-                    println!("{name} {id}: {}", r.map_or_else(|e| e, |v| v.to_string()));
-                }
-            }
-            step_n(&mut harness, 4);
+            step_n(&mut harness, 2);
+        } else if let Some(p) = l.get("inviteOnPage") {
+            println!("inviteOnPage: {:?}", harness.state_mut().invite_on_share_page(p.clone()));
+            step_n(&mut harness, 2);
         } else if let Some(n) = l.get("steps").and_then(|v| v.as_u64()) {
             step_n(&mut harness, n as usize);
         } else if let Some(ms) = l.get("wait").and_then(|v| v.as_u64()) {
@@ -178,6 +174,51 @@ fn main() -> Result<(), String> {
 }
 
 /// The scripted assistant `{"assistScript": …}` describes.
+/// An `{"agent": name, "role"?, "run": [...]}` line: invites `name` the first time (through the
+/// control channel, as an owner's script does) and joins with the key in a copy of their own, then
+/// runs the line's commands in that copy.
+fn agent_line(
+    harness: &mut egui_kittest::Harness<'_, WordApp>,
+    tx: &std::sync::mpsc::Sender<ControlRequest>,
+    lobby: &wordcraft_engine::room::Lobby,
+    agents: &mut Vec<(String, wordcraft_engine::room::Replica)>,
+    name: &str,
+    l: &serde_json::Value,
+) {
+    if !agents.iter().any(|(n, _)| n == name) {
+        let role = l.get("role").and_then(|v| v.as_str()).unwrap_or("editor");
+        let (req, reply) = ControlRequest::new("room.invite", serde_json::json!({"name": name, "role": role}));
+        tx.send(req).expect("send");
+        let mut key = None;
+        for _ in 0..60 {
+            step(harness);
+            if let Ok(r) = reply.try_recv() {
+                key = r.pointer("/result/key").and_then(|k| k.as_str()).map(str::to_string);
+                if key.is_none() {
+                    eprintln!("room.invite {name}: {r}");
+                }
+                break;
+            }
+        }
+        let Some(key) = key else { return };
+        match lobby.join_with(&key) {
+            Ok(copy) => agents.push((name.to_string(), copy)),
+            Err(e) => {
+                eprintln!("{name} joins: {e}");
+                return;
+            }
+        }
+    }
+    if let Some((_, copy)) = agents.iter_mut().find(|(n, _)| n == name) {
+        for c in l.get("run").and_then(|v| v.as_array()).into_iter().flatten() {
+            let (id, params) = (c.get(0).and_then(|v| v.as_str()).unwrap_or_default(), c.get(1).cloned().unwrap_or_default());
+            let r = wordcraft_engine::room::hosted::call(copy, "engine.execute", &serde_json::json!({"command": id, "params": params}));
+            println!("{name} {id}: {}", r.map_or_else(|e| e, |v| v.to_string()));
+        }
+    }
+    step_n(harness, 4);
+}
+
 fn scripted_assistant(turns: &[serde_json::Value]) -> Result<wordcraft_assist::Fake, String> {
     use wordcraft_assist::{PlanEntry, PlanStatus, Priority, Step};
     let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();

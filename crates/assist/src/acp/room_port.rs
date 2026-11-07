@@ -185,6 +185,8 @@ fn sweep(seats: &mut Vec<Seat>) {
 /// The listener's thread: a thread for each connection, until the port closes.
 fn accept(listener: &TcpListener, lobby: &Lobby, seats: &Seats, open: &AtomicBool, first: Duration) {
     let live = Arc::new(AtomicUsize::new(0));
+    // Wrong keys slow down the replies to the next ones, on every connection.
+    let refusals = Arc::new(hosted::Refusals::default());
     for stream in listener.incoming() {
         if !open.load(Ordering::SeqCst) {
             return;
@@ -203,10 +205,10 @@ fn accept(listener: &TcpListener, lobby: &Lobby, seats: &Seats, open: &AtomicBoo
             continue;
         }
         let counted = Live::new(&live);
-        let (lobby, seats) = (lobby.clone(), seats.clone());
+        let (lobby, seats, refusals) = (lobby.clone(), seats.clone(), refusals.clone());
         let spawned = std::thread::Builder::new().name("room port connection".into()).spawn(move || {
             let _counted = counted;
-            serve(stream, &lobby, &seats, first);
+            serve(stream, &lobby, &seats, first, &refusals);
         });
         if let Err(e) = spawned {
             log::warn!("room port: no thread for a connection: {e}");
@@ -337,7 +339,7 @@ fn same_key(given: &str, key: &str) -> bool {
 
 /// A connection: its first request must carry an invite's key, whose holder's copy answers
 /// the rest.
-fn serve(stream: TcpStream, lobby: &Lobby, seats: &Seats, first: Duration) {
+fn serve(stream: TcpStream, lobby: &Lobby, seats: &Seats, first: Duration, refusals: &hosted::Refusals) {
     let _ = stream.set_nodelay(true);
     let Ok(read) = stream.try_clone() else { return };
     let mut out = stream;
@@ -345,6 +347,7 @@ fn serve(stream: TcpStream, lobby: &Lobby, seats: &Seats, first: Duration) {
     let Some(request) = next_request(&mut reader, &mut out) else { return };
     let key = request.key.clone().unwrap_or_default();
     let Some(copy) = seats.take(lobby, &key) else {
+        std::thread::sleep(refusals.refused());
         let _ = send(&mut out, &request.id, json!({"ok": false, "error": "unauthorized"}));
         return;
     };
@@ -357,17 +360,25 @@ fn serve(stream: TcpStream, lobby: &Lobby, seats: &Seats, first: Duration) {
         };
         (copy.room().clone(), copy.id())
     });
-    serve_copy(&mut reader, &mut out, copy, &key, request);
+    serve_copy(&mut reader, &mut out, copy, &key, request, refusals);
 }
 
 /// The rest of a connection whose first request, `first`, carried invite `key`: `copy`, its
 /// holder's copy of the shared document, answers each request (`auth` just says yes). Every
 /// request carries that key or none. The connection ends when the copy is out of the room (the
 /// invite was taken back, or sharing stopped).
-fn serve_copy(reader: &mut BufReader<Deadline>, out: &mut TcpStream, copy: Arc<Mutex<Replica>>, key: &str, first: Request) {
+fn serve_copy(
+    reader: &mut BufReader<Deadline>,
+    out: &mut TcpStream,
+    copy: Arc<Mutex<Replica>>,
+    key: &str,
+    first: Request,
+    refusals: &hosted::Refusals,
+) {
     let mut next = Some(first);
     while let Some(request) = next.take().or_else(|| next_request(reader, out)) {
         if request.key.as_deref().is_some_and(|k| !same_key(k, key)) {
+            std::thread::sleep(refusals.refused());
             let _ = send(out, &request.id, json!({"ok": false, "error": "unauthorized"}));
             return;
         }
@@ -377,7 +388,7 @@ fn serve_copy(reader: &mut BufReader<Deadline>, out: &mut TcpStream, copy: Arc<M
             Ok(mut copy) => match hosted::ended(&copy) {
                 Some(why) => Err(why),
                 None => Ok(match request.method.as_str() {
-                    "auth" => json!({"ok": true, "result": {}}),
+                    "auth" => json!({"ok": true, "result": hosted::auth_reply(&copy)}),
                     method => match hosted::call(&mut copy, method, &request.params) {
                         Ok(v) => json!({"ok": true, "result": v}),
                         Err(e) => json!({"ok": false, "error": e}),
@@ -476,8 +487,10 @@ mod tests {
         }
         assert!(session.doc.revisions.iter().any(|r| r.author == "Claude Code"), "no tracked change in the agent's name");
         assert!(session.doc.final_text(StoryRef::Body).contains("one 2 three"));
-        // `auth` with the same key says yes; another key is refused, and the connection closed.
-        assert_eq!(c.call(&json!({"id": 3, "method": "auth", "key": key}).to_string())["ok"], json!(true));
+        // `auth` with the same key says whose copy it reaches (#74); another key is refused, and
+        // the connection closed.
+        let reply = c.call(&json!({"id": 3, "method": "auth", "key": key}).to_string());
+        assert_eq!((reply["result"]["as"].clone(), reply["result"]["name"].clone()), (json!("participant"), json!("Claude Code")), "{reply}");
         let reply = c.call(&json!({"id": 4, "key": "0".repeat(32), "method": "document.inspect"}).to_string());
         assert_eq!((reply["id"].clone(), reply["error"].clone()), (json!(4), json!("unauthorized")));
         assert!(c.closed());
