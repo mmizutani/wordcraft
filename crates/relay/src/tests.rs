@@ -301,7 +301,8 @@ fn the_relay_holds_back_floods_and_large_bodies() {
         body: Vec::new(),
         peer: None,
     };
-    assert_eq!(relay.body_limit(&req(&format!("/host/r/{room}/reply"), Some(&secret))), MAX_REPLY);
+    // (A large one only while an agent waits for it: large_answers_arriving_at_once_are_capped_per_token.)
+    assert_eq!(relay.body_limit(&req(&format!("/host/r/{room}/reply"), Some(&secret))), MAX_REQUEST, "no agent waits");
     assert_eq!(relay.body_limit(&req(&format!("/host/r/{room}/reply"), Some("nope"))), MAX_REQUEST);
     assert_eq!(relay.body_limit(&req(&format!("/host/r/{room}/reply"), None)), MAX_REQUEST);
     assert_eq!(relay.body_limit(&req(&format!("/r/{room}/mcp"), Some(&secret))), MAX_REQUEST);
@@ -475,4 +476,41 @@ fn a_tokens_waiting_requests_are_capped_across_its_rooms() {
     // Once they're done, the token's rooms take requests again.
     let t = std::thread::spawn(move || http(&a, "POST", &[], "{}").0);
     assert_eq!(t.join().unwrap(), 504, "waited, not turned away");
+}
+
+/// A desktop's answer may be large (a PDF), but only a couple of large answers from one token's
+/// desktops may be arriving at once, and only while an agent waits for one: heads that claim a
+/// large body and never send it can't hold the relay's connections and memory.
+#[test]
+fn large_answers_arriving_at_once_are_capped_per_token() {
+    let (base, _relay) = relay(|_| {});
+    let (status, _, body) = http(&format!("{base}/host/rooms"), "POST", &[("Authorization", &format!("Bearer {TOKEN}"))], "{}");
+    assert_eq!(status, 200, "{body}");
+    let opened: Value = serde_json::from_str(&body).unwrap();
+    let (room, secret, url) =
+        (opened["room"].as_str().unwrap().to_string(), opened["secret"].as_str().unwrap().to_string(), opened["url"].as_str().unwrap().to_string());
+    let port = base.rsplit(':').next().unwrap().to_string();
+    let head = |secret: &str| {
+        let mut s = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let h = format!("POST /host/r/{room}/reply HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {secret}\r\nContent-Length: {MAX_REPLY}\r\n\r\n");
+        s.write_all(h.as_bytes()).unwrap();
+        s
+    };
+    // With no agent waiting, a large answer isn't taken at all.
+    let mut idle = head(&secret);
+    let mut out = String::new();
+    let _ = idle.read_to_string(&mut out);
+    assert!(out.starts_with("HTTP/1.1 413"), "{out}");
+    // An agent waits: two large answers may begin, the third is refused at once.
+    let agent = std::thread::spawn(move || http(&url, "POST", &[], "{}").0);
+    std::thread::sleep(Duration::from_millis(200));
+    let (_a, _b) = (head(&secret), head(&secret));
+    std::thread::sleep(Duration::from_millis(200));
+    let mut third = head(&secret);
+    let started = Instant::now();
+    let mut out = String::new();
+    let _ = third.read_to_string(&mut out);
+    assert!(out.starts_with("HTTP/1.1 413") && started.elapsed() < Duration::from_secs(2), "{out}");
+    drop(agent);
 }

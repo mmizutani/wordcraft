@@ -235,8 +235,13 @@ pub fn read_body(reader: &mut impl BufRead, req: &mut Request, limits: &Limits) 
             if n > limits.body {
                 return Err(refused(413, format!("body over {} bytes", limits.body)));
             }
-            let mut body = vec![0u8; n];
-            reader.read_exact(&mut body).map_err(body_error)?;
+            // Grown as the bytes come, not set aside up front: a head can claim a large body
+            // and never send it.
+            let mut body = Vec::with_capacity(n.min(64 << 10));
+            reader.take(u64::try_from(n).unwrap_or(u64::MAX)).read_to_end(&mut body).map_err(body_error)?;
+            if body.len() < n {
+                return Err(refused(400, "body ended early"));
+            }
             req.body = body;
             Ok(())
         }
@@ -514,8 +519,9 @@ pub fn connection(stream: TcpStream, peer: SocketAddr, config: &Config, body_lim
         let limits = Limits { body: body_limit(&req), ..config.limits };
         if limits.body > config.limits.body {
             // A body allowed to be larger (the relay's desktop sending an answer, its secret
-            // checked) gets time for its size at 64 KiB/s at the least.
-            let more = Duration::from_secs(u64::try_from(limits.body / (64 << 10)).unwrap_or(u64::MAX));
+            // checked) gets time for the size it says it has at 64 KiB/s at the least.
+            let size = req.header("Content-Length").and_then(|n| n.trim().parse::<usize>().ok()).unwrap_or(limits.body).min(limits.body);
+            let more = Duration::from_secs(u64::try_from(size / (64 << 10)).unwrap_or(u64::MAX));
             reader.get_mut().until = after(config.request.saturating_add(more));
         }
         if let Err(e) = read_body(&mut reader, &mut req, &limits) {

@@ -20,6 +20,10 @@ const SECRET_HEX: usize = 64;
 pub const MAX_REQUEST: usize = 1 << 20;
 /// A desktop's answer: a PDF of up to 32 MB, as base64 in JSON.
 pub const MAX_REPLY: usize = 96 << 20;
+/// Answers larger than an agent's request that one token's desktops may be sending at once,
+/// and that all desktops may: each holds a connection, and up to [`MAX_REPLY`] of memory.
+const LARGE_REPLIES_PER_TOKEN: usize = 2;
+const LARGE_REPLIES: usize = 16;
 /// Request ids stay below 2^53, a whole number in any JSON reader.
 const ID_MASK: u64 = (1 << 53) - 1;
 /// Polls one room's desktop may have waiting at once: the app has two. More would only hold
@@ -145,6 +149,9 @@ pub struct Relay {
     sources: Mutex<HashMap<IpAddr, Bucket>>,
     /// Agents' requests waiting for an answer, by the token of their room.
     waiting: Arc<Mutex<HashMap<String, usize>>>,
+    /// Large answers being received: the token of their room, and when the HTTP server gives up
+    /// on each (the time it gives the body), when its place goes back if it hasn't before.
+    large: Mutex<Vec<(String, Instant)>>,
 }
 
 /// One request's place in its token's count, given back however its wait ends.
@@ -173,7 +180,13 @@ fn refusal(status: u16, message: &str) -> Response {
 
 impl Relay {
     pub fn new(config: Config) -> Self {
-        Relay { config, rooms: Mutex::new(HashMap::new()), sources: Mutex::new(HashMap::new()), waiting: Arc::new(Mutex::new(HashMap::new())) }
+        Relay {
+            config,
+            rooms: Mutex::new(HashMap::new()),
+            sources: Mutex::new(HashMap::new()),
+            waiting: Arc::new(Mutex::new(HashMap::new())),
+            large: Mutex::new(Vec::new()),
+        }
     }
 
     fn room(&self, id: &str) -> Option<Arc<Room>> {
@@ -186,13 +199,35 @@ impl Relay {
         bearer(req).is_some_and(|s| same_secret(s, &room.secret)).then_some(room)
     }
 
-    /// How much body `req` may have: a desktop's answer is large, and only its room's secret
-    /// may send one; everything else is an MCP request's size.
+    /// How much body `req` may have: a desktop's answer may be large, when it comes with its
+    /// room's secret, an agent waits for one, and few large answers are arriving (from this
+    /// token's desktops, and in all); everything else is an MCP request's size.
     pub fn body_limit(&self, req: &Request) -> usize {
         let path = req.path();
-        match path.strip_prefix("/host/r/").and_then(|r| r.strip_suffix("/reply")) {
-            Some(id) if self.hosts(req, id).is_some() => MAX_REPLY,
-            _ => MAX_REQUEST,
+        let Some(room) = path.strip_prefix("/host/r/").and_then(|r| r.strip_suffix("/reply")).and_then(|id| self.hosts(req, id)) else {
+            return MAX_REQUEST;
+        };
+        let size = req.header("Content-Length").and_then(|n| n.trim().parse::<usize>().ok());
+        if size.is_some_and(|n| n <= MAX_REQUEST) || room.lock().is_none_or(|w| w.answers.is_empty()) {
+            return MAX_REQUEST;
+        }
+        let Ok(mut large) = self.large.lock() else { return MAX_REQUEST };
+        let now = Instant::now();
+        large.retain(|(_, until)| *until > now);
+        if large.len() >= LARGE_REPLIES || large.iter().filter(|(t, _)| *t == room.token).count() >= LARGE_REPLIES_PER_TOKEN {
+            return MAX_REQUEST;
+        }
+        let secs = 60 + size.unwrap_or(MAX_REPLY).min(MAX_REPLY) / (64 << 10);
+        large.push((room.token.clone(), now + Duration::from_secs(u64::try_from(secs).unwrap_or(u64::MAX))));
+        MAX_REPLY
+    }
+
+    /// A large answer has arrived (or failed to): its place goes to the next.
+    fn large_done(&self, token: &str) {
+        if let Ok(mut large) = self.large.lock()
+            && let Some(i) = large.iter().position(|(t, _)| t == token)
+        {
+            large.remove(i);
         }
     }
 
@@ -327,6 +362,9 @@ impl Relay {
     /// `POST /host/r/<room>/reply`: the desktop's answer to one request.
     fn reply(&self, req: &Request, id: &str) -> Response {
         let Some(room) = self.hosts(req, id) else { return Response::text(404, "no such room (or not its secret)\n") };
+        if req.body.len() > MAX_REQUEST {
+            self.large_done(&room.token);
+        }
         let Some((n, resp)) = serde_json::from_slice::<Value>(&req.body).ok().as_ref().and_then(wire::response_from) else {
             return Response::text(400, "an answer is {\"id\", \"status\", \"headers\", \"body\"}\n");
         };
