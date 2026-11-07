@@ -439,31 +439,40 @@ impl Hub {
     /// Anchor `a` as kept change `k` (by place in the kept list) left it: at the end of its block
     /// when its offset is past every text ([`super::anchor`]), as an offset, the length the
     /// paragraph had then (the end of a table's last paragraph, for a table). Worked out from
-    /// that paragraph as it is now, less what the changes after `k` put in it and plus what they
-    /// took out; `a` as it is when a change after `k` replaced or moved the paragraph whole, or
-    /// it isn't in the document.
+    /// the paragraph's length at the first change after `k` that took it out whole (moved or
+    /// replaced it: the change says how long it was), else as it is now, less what the changes
+    /// after `k` before that put in it and plus what they took out. `a` as it is when a change
+    /// after `k` took out the table the paragraph is in, put the paragraph in without taking it
+    /// out, or it isn't in the document.
     fn end_after(&self, a: Anchor, k: usize) -> Anchor {
         if a.off != usize::MAX {
             return a;
         }
         let Some(para) = self.doc.pos_of(a, None).and_then(|pos| self.doc.para_at(&pos)) else { return a };
         let block = para.id;
-        let mut len = Some(para.len());
-        for later in self.kept.iter().skip(k.saturating_add(1)) {
+        // What the changes after `k` put in the paragraph, less what they took out of it.
+        let (mut put, mut took) = (0usize, 0usize);
+        let mut len = None;
+        'later: for later in self.kept.iter().skip(k.saturating_add(1)) {
             let c = &later.change;
-            let whole = c.splices.iter().any(|s| {
-                s.removed.iter().any(|o| o.id == block || o.inside.contains(&block)) || s.inserted.iter().any(|b| b.0.id() == block)
-            });
-            if whole {
-                return a;
-            }
             for e in c.edits.iter().filter(|e| e.id == block) {
                 if let Some(chars) = &e.chars {
-                    len = len.and_then(|n| n.checked_sub(chars.inserted.text.len())).and_then(|n| n.checked_add(chars.removed));
+                    put = put.saturating_add(chars.inserted.text.len());
+                    took = took.saturating_add(chars.removed);
+                }
+            }
+            for s in &c.splices {
+                if let Some(old) = s.removed.iter().find(|o| o.id == block) {
+                    len = Some(old.len);
+                    break 'later;
+                }
+                if s.removed.iter().any(|o| o.inside.contains(&block)) || s.inserted.iter().any(|b| b.0.id() == block) {
+                    return a;
                 }
             }
         }
-        len.map_or(a, |off| Anchor { block, off })
+        let len = len.unwrap_or_else(|| para.len());
+        len.checked_sub(put).and_then(|n| n.checked_add(took)).map_or(a, |off| Anchor { block, off })
     }
 
     /// Where participant `i` (by place in the list) is as of `version`, as the hub knows it.

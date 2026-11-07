@@ -176,6 +176,27 @@ fn a_place_left_at_a_paragraph_s_end_stays_before_what_is_typed_there_in_the_sam
 }
 
 #[test]
+fn a_place_left_at_a_paragraph_s_end_moves_as_in_its_copy_when_the_paragraph_moves() {
+    // As above, and Bob then moves the paragraph up, all before anybody reads where Ada is: the
+    // room works out where her place was in it from how long the move says the paragraph was,
+    // not from where it ends after what Bob typed, so the move takes her where it takes her in
+    // her own copy.
+    let room = Room::new(Document::from_text("zero\nfirst\nlast one"));
+    let mut ada = join(&room, "Ada");
+    let mut bob = join(&room, "Bob");
+    run(&mut ada, "caret.set", json!({"pos": Pos::body(2, 4)}));
+    ada.present();
+    run(&mut bob, "select.range", json!({"anchor": Pos::body(1, 5), "focus": Pos::body(2, 8)}));
+    run(&mut bob, "text.delete", json!({}));
+    run(&mut bob, "text.insert", json!({"text": "!!"}));
+    run(&mut bob, "para.moveUp", json!({}));
+    bob.send();
+    ada.receive();
+    assert_eq!(super::room::text(&ada), "first!!\nzero");
+    assert_eq!(seen(&mut bob, ada.id()), Some(mine(&ada)));
+}
+
+#[test]
 fn a_new_selection_with_the_numbers_of_an_old_place_reaches_the_others() {
     // Ada selects "two"; Bob types before it, so the room has her further on; she then selects
     // "one", which has the offsets "two" had: the others see her on "one".
@@ -382,6 +403,31 @@ fn places_of_those_who_left_take_no_room_from_those_still_here() {
     for who in [window.id(), stays.id(), late.id()] {
         assert!(seen.iter().any(|s| s.who.id == who && s.at.is_some()), "{who}'s place went");
     }
+}
+
+#[test]
+fn places_of_those_whose_invite_was_taken_back_take_no_room_from_those_still_here() {
+    // As above, but their copies are still open: their invites are taken back instead.
+    let room = Room::new(Document::from_text("one two three"));
+    let mut window = join(&room, "Minoru");
+    window.present();
+    let mut stays = agent(&room, "Stays", Role::Viewer);
+    execute(&mut stays, "caret.set", json!({"pos": Pos::body(0, 2)}));
+    let mut revoked = Vec::new();
+    for i in 0..MAX_PRESENCES {
+        let key = room.invite(&format!("Revoked {i}"), Role::Viewer).unwrap();
+        let mut copy = room.join_with(&key).unwrap();
+        execute(&mut copy, "caret.set", json!({"pos": Pos::body(0, 4)}));
+        assert!(room.revoke(&key));
+        revoked.push(copy);
+    }
+    let mut late = agent(&room, "Late", Role::Viewer);
+    execute(&mut late, "caret.set", json!({"pos": Pos::body(0, 6)}));
+    let seen = room.presences_at(room.version()).1;
+    for who in [window.id(), stays.id(), late.id()] {
+        assert!(seen.iter().any(|s| s.who.id == who && s.at.is_some()), "{who}'s place went");
+    }
+    drop(revoked);
 }
 
 #[test]
@@ -658,6 +704,20 @@ fn a_participant_back_after_someone_took_their_colour_gets_another() {
     assert_eq!(back.color(), 2, "two in the room at once with one colour");
     assert_eq!(room.join_with(&key).unwrap().color(), 2, "her copies share hers");
     drop((bob, cy));
+}
+
+#[test]
+fn a_participant_back_gets_their_colour_again_even_when_a_lower_one_is_free() {
+    let room = Room::new(Document::from_text("one"));
+    let ada = join(&room, "Ada");
+    let key = room.invite("Bob", Role::Editor).unwrap();
+    let bob = room.join_with(&key).unwrap();
+    let cy = join(&room, "Cy");
+    assert_eq!((ada.color(), bob.color(), cy.color()), (0, 1, 2));
+    drop((ada, bob));
+    // The first colour no one in the room has is Ada's, but Bob is back to his.
+    assert_eq!(room.join_with(&key).unwrap().color(), 1);
+    drop(cy);
 }
 
 #[test]
