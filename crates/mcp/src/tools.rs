@@ -56,6 +56,13 @@ fn with_doc(mut schema: Value) -> Value {
     schema
 }
 
+/// Commands one `batch` call runs at most: a batch is for a few steps in order, and a request
+/// of a megabyte could otherwise run tens of thousands.
+pub const MAX_BATCH: usize = 256;
+/// The results one `batch` call keeps, in bytes of JSON. Past this, later results say they were
+/// left out (the commands still run), so a batch of reads can't fill the process's memory.
+pub const MAX_BATCH_ANSWER: usize = 8 << 20;
+
 const DOC_DESC: &str = "Id of the open document to work on (list_documents); the active document when left out. The active document stays active.";
 
 fn tool(name: &str, title: &str, desc: &str, schema: Value, ro: bool) -> Value {
@@ -85,7 +92,7 @@ pub fn tool_definitions() -> Value {
         tool(
             "batch",
             "Run several commands",
-            "Run commands in order; stops at the first error unless keepGoing. `doc` sends every command to that open document.",
+            "Run up to 256 commands in order; stops at the first error unless keepGoing. `doc` sends every command to that open document. Results past 8 MiB in all are left out.",
             with_doc(obj(
                 json!({"commands": {"type": "array", "items": {"type": "object", "properties": {"command": {"type": "string"}, "params": {"type": "object"}}, "required": ["command"]}}, "keepGoing": {"type": "boolean"}}),
                 &["commands"]
@@ -280,15 +287,27 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
         },
         "batch" => {
             let keep = a.get("keepGoing").and_then(Value::as_bool).unwrap_or(false);
+            let commands = a.get("commands").and_then(Value::as_array).cloned().unwrap_or_default();
+            if commands.len() > MAX_BATCH {
+                return ToolResult::error(format!("a batch runs {MAX_BATCH} commands at most; this one has {}: send it in parts", commands.len()));
+            }
             let mut out = Vec::new();
-            for c in a.get("commands").and_then(Value::as_array).cloned().unwrap_or_default() {
+            let mut kept = 0usize;
+            for c in commands {
                 let id = c.get("command").and_then(Value::as_str).unwrap_or("");
                 let r = exec(b, id, c.get("params").cloned().unwrap_or(json!({})), doc);
                 let failed = r.is_err();
-                out.push(match r {
+                let mut one = match r {
                     Ok(v) => json!({"command": id, "ok": true, "result": v}),
                     Err(e) => json!({"command": id, "ok": false, "error": e}),
-                });
+                };
+                let size = serde_json::to_string_pretty(&one).map_or(0, |t| t.len());
+                if kept.saturating_add(size) > MAX_BATCH_ANSWER {
+                    one = json!({"command": id, "ok": !failed, "leftOut": "the batch's results passed 8 MiB: run this command on its own for its result"});
+                } else {
+                    kept += size;
+                }
+                out.push(one);
                 if failed && !keep {
                     return ToolResult { content: vec![json!({"type": "text", "text": Value::Array(out).to_string()})], is_error: true };
                 }

@@ -197,7 +197,7 @@ test source in File › Options › Language and on the bar's Install.
 |---|---|
 | `list_commands` | every command, with its scope and the params that are places (filter with `query` and `scope`; see [Command scopes](#command-scopes)) — over 650 of them |
 | `execute` | run one command: `{command: "insert.table", params: {rows: 3, cols: 4}}` |
-| `batch` | run several commands in order |
+| `batch` | run several commands in order (256 at most; results past 8 MiB in all are left out) |
 | `new_document` | blank, sample, letter, resume, report; opens beside the open documents |
 | `open_document` / `save_document` | docx, doc (open only), odt, rtf, html, md, tex, txt, json; save also pdf, png |
 | `list_documents` | the open documents: `id`, `title`, `path`, `dirty`, `active` |
