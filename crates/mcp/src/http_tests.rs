@@ -19,6 +19,8 @@ struct App {
     slow_ms: AtomicU64,
     /// How long opening a connection to the app takes, in milliseconds.
     open_ms: AtomicU64,
+    /// How long each `auth` call takes, in milliseconds.
+    auth_ms: AtomicU64,
 }
 
 /// A connection to the stand-in app with one key: `window` is the window's key, `stranger` is a
@@ -32,9 +34,8 @@ struct Fake {
 impl Backend for Fake {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         self.app.calls.lock().unwrap().push((self.key.clone(), method.to_string()));
-        if method != "auth" {
-            std::thread::sleep(Duration::from_millis(self.app.slow_ms.load(Ordering::SeqCst)));
-        }
+        let ms = if method == "auth" { &self.app.auth_ms } else { &self.app.slow_ms };
+        std::thread::sleep(Duration::from_millis(ms.load(Ordering::SeqCst)));
         if self.key == "stranger" || self.app.revoked.lock().unwrap().contains(&self.key) {
             self.refused.store(true, Ordering::SeqCst);
             return Err("unauthorized: refused".into());
@@ -384,6 +385,22 @@ fn a_key_taken_back_loses_its_place_even_asking_only_for_the_tool_list() {
     let r = e.handle(&post(Some("ana"), &list, &[]));
     assert_eq!(r.status, 401, "{:?}", body(&r));
     assert_eq!(e.keys(), 0, "its place went");
+}
+
+/// Asking the app again whether it still takes a key can take a while: a request whose caller
+/// gave up meanwhile is dropped, never run late.
+#[test]
+fn a_request_whose_caller_gave_up_while_its_key_was_checked_never_runs() {
+    let (e, app) = endpoint(Options { recheck: Duration::ZERO, timeout: Duration::from_millis(150), ..Options::default() });
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "inspect_document", "arguments": {}}});
+    assert_eq!(e.handle(&post(Some("ana"), &call, &[])).status, 200);
+    let runs = |app: &App| app.calls.lock().unwrap().iter().filter(|(_, m)| m != "auth").count();
+    let before = runs(&app);
+    app.auth_ms.store(400, Ordering::SeqCst);
+    let r = e.handle(&post(Some("ana"), &call, &[]));
+    assert_eq!(r.status, 504, "{:?}", body(&r));
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(runs(&app), before, "it never ran after its caller stopped waiting");
 }
 
 /// Answers waiting to be read by slow clients count against a budget: once it is spent, new

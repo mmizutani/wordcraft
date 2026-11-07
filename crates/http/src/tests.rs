@@ -182,6 +182,43 @@ fn a_slow_drip_of_bytes_is_cut_off_at_the_request_deadline() {
     }
 }
 
+/// A client that reads a long answer a little at a time, each read well within the write
+/// timeout, is cut off once the answer has taken its whole deadline: it can't keep the
+/// connection, or what the answer holds, for long.
+#[test]
+fn a_slow_reader_is_cut_off_at_the_write_deadline() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    struct Held(Arc<AtomicBool>);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let released = Arc::new(AtomicBool::new(false));
+    let r = released.clone();
+    let config = Config { write: Duration::from_millis(500), write_rate: usize::MAX, ..Config::default() };
+    std::thread::spawn(move || {
+        serve(listener, config, Arc::new(move |_: &Request| Response::json(200, vec![b'x'; 32 << 20]).holding(Held(r.clone()))))
+    });
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    s.write_all(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let started = Instant::now();
+    // 64 KiB every 50 ms: the whole would take well over ten seconds.
+    let mut buf = vec![0u8; 64 << 10];
+    while !released.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(4) {
+        std::thread::sleep(Duration::from_millis(50));
+        if matches!(s.read(&mut buf), Ok(0) | Err(_)) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    assert!(released.load(Ordering::SeqCst), "the answer was still being sent after {:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_millis(3000), "{:?}", started.elapsed());
+}
+
 /// Connections turned away at the cap that keep trickling bytes don't hold up the accept loop:
 /// once a place is free, the next request is answered at once.
 #[test]
