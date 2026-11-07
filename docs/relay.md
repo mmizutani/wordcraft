@@ -114,7 +114,7 @@ carries a relay token:
 | Request | Answer |
 |---|---|
 | `POST /host/rooms` `{}`, or `{"room", "secret"}` to open a room again (after the relay restarted) | `{"room", "secret", "url"}`; 401 for a wrong token, 409 for a room whose id isn't from that secret, or that another desktop is using |
-| `POST /host/r/<room>/poll` | `{"requests": [{"id", "method", "target", "headers", "body", "ttlMs"}]}`, waiting up to 25 seconds for one; 404 once the relay has forgotten the room. `ttlMs` is how long the agent still waits: the app doesn't start a request after that, as its agent has been told it timed out, and its MCP endpoint is told what's left (`Wordcraft-Wait-Ms`) so it waits no longer in its own queue |
+| `POST /host/r/<room>/poll` | `{"requests": [{"id", "method", "target", "headers", "body", "ttlMs"}], "waitedMs"}`, waiting up to 25 seconds for one; 404 once the relay has forgotten the room. `ttlMs` is how long the agent still waits, counted by the app from when its poll began plus `waitedMs` (how long the poll waited at the relay), so a slow trip comes out of it: the app doesn't start a request after that, as its agent has been told it timed out, and its MCP endpoint is told what's left (`Wordcraft-Wait-Ms`) so it waits no longer in its own queue |
 | `POST /host/r/<room>/reply` `{"id", "status", "headers", "body"}` | 204; 503 to send it again later; 404 when nobody waits for it any more |
 | `DELETE /host/r/<room>` | closes the room |
 

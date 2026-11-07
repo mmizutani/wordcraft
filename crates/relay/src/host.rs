@@ -18,6 +18,9 @@ const AT_ONCE: usize = 16;
 /// The longest answer the relay sends: its own refusals, and a poll's requests.
 const MAX_FROM_RELAY: u64 = 64 << 20;
 
+/// The longest a relay may say an agent waits: no relay keeps one waiting longer.
+const MAX_TTL: Duration = Duration::from_secs(3600);
+
 /// How long an answer is offered to the relay when it didn't say how long its agent waits.
 const UNTIL_UNSAID: Duration = Duration::from_secs(60);
 
@@ -219,18 +222,26 @@ fn poll_loop(s: &Arc<Shared>) {
     let mut backoff = Duration::from_secs(1);
     while !s.stop.load(Ordering::SeqCst) {
         let url = format!("{}/host/r/{}/poll", s.relay, s.room);
+        let asked = Instant::now();
         let polled = read(s.agent.post(&url).header("Authorization", &format!("Bearer {}", s.secret)).send(&b""[..]));
         let failure = match polled {
             Ok((200, text)) => {
                 set(s, Status::Connected);
                 backoff = Duration::from_secs(1);
-                let requests =
-                    serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("requests").and_then(Value::as_array).cloned()).unwrap_or_default();
-                let now = Instant::now();
+                let polled = serde_json::from_str::<Value>(&text).ok();
+                let requests = polled.as_ref().and_then(|v| v.get("requests").and_then(Value::as_array).cloned()).unwrap_or_default();
+                // Each request's time counts from when the relay sent it: at the latest, when this
+                // call began plus the time the poll waited there. The rest of the call (the trip
+                // there and back, however slow) comes out of it.
+                let waited = polled.as_ref().and_then(wire::waited).unwrap_or_default().min(asked.elapsed());
+                let sent = asked.checked_add(waited).unwrap_or(asked);
                 for r in requests {
                     if let Some((id, req)) = wire::request_from(&r) {
-                        // A tenth less than the relay says, for the time its answer took to get here.
-                        let until = wire::ttl(&r).map(|t| now + t.saturating_sub((t / 10).min(Duration::from_secs(2))));
+                        // A tenth less than the relay says, for the answer's trip back.
+                        let until = wire::ttl(&r).map(|t| {
+                            let t = t.min(MAX_TTL);
+                            sent.checked_add(t.saturating_sub((t / 10).min(Duration::from_secs(2)))).unwrap_or(sent)
+                        });
                         answer(s, id, req, until);
                     }
                 }

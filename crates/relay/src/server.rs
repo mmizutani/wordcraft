@@ -351,6 +351,7 @@ impl Relay {
     /// `POST /host/r/<room>/poll`: the requests waiting for the desktop, after waiting a while
     /// for one.
     fn poll(&self, req: &Request, id: &str) -> Response {
+        let asked = Instant::now();
         let Some(room) = self.hosts(req, id) else { return Response::text(404, "no such room (or not its secret)\n") };
         let Some(mut w) = room.lock() else { return Response::text(500, "internal error\n") };
         if w.polling >= MAX_POLLS {
@@ -375,7 +376,8 @@ impl Relay {
             return Response::text(404, "the room was closed\n");
         }
         // Each says how long its agent still waits, so the desktop never starts one whose agent
-        // has given up (and may already be asking again).
+        // has given up (and may already be asking again). With them, how long the poll waited
+        // here: the desktop counts the rest of its call, the trip there and back, out of that.
         let now = Instant::now();
         let n = w.queue.len().min(PER_POLL);
         let requests: Vec<Value> = w
@@ -388,7 +390,8 @@ impl Relay {
                 (!left.is_zero()).then_some(r)
             })
             .collect();
-        Response::json(200, json!({"requests": requests}).to_string())
+        let waited = u64::try_from(now.saturating_duration_since(asked).as_millis()).unwrap_or(u64::MAX);
+        Response::json(200, json!({"requests": requests, "waitedMs": waited}).to_string())
     }
 
     /// `POST /host/r/<room>/reply`: the desktop's answer to one request.

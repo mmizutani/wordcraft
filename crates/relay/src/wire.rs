@@ -53,6 +53,12 @@ pub fn ttl(v: &Value) -> Option<std::time::Duration> {
     v.get("ttlMs").and_then(Value::as_u64).map(std::time::Duration::from_millis)
 }
 
+/// How long a poll waited at the relay for requests (`waitedMs`). None from a relay that
+/// doesn't say.
+pub fn waited(v: &Value) -> Option<std::time::Duration> {
+    v.get("waitedMs").and_then(Value::as_u64).map(std::time::Duration::from_millis)
+}
+
 /// The desktop's answer to request `id`. A body that isn't UTF-8 (MCP's are JSON) is refused
 /// rather than mangled.
 pub fn reply(id: u64, resp: &Response) -> Value {

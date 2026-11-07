@@ -404,6 +404,48 @@ fn a_request_whose_agent_gave_up_is_never_run_late() {
     drop(hosting);
 }
 
+/// A poll answer that takes a while to arrive (a slow network) uses up its requests' time: the
+/// desktop counts their time from when the relay sent them, not from when it got them.
+#[test]
+fn a_slow_poll_answer_takes_its_requests_time_with_it() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // A stand-in relay whose one poll answer says its request has a second left, and then takes
+    // a second and a half to arrive.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let room = "0123456789abcdef0123456789abcdef";
+    let sent = Arc::new(AtomicBool::new(false));
+    let (b, s) = (base.clone(), sent.clone());
+    let fake: wordcraft_http::Handler = Arc::new(move |req: &Request| {
+        if req.target == "/host/rooms" {
+            return Response::json(200, json!({"room": room, "secret": "s3cret", "url": format!("{b}/r/{room}/mcp")}).to_string());
+        }
+        if req.target.ends_with("/poll") {
+            if s.swap(true, Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(100));
+                return Response::json(200, json!({"requests": [], "waitedMs": 100}).to_string());
+            }
+            let one = json!({"id": 1, "method": "POST", "target": "/mcp", "headers": [], "body": "late", "ttlMs": 1000});
+            std::thread::sleep(Duration::from_millis(1500));
+            return Response::json(200, json!({"requests": [one], "waitedMs": 0}).to_string());
+        }
+        Response::new(204)
+    });
+    std::thread::spawn(move || wordcraft_http::serve(listener, wordcraft_http::Config::default(), fake));
+    let ran = Arc::new(Mutex::new(Vec::<String>::new()));
+    let r = ran.clone();
+    let desktop: wordcraft_http::Handler = Arc::new(move |req: &Request| {
+        r.lock().unwrap().push(String::from_utf8_lossy(&req.body).to_string());
+        Response::json(200, "{}")
+    });
+    let hosting = Hosting::start(&base, TOKEN, None, desktop).unwrap();
+    wait_for("the poll answer arrives", || sent.load(Ordering::SeqCst));
+    std::thread::sleep(Duration::from_millis(2000));
+    assert!(ran.lock().unwrap().is_empty(), "ran after its agent gave up: {:?}", ran.lock().unwrap());
+    drop(hosting);
+}
+
 /// A room's id comes from its secret: once the relay has forgotten a room (it restarted, or the
 /// room was closed), a token holder who knows its URL still can't open it with a secret of their
 /// own and take its agents' requests. Its own desktop can.
