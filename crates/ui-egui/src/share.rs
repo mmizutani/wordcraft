@@ -26,7 +26,7 @@ use crate::WordApp;
 /// session ([`Replica::lend`]).
 pub(crate) struct Share {
     room: Arc<Room>,
-    copy: Replica,
+    pub(crate) copy: Replica,
     /// Everyone else in the room and where they are in the window's copy, as of the last frame
     /// ([`Replica::others_after`]).
     others: Vec<Other>,
