@@ -346,6 +346,16 @@ impl Default for Config {
 /// What answers each request.
 pub type Handler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
 
+/// One of a counted number of places (connections served, connections being turned away),
+/// given back when dropped: when its thread ends, and when the thread never started.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Connections turned away (503) that are closed gently at once; more are dropped.
 const MAX_CLOSING: usize = 16;
 
@@ -385,23 +395,23 @@ pub fn serve(listener: TcpListener, config: Config, handler: Handler) -> std::io
                 let _ = s.shutdown(std::net::Shutdown::Both);
                 continue;
             }
-            let done = closing.clone();
+            let done = Slot(closing.clone());
             let spawned = std::thread::Builder::new().name("http turned away".into()).spawn(move || {
+                let _done = done;
                 let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
                 let _ = write_response(&mut s, &Response::text(503, "too many connections\n").with_header("Retry-After", "1"), true);
                 close_gently(&s, &mut BufReader::new(&s), Duration::from_millis(200));
-                done.fetch_sub(1, Ordering::SeqCst);
             });
-            if spawned.is_err() {
-                // The closure (and the connection) went with the failed spawn.
-                closing.fetch_sub(1, Ordering::SeqCst);
-            }
+            // A failed spawn dropped the closure, the connection and its slot with it.
+            let _ = spawned;
             continue;
         }
-        let (open, handler) = (open.clone(), handler.clone());
+        // Released when the thread ends, or with the closure when no thread starts.
+        let slot = Slot(open.clone());
+        let handler = handler.clone();
         let spawned = std::thread::Builder::new().name("http connection".into()).spawn(move || {
+            let _slot = slot;
             connection(stream, peer, &config, &handler);
-            open.fetch_sub(1, Ordering::SeqCst);
         });
         if spawned.is_err() {
             log::warn!("http: no thread for a connection");
