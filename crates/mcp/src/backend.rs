@@ -26,6 +26,9 @@ pub trait Backend {
     fn ended(&self) -> Option<String> {
         None
     }
+    /// Read no reply longer than `max` bytes from here on: a longer one is an error, and is
+    /// never read whole ([`Server::limit_replies`](crate::server::Server::limit_replies)).
+    fn limit_replies(&mut self, _max: usize) {}
 }
 
 /// Looks up the control key for an address (`HOST:PORT`).
@@ -45,6 +48,8 @@ pub struct Remote {
     find_key: KeyFinder,
     /// The app refused the key on a new connection too.
     refused: bool,
+    /// The longest reply line read from the app.
+    max_reply: usize,
 }
 
 /// The control key: `env` (`WORDCRAFT_CONTROL_KEY`) when set, else the app's key file for
@@ -125,7 +130,17 @@ impl Remote {
     }
 
     fn connect_with(addr: &str, find_key: KeyFinder) -> std::io::Result<Self> {
-        let mut r = Self { addr: addr.to_string(), conn: None, next_id: 1, connected: false, send_key: false, key: None, find_key, refused: false };
+        let mut r = Self {
+            addr: addr.to_string(),
+            conn: None,
+            next_id: 1,
+            connected: false,
+            send_key: false,
+            key: None,
+            find_key,
+            refused: false,
+            max_reply: MAX_REPLY_LINE,
+        };
         r.reconnect()?;
         if let Some(w) = r.key_warning() {
             log::warn!("{w}");
@@ -145,6 +160,7 @@ impl Remote {
             key: None,
             find_key: Box::new(find_key),
             refused: false,
+            max_reply: MAX_REPLY_LINE,
         }
     }
 
@@ -208,13 +224,14 @@ impl Remote {
     }
 
     fn roundtrip(&mut self, line: &str) -> std::io::Result<String> {
+        let max = self.max_reply;
         let Some((reader, writer)) = self.conn.as_mut() else {
             return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "not connected"));
         };
         writer.write_all(line.as_bytes())?;
         writer.write_all(b"\n")?;
         writer.flush()?;
-        match read_bounded_line(reader, MAX_REPLY_LINE)? {
+        match read_bounded_line(reader, max)? {
             BoundedLine::Line(reply) => Ok(reply),
             BoundedLine::Eof => Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "control channel closed")),
             BoundedLine::TooLong => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "reply from app too long")),
@@ -293,6 +310,9 @@ impl Backend for Remote {
         true
     }
 
+    fn limit_replies(&mut self, max: usize) {
+        self.max_reply = max.min(MAX_REPLY_LINE);
+    }
     fn ended(&self) -> Option<String> {
         self.refused.then(|| format!("the WordCraft app at {} no longer takes this key: it was taken back, or its time was up", self.addr))
     }
@@ -440,6 +460,20 @@ mod tests {
         let e = r.call("engine.execute", json!({"command": "text.insert", "params": {"text": "x"}})).unwrap_err();
         assert!(e.contains("bad reply"), "{e}");
         assert_eq!(seen.load(Ordering::SeqCst), 1, "the request was sent once");
+    }
+
+    /// A reply longer than the limit set with `limit_replies` is an error, and the request is
+    /// not sent again; one within it is read.
+    #[test]
+    fn replies_past_the_limit_are_refused() {
+        let (port, rx) =
+            fake_app(|req| Some((json!({"ok": true, "result": {"text": "x".repeat(req["params"]["n"].as_u64().unwrap_or(0) as usize)}}), false)));
+        let mut r = Remote::connect_with(&format!("127.0.0.1:{port}"), fixed_key("k1")).unwrap();
+        r.limit_replies(1024);
+        assert_eq!(r.call("document.inspect", json!({"n": 100})).unwrap()["text"].as_str().map(str::len), Some(100));
+        let e = r.call("document.inspect", json!({"n": 4096})).unwrap_err();
+        assert!(e.contains("too long"), "{e}");
+        assert_eq!(rx.try_iter().count(), 2, "each request was sent once");
     }
 
     fn fixed_key(key: &'static str) -> KeyFinder {

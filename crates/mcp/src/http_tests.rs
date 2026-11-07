@@ -19,6 +19,10 @@ struct App {
     slow_ms: AtomicU64,
     /// How long each `auth` call takes, in milliseconds.
     auth_ms: AtomicU64,
+    /// How long the document's text is (`document.inspect`); 0 for "one two three".
+    text_len: AtomicUsize,
+    /// The longest reply each connection was told to read (`limit_replies`).
+    limits: Mutex<Vec<usize>>,
 }
 
 /// A connection to the stand-in app with one key: `window` is the window's key, `stranger` is a
@@ -43,7 +47,10 @@ impl Backend for Fake {
             "auth" if self.key == "local" => Ok(json!({"as": "participant", "name": self.key, "role": "owner", "remote": false})),
             "auth" => Ok(json!({"as": "participant", "name": self.key, "role": "suggester", "remote": true})),
             "engine.execute" => Ok(json!({"ran": params["command"], "by": self.key})),
-            "document.inspect" => Ok(json!({"text": "one two three"})),
+            "document.inspect" => match self.app.text_len.load(Ordering::SeqCst) {
+                0 => Ok(json!({"text": "one two three"})),
+                n => Ok(json!({"text": "x".repeat(n)})),
+            },
             _ => Ok(json!({})),
         }
     }
@@ -55,6 +62,9 @@ impl Backend for Fake {
     }
     fn ended(&self) -> Option<String> {
         self.refused.load(Ordering::SeqCst).then(|| "refused".to_string())
+    }
+    fn limit_replies(&mut self, max: usize) {
+        self.app.limits.lock().unwrap().push(max);
     }
 }
 
@@ -448,4 +458,26 @@ fn answers_waiting_to_be_sent_are_bounded() {
     // Once it has been sent, requests run again.
     drop(unsent);
     assert_eq!(e.handle(&post(Some("ben"), &call, &[])).status, 200);
+}
+
+/// An answer past `max_answer` is never built whole: the connection to the app reads no longer
+/// reply, and the tool's text and the reply line stop growing at the limit, so the tool answers
+/// that it's too large instead.
+#[test]
+fn an_answer_past_the_limit_is_cut_off_while_it_is_built() {
+    let (e, app) = endpoint(Options { max_answer: 4096, ..Options::default() });
+    app.text_len.store(100_000, Ordering::SeqCst);
+    let call = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "inspect_document", "arguments": {}}});
+    let r = e.handle(&post(Some("ana"), &call, &[]));
+    assert_eq!(*app.limits.lock().unwrap(), vec![4096], "the app's replies are read up to the limit");
+    let v = body(&r);
+    assert_eq!((v["id"].clone(), v["result"]["isError"].clone()), (json!(7), json!(true)), "{v}");
+    assert!(v["result"]["content"][0]["text"].as_str().is_some_and(|t| t.contains("larger than this connection sends at once")), "{v}");
+    // The document as a resource says so too; a small answer goes through.
+    let read = json!({"jsonrpc": "2.0", "id": 8, "method": "resources/read", "params": {"uri": "wordcraft://document"}});
+    let v = body(&e.handle(&post(Some("ana"), &read, &[])));
+    assert!(v["error"]["message"].as_str().is_some_and(|m| m.contains("larger than")), "{v}");
+    app.text_len.store(0, Ordering::SeqCst);
+    let v = body(&e.handle(&post(Some("ana"), &call, &[])));
+    assert_eq!(v["result"]["isError"], false, "{v}");
 }
