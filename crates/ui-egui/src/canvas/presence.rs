@@ -6,10 +6,9 @@
 use std::ops::RangeInclusive;
 
 use egui::{Color32, Painter, Pos2, Rect, Stroke, pos2, vec2};
-use wordcraft_doc::Pos;
+use wordcraft_doc::{Pos, StoryRef};
 use wordcraft_engine::room::{Other, ParticipantId};
-use wordcraft_layout::DocLayout;
-use wordcraft_layout::hit::page_lines;
+use wordcraft_layout::{DocLayout, Placed};
 
 use super::pages::page_screen_scale;
 use crate::share::FLAG_MS;
@@ -114,10 +113,19 @@ fn cut_to_pages(layout: &DocLayout, a: &Pos, b: &Pos, pages: RangeInclusive<usiz
     let (a, b) = if a <= b { (a, b) } else { (b, a) };
     let (mut lo, mut hi): (Option<Pos>, Option<Pos>) = (None, None);
     for page in layout.pages.get(pages)? {
-        for l in page_lines(page, a.story) {
-            let Some(line) = l.para.lines.get(l.li) else { continue };
-            let at = |off| Pos { story: a.story, path: l.path.clone(), off };
-            let (start, stop) = (at(line.start), at(line.stop));
+        // Every piece of the story's text there, turned text (a cell's text direction) too.
+        let parts: [&[Placed]; 3] = match a.story {
+            StoryRef::Body => [&page.items, &[], &[]],
+            StoryRef::Part(_) => [&page.header, &page.footer, &page.items],
+        };
+        for it in parts.into_iter().flatten() {
+            let Placed::Lines { story, path, para, l0, l1, .. } = it else { continue };
+            if *story != a.story {
+                continue;
+            }
+            let (Some(first), Some(last)) = (para.lines.get(*l0), l1.checked_sub(1).and_then(|li| para.lines.get(li))) else { continue };
+            let at = |off| Pos { story: a.story, path: path.clone(), off };
+            let (start, stop) = (at(first.start), at(last.stop));
             if lo.as_ref().is_none_or(|lo| start < *lo) {
                 lo = Some(start);
             }
@@ -527,6 +535,25 @@ mod tests {
         assert_eq!(super::cut_to_pages(&layout, &a, &b, n - 2..=n - 1), None);
         assert_eq!(super::cut_to_pages(&layout, &start, &end, n..=n + 1), None);
         assert!(super::cut_to_pages(&layout, &a, &b, 0..=0).is_some(), "it is on the first page");
+    }
+
+    #[test]
+    fn a_selection_in_turned_text_is_cut_to_the_pages_on_screen_too() {
+        // Turned text (Layout › Text Direction) is laid out turned: its lines bound the cut too,
+        // or a selection on pages holding only turned text is not shaded at all.
+        let text = (0..200).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut s = Session::new(Document::from_text(&text));
+        s.run("layout.textDirection", &json!({"value": "down"})).unwrap();
+        let layout = s.layout();
+        let turned =
+            layout.pages.iter().flat_map(|p| &p.items).any(|it| matches!(it, wordcraft_layout::Placed::Lines { turn, .. } if turn.is_turned()));
+        assert!(turned, "the section's text is laid out turned");
+        s.run("select.all", &json!({})).unwrap();
+        let (start, end) = s.sel.ordered();
+        let last = layout.pages.len() - 1;
+        let (from, to) = super::cut_to_pages(&layout, &start, &end, last.saturating_sub(1)..=last).unwrap();
+        assert_eq!(to, end);
+        assert!(!layout.selection_rects(&s.doc, &from, &to, 0).is_empty(), "and shaded");
     }
 
     fn control_inspect(a: &mut WordApp) -> serde_json::Value {
