@@ -589,7 +589,8 @@ fn prepare_view(app: &mut WordApp, ui: &Ui, full: Rect, layout: &DocLayout) -> C
     {
         app.session.page_hint = c.page;
     }
-    stop_following_on_input(app, ui, area);
+    // Read Mode's wheel turns pages over the whole canvas, its margins too ([`scroll_motion`]).
+    stop_following_on_input(app, ui, if read_mode { full } else { area });
     let followed = app.canvas.follow.and_then(|id| {
         let others = app.others_here();
         let (o, _) = others.into_iter().find(|(o, _)| o.who.id == id)?;
