@@ -111,10 +111,12 @@ fn keys_match(given: &str, key: &str) -> bool {
 fn serve_on(listener: TcpListener, ctx: egui::Context, key: String, first: Duration, lobby: Lobby) -> Receiver<ControlRequest> {
     let (tx, rx) = channel::<ControlRequest>();
     let key: Arc<str> = key.into();
+    // Wrong keys slow down the replies to the next ones, on every connection.
+    let refusals = Arc::new(hosted::Refusals::default());
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let (tx, ctx, key, lobby) = (tx.clone(), ctx.clone(), key.clone(), lobby.clone());
-            std::thread::spawn(move || serve(stream, tx, ctx, &key, first, &lobby));
+            let (tx, ctx, key, lobby, refusals) = (tx.clone(), ctx.clone(), key.clone(), lobby.clone(), refusals.clone());
+            std::thread::spawn(move || serve(stream, tx, ctx, &key, first, &lobby, &refusals));
         }
     });
     rx
@@ -237,7 +239,7 @@ fn send(out: &mut TcpStream, id: &Value, mut v: Value) -> bool {
     writeln!(out, "{v}").is_ok()
 }
 
-fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key: &str, first: Duration, lobby: &Lobby) {
+fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key: &str, first: Duration, lobby: &Lobby, refusals: &hosted::Refusals) {
     let Ok(read) = stream.try_clone() else { return };
     let mut out = stream;
     // One overall deadline from accept to the first authorised request; after it, none.
@@ -253,9 +255,10 @@ fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key:
             // its holder's own copy answers them from now on, on this thread.
             if !authorised && let Ok(copy) = lobby.join_with(&k) {
                 reader.get_mut().set_deadline(None);
-                serve_copy(&mut reader, &mut out, copy, &k, req);
+                serve_copy(&mut reader, &mut out, copy, &k, req, refusals);
                 return;
             }
+            std::thread::sleep(refusals.refused());
             let _ = send(&mut out, &req.id, json!({"ok": false, "error": "unauthorized"}));
             break;
         }
@@ -265,7 +268,8 @@ fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key:
         }
         if req.method == "auth" {
             conn_key = Some(k);
-            if !send(&mut out, &req.id, json!({"ok": true, "result": {}})) {
+            // The window's key: whoever holds it acts as the person, in the window.
+            if !send(&mut out, &req.id, json!({"ok": true, "result": {"as": "window"}})) {
                 break;
             }
             continue;
@@ -286,10 +290,11 @@ fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key:
 /// its holder's own copy of the shared document, answers each request ([`hosted::call`];
 /// `auth` just says yes). Every request carries that key or none. The connection ends, and the
 /// copy leaves the room, when its participant is out of it or sharing stops.
-fn serve_copy(reader: &mut BufReader<Timed>, out: &mut TcpStream, mut copy: Replica, key: &str, first: Request) {
+fn serve_copy(reader: &mut BufReader<Timed>, out: &mut TcpStream, mut copy: Replica, key: &str, first: Request, refusals: &hosted::Refusals) {
     let mut next = Some(first);
     while let Some(req) = next.take().or_else(|| next_request(reader, out)) {
         if req.key.as_deref().is_some_and(|k| !keys_match(k, key)) {
+            std::thread::sleep(refusals.refused());
             let _ = send(out, &req.id, json!({"ok": false, "error": "unauthorized"}));
             return;
         }
@@ -298,7 +303,7 @@ fn serve_copy(reader: &mut BufReader<Timed>, out: &mut TcpStream, mut copy: Repl
             return;
         }
         let reply = match req.method.as_str() {
-            "auth" => json!({"ok": true, "result": {}}),
+            "auth" => json!({"ok": true, "result": hosted::auth_reply(&copy)}),
             method => match hosted::call(&mut copy, method, &req.params) {
                 Ok(v) => json!({"ok": true, "result": v}),
                 Err(e) => json!({"ok": false, "error": e}),
@@ -408,7 +413,8 @@ mod tests {
     fn auth_once_per_connection() {
         let (port, rx) = boot();
         let mut c = Conn::open(port);
-        assert_eq!(c.call(&format!(r#"{{"id":1,"method":"auth","key":"{KEY}"}}"#))["ok"], true);
+        // The window's key reaches the window, and `auth` says so (#74).
+        assert_eq!(c.call(&format!(r#"{{"id":1,"method":"auth","key":"{KEY}"}}"#))["result"], json!({"as": "window"}));
         for id in 2..4 {
             c.send(&format!(r#"{{"id":{id},"method":"document.inspect"}}"#));
             answer(&rx);
@@ -568,7 +574,9 @@ mod tests {
         // Its copy left the room with the connection; `auth` with the key joins again.
         assert!(eventually(|| room.participants().is_empty()));
         let mut c = Conn::open(port);
-        assert_eq!(c.call(&format!(r#"{{"id":1,"method":"auth","params":{{"key":"{key}"}}}}"#))["ok"], true);
+        // `auth` says what the key reaches: a participant's copy, whose (#74).
+        let r = c.call(&format!(r#"{{"id":1,"method":"auth","params":{{"key":"{key}"}}}}"#));
+        assert_eq!(r["result"], json!({"as": "participant", "name": "Agent", "role": "editor"}), "{r}");
         assert_eq!(c.call(r#"{"id":2,"method":"engine.execute","params":{"command":"caret.docEnd"}}"#)["ok"], true);
         assert_eq!(room.participants().len(), 1);
         // The window's key still reaches the window.

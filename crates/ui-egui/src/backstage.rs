@@ -1,4 +1,4 @@
-//! File tab (Backstage): Home/New, Open, Info, Save As, Print, Export, Close, Options, About.
+//! File tab (Backstage): Home/New, Open, Info, Save As, Print, Share, Export, Close, Options, About.
 
 use egui::{Rect, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::json;
@@ -7,7 +7,7 @@ use crate::theme::{Tokens, medium, regular, semibold};
 use crate::{WordApp, icons};
 
 /// The side menu: page id, label and icon (#1714).
-const PAGES: [(&str, &str, &str); 11] = [
+const PAGES: [(&str, &str, &str); 12] = [
     ("home", "Home", "homeFolder"),
     ("new", "New", "blankPage"),
     ("open", "Open", "open"),
@@ -16,6 +16,7 @@ const PAGES: [(&str, &str, &str); 11] = [
     ("save", "Save", "save"),
     ("saveAs", "Save As", "saveAs"),
     ("print", "Print", "print"),
+    ("share", "Share", "share"),
     ("export", "Export", "export"),
     ("close", "Close", "close"),
     ("options", "Options", "options"),
@@ -23,7 +24,7 @@ const PAGES: [(&str, &str, &str); 11] = [
 
 /// The Backstage pages' keytips, as Word's (#4960): Alt, F, then a letter. V is Word's older
 /// Print Preview key, which opens the Print page too.
-const KEYTIPS: [(&str, &str); 11] = [
+const KEYTIPS: [(&str, &str); 12] = [
     ("home", "H"),
     ("new", "N"),
     ("open", "O"),
@@ -32,6 +33,7 @@ const KEYTIPS: [(&str, &str); 11] = [
     ("saveAs", "A"),
     ("print", "P"),
     ("print", "V"),
+    ("share", "Z"),
     ("export", "E"),
     ("close", "C"),
     ("options", "T"),
@@ -119,7 +121,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             }
             ui.add_space(if mac { 12.0 } else { 6.0 });
             for (id, label, icon) in PAGES {
-                // No document open (#1129): Info, Save, Save As, Print and Export are greyed out.
+                // No document open (#1129): Info, Save, Save As, Print, Share and Export are greyed out.
                 let on = has_document || works_without_document(id);
                 let (r, resp) = ui.add_enabled_ui(on, |ui| ui.allocate_exact_size(vec2(200.0, 38.0), Sense::click())).inner;
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, on, tl!(label)));
@@ -188,6 +190,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 "info" => info_page(app, ui),
                 "recover" => recovery_page(app, ui),
                 "print" | "export" => export_page(app, ui),
+                "share" => crate::share_page::page(app, ui),
                 "options" => crate::options::page(app, ui),
                 _ => home_page(app, ui),
             })
