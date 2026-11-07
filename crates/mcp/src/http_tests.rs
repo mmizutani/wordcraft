@@ -366,3 +366,19 @@ fn a_request_waits_only_the_time_its_caller_has_left() {
     app.slow_ms.store(0, Ordering::SeqCst);
     assert_eq!(e.handle(&post(Some("ana"), &call, &[(wordcraft_http::WAIT_HEADER, "999999999")])).status, 200);
 }
+
+/// Requests the endpoint answers without the app (tools/list) still don't keep a key taken
+/// back: every so often its connection asks the app again, and once the app says no, the key
+/// gets 401 and its place goes.
+#[test]
+fn a_key_taken_back_loses_its_place_even_asking_only_for_the_tool_list() {
+    let (e, app) = endpoint(Options { recheck: Duration::from_millis(200), ..Options::default() });
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+    assert_eq!(e.handle(&post(Some("ana"), &list, &[])).status, 200);
+    assert_eq!(e.keys(), 1);
+    app.revoked.lock().unwrap().push("ana".into());
+    std::thread::sleep(Duration::from_millis(300));
+    let r = e.handle(&post(Some("ana"), &list, &[]));
+    assert_eq!(r.status, 401, "{:?}", body(&r));
+    assert_eq!(e.keys(), 0, "its place went");
+}
