@@ -182,6 +182,11 @@ impl Endpoint {
         }
         let Ok(body) = std::str::from_utf8(&req.body) else { return refusal(400, -32700, "the body is not UTF-8") };
         let Ok(msg) = serde_json::from_str::<Value>(body) else { return refusal(400, -32700, "parse error") };
+        // One message a POST. MCP over HTTP has had no batches since 2025-06-18, and a batch
+        // would let one request run any number of tools and hold every answer in memory.
+        if !msg.is_object() {
+            return refusal(400, -32600, "one JSON-RPC message per POST: batches aren't accepted over HTTP");
+        }
         let stateless = msg.get("params").and_then(stateless_version).is_some();
         if stateless {
             if let Err(e) = check_headers(req, &msg) {
