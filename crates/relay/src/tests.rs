@@ -850,3 +850,21 @@ fn answers_waiting_for_slow_agents_are_bounded() {
     drop(unread);
     assert_eq!(ask().status, 200);
 }
+
+/// An answer that fits the desktop's endpoint but not the relay once written (JSON doubles each
+/// `"` in its body) reaches its agent as a size error at once, not as a time-out.
+#[test]
+fn an_answer_too_large_once_written_is_said_at_once() {
+    let (base, _relay) = relay(|c| c.answer_wait = Duration::from_secs(20));
+    let quotes = MAX_REPLY / 2 + (1 << 20);
+    let handler: wordcraft_http::Handler = Arc::new(move |_: &Request| Response::json(200, "\"".repeat(quotes)));
+    let hosting = Hosting::start(&base, TOKEN, None, handler).unwrap();
+    let started = Instant::now();
+    let (status, _, body) = http(hosting.url(), "POST", &[("Content-Type", "application/json")], "{}");
+    assert_eq!(status, 502, "{body}");
+    let said: Value = serde_json::from_str(&body).unwrap();
+    let message = said["error"]["message"].as_str().unwrap();
+    assert!(message.contains("too large to pass through the relay") && message.ends_with("over 96 MiB"), "{body}");
+    assert!(started.elapsed() < Duration::from_secs(15), "the agent waited {:?}", started.elapsed());
+    hosting.stop();
+}

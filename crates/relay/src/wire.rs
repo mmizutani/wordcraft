@@ -72,6 +72,22 @@ pub fn reply(id: u64, resp: &Response) -> Value {
     }
 }
 
+/// [`reply`] as the text sent to the relay, which takes up to `max` bytes. An answer that is
+/// larger once written (JSON escapes each `"` and `\` in its body, so it can grow to twice its
+/// size) becomes a short error its agent can act on, not an upload the relay refuses while the
+/// agent waits until it times out.
+pub fn reply_within(id: u64, resp: &Response, max: usize) -> String {
+    let text = reply(id, resp).to_string();
+    if text.len() <= max {
+        return text;
+    }
+    let mib = |n: usize| n.div_ceil(1 << 20);
+    let why = format!("the answer is too large to pass through the relay: {} MiB once written, over {} MiB", mib(text.len()), mib(max));
+    // The shape of the relay's own refusals.
+    let body = json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": why}}).to_string();
+    json!({"id": id, "status": 502, "headers": [["Content-Type", "application/json"]], "body": body}).to_string()
+}
+
 /// The bytes a response takes as written: its headers as well as its body.
 pub fn size(resp: &Response) -> usize {
     resp.headers.iter().fold(resp.body.len(), |n, (k, v)| n.saturating_add(k.len()).saturating_add(v.len()).saturating_add(4))

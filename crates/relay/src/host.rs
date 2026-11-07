@@ -291,7 +291,7 @@ fn answer(s: &Arc<Shared>, id: u64, req: Request, until: Option<Instant>) {
             req.headers.push((wordcraft_http::WAIT_HEADER.into(), left.as_millis().to_string()));
         }
         let resp = (s.handler)(&req);
-        let body = wire::reply(id, &resp).to_string();
+        let body = wire::reply_within(id, &resp, crate::server::MAX_REPLY);
         send_answer(s, &body, until.unwrap_or_else(|| Instant::now() + UNTIL_UNSAID));
     };
     if s.busy.fetch_add(1, Ordering::SeqCst) >= AT_ONCE {
