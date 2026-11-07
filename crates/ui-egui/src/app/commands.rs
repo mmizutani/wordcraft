@@ -1101,6 +1101,7 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "ui.tab"
             | "ui.backstage"
             | "room.participants"
+            | "room.relay"
             | "room.stop"
             | "ui.dialog"
             | "ui.closeDialog"

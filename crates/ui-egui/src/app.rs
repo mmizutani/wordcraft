@@ -110,6 +110,7 @@ impl WordApp {
             control_rx: None,
             lobby: Default::default(),
             share: None,
+            relay: Default::default(),
             share_form: Default::default(),
             assist: Default::default(),
             shots: crate::control::Shots::default(),

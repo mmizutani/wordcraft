@@ -37,6 +37,7 @@ wordcraft-zotero = { path = "crates/zotero" }
 wordcraft-assist = { path = "crates/assist" }
 wordcraft-control-key = { path = "crates/control-key" }
 wordcraft-http = { path = "crates/http" }
+wordcraft-relay = { path = "crates/relay" }
 wordcraft-ui-egui = { path = "crates/ui-egui" }
 wordcraft-metafile = { path = "crates/metafile" }
 

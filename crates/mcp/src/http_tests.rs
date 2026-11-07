@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use wordcraft_http::{Request, Response};
@@ -338,4 +338,31 @@ fn a_flood_on_one_key_is_bounded_and_late_requests_never_run() {
     // Every caller has its answer; wait for what was begun to finish, then check nothing late ran.
     std::thread::sleep(Duration::from_millis(1200));
     assert!(runs(&app) - before <= 2, "{} ran after their callers stopped waiting", runs(&app) - before);
+}
+
+/// A request passed on by a relay's desktop side says how long its caller still waits: it waits
+/// only that in this endpoint's queue, and is dropped unrun if it can't start in time, so an edit
+/// whose caller was told it timed out never lands later.
+#[test]
+fn a_request_waits_only_the_time_its_caller_has_left() {
+    let (e, app) = endpoint(Options { timeout: Duration::from_secs(5), ..Options::default() });
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "inspect_document", "arguments": {}}});
+    assert_eq!(e.handle(&post(Some("ana"), &call, &[])).status, 200);
+    let runs = |app: &App| app.calls.lock().unwrap().iter().filter(|(_, m)| m != "auth").count();
+    app.slow_ms.store(600, Ordering::SeqCst);
+    let e = Arc::new(e);
+    let (e2, c2) = (e.clone(), call.clone());
+    let busy = std::thread::spawn(move || e2.handle(&post(Some("ana"), &c2, &[])).status);
+    std::thread::sleep(Duration::from_millis(100));
+    let before = runs(&app);
+    let started = Instant::now();
+    let late = e.handle(&post(Some("ana"), &call, &[(wordcraft_http::WAIT_HEADER, "150")]));
+    assert_eq!(late.status, 504, "{:?}", body(&late));
+    assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
+    assert_eq!(busy.join().unwrap(), 200);
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(runs(&app), before, "the late request never ran");
+    // A caller can't make a request wait longer than the endpoint would.
+    app.slow_ms.store(0, Ordering::SeqCst);
+    assert_eq!(e.handle(&post(Some("ana"), &call, &[(wordcraft_http::WAIT_HEADER, "999999999")])).status, 200);
 }

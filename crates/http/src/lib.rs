@@ -346,6 +346,10 @@ impl Default for Config {
 /// What answers each request.
 pub type Handler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
 
+/// The most body a request may have, decided from its head (method, target and headers): a
+/// server can take large bodies only where they belong, and only from whoever may send them.
+pub type BodyLimit = Arc<dyn Fn(&Request) -> usize + Send + Sync>;
+
 /// One of a counted number of places (connections served, connections being turned away),
 /// given back when dropped: when its thread ends, and when the thread never started.
 struct Slot(Arc<AtomicUsize>);
@@ -361,6 +365,12 @@ const MAX_CLOSING: usize = 16;
 
 /// Accept connections on `listener` until it fails, each on a thread of its own.
 pub fn serve(listener: TcpListener, config: Config, handler: Handler) -> std::io::Result<()> {
+    let body = config.limits.body;
+    serve_with(listener, config, Arc::new(move |_: &Request| body), handler)
+}
+
+/// [`serve`], with each request's body capped by `body_limit` instead of `config.limits.body`.
+pub fn serve_with(listener: TcpListener, config: Config, body_limit: BodyLimit, handler: Handler) -> std::io::Result<()> {
     let open = Arc::new(AtomicUsize::new(0));
     // Connections turned away and still being closed, each on a thread of its own, so that a
     // client trickling bytes into one never holds up the next accept.
@@ -408,10 +418,10 @@ pub fn serve(listener: TcpListener, config: Config, handler: Handler) -> std::io
         }
         // Released when the thread ends, or with the closure when no thread starts.
         let slot = Slot(open.clone());
-        let handler = handler.clone();
+        let (handler, body_limit) = (handler.clone(), body_limit.clone());
         let spawned = std::thread::Builder::new().name("http connection".into()).spawn(move || {
             let _slot = slot;
-            connection(stream, peer, &config, &handler);
+            connection(stream, peer, &config, &body_limit, &handler);
         });
         if spawned.is_err() {
             log::warn!("http: no thread for a connection");
@@ -448,7 +458,7 @@ fn refuse(writer: &mut TcpStream, reader: &mut BufReader<Timed>, e: &Refused) {
 }
 
 /// Serve one connection's requests until it closes, idles out or asks to close.
-pub fn connection(stream: TcpStream, peer: SocketAddr, config: &Config, handler: &Handler) {
+pub fn connection(stream: TcpStream, peer: SocketAddr, config: &Config, body_limit: &BodyLimit, handler: &Handler) {
     let Ok(read) = stream.try_clone() else { return };
     let mut reader = BufReader::new(Timed { stream: read, until: Instant::now() });
     let mut writer = stream;
@@ -473,7 +483,14 @@ pub fn connection(stream: TcpStream, peer: SocketAddr, config: &Config, handler:
         {
             return;
         }
-        if let Err(e) = read_body(&mut reader, &mut req, &config.limits) {
+        let limits = Limits { body: body_limit(&req), ..config.limits };
+        if limits.body > config.limits.body {
+            // A body allowed to be larger (the relay's desktop sending an answer, its secret
+            // checked) gets time for its size at 64 KiB/s at the least.
+            let more = Duration::from_secs(u64::try_from(limits.body / (64 << 10)).unwrap_or(u64::MAX));
+            reader.get_mut().until = after(config.request.saturating_add(more));
+        }
+        if let Err(e) = read_body(&mut reader, &mut req, &limits) {
             refuse(&mut writer, &mut reader, &e);
             return;
         }
@@ -510,6 +527,11 @@ pub fn same_secret(a: &str, b: &str) -> bool {
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
+
+/// How long, in milliseconds, whoever passed a request on still waits for its answer: a relay's
+/// desktop side sets it, so a request that waited there doesn't wait its whole time again. A
+/// server takes it only to wait less than it would.
+pub const WAIT_HEADER: &str = "Wordcraft-Wait-Ms";
 
 /// The token in an `Authorization: Bearer <token>` header.
 pub fn bearer(req: &Request) -> Option<&str> {
