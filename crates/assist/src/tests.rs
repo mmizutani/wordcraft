@@ -1045,6 +1045,33 @@ fn the_conversation_thread_and_its_copy_can_be_moved_to_other_threads() {
     let _ = Value::Null;
 }
 
+/// Where the others see the assistant (#32): the selection its copy takes over from the person at
+/// the start of a turn isn't shown as the assistant's, so its caret doesn't sit on the person's;
+/// where its own tool calls leave its caret is.
+#[test]
+fn the_others_see_the_assistant_where_its_own_calls_leave_it() {
+    let mut w = Window::new("one two three");
+    let person = {
+        let at = |off| w.session.doc.anchor_at(&Pos::body(0, off)).unwrap();
+        (at(4), at(7))
+    };
+    let fake = Fake::new()
+        .then(vec![Step::tool("inspect_document", json!({})), Step::say("Read it.")])
+        .then(vec![Step::tool("select_text", json!({"text": "three"})), Step::say("Selected.")]);
+    let mut a = w.start(fake, Options::default());
+    let assistant = |w: &Window| {
+        let all = w.room.presences_at(w.room.version()).1;
+        all.into_iter().find(|s| s.who.name == "Test Assistant").map(|s| s.at.map(|p| (p.anchor.off, p.focus.off)))
+    };
+    a.ask_at("Read it", None, Some(person)).unwrap();
+    assert!(a.wait_idle(WAIT));
+    assert_eq!(assistant(&w), Some(None), "only read: not shown on the person's selection");
+    a.ask_at("Select the last word", None, Some(person)).unwrap();
+    assert!(a.wait_idle(WAIT));
+    w.settle();
+    assert_eq!(assistant(&w), Some(Some((8, 13))));
+}
+
 /// The person's selection in the window is the assistant's copy's when its turn starts: what it
 /// types replaces what the person selected, though the same word comes earlier and a paragraph
 /// put in since moved it down. A selection the copy can't find leaves it where it was, and the

@@ -98,10 +98,11 @@ pub fn ended(copy: &Replica) -> Option<String> {
 ///   as base64 `pdf` or `png` ([`crate::cmd::file::export_bytes`]), up to 32 MB; with a `path`,
 ///   to a new file where the participant may write.
 /// - `ui.parity`: the feature catalog's parity, as the window gives it.
-/// - `room.participants`: who is in the room (`participants`), who the caller is (`you`), the
-///   version of the document the copy has (`version`), and which files the caller's commands
-///   can use (`files`: `none`, `folders` or `all`; with `folders`, `folders`, each `{path,
-///   write}`).
+/// - `room.participants`: who is in the room (`participants`, each with their colour and where
+///   their selection is in the copy's document, [`super::participant_json`]), who the caller is
+///   (`you`), the version of the document the copy has (`version`), and which files the caller's
+///   commands can use (`files`: `none`, `folders` or `all`; with `folders`, `folders`, each
+///   `{path, write}`).
 /// - Any other method: a command id, run as `engine.execute` runs it, with `params` as its
 ///   params (as the window takes it).
 ///
@@ -117,9 +118,17 @@ pub fn ended(copy: &Replica) -> Option<String> {
 /// application's settings an owner changes (fonts, language packs). Every role exports the
 /// document to a new file where it may write ([`crate::scope::EXPORTS`]); no copy runs
 /// `file.options`.
+///
+/// After a request whose commands moved the participant's selection or edited, the others see
+/// where it is now ([`Replica::present_if_moved`]).
 pub fn call(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, String> {
     // Asked for each request, so a changed setting holds from the participant's next one on.
-    copy.room().reach(copy.id()).confine(|| answer(copy, method, params))
+    copy.room().reach(copy.id()).confine(|| {
+        copy.reset_moved();
+        let answer = answer(copy, method, params);
+        copy.present_if_moved();
+        answer
+    })
 }
 
 /// [`call`], within the files the participant can use.
@@ -183,8 +192,14 @@ fn answer(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, Str
         "room.participants" => {
             catch_up(copy, method, false)?;
             let (files, folders) = copy.room().files_for(copy.id());
-            let mut reply =
-                json!({"you": copy.participant(), "participants": copy.room().participants(), "version": copy.received(), "files": files.name()});
+            let others = copy.others();
+            let mine = copy.presence().map(|p| (p, copy.session().sel.clone()));
+            let me = super::participant_json(copy.participant(), copy.color(), mine.as_ref().map(|(p, sel)| (p, sel)));
+            let mut participants: Vec<Value> =
+                others.iter().map(|o| super::participant_json(&o.who, o.color, o.anchors.as_ref().zip(o.at.as_ref()))).collect();
+            let i = others.iter().position(|o| o.who.id > copy.id()).unwrap_or(others.len());
+            participants.insert(i, me);
+            let mut reply = json!({"you": copy.participant(), "participants": participants, "version": copy.received(), "files": files.name()});
             if files == AgentFiles::Folders {
                 reply["folders"] = json!(folders);
             }

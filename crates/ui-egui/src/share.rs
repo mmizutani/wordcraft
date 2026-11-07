@@ -5,15 +5,17 @@
 //! their own on their connection's thread; their changes arrive here every frame.
 //!
 //! The control channel's `room.*` methods are the owner's ([`room_method`]), and commands of the
-//! window's too, which File › Share runs ([`crate::share_page`]); the participants' carets and
-//! names come with presence (milestone A1.5).
+//! window's too, which File › Share runs ([`crate::share_page`]). The others see where the
+//! person's caret and selection are while the window shows the shared document
+//! ([`Replica::present`]); the others' carets and names in the window come next (milestone
+//! A1.5).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use wordcraft_engine::agent_files::AgentFiles;
-use wordcraft_engine::room::{Lobby, Replica, Role, Room, Terms};
+use wordcraft_engine::room::{Lobby, ParticipantId, Replica, Role, Room, Terms};
 use wordcraft_engine::scope::Scope;
 use wordcraft_engine::{CmdError, Session};
 
@@ -91,7 +93,12 @@ impl WordApp {
             self.stop_sharing();
             return;
         }
-        let _ = share.copy.lend_document(&mut self.session, Replica::sync);
+        // The others see where the person is while the window shows the document.
+        let shows = share.copy.document() == self.session.document_id();
+        let _ = share.copy.lend_document(&mut self.session, |c| {
+            c.sync();
+            if shows { c.present() } else { c.absent() }
+        });
         // Its own come back with the next change the room takes (which asks for a frame); a
         // change sent back is sent again a little later.
         if share.copy.has_unconfirmed() {
@@ -197,26 +204,22 @@ impl WordApp {
     }
 
     /// Whether the window shares a document, which one, its version, who the window is in it and
-    /// who else is: for each participant who joined with a key, which files their commands can use
-    /// now (`files`), as File › Options › Agents (`agentFiles`) and their invite say; and the
-    /// invites not taken back, each with how many copies joined with it (`invited`).
+    /// who else is, each with their colour and where their selection is in that version
+    /// ([`wordcraft_engine::room::participant_json`]): for each participant who joined with a key,
+    /// which files their commands can use now (`files`), as File › Options › Agents
+    /// (`agentFiles`) and their invite say; and the invites not taken back, each with how many
+    /// copies joined with it (`invited`).
     pub(crate) fn share_state(&self) -> Value {
         match &self.share {
             None => json!({"shared": false}),
             Some(s) => {
-                let participants: Vec<Value> = s
-                    .room
-                    .participants()
-                    .into_iter()
-                    .map(|p| {
-                        let files = s.room.held_to(p.id);
-                        let mut v = json!(p);
-                        if let Some(files) = files {
-                            v["files"] = json!(files.name());
-                        }
-                        v
-                    })
-                    .collect();
+                let (version, mut participants) = s.room.participants_now();
+                for v in &mut participants {
+                    let id = v.get("id").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).map(ParticipantId);
+                    if let Some(files) = id.and_then(|id| s.room.held_to(id)) {
+                        v["files"] = json!(files.name());
+                    }
+                }
                 let invited: Vec<Value> = s
                     .room
                     .invites()
@@ -236,7 +239,7 @@ impl WordApp {
                 json!({
                     "shared": true,
                     "document": s.copy.document(),
-                    "version": s.room.version(),
+                    "version": version,
                     "you": s.copy.participant(),
                     "participants": participants,
                     "invited": invited,
@@ -352,7 +355,7 @@ pub(crate) fn room_method(app: &mut WordApp, method: &str, p: &Value) -> Option<
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
-    use wordcraft_doc::{Document, StoryRef};
+    use wordcraft_doc::{Document, Pos, StoryRef};
     use wordcraft_engine::Session;
     use wordcraft_engine::agent_files::AgentFiles;
     use wordcraft_engine::room::{Lobby, Replica, hosted};
@@ -612,6 +615,55 @@ mod tests {
             a.sync_share(&ctx);
         }
         window_is_hub(&a);
+    }
+
+    /// Presence (#32): agents see where the person's caret is while the window shows the shared
+    /// document, and the window's key sees where every agent's is, whichever document it shows.
+    #[test]
+    fn the_window_and_agents_see_where_each_other_are() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let ctx = egui::Context::default();
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Ada", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        let where_is = |all: &Value, name: &str| -> Value {
+            all["participants"].as_array().unwrap().iter().find(|p| p["name"] == name).map(|p| p["selection"].clone()).unwrap()
+        };
+        // The person's caret reaches the agent with the next frame.
+        a.execute("caret.set", json!({"pos": Pos::body(0, 4)})).unwrap();
+        a.sync_share(&ctx);
+        let seen = hosted::call(&mut agent, "room.participants", &json!({})).unwrap();
+        assert_eq!((where_is(&seen, "Minoru")["focus"]["off"].as_u64(), where_is(&seen, "Minoru")["story"].as_str()), (Some(4), Some("body")));
+        // The agent's selection reaches the window's key, with its colour, and no text.
+        agent_runs(&mut agent, "select.text", json!({"text": "three"}));
+        let state = result(&mut a, "room.participants", json!({}));
+        let ada = where_is(&state, "Ada");
+        assert_eq!((ada["anchor"]["off"].as_u64(), ada["focus"]["off"].as_u64(), ada["index"].as_u64()), (Some(8), Some(13), Some(0)), "{state}");
+        assert!(!state.to_string().contains("three"), "{state}");
+        let colours: Vec<&Value> = state["participants"].as_array().unwrap().iter().map(|p| &p["color"]).collect();
+        assert!(colours.iter().all(|c| c.is_u64()) && colours.first() != colours.get(1), "{state}");
+        // While the window shows another document, the agents don't see the person's caret,
+        // and the window's key still sees the agent's.
+        a.execute("file.new", json!({})).unwrap();
+        a.sync_share(&ctx);
+        let seen = hosted::call(&mut agent, "room.participants", &json!({})).unwrap();
+        assert_eq!(where_is(&seen, "Minoru"), Value::Null, "{seen}");
+        agent_runs(&mut agent, "select.text", json!({"text": "two"}));
+        let state = result(&mut a, "room.participants", json!({}));
+        assert_eq!(where_is(&state, "Ada")["anchor"]["off"].as_u64(), Some(4), "{state}");
+        assert_eq!(state["version"], json!(0));
+        // Back on it, they do again.
+        a.execute("view.switchWindows", json!({"id": shared})).unwrap();
+        a.sync_share(&ctx);
+        let seen = hosted::call(&mut agent, "room.participants", &json!({})).unwrap();
+        assert_eq!(where_is(&seen, "Minoru")["focus"]["off"].as_u64(), Some(4), "{seen}");
+        // An idle window tells the room nothing more.
+        let stamp = a.share.as_ref().map(|s| s.room.presence_stamp());
+        for _ in 0..10 {
+            a.sync_share(&ctx);
+        }
+        assert_eq!(a.share.as_ref().map(|s| s.room.presence_stamp()), stamp);
     }
 
     #[test]
