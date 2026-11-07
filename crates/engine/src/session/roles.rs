@@ -48,9 +48,19 @@ impl Session {
         }
         crate::file_access::check_write(path).map_err(CmdError::Failed)?;
         if crate::io::entry_exists(std::path::Path::new(path)) {
-            return Err(CmdError::Failed(format!("{path} is there already: an export from a shared document makes a new file, never replaces one")));
+            return Err(CmdError::Failed(crate::io::not_new(path)));
         }
         Ok(())
+    }
+
+    /// Write an export's `bytes` to `path`, once it is made. From a participant's copy, as a new
+    /// file only, created so that nothing put there meanwhile (another participant's export of
+    /// the same name, say) is replaced, and only if the copy may still write there: the files it
+    /// can use may have narrowed while the export was made ([`crate::io::write_new_file`]).
+    /// Otherwise as any file is written.
+    pub(crate) fn write_export(&self, path: &str, bytes: &[u8]) -> Result<(), CmdError> {
+        let written = if self.confined { crate::io::write_new_file(path, bytes) } else { crate::io::write_file(path, bytes) };
+        written.map_err(CmdError::Failed)
     }
 
     /// Whether a command is held to the participant's role as a whole: an edit (`mutates`), and

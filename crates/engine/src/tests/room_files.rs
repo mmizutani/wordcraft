@@ -387,3 +387,42 @@ fn an_edit_made_again_reads_a_file_only_while_the_setting_allows_it() {
         }
     }
 }
+
+/// An export is written once it is made, as a new file, and only if the copy still may write
+/// there: the files it can use narrowing while it is made, or a file of that name put there
+/// meanwhile (another participant's export of the same name), stop it.
+#[test]
+fn an_export_is_written_only_while_allowed_and_only_as_a_new_file() {
+    let f = Folders::new("export-late");
+    let (mut win, mut own, room, lobby) = shared(Some(f.setting("folders")));
+    let ed = agent(&room, &lobby, "Editor agent", Role::Editor, None);
+    // The reach the export took as it started; the person narrows it while the export is made.
+    let late = f.path("write/late.pdf");
+    let running = room.reach(ed.id());
+    in_window(&mut own, &mut win, "file.options", json!({"agentFiles": "none"}));
+    let e = running.confine(|| ed.session().write_export(&late, b"%PDF-")).unwrap_err();
+    assert!(e.to_string().contains("changed while this request ran"), "{e}");
+    assert!(!Path::new(&late).exists());
+    // Another export of the same name got there first.
+    in_window(&mut own, &mut win, "file.options", json!({"agentFiles": "folders"}));
+    let first = f.path("write/first.pdf");
+    room.reach(ed.id()).confine(|| ed.session().write_export(&first, b"one")).unwrap();
+    let e = room.reach(ed.id()).confine(|| ed.session().write_export(&first, b"two")).unwrap_err();
+    assert!(e.to_string().contains("is there already"), "{e}");
+    assert_eq!(std::fs::read(&first).unwrap(), b"one");
+    // Nor through a link put there, even one that leads nowhere yet.
+    #[cfg(unix)]
+    {
+        let link = f.path("write/link.pdf");
+        std::os::unix::fs::symlink(f.0.join("write/elsewhere.pdf"), &link).unwrap();
+        assert!(room.reach(ed.id()).confine(|| ed.session().write_export(&link, b"x")).is_err());
+        assert!(!f.0.join("write/elsewhere.pdf").exists());
+        // Unconfined, a new file is still never written through one.
+        let e = crate::io::write_new_file(&link, b"x").unwrap_err();
+        assert!(e.contains("is there already"), "{e}");
+        assert!(!f.0.join("write/elsewhere.pdf").exists());
+    }
+    // The window's own exports replace a file as before.
+    win.run("file.exportPdf", &json!({"path": first})).unwrap();
+    assert_ne!(std::fs::read(&first).unwrap(), b"one");
+}

@@ -253,7 +253,7 @@ pub(crate) fn print_pdf_to_file(s: &mut Session, v: &Value) -> Result<Value, Cmd
     let (bytes, plan) = s.print_pdf(v)?;
     // Through `io`, so an agent confined to an automation write root (#769) can't print elsewhere.
     #[cfg(not(target_arch = "wasm32"))]
-    crate::io::write_file(&path, &bytes).map_err(CmdError::Failed)?;
+    s.write_export(&path, &bytes)?;
     Ok(json!({"path": path, "pages": plan.pages.len(), "chosen": plan.chosen, "copies": plan.copies, "bytes": bytes.len()}))
 }
 

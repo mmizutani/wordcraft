@@ -838,6 +838,38 @@ pub fn write_file(path: &str, _bytes: &[u8]) -> Result<(), String> {
     Err(format!("{path}: files are saved through the browser on the web"))
 }
 
+/// Why an export from a shared document isn't written to `path`: something is there.
+pub(crate) fn not_new(path: &str) -> String {
+    format!("{path} is there already: an export from a shared document makes a new file, never replaces one")
+}
+
+/// Write `bytes` to `path` as a new file, never over anything: the file is created only if
+/// nothing is at `path` (not even a link), in one step, so two writers racing to one name, or a
+/// file another program puts there meanwhile, are never replaced. Whether `path` may be written
+/// is asked now, as the roots in force say now. For exports from a participant's copy of a
+/// shared document (#31). A write that fails takes the new file away again.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_new_file(path: &str, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    crate::file_access::check_write(path)?;
+    let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(not_new(path)),
+        Err(e) => return Err(format!("{path}: {e}")),
+    };
+    if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("{path}: {e}"));
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn write_new_file(path: &str, _bytes: &[u8]) -> Result<(), String> {
+    Err(format!("{path}: files are saved through the browser on the web"))
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn open_path_with(path: &std::path::Path, _password: Option<&str>) -> Result<(Document, bool), String> {
     Err(format!("{}: files are opened through the browser on the web", path.display()))

@@ -328,7 +328,8 @@ saved with the app's settings:
   window's key, is never in reach, even with `all`.
 - Every role exports the document where it may write: `file.exportPdf`, `file.exportPng` and
   `file.printPdf` run in every copy, each with a `path` (there is no window to ask), and make a new
-  file, never replacing one. Saving (`file.save`, `file.saveAs`) stays the window's: it stamps the
+  file, never replacing one: it is created in one step once the export is made, so two exports
+  racing to one name never replace each other, and only if the participant may still write there. Saving (`file.save`, `file.saveAs`) stays the window's: it stamps the
   document and gives it a path. An owner's commands on the application's settings (fonts,
   language packs) reach no file.
 - No participant's copy runs `file.options`, whatever its role: which files agents can use is set

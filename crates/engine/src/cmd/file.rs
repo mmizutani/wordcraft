@@ -113,7 +113,13 @@ pub fn specs() -> Vec<CommandSpec> {
             let path = if path.to_ascii_lowercase().ends_with(".pdf") { path.to_string() } else { format!("{path}.pdf") };
             s.exports_to_new_file(&path)?;
             let opts = export_options(s, v);
-            crate::io::save_path_with(std::path::Path::new(&path), &s.doc, None, &opts).map_err(CmdError::Failed)?;
+            if s.confined {
+                // Made first, then written as a new file, if it still may be.
+                let bytes = crate::io::save_bytes_with(&path, &s.doc, None, &opts).map_err(CmdError::Failed)?;
+                s.write_export(&path, &bytes)?;
+            } else {
+                crate::io::save_path_with(std::path::Path::new(&path), &s.doc, None, &opts).map_err(CmdError::Failed)?;
+            }
             Ok(json!({"path": path, "markup": opts.markup}))
         })
         .params(r#"{"path": string, "markup"?: bool (Print Markup: tracked changes marked up and each page scaled down beside the comments in balloons; default file.printMarkup)}"#)
@@ -463,7 +469,7 @@ fn export_png(s: &mut Session, v: &Value) -> CmdResult {
     s.exports_to_new_file(path)?;
     let img = wordcraft_render::render_page(&s.doc, pg, scale, &opts);
     let png = img.to_png();
-    crate::io::write_file(path, &png).map_err(CmdError::Failed)?;
+    s.write_export(path, &png)?;
     Ok(json!({"path": path, "width": img.width, "height": img.height, "bytes": png.len()}))
 }
 
