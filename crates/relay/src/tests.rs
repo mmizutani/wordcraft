@@ -868,3 +868,54 @@ fn an_answer_too_large_once_written_is_said_at_once() {
     assert!(started.elapsed() < Duration::from_secs(15), "the agent waited {:?}", started.elapsed());
     hosting.stop();
 }
+
+/// An answer is written for the relay straight from its body into a buffer that never grows
+/// past the relay's limit, not built whole and measured afterwards.
+#[test]
+fn an_answer_is_written_within_the_relays_limit() {
+    use std::io::Write;
+    let quotes = |n: usize| Response::json(200, "\"".repeat(n));
+    // 450 quotes are 900 bytes once escaped: it fits 1,000, in no more than 1,000.
+    let fits = super::wire::reply_within(7, &quotes(450), 1000);
+    assert!(fits.len() <= 1000 && fits.capacity() <= 1000, "{} bytes in {}", fits.len(), fits.capacity());
+    let (id, resp) = super::wire::response_from(&serde_json::from_slice(&fits).unwrap()).unwrap();
+    assert_eq!((id, resp.status, resp.body.len()), (7, 200, 450));
+    // 600 are 1,200: a short error instead.
+    let over: Value = serde_json::from_slice(&super::wire::reply_within(7, &quotes(600), 1000)).unwrap();
+    assert_eq!(over["status"], 502);
+    assert!(over["body"].as_str().unwrap().contains("too large to pass through the relay"), "{over}");
+    // The buffer itself.
+    let mut capped = super::wire::Capped { buf: Vec::new(), max: 100 };
+    for _ in 0..10 {
+        capped.write_all(&[b'x'; 10]).unwrap();
+    }
+    assert!(capped.write_all(b"x").is_err());
+    assert_eq!((capped.buf.len(), capped.buf.capacity() <= 100), (100, true));
+}
+
+/// Large answers are written out and offered to the relay two at a time, as many as it takes
+/// at once from one token's desktops: the others wait their turn with only their own bodies.
+#[test]
+fn large_answers_are_written_out_two_at_a_time() {
+    let (base, _relay) = relay(|_| {});
+    let at_once = 6;
+    let all_answered = Arc::new(std::sync::Barrier::new(at_once));
+    let handler: wordcraft_http::Handler = Arc::new(move |_: &Request| {
+        all_answered.wait();
+        Response::json(200, format!("\"{}\"", "a".repeat(2 << 20)))
+    });
+    let hosting = Hosting::start(&base, TOKEN, None, handler).unwrap();
+    let url = hosting.url().to_string();
+    let agents: Vec<_> = (0..at_once)
+        .map(|_| {
+            let url = url.clone();
+            std::thread::spawn(move || http(&url, "POST", &[("Content-Type", "application/json")], "{}"))
+        })
+        .collect();
+    for agent in agents {
+        let (status, _, body) = agent.join().unwrap();
+        assert_eq!((status, body.len()), (200, (2 << 20) + 2));
+    }
+    assert_eq!(hosting.most_large_answers_at_once(), 2);
+    hosting.stop();
+}

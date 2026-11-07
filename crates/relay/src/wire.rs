@@ -72,20 +72,72 @@ pub fn reply(id: u64, resp: &Response) -> Value {
     }
 }
 
-/// [`reply`] as the text sent to the relay, which takes up to `max` bytes. An answer that is
+/// [`reply`] as the bytes sent to the relay, which takes up to `max` of them. The body is written
+/// from where it is, not copied first, into a buffer that never grows past `max`. An answer
 /// larger once written (JSON escapes each `"` and `\` in its body, so it can grow to twice its
 /// size) becomes a short error its agent can act on, not an upload the relay refuses while the
 /// agent waits until it times out.
-pub fn reply_within(id: u64, resp: &Response, max: usize) -> String {
-    let text = reply(id, resp).to_string();
-    if text.len() <= max {
-        return text;
+pub fn reply_within(id: u64, resp: &Response, max: usize) -> Vec<u8> {
+    let Ok(body) = std::str::from_utf8(&resp.body) else {
+        return reply(id, resp).to_string().into_bytes();
+    };
+    let mut out = Capped { buf: Vec::new(), max };
+    let written = (|| -> Result<(), std::io::Error> {
+        use std::io::Write;
+        write!(out, "{{\"id\":{id},\"status\":{},\"headers\":", resp.status)?;
+        serde_json::to_writer(&mut out, &headers_json(&resp.headers, RESPONSE_HEADERS))?;
+        out.write_all(b",\"body\":")?;
+        serde_json::to_writer(&mut out, body)?;
+        out.write_all(b"}")
+    })();
+    if written.is_ok() {
+        return out.buf;
     }
+    drop(out);
+    // How large it would have been, counted without keeping it.
+    let mut counted = Counted(0);
+    let _ = serde_json::to_writer(&mut counted, body);
     let mib = |n: usize| n.div_ceil(1 << 20);
-    let why = format!("the answer is too large to pass through the relay: {} MiB once written, over {} MiB", mib(text.len()), mib(max));
+    let why = format!("the answer is too large to pass through the relay: {} MiB once written, over {} MiB", mib(counted.0), mib(max));
     // The shape of the relay's own refusals.
     let body = json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": why}}).to_string();
-    json!({"id": id, "status": 502, "headers": [["Content-Type", "application/json"]], "body": body}).to_string()
+    json!({"id": id, "status": 502, "headers": [["Content-Type", "application/json"]], "body": body}).to_string().into_bytes()
+}
+
+/// A buffer that refuses to grow past `max` bytes, and whose capacity never passes it either.
+#[doc(hidden)]
+pub struct Capped {
+    pub buf: Vec<u8>,
+    pub max: usize,
+}
+
+impl std::io::Write for Capped {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let len = self.buf.len().checked_add(bytes.len()).filter(|n| *n <= self.max).ok_or_else(|| std::io::Error::other("past the limit"))?;
+        if len > self.buf.capacity() {
+            let want = self.buf.capacity().saturating_mul(2).max(len).min(self.max);
+            self.buf.reserve_exact(want.saturating_sub(self.buf.len()));
+        }
+        self.buf.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct Counted(usize);
+
+impl std::io::Write for Counted {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// The bytes a response takes as written: its headers as well as its body.

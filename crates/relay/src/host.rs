@@ -18,6 +18,11 @@ const AT_ONCE: usize = 16;
 /// The longest answer the relay sends: its own refusals, and a poll's requests.
 const MAX_FROM_RELAY: u64 = 64 << 20;
 
+/// Large answers (longer than an agent's request) written out and offered to the relay at once.
+/// The relay takes two at a time from one token's desktops, and each takes up to
+/// [`crate::server::MAX_REPLY`] here beyond the answer itself, so more would only hold memory.
+const LARGE_AT_ONCE: usize = 2;
+
 /// The longest a relay may say an agent waits: no relay keeps one waiting longer.
 const MAX_TTL: Duration = Duration::from_secs(3600);
 
@@ -49,6 +54,9 @@ struct Shared {
     stop: AtomicBool,
     status: Mutex<Status>,
     busy: AtomicUsize,
+    /// Large answers being written out and offered to the relay now, and the most there have been.
+    large: Mutex<usize>,
+    large_peak: AtomicUsize,
     handler: Handler,
 }
 
@@ -152,6 +160,8 @@ impl Hosting {
             stop: AtomicBool::new(false),
             status: Mutex::new(Status::Connected),
             busy: AtomicUsize::new(0),
+            large: Mutex::new(0),
+            large_peak: AtomicUsize::new(0),
             handler,
         });
         let hosting = Hosting { shared };
@@ -169,6 +179,12 @@ impl Hosting {
     /// The URL agents use: the relay's, for this room (`https://<relay>/r/<room>/mcp`).
     pub fn url(&self) -> &str {
         &self.shared.url
+    }
+
+    /// The most large answers that have been written out and offered to the relay at once.
+    #[doc(hidden)]
+    pub fn most_large_answers_at_once(&self) -> usize {
+        self.shared.large_peak.load(Ordering::SeqCst)
     }
 
     /// The room's id and secret, to open the same room (and so keep its URL) next time.
@@ -291,8 +307,21 @@ fn answer(s: &Arc<Shared>, id: u64, req: Request, until: Option<Instant>) {
             req.headers.push((wordcraft_http::WAIT_HEADER.into(), left.as_millis().to_string()));
         }
         let resp = (s.handler)(&req);
+        let until = until.unwrap_or_else(|| Instant::now() + UNTIL_UNSAID);
+        let _place = if resp.body.len() > crate::server::MAX_REQUEST {
+            match LargePlace::take(s, until) {
+                Some(place) => Some(place),
+                None => {
+                    log::warn!("relay: a large answer waited too long for its turn and wasn't sent");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let body = wire::reply_within(id, &resp, crate::server::MAX_REPLY);
-        send_answer(s, &body, until.unwrap_or_else(|| Instant::now() + UNTIL_UNSAID));
+        drop(resp);
+        send_answer(s, &body, until);
     };
     if s.busy.fetch_add(1, Ordering::SeqCst) >= AT_ONCE {
         run(s);
@@ -310,20 +339,45 @@ fn answer(s: &Arc<Shared>, id: u64, req: Request, until: Option<Instant>) {
     }
 }
 
+/// One of the [`LARGE_AT_ONCE`] places, given back when dropped.
+struct LargePlace<'a>(&'a Shared);
+
+impl<'a> LargePlace<'a> {
+    /// Wait for a place, until `until` or the room stops.
+    fn take(s: &'a Shared, until: Instant) -> Option<Self> {
+        loop {
+            if let Ok(mut n) = s.large.lock()
+                && *n < LARGE_AT_ONCE
+            {
+                *n += 1;
+                s.large_peak.fetch_max(*n, Ordering::SeqCst);
+                return Some(LargePlace(s));
+            }
+            if s.stop.load(Ordering::SeqCst) || Instant::now() >= until {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for LargePlace<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut n) = self.0.large.lock() {
+            *n = n.saturating_sub(1);
+        }
+    }
+}
+
 /// Send an answer that has been worked out to the relay. The relay may not take it yet (too
 /// many large answers arriving, or earlier answers still being read by their agents): it is then
 /// sent again, never run again, until its agent stops waiting at `until`.
-fn send_answer(s: &Shared, body: &str, until: Instant) {
+fn send_answer(s: &Shared, body: &[u8], until: Instant) {
     let url = format!("{}/host/r/{}/reply", s.relay, s.room);
     let mut wait = Duration::from_millis(250);
     loop {
-        let sent = read(
-            s.agent
-                .post(&url)
-                .header("Authorization", &format!("Bearer {}", s.secret))
-                .header("Content-Type", "application/json")
-                .send(body.as_bytes()),
-        );
+        let sent =
+            read(s.agent.post(&url).header("Authorization", &format!("Bearer {}", s.secret)).header("Content-Type", "application/json").send(body));
         let why = match sent {
             Ok((status, _)) if (200..300).contains(&status) => return,
             // Not now: send it again.
