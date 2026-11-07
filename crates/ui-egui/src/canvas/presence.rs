@@ -68,12 +68,32 @@ pub(crate) fn marks(pages: &Pages<'_>, others: &[(&Other, f64)], now: f64, point
         (sr.height() > 0.0).then_some(sr)
     };
     let shown_pages = pages_on_screen(rects, bands, visible);
+    // Whether page `pi`'s text from `top` to `bottom` (page points) is within a screen of what
+    // is seen: a page can be as long as the document (Web Layout), so its lines are cut too.
+    let reach = visible.expand2(vec2(0.0, visible.height().min(1e6)));
+    let near = |pi: usize, top: f32, bottom: f32| {
+        rects.get(pi).is_none_or(|pr| {
+            let s = layout.pages.get(pi).map_or(scale, |page| page_screen_scale(*pr, page, scale));
+            egui::Rangef::new(pr.min.y + top * s, pr.min.y + bottom * s).intersects(reach.y_range())
+        })
+    };
+    // What of each story is near the screen, found once a frame for everyone in that story.
+    let mut spans: Vec<(StoryRef, Option<(Pos, Pos)>)> = Vec::new();
     let mut budget = MAX_RECTS;
     let mut out = Vec::new();
     for (o, moved) in others.iter().filter(|(o, _)| o.at.is_some()).take(MAX_DRAWN) {
         let Some(sel) = o.at.as_ref() else { continue };
         let mut sel_rects = Vec::new();
-        let on_screen = shown_pages.clone().and_then(|pages| cut_to_pages(layout, &sel.anchor, &sel.focus, pages));
+        let story = sel.anchor.story;
+        let span = match spans.iter().find(|(st, _)| *st == story) {
+            Some((_, span)) => span.clone(),
+            None => {
+                let span = shown_pages.clone().and_then(|pages| screen_span(layout, story, pages, &near));
+                spans.push((story, span.clone()));
+                span
+            }
+        };
+        let on_screen = span.and_then(|span| cut(&sel.anchor, &sel.focus, span));
         if let Some((from, to)) = on_screen.filter(|_| budget > 0) {
             // Only what is on screen counts: a long selection, or one far off, costs the pages
             // the person sees, and leaves the budget to the selections there.
@@ -114,26 +134,45 @@ fn pages_on_screen(rects: &[Rect], bands: &[(f32, f32)], visible: Rect) -> Optio
     Some(first.saturating_sub(1)..=last.saturating_add(1).min(rects.len().saturating_sub(1)))
 }
 
-/// Of the selection `a..b`, the part on `pages`: from the first line there it holds to the last.
-/// None when it holds none of their lines (or is a caret). Others' selections are laid out only
-/// there, so a participant selecting a whole long document costs the window the pages on screen
-/// each frame, not every line.
-fn cut_to_pages(layout: &DocLayout, a: &Pos, b: &Pos, pages: RangeInclusive<usize>) -> Option<(Pos, Pos)> {
+/// Of the selection `a..b`, the part on `pages` that `near` keeps (a page, and a line's top and
+/// bottom on it in page points): from the first such line it holds to the last. None when it
+/// holds none of them (or is a caret). Others' selections are laid out only there, so a
+/// participant selecting a whole long document costs the window the lines near the screen each
+/// frame, not every line, even where one page holds the whole document (Web Layout). Turned
+/// text (a cell's text direction) is kept or cut a piece at a time.
+#[cfg(test)]
+fn cut_to_pages(layout: &DocLayout, a: &Pos, b: &Pos, pages: RangeInclusive<usize>, near: &dyn Fn(usize, f32, f32) -> bool) -> Option<(Pos, Pos)> {
+    cut(a, b, screen_span(layout, a.story, pages, near)?)
+}
+
+/// Of the selection `a..b` (either way round), the part within `span`.
+fn cut(a: &Pos, b: &Pos, (lo, hi): (Pos, Pos)) -> Option<(Pos, Pos)> {
     let (a, b) = if a <= b { (a, b) } else { (b, a) };
+    let (from, to) = (lo.max(a.clone()), hi.min(b.clone()));
+    (from < to).then_some((from, to))
+}
+
+/// Of `story`'s text on `pages`, the lines `near` keeps ([`cut_to_pages`]): from the start of
+/// the first of them in the document to the end of the last.
+fn screen_span(layout: &DocLayout, story: StoryRef, pages: RangeInclusive<usize>, near: &dyn Fn(usize, f32, f32) -> bool) -> Option<(Pos, Pos)> {
     let (mut lo, mut hi): (Option<Pos>, Option<Pos>) = (None, None);
-    for page in layout.pages.get(pages)? {
+    let first_page = *pages.start();
+    for (pi, page) in layout.pages.get(pages)?.iter().enumerate().map(|(i, p)| (first_page + i, p)) {
         // Every piece of the story's text there, turned text (a cell's text direction) too.
-        let parts: [&[Placed]; 3] = match a.story {
+        let parts: [&[Placed]; 3] = match story {
             StoryRef::Body => [&page.items, &[], &[]],
             StoryRef::Part(_) => [&page.header, &page.footer, &page.items],
         };
         for it in parts.into_iter().flatten() {
-            let Placed::Lines { story, path, para, l0, l1, .. } = it else { continue };
-            if *story != a.story {
+            let Placed::Lines { story: theirs, path, para, l0, l1, y, turn, .. } = it else { continue };
+            if *theirs != story {
                 continue;
             }
-            let (Some(first), Some(last)) = (para.lines.get(*l0), l1.checked_sub(1).and_then(|li| para.lines.get(li))) else { continue };
-            let at = |off| Pos { story: a.story, path: path.clone(), off };
+            let Some(top) = para.lines.get(*l0).map(|l| l.top) else { continue };
+            let kept = |li: &usize| para.lines.get(*li).is_some_and(|l| turn.is_turned() || near(pi, y + l.top - top, y + l.top - top + l.height));
+            let (Some(first), Some(last)) = ((*l0..*l1).find(kept), (*l0..*l1).rev().find(kept)) else { continue };
+            let (Some(first), Some(last)) = (para.lines.get(first), para.lines.get(last)) else { continue };
+            let at = |off| Pos { story, path: path.clone(), off };
             let (start, stop) = (at(first.start), at(last.stop));
             if lo.as_ref().is_none_or(|lo| start < *lo) {
                 lo = Some(start);
@@ -143,9 +182,7 @@ fn cut_to_pages(layout: &DocLayout, a: &Pos, b: &Pos, pages: RangeInclusive<usiz
             }
         }
     }
-    let from = lo?.max(a.clone());
-    let to = hi?.min(b.clone());
-    (from < to).then_some((from, to))
+    Some((lo?, hi?))
 }
 
 /// Others' selections, under the person's own.
@@ -532,18 +569,18 @@ mod tests {
             s.sel.ordered()
         };
         let (start, end) = all(&mut s);
-        let (from, to) = super::cut_to_pages(&layout, &start, &end, n - 2..=n - 1).unwrap();
+        let (from, to) = super::cut_to_pages(&layout, &start, &end, n - 2..=n - 1, &every).unwrap();
         assert!(layout.page_of(&from).is_some_and(|p| p >= n - 2), "from {from:?}, on {:?}", layout.page_of(&from));
         assert_eq!(to, end, "to the end of the selection, on the last page");
         let rects = layout.selection_rects(&s.doc, &from, &to, 0);
         assert!(!rects.is_empty() && rects.iter().all(|(pi, _)| *pi >= n - 2), "only those pages are laid out");
         // Backwards is the same selection; one off those pages, or pages past the end, is none.
-        assert_eq!(super::cut_to_pages(&layout, &end, &start, n - 2..=n - 1), Some((from, to)));
+        assert_eq!(super::cut_to_pages(&layout, &end, &start, n - 2..=n - 1, &every), Some((from, to)));
         s.run("select.text", &json!({"text": "line 3"})).unwrap();
         let (a, b) = s.sel.ordered();
-        assert_eq!(super::cut_to_pages(&layout, &a, &b, n - 2..=n - 1), None);
-        assert_eq!(super::cut_to_pages(&layout, &start, &end, n..=n + 1), None);
-        assert!(super::cut_to_pages(&layout, &a, &b, 0..=0).is_some(), "it is on the first page");
+        assert_eq!(super::cut_to_pages(&layout, &a, &b, n - 2..=n - 1, &every), None);
+        assert_eq!(super::cut_to_pages(&layout, &start, &end, n..=n + 1, &every), None);
+        assert!(super::cut_to_pages(&layout, &a, &b, 0..=0, &every).is_some(), "it is on the first page");
     }
 
     #[test]
@@ -560,7 +597,7 @@ mod tests {
         s.run("select.all", &json!({})).unwrap();
         let (start, end) = s.sel.ordered();
         let last = layout.pages.len() - 1;
-        let (from, to) = super::cut_to_pages(&layout, &start, &end, last.saturating_sub(1)..=last).unwrap();
+        let (from, to) = super::cut_to_pages(&layout, &start, &end, last.saturating_sub(1)..=last, &every).unwrap();
         assert_eq!(to, end);
         assert!(!layout.selection_rects(&s.doc, &from, &to, 0).is_empty(), "and shaded");
     }
@@ -579,6 +616,32 @@ mod tests {
         assert_eq!(super::pages_on_screen(&column, &bands, view), Some(1..=3), "only page 2's band, not page 1's rect");
         assert_eq!(super::pages_on_screen(&column, &bands, Rect::from_min_size(egui::pos2(0.0, 9000.0), egui::Vec2::splat(10.0))), None);
         assert_eq!(super::pages_on_screen(&[], &[], view), None);
+    }
+
+    /// Keeps every line ([`super::cut_to_pages`]).
+    fn every(_: usize, _: f32, _: f32) -> bool {
+        true
+    }
+
+    #[test]
+    fn where_one_page_holds_the_whole_document_only_the_lines_near_the_screen_are_laid_out() {
+        // Codex's security review: Web Layout lays the document out as one page, so cutting a
+        // selection to the pages on screen alone would still lay all of it out.
+        let text = (0..2600).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut s = Session::new(Document::from_text(&text));
+        s.run("view.webLayout", &json!({})).unwrap();
+        let layout = s.layout();
+        assert_eq!(layout.pages.len(), 1, "Web Layout is one page");
+        s.run("select.all", &json!({})).unwrap();
+        let (start, end) = s.sel.ordered();
+        // Lines from 1,000 to 1,100 points down the page.
+        let near = |_: usize, top: f32, bottom: f32| bottom >= 1000.0 && top <= 1100.0;
+        let (from, to) = super::cut_to_pages(&layout, &start, &end, 0..=0, &near).unwrap();
+        let rects = layout.selection_rects(&s.doc, &from, &to, 0);
+        assert!(!rects.is_empty() && rects.len() < 20, "only the lines there: {}", rects.len());
+        assert!(rects.iter().all(|(_, r)| r.y + r.h >= 1000.0 - 1.0 && r.y <= 1100.0 + 1.0), "{rects:?}");
+        assert!(from > start && to < end);
+        assert_eq!(super::cut_to_pages(&layout, &start, &end, 0..=0, &|_, _, _| false), None);
     }
 
     fn control_inspect(a: &mut WordApp) -> serde_json::Value {
