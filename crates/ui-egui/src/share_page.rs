@@ -32,6 +32,9 @@ pub(crate) struct Form {
     /// The URL the invite just made reaches the document at, for an agent on another computer
     /// (the relay's, #76), shown with its key.
     pub(crate) shown_url: Option<String>,
+    /// Whether the invite just made is for an agent on another computer: it joins through the
+    /// relay, never through this computer's room port.
+    pub(crate) shown_remote: bool,
     /// The relay's address and token being typed (`room.relay`).
     pub(crate) relay: String,
     pub(crate) token: String,
@@ -47,6 +50,7 @@ impl Default for Form {
             error: String::new(),
             remote: false,
             shown_url: None,
+            shown_remote: false,
             relay: String::new(),
             token: String::new(),
         }
@@ -353,16 +357,42 @@ impl WordApp {
         let name = v.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
         self.share_form.shown = Some((name, key));
         self.share_form.shown_url = v.get("url").and_then(Value::as_str).map(str::to_string);
+        self.share_form.shown_remote = v.get("remote").and_then(Value::as_bool) == Some(true);
         self.share_form.name.clear();
         Some(v)
     }
+
+    /// How the agent whose key is showing joins, as the page says under the key. An agent on
+    /// another computer gets the relay's URL as it is now, so an invite made while the relay was
+    /// still connecting shows it once it is up; until then the page says so, and never gives a
+    /// command for this computer's room port, which the agent can't reach.
+    pub(crate) fn shown_join(&self) -> Join {
+        if self.share_form.shown_remote {
+            return Join::Relay(self.relay_url().or_else(|| self.share_form.shown_url.clone()));
+        }
+        match self.lobby.addr() {
+            Some(addr) => Join::Here(addr),
+            None => Join::Closed,
+        }
+    }
+}
+
+/// How the agent an invite was just made for joins (`WordApp::shown_join`).
+#[derive(Debug, PartialEq)]
+pub(crate) enum Join {
+    /// From another computer, at the relay's URL: `None` until the relay is connected.
+    Relay(Option<String>),
+    /// On this computer, through the room port at this address.
+    Here(std::net::SocketAddr),
+    /// On this computer, but the room port isn't open.
+    Closed,
 }
 
 /// The key the last invite gave, to copy now: it isn't shown again.
 fn shown_key(app: &mut WordApp, ui: &mut Ui) {
     let Some((name, key)) = app.share_form.shown.clone() else { return };
     let t = Tokens::get(ui.ctx());
-    let addr = app.lobby.addr();
+    let join = app.shown_join();
     ui.add_space(10.0);
     egui::Frame::NONE.fill(t.panel).stroke(egui::Stroke::new(1.0, t.border)).corner_radius(6.0).inner_margin(12).show(ui, |ui| {
         ui.label(RichText::new(tl!("Key for {name}").replace("{name}", &name)).font(semibold(14.0)));
@@ -375,8 +405,8 @@ fn shown_key(app: &mut WordApp, ui: &mut Ui) {
             }
         });
         ui.add_space(6.0);
-        match (app.share_form.shown_url.clone(), addr) {
-            (Some(url), _) => {
+        match join {
+            Join::Relay(Some(url)) => {
                 let config = serde_json::to_string_pretty(&crate::relay::mcp_config(&url, &key)).unwrap_or_default();
                 note(ui, tl!("For an MCP client on another computer, such as an AI agent's:"));
                 ui.add(egui::Label::new(RichText::new(&config).monospace()).selectable(true));
@@ -384,7 +414,14 @@ fn shown_key(app: &mut WordApp, ui: &mut Ui) {
                     ui.ctx().copy_text(config.clone());
                 }
             }
-            (None, Some(addr)) => {
+            Join::Relay(None) => {
+                note(
+                    ui,
+                    tl!("The relay isn't connected yet, so there's no address for the agent to reach the document at. Its configuration shows here once it is."),
+                );
+                note(ui, &relay_status(&app.relay_state()));
+            }
+            Join::Here(addr) => {
                 let line = mcp_line(&key, addr);
                 note(ui, tl!("For an MCP client, such as an AI agent's:"));
                 ui.horizontal(|ui| {
@@ -394,7 +431,7 @@ fn shown_key(app: &mut WordApp, ui: &mut Ui) {
                     }
                 });
             }
-            (None, None) => note(ui, tl!("Agents join through the app's room port, which isn't open: they can't join right now.")),
+            Join::Closed => note(ui, tl!("Agents join through the app's room port, which isn't open: they can't join right now.")),
         }
         ui.add_space(6.0);
         if ui.button(tl!("Done")).clicked() {

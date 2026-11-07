@@ -9,6 +9,7 @@ use wordcraft_engine::Session;
 use wordcraft_engine::room::Lobby;
 
 use crate::control::{self, ControlRequest, Outcome};
+use crate::share_page::Join;
 use crate::{Services, WordApp};
 
 const TOKEN: &str = "relay-token-for-tests-0123456789abcdef";
@@ -215,9 +216,18 @@ fn a_relay_out_of_reach_is_tried_again() {
     result(&mut a, "room.share", json!({}));
     let retrying = relay_becomes(&mut a, "retrying");
     assert!(retrying["why"].as_str().is_some_and(|w| w.contains("reached")), "{retrying}");
+    // An agent invited from File › Share meanwhile is told to wait for the relay, never given a
+    // command for this computer's room port, which it can't reach.
+    a.invite_on_share_page(json!({"name": "Sandbox", "remote": true})).unwrap();
+    assert_eq!(a.shown_join(), Join::Relay(None));
     relay_on(TcpListener::bind(("127.0.0.1", port)).unwrap());
     let up = relay_becomes(&mut a, "connected");
     assert!(up["url"].as_str().is_some_and(|u| u.starts_with(&format!("http://127.0.0.1:{port}/r/"))), "{up}");
+    // Once the relay is up, the page shows the agent its URL.
+    assert_eq!(a.shown_join(), Join::Relay(up["url"].as_str().map(str::to_string)));
+    // An agent on this computer still joins through the room port.
+    a.invite_on_share_page(json!({"name": "Here"})).unwrap();
+    assert!(matches!(a.shown_join(), Join::Here(_)), "{:?}", a.shown_join());
     // A token the relay refuses isn't tried again.
     result(&mut a, "room.relay", json!({"relay": format!("http://127.0.0.1:{port}"), "token": "not-this-relay-s-token-not-this-one"}));
     let refused = relay_becomes(&mut a, "failed");
