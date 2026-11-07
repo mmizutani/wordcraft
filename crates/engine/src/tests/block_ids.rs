@@ -272,3 +272,26 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn a_saved_word_file_opens_with_the_ids_it_was_saved_with() {
+    // #38: the docx keeps block ids, so a copy saved and opened again names its blocks as the
+    // room does, including those made after the document was opened.
+    let dir = std::env::temp_dir().join(format!("wordcraft-engine-block-ids-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ids.docx");
+    let mut s = Session::new(sample_document());
+    run(&mut s, "caret.docEnd", json!({}));
+    run(&mut s, "text.newParagraph", json!({}));
+    type_text(&mut s, "made here");
+    assert_eq!(id_problem(&s.doc), None);
+    let before = ids(&s.doc);
+    run(&mut s, "file.saveAs", json!({"path": path.to_string_lossy()}));
+    let mut again = Session::new(Document::new());
+    run(&mut again, "file.open", json!({"path": path.to_string_lossy()}));
+    assert_eq!(id_problem(&again.doc), None);
+    let after = ids(&again.doc);
+    let lost: Vec<&BlockId> = before.iter().filter(|id| !after.contains(id)).collect();
+    assert!(lost.is_empty(), "{} of {} ids lost: {lost:?}", lost.len(), before.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}

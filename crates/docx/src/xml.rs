@@ -50,7 +50,12 @@ pub const NAMESPACES: &[(&str, &str)] = &[
     ("cx6", "http://schemas.microsoft.com/office/drawing/2016/5/12/chartex"),
     ("cx7", "http://schemas.microsoft.com/office/drawing/2016/5/13/chartex"),
     ("cx8", "http://schemas.microsoft.com/office/drawing/2016/5/14/chartex"),
+    // WordCraft's own: a block's whole id beside its paragraph id (`write::para_ids`). Ignorable.
+    ("wc", BLOCK_ID_NS),
 ];
+
+/// The namespace of `wc:blockId`, WordCraft's block id of a paragraph or table.
+pub const BLOCK_ID_NS: &str = "urn:wordcraft:docx:2026";
 
 /// The `a:ext` URI under which a drawing is marked decorative ([MS-ODRAWXML]), and the
 /// namespace of its `adec:decorative` element.
@@ -569,7 +574,7 @@ impl W {
 /// `xmlns:` declarations for the body-part namespaces, plus `mc:Ignorable`.
 pub fn body_ns() -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = NAMESPACES.iter().map(|(p, u)| (format!("xmlns:{p}"), (*u).to_string())).collect();
-    v.push(("mc:Ignorable".into(), "w14 w15 wp14".into()));
+    v.push(("mc:Ignorable".into(), "w14 w15 wp14 wc".into()));
     v
 }
 

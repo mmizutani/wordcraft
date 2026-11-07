@@ -78,7 +78,7 @@ echo '{"text": "Hello"}' | wordcraft-cli call text.insert - --connect 127.0.0.1:
 | `engine.execute` | `command`, `params`, `doc?` | the command's result (any id from `engine.commands`, including UI commands `ui.tab`, `ui.dialog` (`{"name": dialog, "part"?: table style part}`; `part` opens New / Modify Table Style (`newTableStyle` / `modifyTableStyle`) on that part: `wholeTable`, `headerRow`, `firstColumn`, `bandedRows`, `nwCell`… as `table.modifyStyle` names them), `ui.backstage`, `ui.zotero.*` (see `docs/zotero.md`), `ui.language` (`{"value": "auto"\|"en"\|"zh-hans"\|"zh-hant"\|"ja"\|"pt-br"\|"es"\|"uk"\|"sr"\|"sr-latn"\|"et"\|"tr"\|"ru"\|"pl"\|"de"\|"it"\|"cs"\|"hu"\|"fr"}`), `ui.theme` (`{"value": "system"\|"light"\|"dark"}`; `system` follows the OS appearance, light when it reports none), `ui.interfaceSize` (`{"value": "auto"}` or `{"percent": 50–300}`, clamped; no value reads it; `auto` keeps the system display scale, a percentage is absolute, so 100 is one screen pixel per point (#822); the result's `percent` is the size drawn at and `auto` whether it follows the system; document zoom stays `view.zoom`), `ui.animations` (`{"value": "system"\|"on"\|"off"}`; no value reads it; `system` follows the system's animation setting, which the desktop app reads on Windows, macOS, Linux and the BSDs and the web app from `prefers-reduced-motion`, and means on where the system doesn't say; the result's `enabled` is what the setting comes to and `system` what the system reports, `null` when it doesn't say), `ui.fileBrowser` (desktop: `{"purpose": "document"\|"picture"\|"recipients"\|"save"}` opens WordCraft's own file browser, for when the system file dialog doesn't show up, #576), `ui.saveAsTemplate` (File › Save As › Save as Word Template: the Save dialog for a `.dotx`, starting in the user templates folder; the result's `dir` is that folder, `null` on the web, #2852), `ui.caretAnimation` (`{"value": true\|false}`; no value reads it; off, the caret jumps and blinks on and off instead of gliding and fading), `ui.startScreen` (`{"value": true\|false}`; no value reads it; on, the default, the desktop and web apps start on File › Home when launched with nothing to open, #766), `ui.displayServer` (`{"value": "auto"\|"wayland"\|"x11"}`; no value reads it; File › Options › Advanced › Linux display server, which the desktop app reads on Linux and the BSDs at its next launch; `WORDCRAFT_WAYLAND` overrides it, #2184), `ui.alignmentGuides` (`{"value": true\|false}`; no value reads it; on, the default, moving a picture or shape snaps it to the page, the margins and other objects, with guide lines while dragging; Alt moves freely), `ui.quickAccessToolbar` (`{"value": true\|false}`; no value toggles it; false takes the Quick Access Toolbar out of the title bar, as its menu's Hide Quick Access Toolbar does, and true brings it back, #1945), `ui.statusCount` (`{"value": "words"\|"characters"\|"charactersNoSpaces"}`; no value reads it; what the status bar's count shows — words (the default), characters with spaces, or characters without spaces — kept between runs, #2797), `ui.focusRibbon` (`{"value": true\|false}`; no value toggles it; in Focus, true drops the ribbon down over the page, as the bar's ⋯ does, and false puts it away, as a click on the page does; outside Focus it stays put away, #1678), `ui.contextMenu` (opens the page's context menu below the caret, as Shift+F10 does), `ui.paneDock` (`{"pane": "navigation"\|"clipboard"\|"styles"\|"styleInspector"\|"accessibility"\|"altText"\|"formatShape"\|"restrictEditing"\|"comments"\|"smartArtText", "dock"?: "left"\|"right"\|"float", "before"?: pane\|null}`; no `dock` reads it; docks or floats a task pane as its menu does, kept between runs; Styles is `view.stylesPaneDock`, #1756; `before` puts the pane directly before that pane in the order, outside it on their edge, as a drop over a docked pane's outer third does, and `null` after every pane; the order is kept between runs)…) |
 | `engine.commands` | — | every command: id, label, location, shortcut, params, mutates, `scope` and `positions` (as MCP's `list_commands` gives them, see [Command scopes](mcp.md#command-scopes)), enabled |
 | `document.inspect` | `text?`, `doc?` | blocks (`id`, text, style, runs, lists, tables), parts, sections, selection, pages; `version`, for `document.changes` |
-| `ui.inspect` | — | UI state, view, dialog, window size, page rects on screen, caret, comment balloons (`balloons`: id + screen rect; `balloon`: the selected one), perf; `document`: the active document's id; `documents`: the open documents (`id`, `title`, `path`, `dirty`, `active`) |
+| `ui.inspect` | — | UI state, view, dialog, window size, page rects on screen, caret, comment balloons (`balloons`: id + screen rect; `balloon`: the selected one), perf; `document`: the active document's id; `documents`: the open documents (`id`, `title`, `path`, `dirty`, `active`); `following`: the participant of the shared document the view follows (`ui.follow`), or `null` |
 | `ui.click` | `x`, `y`, `button?`, `count?`, `shift?`, `cmd?`, `alt?` | real pointer input at window coordinates |
 | `ui.clickText` | `page` (0-based), `x`, `y` (points from the page's top-left), `count?` | click inside a page |
 | `ui.move` / `ui.drag` | `x`,`y` / `x`,`y`,`toX`,`toY`,`steps?` | pointer move / drag |
@@ -264,7 +264,7 @@ them):
 
 | Method | Params | Result |
 |---|---|---|
-| `room.share` | `name?` | shares the active document; the window joins its room as its owner, under `name`, else the author name (File › Options › User name), else `Owner`. `{"shared": true, "document", "version", "you", "participants", "agentFiles"}`: the document's id, the number of changes the room took, the window's participant and everyone in the room, each `{"id", "name", "role"}` and, for those who joined with a key, `"files"`: which files their commands can use now (`none`, `folders` or `all`, see [Files participants can use](#files-participants-can-use)); `agentFiles` is what File › Options › Agents gives agents. Sharing the same document again answers the same; another one is an error while one is shared |
+| `room.share` | `name?` | shares the active document; the window joins its room as its owner, under `name`, else the author name (File › Options › User name), else `Owner`. `{"shared": true, "document", "version", "you", "participants", "agentFiles"}`: the document's id, the number of changes the room took, the window's participant and everyone in the room, each `{"id", "name", "role", "color", "selection"}` (see [Where everyone is](#where-everyone-is)) and, for those who joined with a key, `"files"`: which files their commands can use now (`none`, `folders` or `all`, see [Files participants can use](#files-participants-can-use)); `agentFiles` is what File › Options › Agents gives agents. Sharing the same document again answers the same; another one is an error while one is shared |
 | `room.invite` | `name`, `role?`, `files?`, `remote?`, `expiresIn?`, `uses?` | a key (32 hex digits, random) for a participant called `name`, with `role` ([roles](#roles), `suggester` unless given): `{"key", "name", "role", "files", "remote", "expires", "uses"}`. `expiresIn` (seconds, 60 to 2,592,000, that is 30 days): the key stops working then (`expires`, in seconds since 1970), as if taken back, and the copies that joined with it are out of the room. `uses` (from 1): how many times the key joins, each copy a join; the copies that joined stay. `remote: true` is for a participant on another machine ([Agents on other machines](#agents-on-other-machines)): never `owner`, no file unless `files` names some, and a day (`expiresIn` 86,400) unless `expiresIn` says otherwise. A name is someone's in the room for good, even after they left, since their comments and tracked changes keep it: up to 128 characters, no control characters, compared without case. `files` (`none`, `folders` or `all`) gives the participant fewer files than File › Options › Agents gives agents, never more; left out (`null`), they get what the setting gives, whenever it changes |
 | `room.revoke` | `key` or `name` | takes the invite back, by its key or by the name it was for (compared without case; the key shows once in File › Share): nobody joins with the key any more, and the copies that joined with it are out of the room (the room refuses their changes, and their connections end). `{"revoked": bool}` |
 | `room.role` | `name`, `role` | gives the participant invited as `name` (compared without case) `role` from now on: the room holds their next change to it, their copies' next requests follow it, and a copy that joins with the key later has it. `{"changed": bool, "name", "role"}`. Only invited participants change role: the window keeps its own, and the built-in assistant's is chosen in its Assistant pane |
@@ -306,7 +306,7 @@ the same key or none. The copy answers:
 | `ui.render` | `page?`, `scale?` | a page of the document as base64 `png`, as for the window; `path` is refused (`file.exportPng` writes a page to a file the participant may write) |
 | `file.exportPdf`, `file.exportPng` | as for the window, without `path` | the PDF (`{"pdf", "bytes", "markup"}`) or the page (`{"png", "bytes", "width", "height", "pages", "markup"}`) in the reply, base64, up to 32 MB; with a `path`, a new file where the participant may write, as below |
 | `ui.parity` | — | as for the window |
-| `room.participants` | — | `{"you", "participants", "version", "files"}`: the caller, everyone in the room, the version of the document the copy has, and which files the caller's commands can use now (`none`, `folders` or `all`; with `folders`, also `"folders"`, each `{"path", "write"}`) |
+| `room.participants` | — | `{"you", "participants", "version", "files"}`: the caller, everyone in the room (the caller too), each with their colour and where their selection is in the copy's document (see [Where everyone is](#where-everyone-is)), the version of the document the copy has, and which files the caller's commands can use now (`none`, `folders` or `all`; with `folders`, also `"folders"`, each `{"path", "write"}`) |
 
 Any other method name is a command id, as for the window. Each request the copy doesn't refuse
 first sends the participant's changes the room hasn't taken yet, if an earlier command left
@@ -326,6 +326,45 @@ document is shared.
 
 `wordcraft-cli mcp --connect 127.0.0.1:7981` with `WORDCRAFT_CONTROL_KEY` set to the invite's
 key gives an agent its copy through MCP's tools (see [MCP](mcp.md#shared-documents)).
+
+### Where everyone is
+
+Each participant in `room.participants` (and `room.share`) says where their selection is, so an
+agent can keep clear of where a person or another agent is working:
+
+```json
+{"id": 2, "name": "Fact checker", "role": "suggester", "color": 1,
+ "selection": {"anchor": {"block": "3f2a…", "off": 12}, "focus": {"block": "3f2a…", "off": 18},
+               "story": "body", "index": 4}}
+```
+
+- `anchor` and `focus` (the caret) are anchors: a paragraph's id and a byte offset in its text,
+  as `select.range` takes them, in the document as the asking copy has it (the window's key: as
+  of `version`). They follow the text: when someone types before a caret, it moves on with its
+  text; when its paragraph is deleted, it goes to where the paragraph was.
+- `story` is the story the caret is in, as positions name it: `"body"`, or `{"part": n}` with
+  the id `document.inspect` lists a part (a header, a note, a comment) under; `index` is the
+  top-level block the caret is in there, as `document.inspect` numbers them: a table's, for a
+  caret in one of its cells.
+- `color` is a number from 0 to 7. Copies with the same name (any case) share one; a participant
+  who leaves and comes back gets theirs again unless someone else in the room has it by then;
+  and those in the room at once have different ones while there are eight to go round.
+- `selection` is `null` while nobody knows: the participant hasn't moved their caret yet, the
+  text it was in is gone, the window shows another document, or the room keeps the places of
+  64 participants at most (the window's is always kept).
+
+The window's place is the person's caret whenever the window shows the shared document. An
+agent's is where its last command that moved its caret or edited left it: a request that only
+reads (`document.inspect`, `room.participants`) doesn't move it. No text is sent with a place.
+
+The window draws everyone else where they are while it shows the shared document: their
+selections shaded and their carets in their colours, a flag with their name for three seconds
+after they move (and while the pointer is over the caret), and their avatars beside Share.
+Clicking an avatar follows that participant; for scripts, `ui.follow` (`engine.execute`) does the
+same: `{"participant": id}` (an id from `room.participants`) keeps their caret in view until the
+person scrolls, clicks the page or types, `{"participant": null}` stops, and no value reads it.
+Each returns `{"following": id | null}`; following stops by itself when they leave. `ui.inspect`
+says whom the window follows (`following`).
 
 ### Files participants can use
 
