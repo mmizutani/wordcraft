@@ -163,6 +163,25 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(json!({"hint": "The app's File › Share shares the document with people and agents (room.share, room.invite); file.exportPdf and file.saveAs make a copy to send."}))
         })
         .pure(),
+        // Sharing the document (#33): the app's window holds the room, so it runs these (File ›
+        // Share, the control channel, MCP's `room` tool); here they're listed for command search
+        // and shortcuts, and a session without a window says where to run them.
+        CommandSpec::new("room.share", "Share This Document", "File › Share", |_, _| Err(window_only("room.share")))
+            .params(r#"{"name"?: your name in the document (the author name by default)} → {"shared", "document", "version", "you", "participants", "invited", "agentFiles"}"#)
+            .pure(),
+        CommandSpec::new("room.invite", "Invite to Shared Document", "File › Share", |_, _| Err(window_only("room.invite")))
+            .params(r#"{"name": who, "role"?: "viewer"|"commenter"|"suggester" (default)|"editor"|"owner", "files"?: "none"|"folders"|"all"} → {"key", "name", "role", "files"}"#)
+            .pure(),
+        CommandSpec::new("room.role", "Change Participant's Role", "File › Share", |_, _| Err(window_only("room.role")))
+            .params(r#"{"name": an invited participant, "role": "viewer"|"commenter"|"suggester"|"editor"|"owner"} → {"changed", "name", "role"}"#)
+            .pure(),
+        CommandSpec::new("room.revoke", "Remove Access", "File › Share", |_, _| Err(window_only("room.revoke")))
+            .params(r#"{"key"?: an invite's key, "name"?: the name it was for} → {"revoked"}"#)
+            .pure(),
+        CommandSpec::new("room.participants", "Participants", "File › Share", |_, _| Err(window_only("room.participants")))
+            .params(r#"{} → {"shared": false} or what room.share answers"#)
+            .pure(),
+        CommandSpec::new("room.stop", "Stop Sharing", "File › Share", |_, _| Err(window_only("room.stop"))).params(r#"{} → {"stopped"}"#).pure(),
         CommandSpec::new("insert.quickParts", "Quick Parts", "Insert › Text", |s, v| quick_parts(s, v, wordcraft_doc::QUICK_PARTS_GALLERY)).params(
             r#"{"save"?: name (from the selection), "in"?: "document" (save into the document's own building blocks, kept in its file; else this session's), "insert"?: name, "delete"?: name} → {"parts": names (this session's, then the document's Quick Parts), "document": the document's Quick Parts}"#,
         ),
@@ -393,4 +412,11 @@ pub fn specs() -> Vec<CommandSpec> {
         })
         .pure(),
     ]
+}
+
+/// Why a sharing command (`room.*`) doesn't run in a session without the app's window.
+fn window_only(id: &str) -> CmdError {
+    CmdError::Disabled(format!(
+        "{id} shares the document the app's window shows: run it there (File › Share, the control channel or `wordcraft-cli mcp --connect`)"
+    ))
 }

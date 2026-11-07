@@ -371,6 +371,8 @@ fn shown_key(app: &mut WordApp, ui: &mut Ui) {
 fn participants(app: &mut WordApp, ui: &mut Ui, state: &Value) {
     section(ui, "People and agents");
     let rows = rows(state);
+    // The assistant's role is the Assistant pane's to choose (`room.role` refuses it).
+    let assistant: Vec<bool> = rows.iter().map(|r| app.assistant_named(&r.name).is_some()).collect();
     let mut action: Option<(&str, Value)> = None;
     crate::rtl::Table::new("share_participants").columns(5).spacing(vec2(18.0, 8.0)).striped(true).show(ui, |t| {
         t.row(|r| {
@@ -388,7 +390,9 @@ fn participants(app: &mut WordApp, ui: &mut Ui, state: &Value) {
                     }
                 });
                 r.cell(|ui| {
-                    if row.invited {
+                    if assistant.get(i).copied().unwrap_or(false) {
+                        ui.label(tl!(role_label(row.role))).on_hover_text(tl!("The assistant's role is chosen in the Assistant pane."));
+                    } else if row.invited {
                         let combo = craft_ui::ComboBox::from_id_salt(("share_role", i))
                             .selected_text(tl!(role_label(row.role)))
                             .width(130.0)

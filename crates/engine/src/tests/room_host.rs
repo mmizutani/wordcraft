@@ -813,3 +813,24 @@ fn the_owner_changes_a_participant_s_role() {
     room.close();
     assert!(matches!(room.set_role("Ana", Role::Editor), Err(RoomError::Closed)));
 }
+
+/// The sharing commands are in the registry, so command search and Customize Keyboard list them
+/// (#70, Codex); a session without the app's window says where to run them.
+#[test]
+fn the_sharing_commands_are_listed_and_say_they_need_the_window() {
+    let mut s = Session::new(Document::from_text("one"));
+    for id in ["room.share", "room.invite", "room.role", "room.revoke", "room.participants", "room.stop"] {
+        let spec = s.registry.get(id).unwrap_or_else(|| panic!("{id} is registered"));
+        assert_eq!(spec.location, "File › Share");
+        assert_eq!(crate::scope::Scope::of(id), Some(crate::scope::Scope::Ui));
+        match s.run(id, &json!({"name": "Ana", "role": "editor"})) {
+            Err(CmdError::Disabled(why)) => assert!(why.contains("app's window"), "{id}: {why}"),
+            other => panic!("{id}: {other:?}"),
+        }
+    }
+    // No participant's copy runs them.
+    let (room, _own) = Room::host(&mut s, "Minoru").unwrap();
+    let key = room.invite("Ana", Role::Owner).unwrap();
+    let mut ana = room.join_with(&key).unwrap();
+    assert!(execute(&mut ana, "room.role", json!({"name": "Ana", "role": "owner"})).is_err());
+}

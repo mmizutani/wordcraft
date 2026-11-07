@@ -65,6 +65,13 @@ impl WordApp {
         self.share.as_mut()?.run(&mut self.session, id, params, ime)
     }
 
+    /// The name of the built-in assistant's conversation, still going, when it joined the shared
+    /// document as `name` (compared without case).
+    pub(crate) fn assistant_named(&self, name: &str) -> Option<String> {
+        let a = self.conversation().filter(|a| !a.has_ended())?;
+        (a.name().to_lowercase() == name.trim().to_lowercase()).then(|| a.name().to_string())
+    }
+
     /// The document the window shares, if it shares one.
     pub(crate) fn shared_document(&self) -> Option<u64> {
         self.share.as_ref().map(|s| s.copy.document())
@@ -278,6 +285,11 @@ pub(crate) fn room_method(app: &mut WordApp, method: &str, p: &Value) -> Option<
             let name = s("name").ok_or("missing `name`")?;
             let role = s("role").ok_or("missing `role`")?;
             let role = Role::named(role).ok_or_else(|| format!("`role` {role:?}: viewer, commenter, suggester, editor or owner"))?;
+            // The assistant's conversation was started with its role, told it, and keeps
+            // comparing it with the role asked for: that role is the Assistant pane's to choose.
+            if let Some(assistant) = app.assistant_named(name) {
+                return Err(format!("{assistant} is the assistant: choose its role in the Assistant pane, which starts a new conversation with it"));
+            }
             let changed = room.set_role(name, role).map_err(|e| e.to_string())?;
             Ok(json!({"changed": changed, "name": name.trim(), "role": role}))
         })(),
