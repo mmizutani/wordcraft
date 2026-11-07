@@ -1,6 +1,6 @@
 # Co-editing: people and agents edit one document at once
 
-> **Last reviewed:** 2026-11-07 · **Last updated:** 2026-11-07 · **Change:** minor (block ids kept in Word files (#38, #69): `w14:paraId` and an ignorable `wc:blockId`, read back on open; A5 rows updated); previously minor (File › Share (#33) and remote-safe invites (#74) as built: the page, `room.role`, revoking by name, invites that expire, join a set number of times or are for another machine; known limits and milestones follow); previously minor (the built-in assistant in the Assistant pane as a co-editor: who takes part, how a conversation joins and leaves, roles in the pane, tracked changes in its name, editing at the same time as the person and other agents, what comes next for it); previously major (first version: the design as built on `main` through A1.4 and the agents' file setting, what comes next by milestone, and the decisions; presence is a placeholder until A1.5 lands, #40) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+> **Last reviewed:** 2026-11-07 · **Last updated:** 2026-11-07 · **Change:** trivial (A1 done: the gate test (#34, #77) passes; the A1 row, a guarantee row and the assistant's A1.6 line); previously minor (presence as built (#32, #71, #72): places as anchors moved with the text, colours, `room.participants`, others drawn in the window, avatars, following; the assistant's known limit and the A1 rows updated); previously minor (block ids kept in Word files (#38, #69): `w14:paraId` and an ignorable `wc:blockId`, read back on open; A5 rows updated); previously minor (File › Share (#33) and remote-safe invites (#74) as built: the page, `room.role`, revoking by name, invites that expire, join a set number of times or are for another machine; known limits and milestones follow); previously minor (the built-in assistant in the Assistant pane as a co-editor: who takes part, how a conversation joins and leaves, roles in the pane, tracked changes in its name, editing at the same time as the person and other agents, what comes next for it); previously major (first version: the design as built on `main` through A1.4 and the agents' file setting, what comes next by milestone, and the decisions; presence is a placeholder until A1.5 lands, #40) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
 
 This is the design of co-editing in WordCraft: several people and AI agents edit one document at
 the same time, each change carries its author, and nothing is lost or corrupted. The agents are
@@ -354,14 +354,41 @@ assistant leaves the other going. `the_window_never_waits_for_its_assistants`
 **Desktop only.** The web app has the pane and the commands but no backend: ChatGPT's sign-in
 needs a loopback port and ACP agents are programs a web page can't start.
 
-### Presence (A1.5, #32): in progress
+### Presence (A1.5, #32, #71, #72)
 
-_Placeholder: presence is being built (#32). This section will describe it once it lands on
-`main`._ The plan: each copy tells the room where its caret and selection are, as anchors; the
-hub keeps each participant's and moves them through every accepted change (`ChangeSet::map`);
-the window draws others' carets, names and selections in each participant's colour from
-`theme::Tokens`, with a row of avatars drawn in code and following someone's caret; agents read
-where everyone is from `room.participants`. Presence sends no document text.
+Everyone sees where everyone else is. Presence sends no document text, only places.
+
+- **Places as anchors.** Each copy tells the hub where its participant's selection is
+  (`room::Presence`: where it starts and the caret, each an anchor, a paragraph's id and a byte
+  offset in its text), as of the version the copy has (`Replica::present`, `Hub::set_presence`).
+  The window tells the person's place while it shows the shared document; an agent's place is
+  where its last command that moved its caret or edited left it. The hub keeps at most 64 places
+  (`MAX_PRESENCES`): past them, the one told longest ago goes.
+- **Moved with the text.** A reader gets every place moved through the changes since it was told
+  and through its own edits not yet back (`Presence::through`, `ChangeSet::map`), so a place
+  stays on the words it was on while others type. A participant's own typing goes past their own
+  caret (`ChangeSet::map_past`), as in their copy. A place in a part that is gone is dropped.
+- **Colours.** Each participant has one of eight colours (`COLORS`), the same for every copy with
+  their name, and theirs again when they come back unless someone else has it by then. The
+  window draws them from `Tokens::participant_colors`, the same in both themes, each readable
+  with white text.
+- **For agents.** `room.participants` gives each participant `color` and `selection` (anchors
+  as `select.range` takes them, with the story and the top-level block, or `null` while
+  unknown), so an agent can keep clear of where a person types.
+- **In the window.** While it shows the shared document, the window draws each other
+  participant's selection shaded and caret in their colour, with a flag carrying their name for
+  three seconds after they move, while the pointer is over their caret, and always for the one
+  the view follows (`canvas/presence.rs`). Beside Share, a row of avatars drawn in code
+  (initials in their colour; past four, a "+n" menu) says who else is there. Clicking one follows
+  that participant's caret until the person scrolls, clicks the page, types (an input method
+  too), pastes or cuts; `ui.follow` does the same for scripts.
+- **Cost.** The window reads the others' places only when the room's presence stamp changed or
+  its own edits aren't back yet, so an idle room costs nothing. Others' selections are laid out
+  only on the pages on screen (and one either side), and there only the lines within a screen's
+  height of what is seen, a turned cell's text too. What of each story is near the screen is kept
+  between frames until the layout or the view changes, so others moving costs no walk of a long
+  page (Web Layout). At most 64 others and 2,000 selection rectangles are drawn: eight
+  participants each selecting a 20,000-line document cost about 0.1 ms a frame.
 
 ## What it guarantees, and what pins it
 
@@ -377,7 +404,10 @@ where everyone is from `room.participants`. Presence sends no document text.
 | File › Share runs the room's commands and shows its state | `crates/ui-egui/src/share_page/tests.rs` |
 | Agents reach only the files the setting allows | `crates/engine/src/tests/room_files.rs` |
 | Undo takes back only one's own steps | `crates/engine/src/tests/room_undo.rs` |
+| Places follow the text and reach every copy, with a colour each | `crates/engine/src/tests/room_presence.rs` |
+| The window draws others where they are, follows them, and stays in time with long selections | `crates/ui-egui/src/canvas/presence.rs` tests |
 | A person, ChatGPT and an ACP agent edit at once (fakes) | `apps/wordcraft-cli/tests/it/gate.rs` |
+| The A1 gate: a person in the window and three agents over the room's port edit a 191-page document at once, with no stall, no caret jump, every edit once with its author, and undo of only the person's steps | `crates/ui-egui/src/tests/gate.rs` |
 | No command panics on junk params | `crates/engine/src/tests.rs::hostile_params_never_panic` |
 
 ## Known limits today
@@ -394,9 +424,10 @@ where everyone is from `room.participants`. Presence sends no document text.
   and a tracked step can't be undone after anyone else's tracked change. Text-level undo is A4.
 - **No agent API yet.** Agents use the same commands as people, addressed by places; guarded,
   content-addressed edits, leases and events are A2.
-- **The assistant's place isn't drawn.** The person sees the assistant's edits but not its caret,
-  selection or name in the text until presence lands (#32), and the assistant learns of the
-  person's typing only from the changes, not from where the person is.
+- **The assistant doesn't see where others are.** The window draws the assistant's caret,
+  selection and name like any participant's (#32), but the assistant has no tool for
+  `room.participants` yet, so it learns of the person's typing only from the changes, not from
+  where the person is.
 - **The assistant doesn't wake on its own.** It works when the person asks in the pane (or a
   script asks through `assist.*`); a comment that mentions it doesn't reach it until A2.
 
@@ -408,7 +439,7 @@ agents. Issues: #28 (parent) and one sub-issue per milestone.
 | Milestone | Scope | Gate |
 |---|---|---|
 | **A0 Foundations** (done) | Block ids (#2), changes that apply to any copy (#3), command scopes (#4), the hub spike (#5, kept open as a reference, never merged), this design doc (#40) | A second copy follows a person's edits exactly |
-| **A1 Shared instance** (#29) | In one process: in-app hub, agents' copies on their own threads, keys and roles, undo per participant (done: #7, #9, #12, #13, #14, #45, #64, and File › Share #33 in #70); left: presence (#32), the gate test (#34) | Two agents and a person edit at once, with no stalls |
+| **A1 Shared instance** (#29, done) | In one process: in-app hub, agents' copies on their own threads, keys and roles, undo per participant (#7, #9, #12, #13, #14, #45, #64), File › Share (#33 in #70), presence (#32 in #71 and #72), and the gate test (#34 in #77) | Two agents and a person edit at once, with no stalls |
 | **A2 Agent API** (#35) | On one machine: content-addressed reads, guarded edits, rewrites as word-level tracked changes, room chat, leases (Review › Block Authors), people first (an agent's direct edit to a paragraph a person just typed in is refused as busy), MCP Events push and poll | Scenario steps 1 to 4 pass with scripted agents |
 | **A3 Network rooms** (#36) | Agents in remote sandboxes join the person's desktop room (design #73): remote-safe invites (done, #74), MCP over Streamable HTTP (#75), an outbound relay so no tunnel is needed (#76). Then the hub over TLS with keys, durable write-ahead log, snapshots that keep source XML, app and browser copies, offline editing in Merge and Suggest modes, version history, agent drafts (fork and merge), signed webhooks | With the hub killed or a laptop offline for an hour, nothing is lost |
 | **A4 Hardening** (#37) | Seeded simulation over a lossy network, protocol fuzzing, text-level undo, 10 people on 188 pages | Simulation clean, latency targets met |
@@ -437,11 +468,12 @@ agents. Issues: #28 (parent) and one sub-issue per milestone.
 
 The assistant gains with each milestone, as every agent does:
 
-- **A1.5 presence (#32):** its caret, selection and name drawn in the text in its own colour while
-  it works, and the person's place visible to it, so it can keep away from where the person is
-  typing.
-- **A1.6 gate (#34):** two agents and a person edit at once with no stalls, the pane's assistant
-  among them.
+- **A1.5 presence (#32, done):** its caret, selection and name are drawn in the text in its own
+  colour while it works. Next, a tool for the person's place, so it can keep away from where the
+  person is typing.
+- **A1.6 gate (#34, done):** a person and three agents edit at once with no stalls
+  (`crates/ui-egui/src/tests/gate.rs`); the pane's assistant has its own gate with ChatGPT and an
+  ACP agent (#27, `apps/wordcraft-cli/tests/it/gate.rs`).
 - **A2 (#35):** guarded, content-addressed edits, so a stale rewrite is refused with the current
   text instead of landing; rewrites as word-level tracked changes with a rationale; room chat;
   leases on a range; a person's paragraph kept free while they type in it; mentions in comments
@@ -495,11 +527,15 @@ ids included.
 | Hub, copy, role rules, hosted copies | `crates/engine/src/room/{hub,replica,rules,hosted}.rs` |
 | Files agents can use | `crates/engine/src/agent_files.rs` |
 | The window's room; File › Share | `crates/ui-egui/src/share.rs`, `crates/ui-egui/src/share_page.rs` |
+| Places (presence) | `crates/engine/src/room.rs` (`Presence`), `room/{hub,replica}.rs` |
+| Others in the window, avatars, following | `crates/ui-egui/src/canvas/presence.rs`, `crates/ui-egui/src/avatars.rs` |
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-07 | trivial | A1 done: the gate test (#34, #77) passes; the A1 row, a guarantee row for it, and the assistant's A1.6 line |
+| 2026-11-07 | minor | Presence as built (#32, #71, #72) replaces the placeholder: places as anchors told as of a version and moved with the text, eight colours, `room.participants` for agents, others' carets, selections and names in the window, avatars and following, and its cost; two guarantee rows, two code map rows; "the assistant's place isn't drawn" becomes "the assistant doesn't see where others are"; A1 row and the assistant's A1.5 line updated |
 | 2026-11-07 | minor | Block ids kept in Word files (#38, #69): paragraphs carry `w14:paraId` and, when it can't hold the whole id, an ignorable `wc:blockId`; tables `wc:blockId`; read back on open; the A5 row says the first step is done |
 | 2026-11-07 | minor | File › Share (#33, #70) and remote-safe invites (#74) as built: the page, `room.role`, revoking by name, invites that expire, join a set number of times or are remote; "No File › Share yet" dropped from known limits; A1 and A3 rows updated |
 | 2026-11-07 | minor | The built-in assistant as a co-editor: a "Who edits together" table (the person, the pane's assistant, outside agents), and how the pane's assistant joins and leaves, its roles, where its copy runs, a turn while the person types, tracked changes in its name, Stop, several assistants at once, its known limits and what comes next for it (Minoru's review of #68) |
