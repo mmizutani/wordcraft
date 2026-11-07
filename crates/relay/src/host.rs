@@ -265,9 +265,16 @@ fn poll_loop(s: &Arc<Shared>) {
 /// dropped unrun: its agent was told it timed out, and may already have sent it again.
 fn answer(s: &Arc<Shared>, id: u64, req: Request, until: Option<Instant>) {
     let run = move |s: &Shared| {
-        if until.is_some_and(|u| Instant::now() >= u) {
-            log::debug!("relay: a request waited too long here and wasn't run");
-            return;
+        let mut req = req;
+        if let Some(u) = until {
+            let left = u.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                log::debug!("relay: a request waited too long here and wasn't run");
+                return;
+            }
+            // The endpoint waits only what's left, in its own queue too.
+            req.headers.retain(|(n, _)| !n.eq_ignore_ascii_case(wordcraft_http::WAIT_HEADER));
+            req.headers.push((wordcraft_http::WAIT_HEADER.into(), left.as_millis().to_string()));
         }
         let resp = (s.handler)(&req);
         let body = wire::reply(id, &resp).to_string();

@@ -101,7 +101,7 @@ answers 503 with `Retry-After`.
 | Rooms | 1,024 in all, 16 a token. A room whose desktop hasn't asked for 40 seconds is offline to agents; after 24 hours it is forgotten |
 | An agent's request | 1 MiB, an answer within 180 seconds (else 504) |
 | A desktop's answer | 96 MiB (a 32 MB PDF as base64) |
-| Requests waiting for one desktop | 64 (else 503); a desktop may have 4 polls waiting at once (else 429) |
+| Requests waiting for one desktop | 64 (else 503), and 128 in all the rooms of one token (else 503); a desktop may have 4 polls waiting at once (else 429) |
 | Rate | 20 requests a second from one address (bursts of 40), 50 a second to one room (bursts of 100); more get 429 |
 | A request's head and body | must arrive within 60 seconds of its start, and a connection may sit idle 60 seconds between requests |
 
@@ -113,7 +113,7 @@ carries a relay token:
 | Request | Answer |
 |---|---|
 | `POST /host/rooms` `{}`, or `{"room", "secret"}` to open a room again (after the relay restarted) | `{"room", "secret", "url"}`; 401 for a wrong token, 409 for a room whose id isn't from that secret, or that another desktop is using |
-| `POST /host/r/<room>/poll` | `{"requests": [{"id", "method", "target", "headers", "body", "ttlMs"}]}`, waiting up to 25 seconds for one; 404 once the relay has forgotten the room. `ttlMs` is how long the agent still waits: the app doesn't start a request after that, as its agent has been told it timed out |
+| `POST /host/r/<room>/poll` | `{"requests": [{"id", "method", "target", "headers", "body", "ttlMs"}]}`, waiting up to 25 seconds for one; 404 once the relay has forgotten the room. `ttlMs` is how long the agent still waits: the app doesn't start a request after that, as its agent has been told it timed out, and its MCP endpoint is told what's left (`Wordcraft-Wait-Ms`) so it waits no longer in its own queue |
 | `POST /host/r/<room>/reply` `{"id", "status", "headers", "body"}` | 204 |
 | `DELETE /host/r/<room>` | closes the room |
 

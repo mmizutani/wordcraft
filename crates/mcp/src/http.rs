@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use wordcraft_http::{Request, Response, bearer};
+use wordcraft_http::{Request, Response, WAIT_HEADER, bearer};
 
 use crate::backend::Backend;
 use crate::server::{ALL_VERSIONS, MAX_REQUEST_LINE, META_VERSION, Server, UNSUPPORTED_VERSION, stateless_version};
@@ -201,7 +201,13 @@ impl Endpoint {
             e["error"]["data"] = json!({"supported": ALL_VERSIONS, "requested": v});
             return Response::json(400, e.to_string());
         }
-        let answer = match self.ask(key, body.to_string()) {
+        // A request that waited on the way here (a relay's desktop side says how long is left)
+        // waits only what's left: it never runs after its caller was told it timed out.
+        let wait = req
+            .header(WAIT_HEADER)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(self.options.timeout, |ms| self.options.timeout.min(Duration::from_millis(ms)));
+        let answer = match self.ask(key, body.to_string(), wait) {
             Ok(a) => a,
             Err(resp) => return resp,
         };
@@ -215,11 +221,11 @@ impl Endpoint {
     }
 
     /// Run `body` on `key`'s thread, opening it first when it has none.
-    fn ask(&self, key: &str, body: String) -> Result<Option<String>, Response> {
+    fn ask(&self, key: &str, body: String, wait: Duration) -> Result<Option<String>, Response> {
         for _ in 0..2 {
             let jobs = self.seat(key)?;
             let (tx, rx) = mpsc::channel();
-            let until = Instant::now().checked_add(self.options.timeout).unwrap_or_else(Instant::now);
+            let until = Instant::now().checked_add(wait).unwrap_or_else(Instant::now);
             match jobs.try_send(Job { body: body.clone(), answer: tx, until }) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
@@ -231,7 +237,7 @@ impl Endpoint {
                     continue;
                 }
             }
-            return match rx.recv_timeout(self.options.timeout) {
+            return match rx.recv_timeout(wait) {
                 Ok(a) if a.ended => {
                     self.forget(key);
                     Err(refusal(401, -32600, "the WordCraft app no longer takes this key: it was taken back, or its time was up")

@@ -50,6 +50,9 @@ pub struct Config {
     pub forget_after: Duration,
     /// Requests waiting in one room.
     pub max_waiting: usize,
+    /// Agents' requests waiting for an answer, in all the rooms of one token: queued or being
+    /// answered. One token can't hold every connection the relay has.
+    pub waiting_per_token: usize,
     /// Requests per second (and burst) from one address, and to one room.
     pub per_source: (f64, f64),
     pub per_room: (f64, f64),
@@ -68,6 +71,7 @@ impl Default for Config {
             offline_after: Duration::from_secs(40),
             forget_after: Duration::from_secs(24 * 60 * 60),
             max_waiting: 64,
+            waiting_per_token: 128,
             per_source: (20.0, 40.0),
             per_room: (50.0, 100.0),
         }
@@ -139,6 +143,27 @@ pub struct Relay {
     config: Config,
     rooms: Mutex<HashMap<String, Arc<Room>>>,
     sources: Mutex<HashMap<IpAddr, Bucket>>,
+    /// Agents' requests waiting for an answer, by the token of their room.
+    waiting: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+/// One request's place in its token's count, given back however its wait ends.
+struct Waits {
+    counts: Arc<Mutex<HashMap<String, usize>>>,
+    token: String,
+}
+
+impl Drop for Waits {
+    fn drop(&mut self) {
+        if let Ok(mut c) = self.counts.lock()
+            && let Some(n) = c.get_mut(&self.token)
+        {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                c.remove(&self.token);
+            }
+        }
+    }
 }
 
 /// An error an MCP client reads: a JSON-RPC error with no id.
@@ -148,7 +173,7 @@ fn refusal(status: u16, message: &str) -> Response {
 
 impl Relay {
     pub fn new(config: Config) -> Self {
-        Relay { config, rooms: Mutex::new(HashMap::new()), sources: Mutex::new(HashMap::new()) }
+        Relay { config, rooms: Mutex::new(HashMap::new()), sources: Mutex::new(HashMap::new()), waiting: Arc::new(Mutex::new(HashMap::new())) }
     }
 
     fn room(&self, id: &str) -> Option<Arc<Room>> {
@@ -365,6 +390,15 @@ impl Relay {
         }
         let Some(room) = self.room(id) else { return refusal(404, "no such room: the link is wrong, or the document isn't shared any more") };
         let Ok(body) = std::str::from_utf8(&req.body) else { return refusal(400, "the body is not UTF-8") };
+        let _waits = {
+            let Ok(mut c) = self.waiting.lock() else { return refusal(500, "internal error") };
+            let n = c.entry(room.token.clone()).or_insert(0);
+            if *n >= self.config.waiting_per_token {
+                return refusal(503, "too many requests are waiting for this relay user's documents").with_header("Retry-After", "1");
+            }
+            *n += 1;
+            Waits { counts: self.waiting.clone(), token: room.token.clone() }
+        };
         let (tx, rx) = mpsc::channel();
         let n = {
             let Some(mut w) = room.lock() else { return refusal(500, "internal error") };

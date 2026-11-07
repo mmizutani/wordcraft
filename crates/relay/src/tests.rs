@@ -381,6 +381,9 @@ fn a_request_whose_agent_gave_up_is_never_run_late() {
     let r = ran.clone();
     let desktop: wordcraft_http::Handler = Arc::new(move |req: &Request| {
         let body = String::from_utf8_lossy(&req.body).to_string();
+        // The endpoint is told how long the agent has left, to wait no longer in its own queue.
+        let left = req.header(wordcraft_http::WAIT_HEADER).and_then(|v| v.parse::<u64>().ok());
+        assert!(left.is_some_and(|ms| ms > 0 && ms <= 10_000), "{left:?}");
         r.lock().unwrap().push(body.clone());
         std::thread::sleep(Duration::from_millis(match body.as_str() {
             "hold" => 1500,
@@ -440,4 +443,36 @@ fn a_rooms_waiting_polls_are_capped() {
     let mut statuses: Vec<u16> = polls.into_iter().map(|p| p.join().unwrap()).collect();
     statuses.sort_unstable();
     assert_eq!(statuses, [200, 200, 200, 200, 429, 429, 429, 429]);
+}
+
+/// One token's rooms together hold only so many agents' requests waiting: past that, more are
+/// refused at once rather than holding the relay's connections from everyone else.
+#[test]
+fn a_tokens_waiting_requests_are_capped_across_its_rooms() {
+    let (base, _relay) = relay(|c| {
+        c.waiting_per_token = 3;
+        c.answer_wait = Duration::from_millis(1200);
+    });
+    let open = || {
+        let (status, _, body) = http(&format!("{base}/host/rooms"), "POST", &[("Authorization", &format!("Bearer {TOKEN}"))], "{}");
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()["url"].as_str().unwrap().to_string()
+    };
+    let (a, b) = (open(), open());
+    // Nobody answers: each request waits until it times out, unless it is turned away.
+    let agents: Vec<_> = [&a, &a, &b, &b]
+        .into_iter()
+        .map(|url| {
+            let url = url.clone();
+            let t = std::thread::spawn(move || http(&url, "POST", &[], "{}"));
+            std::thread::sleep(Duration::from_millis(50));
+            t
+        })
+        .collect();
+    let mut statuses: Vec<u16> = agents.into_iter().map(|t| t.join().unwrap().0).collect();
+    statuses.sort_unstable();
+    assert_eq!(statuses, [503, 504, 504, 504]);
+    // Once they're done, the token's rooms take requests again.
+    let t = std::thread::spawn(move || http(&a, "POST", &[], "{}").0);
+    assert_eq!(t.join().unwrap(), 504, "waited, not turned away");
 }

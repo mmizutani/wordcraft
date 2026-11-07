@@ -528,6 +528,11 @@ pub fn same_secret(a: &str, b: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// How long, in milliseconds, whoever passed a request on still waits for its answer: a relay's
+/// desktop side sets it, so a request that waited there doesn't wait its whole time again. A
+/// server takes it only to wait less than it would.
+pub const WAIT_HEADER: &str = "Wordcraft-Wait-Ms";
+
 /// The token in an `Authorization: Bearer <token>` header.
 pub fn bearer(req: &Request) -> Option<&str> {
     let v = req.header("Authorization")?;
