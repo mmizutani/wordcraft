@@ -35,6 +35,11 @@ const ARRIVING_PER_SOURCE: usize = 16;
 /// Bodies that may be arriving at once from one token's desktops (rooms opened, small answers):
 /// a desktop answers up to 16 requests at once.
 const ARRIVING_PER_TOKEN: usize = 32;
+/// The most an agent's request may be once written into a poll's answer: a JSON body escapes
+/// to at most twice its size; more means bytes that JSON would never carry raw.
+const MAX_QUEUED: usize = 2 * MAX_REQUEST + (64 << 10);
+/// The most one poll's answer carries, unless its first request alone is more.
+const PER_POLL_BYTES: usize = 4 << 20;
 /// Requests a desktop takes in one poll.
 const PER_POLL: usize = 16;
 
@@ -123,6 +128,8 @@ impl Bucket {
 struct Queued {
     request: Value,
     until: Instant,
+    /// Its size in a poll's answer.
+    bytes: usize,
 }
 
 struct Waiting {
@@ -452,19 +459,45 @@ impl Relay {
         // has given up (and may already be asking again). With them, how long the poll waited
         // here: the desktop counts the rest of its call, the trip there and back, out of that.
         let now = Instant::now();
-        let n = w.queue.len().min(PER_POLL);
+        w.queue.retain(|q| q.until > now);
+        // A few megabytes at most, so a poll's answer, held until the desktop has read it, is
+        // never large.
+        let (mut n, mut bytes) = (0, 0usize);
+        while let Some(q) = w.queue.get(n) {
+            if n >= PER_POLL || (n > 0 && bytes.saturating_add(q.bytes) > PER_POLL_BYTES) {
+                break;
+            }
+            bytes = bytes.saturating_add(q.bytes);
+            n += 1;
+        }
+        // Counted with the token's answers waiting to be read: past its budget, the requests
+        // stay queued and the desktop asks again shortly.
+        let unsent = match (n, self.reserve(&room.token, bytes)) {
+            (0, _) => None,
+            (_, Some(u)) => Some(u),
+            (_, None) => {
+                drop(w);
+                std::thread::sleep(Duration::from_millis(250));
+                let waited = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
+                return Response::json(200, json!({"requests": [], "waitedMs": waited}).to_string());
+            }
+        };
         let requests: Vec<Value> = w
             .queue
             .drain(..n)
-            .filter_map(|q| {
+            .map(|q| {
                 let left = q.until.saturating_duration_since(now);
                 let mut r = q.request;
                 r["ttlMs"] = json!(u64::try_from(left.as_millis()).unwrap_or(u64::MAX));
-                (!left.is_zero()).then_some(r)
+                r
             })
             .collect();
         let waited = u64::try_from(now.saturating_duration_since(asked).as_millis()).unwrap_or(u64::MAX);
-        Response::json(200, json!({"requests": requests, "waitedMs": waited}).to_string())
+        let resp = Response::json(200, json!({"requests": requests, "waitedMs": waited}).to_string());
+        match unsent {
+            Some(u) => resp.holding(u),
+            None => resp,
+        }
     }
 
     /// `POST /host/r/<room>/reply`: the desktop's answer to one request.
@@ -553,6 +586,11 @@ impl Relay {
         }
         let Some(room) = self.room(id) else { return refusal(404, "no such room: the link is wrong, or the document isn't shared any more") };
         let Ok(body) = std::str::from_utf8(&req.body) else { return refusal(400, "the body is not UTF-8") };
+        // Its size as the desktop will be sent it (the id written later is a few digits more).
+        let bytes = wire::forward(0, req, target, body).to_string().len().saturating_add(32);
+        if bytes > MAX_QUEUED {
+            return refusal(413, "the request is too large once written for the desktop (an MCP request's JSON never is)");
+        }
         // While agents are slow to read answers already given, nothing new goes to the desktop:
         // refused before it runs, a request is safe to send again.
         if let Ok(s) = self.sending.lock()
@@ -591,7 +629,7 @@ impl Relay {
             }
             let n = w.next;
             w.next = w.next.wrapping_add(1) & ID_MASK;
-            w.queue.push_back(Queued { request: wire::forward(n, req, target, body), until: Instant::now() + self.config.answer_wait });
+            w.queue.push_back(Queued { request: wire::forward(n, req, target, body), until: Instant::now() + self.config.answer_wait, bytes });
             w.answers.insert(n, tx);
             n
         };

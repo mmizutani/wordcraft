@@ -659,6 +659,54 @@ fn refused_agent_requests_close_their_connection() {
     drop(hosting);
 }
 
+/// What a desktop is sent in one poll is bounded in bytes, as written: a request whose body
+/// would grow past twice its size in a poll's answer (raw control bytes, which an MCP request's
+/// JSON never has) is refused, a poll carries a few megabytes at most, and polls' answers count
+/// with the token's answers waiting to be read.
+#[test]
+fn polls_are_bounded_in_bytes() {
+    let (_base, relay) = relay(|c| {
+        c.poll_wait = Duration::from_millis(200);
+        c.answer_wait = Duration::from_secs(5);
+        c.sending_per_token = 10;
+    });
+    let call = |method: &str, target: &str, auth: Option<&str>, body: Vec<u8>| {
+        let headers = auth.map(|a| vec![("Authorization".to_string(), format!("Bearer {a}"))]).unwrap_or_default();
+        relay.handle(&Request { method: method.into(), target: target.into(), headers, body, peer: None })
+    };
+    let opened: Value = serde_json::from_slice(&call("POST", "/host/rooms", Some(TOKEN), b"{}".to_vec()).body).unwrap();
+    let (room, secret) = (opened["room"].as_str().unwrap().to_string(), opened["secret"].as_str().unwrap().to_string());
+    let poll = || {
+        let r = call("POST", &format!("/host/r/{room}/poll"), Some(&secret), Vec::new());
+        let n = serde_json::from_slice::<Value>(&r.body).unwrap()["requests"].as_array().map_or(0, Vec::len);
+        (n, r)
+    };
+    // Marks the room online.
+    assert_eq!(poll().0, 0);
+    let raw = "\u{1}".repeat(MAX_REQUEST / 2).into_bytes();
+    assert_eq!(call("POST", &format!("/r/{room}/mcp"), None, raw).status, 413);
+    // Three requests of about 1.8 MB each as written: a poll carries two.
+    let agents: Vec<_> = (0..3)
+        .map(|_| {
+            let (relay, room) = (relay.clone(), room.clone());
+            std::thread::spawn(move || {
+                let body = format!("\"{}\"", "\\".repeat(900_000)).into_bytes();
+                relay.handle(&Request { method: "POST".into(), target: format!("/r/{room}/mcp"), headers: Vec::new(), body, peer: None }).status
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    let (first, held) = poll();
+    assert_eq!(first, 2);
+    assert!(held.body.len() <= 4 << 20, "{}", held.body.len());
+    // Its answer counts with the token's answers being sent: past that budget, the next poll
+    // waits until it has been read.
+    assert_eq!(poll().0, 0, "the first poll's answer hasn't been read");
+    drop(held);
+    assert_eq!(poll().0, 1);
+    drop(agents);
+}
+
 /// A large answer whose upload breaks off gives its place back at once, not when its time would
 /// have run out: two broken uploads don't keep the token's next large answers out.
 #[test]

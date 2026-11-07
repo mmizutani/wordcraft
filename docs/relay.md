@@ -99,7 +99,8 @@ answers 503 with `Retry-After`.
 | | |
 |---|---|
 | Rooms | 1,024 in all, 16 a token. A room whose desktop hasn't asked for 40 seconds is offline to agents; after 24 hours it is forgotten |
-| An agent's request | 1 MiB, an answer within 180 seconds (else 504) |
+| An agent's request | 1 MiB, an answer within 180 seconds (else 504). One that would grow past about 2 MiB as written in a poll's answer (raw control characters, which an MCP request's JSON never has) is refused with 413 |
+| A poll's answer | 16 requests and 4 MiB as written (one larger request goes alone). It counts with the token's answers waiting to be read: past that budget, a poll comes back empty after a moment and its requests stay queued |
 | A desktop's answer | 96 MiB (a 32 MB PDF as base64). One larger than an agent's request is taken only while an agent waits (else 404), two at once from one token's desktops and 16 in all (else 503: the desktop sends it again). A place goes back as soon as its upload ends, even when it breaks off |
 | Answers waiting for agents to read them | 192 MiB from one token's rooms, 1 GiB in all: past that, new requests get 503 before they reach the desktop, and an answer that arrives past it gets 503 too: the desktop keeps it and sends it again (never runs it again) until its agent stops waiting |
 | Requests waiting for one desktop | 64 (else 503), and 128 in all the rooms of one token (else 503); a desktop may have 4 polls waiting at once (else 429) |
