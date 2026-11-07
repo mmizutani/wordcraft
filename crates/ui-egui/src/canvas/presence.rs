@@ -452,7 +452,8 @@ mod tests {
         let mut ada = agent(a, &lobby, "Ada");
         let mut ben = agent(a, &lobby, "Ben");
         runs(&mut ada, "select.all", json!({}));
-        runs(&mut ben, "select.text", json!({"text": "line 2590"}));
+        // The last line, on the last page whatever fonts lay the document out.
+        runs(&mut ben, "select.text", json!({"text": "line 2599"}));
         owner(h.state_mut(), "caret.docEnd", json!({}));
         h.run_steps(4);
         let a = h.state_mut();
