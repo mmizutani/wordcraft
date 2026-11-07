@@ -744,10 +744,17 @@ mod tests {
         let mut agent = lobby.join_with(&key).unwrap();
         agent_runs(&mut agent, "caret.docEnd", json!({}));
         agent_runs(&mut agent, "text.insert", json!({"text": " four"}));
-        // `app.quit` quits unasked, and sharing stops first: the agent's copy stops answering.
-        // (The agent's edit is in the window already: every control request first gets what the
-        // room took.)
-        result(&mut a, "app.quit", json!({}));
+        // The agent's edit is unsaved work in the window (every control request first gets what
+        // the room took), so `app.quit` without `force` refuses, as with any unsaved change
+        // (#3274), and the room stays open.
+        let refused = call(&mut a, "app.quit", json!({}));
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert!(refused["error"].as_str().unwrap().contains("unsaved"), "{refused}");
+        assert!(!a.quit_requested);
+        assert!(a.share.is_some());
+        assert_eq!(agent_runs(&mut agent, "document.inspect", json!({}))["blocks"][0]["text"], "one two three four");
+        // With `force` it quits, and sharing stops first: the agent's copy stops answering.
+        result(&mut a, "app.quit", json!({"force": true}));
         assert!(a.quit_requested);
         assert!(a.share.is_none());
         assert_eq!(text(&a), "one two three four");

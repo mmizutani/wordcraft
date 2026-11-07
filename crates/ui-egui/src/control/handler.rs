@@ -431,9 +431,8 @@ pub fn handle(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) -> O
             if let Some(e) = quit_refused(app, p) {
                 return err(e);
             }
-            // The app quits at once, unasked: sharing stops first, so the participants'
-            // connections end with the room, and the window has every change it took, which is
-            // checked again.
+            // Sharing stops before the app quits, so the participants' connections end with the
+            // room, and the window has every change it took, which is checked again.
             if app.stop_sharing()
                 && let Some(e) = quit_refused(app, p)
             {

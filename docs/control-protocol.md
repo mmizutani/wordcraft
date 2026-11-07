@@ -273,10 +273,10 @@ window's own do while it shows the document.
 
 Closing the shared document stops sharing too, however it closes (`file.close`, with `doc` or
 without, or `file.closeDocument`), and so does quitting the app: once nothing is left unsaved,
-the room closes before the app does (`app.quit`, which quits without asking, closes it first
-too). A close or a quit sees every change the room took until then: an agent's edit since the
-window's last frame is unsaved work, so a close without `force` is refused for it, and the
-person's Close or quit asks to save it. A macro can't close the shared document while it is
+the room closes before the app does (`app.quit` closes it first too). A close or a quit sees
+every change the room took until then: an agent's edit since the window's last frame is unsaved
+work, so a close or `app.quit` without `force` is refused for it, and the person's Close or quit
+asks to save it. A macro can't close the shared document while it is
 shared: its `file.closeDocument` step fails, saying to stop sharing first. A shared document is
 never replaced by a file opened in its place, even a blank one: `file.open` opens beside it.
 One document is shared at a time. Undo and Redo (`edit.undo`, `edit.redo`, `edit.undoTo`) take
