@@ -32,6 +32,9 @@ const MAX_POLLS: usize = 4;
 /// Agents' request bodies that may be arriving at once from one address: each holds a
 /// connection until it has arrived.
 const ARRIVING_PER_SOURCE: usize = 16;
+/// Bodies that may be arriving at once from one token's desktops (rooms opened, small answers):
+/// a desktop answers up to 16 requests at once.
+const ARRIVING_PER_TOKEN: usize = 32;
 /// Requests a desktop takes in one poll.
 const PER_POLL: usize = 16;
 
@@ -164,7 +167,7 @@ pub struct Relay {
     /// Large answers being received, by the token of their room: each place goes back once its
     /// request is done, however it ends.
     large: Arc<Mutex<HashMap<String, usize>>>,
-    /// Agents' request bodies being received, by the address they come from.
+    /// Bodies being received: agents' by the address they come from, desktops' by their token.
     arriving: Arc<Mutex<HashMap<String, usize>>>,
 }
 
@@ -248,7 +251,8 @@ impl Relay {
     /// a client that sends a head and holds back the body can't hold a connection unless it
     /// could make the request at all:
     ///
-    /// - a desktop's calls need its room's secret (or, to open a room, a relay token);
+    /// - a desktop's calls need its room's secret (or, to open a room, a relay token), and only
+    ///   a few bodies may be arriving at once for one token's desktops;
     /// - an agent's request needs a room that exists, and only a few may be arriving at once
     ///   from one address;
     /// - anything else has no body.
@@ -260,33 +264,55 @@ impl Relay {
         let path = req.path().to_string();
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         match parts.as_slice() {
-            ["host", "rooms"] => {
-                if bearer(req).is_some_and(|t| self.config.tokens.iter().any(|k| same_secret(t, k))) {
-                    Ok((MAX_REQUEST, Hold::default()))
-                } else {
-                    Err(Response::text(401, "a relay token goes in Authorization: Bearer\n")
-                        .with_header("WWW-Authenticate", "Bearer realm=\"wordcraft-relay\""))
-                }
-            }
+            ["host", "rooms"] => match bearer(req).and_then(|t| self.config.tokens.iter().find(|k| same_secret(t, k))) {
+                Some(token) => self.host_body(req, token),
+                None => Err(Response::text(401, "a relay token goes in Authorization: Bearer\n")
+                    .with_header("WWW-Authenticate", "Bearer realm=\"wordcraft-relay\"")),
+            },
             ["host", "r", id, rest @ ..] => match self.hosts(req, id) {
                 None => Err(Response::text(404, "no such room (or not its secret)\n")),
                 Some(room) if rest == ["reply"] => self.answer_limit(req, &room),
-                Some(_) => Ok((MAX_REQUEST, Hold::default())),
+                Some(room) => self.host_body(req, &room.token),
             },
             ["r", id, rest @ ..] if !rest.is_empty() => {
                 if self.room(id).is_none() {
                     return Err(refusal(404, "no such room: the link is wrong, or the document isn't shared any more"));
                 }
                 let from = self.source(req).map(|ip| ip.to_string()).unwrap_or_default();
-                let Ok(mut arriving) = self.arriving.lock() else { return Err(refusal(500, "internal error")) };
-                let n = arriving.entry(from.clone()).or_insert(0);
-                if *n >= ARRIVING_PER_SOURCE {
-                    return Err(refusal(429, "too many requests from this address").with_header("Retry-After", "1"));
+                match self.arrive(format!("from {from}"), ARRIVING_PER_SOURCE) {
+                    Some(place) => Ok((MAX_REQUEST, place)),
+                    None => Err(refusal(429, "too many requests from this address").with_header("Retry-After", "1")),
                 }
-                *n += 1;
-                Ok((MAX_REQUEST, Hold::new(Place { counts: self.arriving.clone(), key: from })))
             }
             _ => Ok((0, Hold::default())),
+        }
+    }
+
+    /// A place among the bodies arriving at once under `key`, when fewer than `cap` are.
+    fn arrive(&self, key: String, cap: usize) -> Option<Hold> {
+        let mut arriving = self.arriving.lock().ok()?;
+        let n = arriving.entry(key.clone()).or_insert(0);
+        if *n >= cap {
+            return None;
+        }
+        *n += 1;
+        Some(Hold::new(Place { counts: self.arriving.clone(), key }))
+    }
+
+    /// The body limit for a call from one of `token`'s desktops: a place among that token's
+    /// bodies arriving at once, when it has a body.
+    fn host_body(&self, req: &Request, token: &str) -> Result<(usize, Hold), Response> {
+        let has_body = match req.header("Content-Length") {
+            Some(n) => n.trim() != "0",
+            None => req.header("Transfer-Encoding").is_some(),
+        };
+        if !has_body {
+            return Ok((MAX_REQUEST, Hold::default()));
+        }
+        match self.arrive(format!("token {token}"), ARRIVING_PER_TOKEN) {
+            Some(place) => Ok((MAX_REQUEST, place)),
+            None => Err(Response::text(429, "too many calls from this relay user's desktops are arriving at once: try again\n")
+                .with_header("Retry-After", "1")),
         }
     }
 
@@ -294,7 +320,7 @@ impl Relay {
     fn answer_limit(&self, req: &Request, room: &Room) -> Result<(usize, Hold), Response> {
         let size = req.header("Content-Length").and_then(|n| n.trim().parse::<usize>().ok());
         if size.is_some_and(|n| n <= MAX_REQUEST) {
-            return Ok((MAX_REQUEST, Hold::default()));
+            return self.host_body(req, &room.token);
         }
         if room.lock().is_none_or(|w| w.answers.is_empty()) {
             return Err(Response::text(404, "nobody waits for an answer\n"));

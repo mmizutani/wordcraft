@@ -596,6 +596,40 @@ fn heads_without_their_bodies_are_turned_away_unless_the_request_could_be_made()
     drop(hosting);
 }
 
+/// A relay token's holder can't hold the relay's connections by sending desktop calls' heads
+/// and holding back their bodies: only a few may be arriving at once for one token, rooms
+/// opened and answers alike; polls, which have no body, aren't held back.
+#[test]
+fn a_tokens_desktop_bodies_arriving_at_once_are_capped() {
+    let (base, _relay) = relay(|c| c.poll_wait = Duration::from_millis(200));
+    let (status, _, body) = http(&format!("{base}/host/rooms"), "POST", &[("Authorization", &format!("Bearer {TOKEN}"))], "{}");
+    assert_eq!(status, 200, "{body}");
+    let opened: Value = serde_json::from_str(&body).unwrap();
+    let (room, secret) = (opened["room"].as_str().unwrap().to_string(), opened["secret"].as_str().unwrap().to_string());
+    let port = base.rsplit(':').next().unwrap().to_string();
+    let head = |path: &str, auth: &str| {
+        let mut s = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        s.write_all(format!("POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {auth}\r\nContent-Length: 1000\r\n\r\n").as_bytes()).unwrap();
+        s
+    };
+    let answered = |s: &mut TcpStream| {
+        s.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut out = [0u8; 12];
+        s.read(&mut out).ok().filter(|n| *n >= 12).and_then(|_| std::str::from_utf8(&out[9..12]).ok().and_then(|c| c.parse::<u16>().ok()))
+    };
+    let reply = format!("/host/r/{room}/reply");
+    let mut waiting: Vec<TcpStream> = (0..32).map(|i| if i % 2 == 0 { head("/host/rooms", TOKEN) } else { head(&reply, &secret) }).collect();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(answered(&mut head("/host/rooms", TOKEN)), Some(429));
+    assert_eq!(answered(&mut head(&reply, &secret)), Some(429));
+    // A poll has no body: it isn't held back.
+    let (status, _, _) = http(&format!("{base}/host/r/{room}/poll"), "POST", &[("Authorization", &format!("Bearer {secret}"))], "");
+    assert_eq!(status, 200);
+    drop(waiting.pop());
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(answered(&mut head("/host/rooms", TOKEN)), None);
+}
+
 /// A large answer whose upload breaks off gives its place back at once, not when its time would
 /// have run out: two broken uploads don't keep the token's next large answers out.
 #[test]
