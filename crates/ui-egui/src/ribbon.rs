@@ -163,6 +163,9 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                     let editing_label = if app.session.doc.settings.track_changes { tl!("Reviewing") } else { tl!("Editing") };
                     let comments = tl!("Comments");
                     let share_w = ui.ctx().fonts_mut(|f| f.layout_no_wrap(share.to_string(), medium(12.0), t.text).size().x);
+                    // Who else is in the shared document (#32): their avatars keep their room too.
+                    let avatars = app.avatars();
+                    let avatars_w = crate::avatars::width(avatars.len());
                     let spaced = |w: f32| w + 2.0;
                     let button_widths = |level: usize| -> f32 {
                         let labels = level == 0;
@@ -171,7 +174,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                         let editing = crate::widgets::icon_text_button_width(ui, editing_label, regular(12.0), true, labels);
                         let comment = crate::widgets::icon_text_button_width(ui, comments, regular(12.0), false, labels);
                         // The gaps (6 + 4 + 8) and the strip's margin.
-                        spaced(share_button) + spaced(editing) + spaced(comment) + 18.0 + 12.0
+                        spaced(share_button) + spaced(editing) + spaced(comment) + 18.0 + 12.0 + avatars_w
                     };
                     let button_levels = [button_widths(0), button_widths(1), button_widths(2)];
                     let labels: Vec<&str> = tabs.iter().map(|(tab, custom)| if *custom { tab.as_str() } else { tl!(tab) }).collect();
@@ -244,6 +247,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                             if comments_button.clicked() {
                                 let _ = app.run("view.commentsPane", json!({}));
                             }
+                            crate::avatars::row(app, ui, &t, &avatars);
                         });
                         ui.add_space(8.0);
                         // The tabs fill the room left of the cluster, from the side reading starts from.

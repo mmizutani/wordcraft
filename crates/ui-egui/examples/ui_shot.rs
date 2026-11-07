@@ -24,7 +24,12 @@
 //! signing in to ChatGPT (`assist.chatgpt.signIn`, #19; no browser opens here).
 //! `{"settingsDir": "/abs/dir"}` gives the window a settings folder (the agents' settings in
 //! File › Options › Assistant read and save there, and a ChatGPT sign-in is kept there), and
-//! `{"web": true}` has it offer what the web app does: no assistant.
+//! `{"web": true}` has it offer what the web app does: no assistant. Once the document is shared
+//! (`{"method": "room.share"}`), `{"agent": name, "role"?: role, "run": [[command, params], …]}`
+//! invites a participant called `name` (an editor unless `role` says otherwise), joins with the
+//! key in a copy of their own, as an agent does over the control channel, and runs the commands
+//! there (`select.text`, `caret.set`, `text.insert`…), so the window shows their caret, selection
+//! and name (#32); the next line naming the same agent runs more commands in the same copy.
 
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{ControlRequest, Services, WordApp};
@@ -65,7 +70,9 @@ fn main() -> Result<(), String> {
     // `{"settingsDir": "/abs/dir"}`: the settings folder, where File › Options › Assistant keeps
     // the agents' settings (#24); none otherwise, as in tests.
     let settings_dir = lines.iter().find_map(|l| l.get("settingsDir").and_then(|v| v.as_str())).map(std::path::PathBuf::from);
-    let mut app = WordApp::new(Session::new(doc), Services { settings_dir, ..Services::default() }).with_control(rx);
+    let lobby = wordcraft_engine::room::Lobby::default();
+    let mut agents: Vec<(String, wordcraft_engine::room::Replica)> = Vec::new();
+    let mut app = WordApp::new(Session::new(doc), Services { settings_dir, ..Services::default() }).with_control(rx).with_lobby(lobby.clone());
     app.integrated_titlebar = true;
     if lines.first().is_some_and(|l| l.get("startScreen").is_some()) {
         app.start_screen();
@@ -110,6 +117,39 @@ fn main() -> Result<(), String> {
             let r = harness.state_mut().run(id, l.get("params").cloned().unwrap_or_else(|| serde_json::json!({})));
             println!("{id}: {}", r.map_or_else(|e| e, |v| v.to_string()));
             step_n(&mut harness, 2);
+        } else if let Some(name) = l.get("agent").and_then(|v| v.as_str()) {
+            if !agents.iter().any(|(n, _)| n == name) {
+                let role = l.get("role").and_then(|v| v.as_str()).unwrap_or("editor");
+                let (req, reply) = ControlRequest::new("room.invite", serde_json::json!({"name": name, "role": role}));
+                tx.send(req).expect("send");
+                let mut key = None;
+                for _ in 0..60 {
+                    step(&mut harness);
+                    if let Ok(r) = reply.try_recv() {
+                        key = r.pointer("/result/key").and_then(|k| k.as_str()).map(str::to_string);
+                        if key.is_none() {
+                            eprintln!("room.invite {name}: {r}");
+                        }
+                        break;
+                    }
+                }
+                let Some(key) = key else { continue };
+                match lobby.join_with(&key) {
+                    Ok(copy) => agents.push((name.to_string(), copy)),
+                    Err(e) => {
+                        eprintln!("{name} joins: {e}");
+                        continue;
+                    }
+                }
+            }
+            if let Some((_, copy)) = agents.iter_mut().find(|(n, _)| n == name) {
+                for c in l.get("run").and_then(|v| v.as_array()).into_iter().flatten() {
+                    let (id, params) = (c.get(0).and_then(|v| v.as_str()).unwrap_or_default(), c.get(1).cloned().unwrap_or_default());
+                    let r = wordcraft_engine::room::hosted::call(copy, "engine.execute", &serde_json::json!({"command": id, "params": params}));
+                    println!("{name} {id}: {}", r.map_or_else(|e| e, |v| v.to_string()));
+                }
+            }
+            step_n(&mut harness, 4);
         } else if let Some(n) = l.get("steps").and_then(|v| v.as_u64()) {
             step_n(&mut harness, n as usize);
         } else if let Some(ms) = l.get("wait").and_then(|v| v.as_u64()) {

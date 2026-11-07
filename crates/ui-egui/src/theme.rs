@@ -288,6 +288,13 @@ pub struct Tokens {
     /// The same colours for the leader line across the page: the paper stays white in the dark
     /// theme, so these are the light-theme colours in both.
     pub leader_colors: [Color32; 5],
+    /// One colour per participant in a shared document (#32), by the room's colour index: their
+    /// caret, the flag with their name, their avatar, and (faint) their selection. Drawn on the
+    /// page, which stays white in the dark theme, and behind white initials on the avatars, so
+    /// the same in both themes.
+    pub participant_colors: [Color32; 8],
+    /// The name on a participant's flag and the initials on their avatar.
+    pub on_participant: Color32,
     pub menu: Color32,
     pub blue: Color32,
     pub red: Color32,
@@ -300,7 +307,26 @@ pub struct Tokens {
     pub on_close: Color32,
 }
 
+/// [`Tokens::participant_colors`]: blue, red, green, purple, orange, teal, magenta, brown. Each
+/// reaches 4.5:1 with white, so the white name on a flag and the initials on an avatar read, and a
+/// caret shows on white paper.
+const PARTICIPANT_COLORS: [Color32; 8] = [
+    Color32::from_rgb(0x1F, 0x5F, 0xC0),
+    Color32::from_rgb(0xB3, 0x26, 0x1E),
+    Color32::from_rgb(0x1E, 0x6E, 0x34),
+    Color32::from_rgb(0x7B, 0x3F, 0xB0),
+    Color32::from_rgb(0xA8, 0x4E, 0x00),
+    Color32::from_rgb(0x00, 0x6E, 0x6E),
+    Color32::from_rgb(0xAD, 0x14, 0x57),
+    Color32::from_rgb(0x6D, 0x4C, 0x41),
+];
+
 impl Tokens {
+    /// The colour of participant colour index `color` ([`Tokens::participant_colors`]).
+    pub fn participant(&self, color: u8) -> Color32 {
+        self.participant_colors.get(usize::from(color) % self.participant_colors.len()).copied().unwrap_or(self.accent)
+    }
+
     pub fn light() -> Self {
         Tokens {
             dark: false,
@@ -356,6 +382,8 @@ impl Tokens {
                 Color32::from_rgb(0x8E, 0x44, 0xAD),
                 Color32::from_rgb(0xE0, 0x7B, 0x1F),
             ],
+            participant_colors: PARTICIPANT_COLORS,
+            on_participant: Color32::WHITE,
             menu: Color32::WHITE,
             blue: Color32::from_rgb(0x2F, 0x6F, 0xD0),
             red: Color32::from_rgb(0xD1, 0x3B, 0x3B),
@@ -423,6 +451,8 @@ impl Tokens {
                 Color32::from_rgb(0x8E, 0x44, 0xAD),
                 Color32::from_rgb(0xE0, 0x7B, 0x1F),
             ],
+            participant_colors: PARTICIPANT_COLORS,
+            on_participant: Color32::WHITE,
             menu: Color32::from_rgb(0x2B, 0x2B, 0x2B),
             blue: Color32::from_rgb(0x6C, 0x9B, 0xEA),
             red: Color32::from_rgb(0xEE, 0x6A, 0x6A),
@@ -927,6 +957,23 @@ mod tests {
                 let r = contrast(t.on_accent, bg);
                 assert!(r >= 4.5, "dark={}: on_accent on {name} is {r:.2}:1", t.dark);
             }
+        }
+    }
+
+    /// #32: the name on a participant's flag and the initials on their avatar reach 4.5:1 on
+    /// every participant colour, the colours are different, and there is one for each of the
+    /// room's colour indexes.
+    #[test]
+    fn participant_colours_read_and_differ() {
+        assert_eq!(super::Tokens::light().participant_colors.len(), usize::from(wordcraft_engine::room::COLORS));
+        for t in [super::Tokens::light(), super::Tokens::dark()] {
+            for (i, c) in t.participant_colors.iter().enumerate() {
+                let r = contrast(t.on_participant, *c);
+                assert!(r >= 4.5, "dark={}: on_participant on participant colour {i} is {r:.2}:1", t.dark);
+            }
+            let distinct: BTreeSet<[u8; 4]> = t.participant_colors.iter().map(|c| c.to_array()).collect();
+            assert_eq!(distinct.len(), t.participant_colors.len());
+            assert_eq!(t.participant(8), t.participant(0), "an index past the palette wraps round");
         }
     }
 
