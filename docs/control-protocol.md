@@ -265,7 +265,7 @@ them):
 | Method | Params | Result |
 |---|---|---|
 | `room.share` | `name?` | shares the active document; the window joins its room as its owner, under `name`, else the author name (File › Options › User name), else `Owner`. `{"shared": true, "document", "version", "you", "participants", "agentFiles"}`: the document's id, the number of changes the room took, the window's participant and everyone in the room, each `{"id", "name", "role"}` and, for those who joined with a key, `"files"`: which files their commands can use now (`none`, `folders` or `all`, see [Files participants can use](#files-participants-can-use)); `agentFiles` is what File › Options › Agents gives agents. Sharing the same document again answers the same; another one is an error while one is shared |
-| `room.invite` | `name`, `role?`, `files?`, `remote?`, `expiresIn?`, `uses?` | a key (32 hex digits, random) for a participant called `name`, with `role` ([roles](#roles), `suggester` unless given): `{"key", "name", "role", "files", "remote", "expires", "uses"}`. `expiresIn` (seconds, 60 to 2,592,000, that is 30 days): the key stops working then (`expires`, in seconds since 1970), as if taken back, and the copies that joined with it are out of the room. `uses` (from 1): how many times the key joins, each copy a join; the copies that joined stay. `remote: true` is for a participant on another machine ([Agents on other machines](#agents-on-other-machines)): never `owner`, no file unless `files` names some, and a day (`expiresIn` 86,400) unless `expiresIn` says otherwise; the reply also has `connect` and `tunnel`, the lines that reach the room's port through an SSH tunnel. A name is someone's in the room for good, even after they left, since their comments and tracked changes keep it: up to 128 characters, no control characters, compared without case. `files` (`none`, `folders` or `all`) gives the participant fewer files than File › Options › Agents gives agents, never more; left out (`null`), they get what the setting gives, whenever it changes |
+| `room.invite` | `name`, `role?`, `files?`, `remote?`, `expiresIn?`, `uses?` | a key (32 hex digits, random) for a participant called `name`, with `role` ([roles](#roles), `suggester` unless given): `{"key", "name", "role", "files", "remote", "expires", "uses"}`. `expiresIn` (seconds, 60 to 2,592,000, that is 30 days): the key stops working then (`expires`, in seconds since 1970), as if taken back, and the copies that joined with it are out of the room. `uses` (from 1): how many times the key joins, each copy a join; the copies that joined stay. `remote: true` is for a participant on another machine ([Agents on other machines](#agents-on-other-machines)): never `owner`, no file unless `files` names some, and a day (`expiresIn` 86,400) unless `expiresIn` says otherwise. A name is someone's in the room for good, even after they left, since their comments and tracked changes keep it: up to 128 characters, no control characters, compared without case. `files` (`none`, `folders` or `all`) gives the participant fewer files than File › Options › Agents gives agents, never more; left out (`null`), they get what the setting gives, whenever it changes |
 | `room.revoke` | `key` or `name` | takes the invite back, by its key or by the name it was for (compared without case; the key shows once in File › Share): nobody joins with the key any more, and the copies that joined with it are out of the room (the room refuses their changes, and their connections end). `{"revoked": bool}` |
 | `room.role` | `name`, `role` | gives the participant invited as `name` (compared without case) `role` from now on: the room holds their next change to it, their copies' next requests follow it, and a copy that joins with the key later has it. `{"changed": bool, "name", "role"}`. Only invited participants change role: the window keeps its own, and the built-in assistant's is chosen in its Assistant pane |
 | `room.participants` | — | `{"shared": false}`, or what `room.share` answers, with `"invited"`: the invites not taken back, each `{"name", "role", "files", "joined", "remote", "expires", "usesLeft"}` (`joined`: how many copies are in the room with its key now; `expires` and `usesLeft` are `null` when the invite didn't set them), never their keys |
@@ -389,18 +389,11 @@ bound resource use; a continuous local connection flood can still deny availabil
 
 ### Agents on other machines
 
-An agent in a sandbox (E2B, a Kubernetes agent sandbox, any cloud runner) joins like one on this
-computer, through a tunnel that ends at its own `127.0.0.1`: `wordcraft-cli mcp --connect` sends
-a key only to `127.0.0.1`, and only when that is where the connection really leads. Invite it
-with `remote: true` and tunnel the room's port, which no key but an invite's opens:
-
-```sh
-# The person's computer: make the sandbox's 127.0.0.1:<port> lead to the room's port here
-# (`room.invite` with `remote: true` answers this line as `tunnel`, with the port filled in).
-ssh -N -R <port>:127.0.0.1:<port> agent@sandbox
-# The sandbox (the `connect` line):
-WORDCRAFT_CONTROL_KEY=<invite key> wordcraft-cli mcp --connect 127.0.0.1:<port>
-```
+An agent in a sandbox (E2B, a Kubernetes agent sandbox, any cloud runner) is invited with
+`remote: true`. Nobody runs a tunnel to let it in: this computer will dial out to a relay
+(self-hosted, or the project's), and the agent will reach the room at a URL with its invite's key,
+from any MCP client (MCP over Streamable HTTP, #75, through the relay, #76). Until then a remote
+invite sets the rules below, which every way in keeps.
 
 - Never put the window's key in a sandbox: whoever holds it acts as the person, in the window,
   with every file the person can use. Only an invite's key leaves this computer. `auth` says which
@@ -413,9 +406,19 @@ WORDCRAFT_CONTROL_KEY=<invite key> wordcraft-cli mcp --connect 127.0.0.1:<port>
   On the room's port every connection with the key works on one copy, so reconnecting there is
   not another join; on the window's port each connection is. Taking the key back
   (`room.revoke`) ends its copies at once, as for any invite.
-- The tunnel needs an SSH server in the sandbox that this computer reaches. A URL any MCP client
-  can use (MCP over Streamable HTTP, #75) and a relay this computer dials out to, so no tunnel is
-  needed (#76), are next.
+
+For developers only, before the relay: `wordcraft-cli mcp --connect` sends a key only to
+`127.0.0.1`, and only when that is where the connection really leads, so a reverse SSH tunnel
+from this computer to a sandbox you can reach lets a remote invite join the room's port
+(File › Share's MCP line shows the port). This is a way to test, not how
+people connect.
+
+```sh
+# This computer: make the sandbox's 127.0.0.1:<port> lead to the room's port here.
+ssh -N -R <port>:127.0.0.1:<port> agent@sandbox
+# The sandbox:
+WORDCRAFT_CONTROL_KEY=<invite key> wordcraft-cli mcp --connect 127.0.0.1:<port>
+```
 
 ### Roles
 

@@ -264,7 +264,8 @@ const MAX_EXPIRY: u64 = 30 * 24 * 60 * 60;
 ///   File › Options › Agents allows, or fewer when `files` says so: `none`, `folders` (that pane's
 ///   folders) or `all`, never more than the setting. `remote` (an agent on another machine): never
 ///   the owner, no files unless `files` names some, and the key stops working after a day unless
-///   `expiresIn` says otherwise; the reply then carries the lines to connect through an SSH tunnel.
+///   `expiresIn` says otherwise. The reply carries no connection lines: people don't run tunnels,
+///   the relay (#76) will give a remote invite its URL.
 ///   `expiresIn`: seconds until the key stops working (60 to 30 days). `uses`: how many times it
 ///   joins.
 /// - `room.revoke {key | name}`: take an invite back, by its key or by the name it was for (the key
@@ -311,7 +312,7 @@ pub(crate) fn room_method(app: &mut WordApp, method: &str, p: &Value) -> Option<
             let key = room.invite_on(name, role, terms).map_err(|e| e.to_string())?;
             // A remote invite's files are none unless it named some (`Hub::invite_on`).
             let files = if remote { Some(files.unwrap_or(AgentFiles::None)) } else { files };
-            let mut reply = json!({
+            Ok(json!({
                 "key": key,
                 "name": name.trim(),
                 "role": role,
@@ -319,13 +320,7 @@ pub(crate) fn room_method(app: &mut WordApp, method: &str, p: &Value) -> Option<
                 "remote": remote,
                 "expires": expires,
                 "uses": uses,
-            });
-            if remote && let Some(addr) = app.lobby.addr() {
-                let port = addr.port();
-                reply["connect"] = json!(format!("WORDCRAFT_CONTROL_KEY={key} wordcraft-cli mcp --connect 127.0.0.1:{port}"));
-                reply["tunnel"] = json!(format!("ssh -N -R {port}:127.0.0.1:{port} <sandbox>"));
-            }
-            Ok(reply)
+            }))
         })(),
         "room.revoke" => (|| {
             let room = room()?;
@@ -463,10 +458,10 @@ mod tests {
     }
 
     /// An invite for an agent on another machine (#74): never the owner, no files unless it
-    /// names some, a day unless it says, the lines to connect through a tunnel; junk terms are
+    /// names some, a day unless it says, and no tunnel line for a person to run; junk terms are
     /// refused.
     #[test]
-    fn a_remote_invite_is_held_back_and_says_how_to_connect() {
+    fn a_remote_invite_is_held_back() {
         let lobby = Lobby::default();
         lobby.set_addr(Some("127.0.0.1:43210".parse().unwrap()));
         let mut a = window(&lobby);
@@ -478,15 +473,13 @@ mod tests {
         let expires = r["expires"].as_u64().unwrap();
         assert!((now + 86_400..=now + 86_402).contains(&expires), "a day: {expires}");
         let key = r["key"].as_str().unwrap();
-        assert_eq!(r["connect"], format!("WORDCRAFT_CONTROL_KEY={key} wordcraft-cli mcp --connect 127.0.0.1:43210"));
-        assert_eq!(r["tunnel"], "ssh -N -R 43210:127.0.0.1:43210 <sandbox>");
+        assert_eq!((r.get("connect"), r.get("tunnel")), (None, None), "no command for a person to run");
         let copy = lobby.join_with(key).unwrap();
         assert_eq!(a.shared_room().unwrap().files_for(copy.id()).0, AgentFiles::None, "the setting says all, a remote invite none");
 
         let r = result(&mut a, "room.invite", json!({"name": "Hour", "expiresIn": 3600, "uses": 1}));
         assert_eq!((r["remote"].clone(), r["uses"].clone()), (json!(false), json!(1)));
         assert!(r["expires"].as_u64().unwrap() >= now + 3600);
-        assert_eq!(r.get("connect"), None, "only remote invites get the lines");
         let invited = result(&mut a, "room.participants", json!({}))["invited"].clone();
         let hour = invited.as_array().unwrap().iter().find(|i| i["name"] == "Hour").unwrap().clone();
         assert_eq!((hour["usesLeft"].clone(), hour["remote"].clone()), (json!(1), json!(false)));

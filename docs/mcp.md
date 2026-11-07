@@ -313,11 +313,11 @@ other documents and the window (`open_document`, `save_document`, `list_document
 with `file.exportPdf` or `file.exportPng` and no `path` hands the PDF or page back in the reply
 (base64 `pdf` or `png`, up to 32 MB), for an agent with no file to write to.
 
-An agent on another machine (a sandbox reaching this computer through a tunnel) is invited with
+An agent on another machine (a sandbox) is invited with
 `{"action": "invite", "name": "Sandbox", "remote": true}`: never the owner, no file unless
 `files` names some, and a key that stops working after a day unless `expiresIn` (seconds) says
-otherwise; `uses: 1` lets it join once. The reply's `connect` and `tunnel` are the lines to run in
-the sandbox and on this computer; see
+otherwise; `uses: 1` lets it join once. It will reach the room through a relay this computer
+dials out to, with no tunnel to run (#75, #76); see
 [Agents on other machines](control-protocol.md#agents-on-other-machines). Only an invite's key
 goes to a sandbox, never the window's.
 
