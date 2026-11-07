@@ -78,7 +78,7 @@ milestone's gate are in [collaboration.md](collaboration.md).
 | A2 Agent API (#35) | not started | Scenario steps 1 to 4 with scripted agents |
 | A3 Network rooms, offline editing (#36) | remote-safe invites done (#74); MCP over HTTP (#75) and an outbound relay (#76) next | Hub killed or a laptop offline for an hour: nothing lost |
 | A4 Hardening (#37) | not started | Simulation clean, latency targets met |
-| A5 Word interop (#38) | not started | The scenario's output round-trips through Word |
+| A5 Word interop (#38) | block ids kept in Word files as paragraph ids done (#69); merging Word edits back through Compare next | The scenario's output round-trips through Word |
 | A6 Peer-to-peer, only if needed (#39) | not started | Two laptops edit offline and converge |
 
 ## Next after beta

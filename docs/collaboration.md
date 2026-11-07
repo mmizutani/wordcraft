@@ -1,6 +1,6 @@
 # Co-editing: people and agents edit one document at once
 
-> **Last reviewed:** 2026-11-07 · **Last updated:** 2026-11-07 · **Change:** minor (File › Share (#33) and remote-safe invites (#74) as built: the page, `room.role`, revoking by name, invites that expire, join a set number of times or are for another machine; known limits and milestones follow); previously minor (the built-in assistant in the Assistant pane as a co-editor: who takes part, how a conversation joins and leaves, roles in the pane, tracked changes in its name, editing at the same time as the person and other agents, what comes next for it); previously major (first version: the design as built on `main` through A1.4 and the agents' file setting, what comes next by milestone, and the decisions; presence is a placeholder until A1.5 lands, #40) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+> **Last reviewed:** 2026-11-07 · **Last updated:** 2026-11-07 · **Change:** minor (block ids kept in Word files (#38, #69): `w14:paraId` and an ignorable `wc:blockId`, read back on open; A5 rows updated); previously minor (File › Share (#33) and remote-safe invites (#74) as built: the page, `room.role`, revoking by name, invites that expire, join a set number of times or are for another machine; known limits and milestones follow); previously minor (the built-in assistant in the Assistant pane as a co-editor: who takes part, how a conversation joins and leaves, roles in the pane, tracked changes in its name, editing at the same time as the person and other agents, what comes next for it); previously major (first version: the design as built on `main` through A1.4 and the agents' file setting, what comes next by milestone, and the decisions; presence is a placeholder until A1.5 lands, #40) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
 
 This is the design of co-editing in WordCraft: several people and AI agents edit one document at
 the same time, each change carries its author, and nothing is lost or corrupted. The agents are
@@ -69,7 +69,7 @@ a later option (A6), only if it is needed.
 Everything below is on `main` and runs in one process: the app's window, or a headless
 `wordcraft-cli`, holds the room. Networking is A3.
 
-### Block ids (A0.2, #2)
+### Block ids (A0.2, #2; kept in Word files, A5.1, #69)
 
 Every paragraph and table, in every story and in table cells, has a `doc::BlockId`
 (`crates/doc/src/block_id.rs`). An id is random, not counted, so copies that add blocks at the
@@ -77,7 +77,19 @@ same time don't make the same ones. Editing a block keeps its id. After every co
 `Document::ensure_block_ids` gives new or copied blocks ids of their own, looking only at blocks
 that aren't the same allocations as before the command. A block a command took away and made
 again, holding the same, gets its id back. An id is not part of what a block holds: `==` ignores
-it, files don't store it, and the markup kept from a file doesn't depend on it.
+it, the JSON form leaves it out, and the markup kept from a file doesn't depend on it.
+
+A .docx keeps the ids (#69, `crates/docx/src/write/para_ids.rs`), so a copy saved and opened
+again names its paragraphs as the room does. Every paragraph is written with a paragraph id
+(`w14:paraId`, 31 bits, unique in the file): the block id's low 31 bits, or a free value when
+another paragraph has those. When that can't hold the whole 64-bit id, the paragraph also carries
+`wc:blockId` (16 hex digits) in WordCraft's own namespace, `urn:wordcraft:docx:2026`, which every
+body part declares ignorable (ECMA-376 Part 3, Markup Compatibility); tables, which have no
+paragraph id, carry `wc:blockId` only. On open, `wc:blockId` is read first, then `w14:paraId`, so
+Word's own paragraph ids become block ids and are written back unchanged; repeated, zero or
+malformed ids are split apart by `ensure_block_ids`. Word drops `wc:blockId` but keeps the
+paragraph id, which is what the Compare step of A5 (#38) matches a Word-edited copy on.
+`crates/docx/tests/it/block_ids.rs` pins it, hostile values included.
 
 ### Changes that apply to any copy (A0.3, #3; A1.1, #7)
 
@@ -400,7 +412,7 @@ agents. Issues: #28 (parent) and one sub-issue per milestone.
 | **A2 Agent API** (#35) | On one machine: content-addressed reads, guarded edits, rewrites as word-level tracked changes, room chat, leases (Review › Block Authors), people first (an agent's direct edit to a paragraph a person just typed in is refused as busy), MCP Events push and poll | Scenario steps 1 to 4 pass with scripted agents |
 | **A3 Network rooms** (#36) | Agents in remote sandboxes join the person's desktop room (design #73): remote-safe invites (done, #74), MCP over Streamable HTTP (#75), an outbound relay so no tunnel is needed (#76). Then the hub over TLS with keys, durable write-ahead log, snapshots that keep source XML, app and browser copies, offline editing in Merge and Suggest modes, version history, agent drafts (fork and merge), signed webhooks | With the hub killed or a laptop offline for an hour, nothing is lost |
 | **A4 Hardening** (#37) | Seeded simulation over a lossy network, protocol fuzzing, text-level undo, 10 people on 188 pages | Simulation clean, latency targets met |
-| **A5 Interop** (#38) | Block ids saved as Word's paragraph ids (`w14:paraId`); edits made in Word merged back through Compare as tracked changes | The scenario's output round-trips through Word |
+| **A5 Interop** (#38) | Block ids saved as Word's paragraph ids (`w14:paraId`, done in #69); edits made in Word merged back through Compare as tracked changes, and names and dates through Word | The scenario's output round-trips through Word |
 | **A6 Peer-to-peer** (#39), only if needed | Copies merge each other's logs with no hub | Two laptops edit offline and converge |
 
 ### The scenario
@@ -488,6 +500,7 @@ ids included.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-07 | minor | Block ids kept in Word files (#38, #69): paragraphs carry `w14:paraId` and, when it can't hold the whole id, an ignorable `wc:blockId`; tables `wc:blockId`; read back on open; the A5 row says the first step is done |
 | 2026-11-07 | minor | File › Share (#33, #70) and remote-safe invites (#74) as built: the page, `room.role`, revoking by name, invites that expire, join a set number of times or are remote; "No File › Share yet" dropped from known limits; A1 and A3 rows updated |
 | 2026-11-07 | minor | The built-in assistant as a co-editor: a "Who edits together" table (the person, the pane's assistant, outside agents), and how the pane's assistant joins and leaves, its roles, where its copy runs, a turn while the person types, tracked changes in its name, Stop, several assistants at once, its known limits and what comes next for it (Minoru's review of #68) |
 | 2026-11-07 | major | First version (#40): the design as built on `main` (block ids, changes, rebasing and mapping, scopes, rooms, roles and keys, agents' copies, the agents' file setting, undo per participant, the assistant), presence as a placeholder (#32), known limits, milestones A0–A6, the scenario, events and the decisions |

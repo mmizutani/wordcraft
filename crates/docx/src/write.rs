@@ -6,6 +6,7 @@ mod glossary;
 mod settings_merge;
 pub(crate) use settings_merge::has_unowned as settings_has_unowned;
 mod math;
+mod para_ids;
 mod props;
 mod sdt;
 mod story;
@@ -108,8 +109,8 @@ pub(crate) struct Writer<'d> {
     wm_header: u32,
     /// The watermark shape to put at the start of the next top-level paragraph (a header's first).
     pending_watermark: Option<String>,
-    /// Paragraphs that need a `w14:paraId` (last paragraph of each comment), by address.
-    para_ids: HashMap<usize, String>,
+    /// Paragraph ids (`w14:paraId`) from block ids, and the last paragraph of each comment's.
+    para_ids: para_ids::ParaIds,
     /// A note reference mark to put at the start of the next paragraph.
     pending_mark: Option<&'static str>,
     /// The note being written (is footnote, part id): its reference to itself is the mark above.
@@ -219,8 +220,8 @@ impl Writer<'_> {
         Some(rels.add(if footer { rt::FOOTER } else { rt::HEADER }, &file, false))
     }
 
-    fn take_para_id(&self, p: &wordcraft_doc::Paragraph) -> Option<String> {
-        self.para_ids.get(&(p as *const _ as usize)).cloned()
+    fn take_para_id(&mut self, p: &wordcraft_doc::Paragraph) -> Option<para_ids::ParaTag> {
+        self.para_ids.take(p)
     }
 
     /// Whether `p` holds a reference to the note being written.
