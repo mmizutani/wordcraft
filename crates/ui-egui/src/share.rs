@@ -218,6 +218,8 @@ impl WordApp {
         share.room.close();
         let _ = share.copy.lend_document(&mut self.session, Replica::receive);
         self.lobby.close();
+        // Nobody is followed in a document that isn't shared.
+        self.canvas.follow = None;
         true
     }
 

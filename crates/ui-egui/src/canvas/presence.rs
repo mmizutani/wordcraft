@@ -11,8 +11,8 @@ use super::pages::page_screen_scale;
 use crate::share::FLAG_MS;
 use crate::theme::{Tokens, medium};
 
-/// At most this many others are drawn, and at most this many selection rectangles in all: a
-/// room with many agents selecting long stretches still draws in time.
+/// At most this many others are drawn, and at most this many selection rectangles in all of
+/// those on screen: a room with many agents selecting long stretches still draws in time.
 const MAX_DRAWN: usize = 64;
 const MAX_RECTS: usize = 2000;
 
@@ -35,19 +35,21 @@ pub(crate) struct Mark {
 }
 
 /// The pages others are drawn on: `layout` of `doc` (with the page the caret is on,
-/// `page_hint`), the pages' screen rectangles and the zoom.
+/// `page_hint`), the pages' screen rectangles, the zoom, and the part of the screen the pages
+/// are seen in.
 pub(crate) struct Pages<'a> {
     pub(crate) layout: &'a DocLayout,
     pub(crate) doc: &'a wordcraft_doc::Document,
     pub(crate) page_hint: usize,
     pub(crate) rects: &'a [Rect],
     pub(crate) scale: f32,
+    pub(crate) visible: Rect,
 }
 
 /// Where everyone else in `others` (with when their place last changed) is on `pages`; `now` and
 /// the `pointer` say whose names show, and `follow` whom the person follows.
 pub(crate) fn marks(pages: &Pages<'_>, others: &[(&Other, f64)], now: f64, pointer: Option<Pos2>, follow: Option<ParticipantId>) -> Vec<Mark> {
-    let Pages { layout, doc, page_hint, rects, scale } = *pages;
+    let Pages { layout, doc, page_hint, rects, scale, visible } = *pages;
     let to_screen = |pi: usize, r: &wordcraft_geom::Rect| -> Option<Rect> {
         let pr = rects.get(pi)?;
         let s = layout.pages.get(pi).map_or(scale, |page| page_screen_scale(*pr, page, scale));
@@ -59,11 +61,10 @@ pub(crate) fn marks(pages: &Pages<'_>, others: &[(&Other, f64)], now: f64, point
         let Some(sel) = o.at.as_ref() else { continue };
         let mut sel_rects = Vec::new();
         if sel.anchor != sel.focus && budget > 0 {
-            for (pi, r) in layout.selection_rects(doc, &sel.anchor, &sel.focus, page_hint).iter().take(budget) {
-                if let Some(sr) = to_screen(*pi, r) {
-                    sel_rects.push(sr);
-                }
-            }
+            // Only what is on screen counts: a long selection, or one far off, leaves the budget
+            // to the selections the person sees.
+            let shown = layout.selection_rects(doc, &sel.anchor, &sel.focus, page_hint);
+            sel_rects.extend(shown.iter().filter_map(|(pi, r)| to_screen(*pi, r)).filter(|sr| sr.intersects(visible)).take(budget));
             budget = budget.saturating_sub(sel_rects.len());
         }
         let caret = layout.caret_on(&sel.focus, page_hint).and_then(|c| {
@@ -126,6 +127,7 @@ pub(crate) fn paint_carets(painter: &Painter, t: &Tokens, marks: &[Mark]) {
 
 #[cfg(test)]
 mod tests {
+    use egui::Rect;
     use serde_json::json;
     use wordcraft_doc::Document;
     use wordcraft_engine::Session;
@@ -171,10 +173,21 @@ mod tests {
 
     /// Where the window draws everyone else, as of `now`, with the pointer at `pointer`.
     fn drawn(a: &mut WordApp, now: f64, pointer: Option<egui::Pos2>) -> Vec<Mark> {
+        drawn_in(a, Rect::EVERYTHING, now, pointer)
+    }
+
+    /// [`drawn`], with the pages seen in `visible` only.
+    fn drawn_in(a: &mut WordApp, visible: Rect, now: f64, pointer: Option<egui::Pos2>) -> Vec<Mark> {
         let layout = a.session.layout();
         let others = a.others_here();
-        let pages =
-            super::Pages { layout: &layout, doc: &a.session.doc, page_hint: a.session.page_hint, rects: &a.canvas.page_rects, scale: a.canvas.scale };
+        let pages = super::Pages {
+            layout: &layout,
+            doc: &a.session.doc,
+            page_hint: a.session.page_hint,
+            rects: &a.canvas.page_rects,
+            scale: a.canvas.scale,
+            visible,
+        };
         marks(&pages, &others, now, pointer, a.canvas.follow)
     }
 
@@ -303,6 +316,41 @@ mod tests {
         drop(ada);
         h.run_steps(2);
         assert_eq!(h.state().canvas.follow, None);
+        // Nor once the document isn't shared any more.
+        let a = h.state_mut();
+        let mut ben = agent(a, &lobby, "Ben");
+        runs(&mut ben, "caret.set", json!({"pos": wordcraft_doc::Pos::body(0, 1)}));
+        h.run_steps(2);
+        let a = h.state_mut();
+        a.run("ui.follow", json!({"participant": ben.id()})).unwrap();
+        owner(a, "room.stop", json!({}));
+        assert_eq!(a.canvas.follow, None, "stopping sharing stops following");
+        assert_eq!(control_inspect(a)["following"], json!(null));
+        assert_eq!(a.run("ui.follow", json!({})).unwrap(), json!({"following": null}));
+    }
+
+    #[test]
+    fn a_selection_longer_than_what_is_drawn_is_shaded_where_the_person_looks() {
+        // More lines selected than selection rectangles are drawn: the end of the selection,
+        // on screen, is still shaded, and so is someone else's selection there.
+        let text = (0..2600).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let (mut h, lobby) = harness(&text);
+        h.run_steps(2);
+        let a = h.state_mut();
+        owner(a, "room.share", json!({}));
+        let mut ada = agent(a, &lobby, "Ada");
+        let mut ben = agent(a, &lobby, "Ben");
+        runs(&mut ada, "select.all", json!({}));
+        runs(&mut ben, "select.text", json!({"text": "line 2590"}));
+        owner(h.state_mut(), "caret.docEnd", json!({}));
+        h.run_steps(4);
+        let a = h.state_mut();
+        let last = a.canvas.page_rects.last().copied().unwrap();
+        let marks = drawn_in(a, last, 0.0, None);
+        let rects = |id| marks.iter().find(|m| m.who == id).map_or(0, |m| m.rects.iter().filter(|r| r.intersects(last)).count());
+        assert!(rects(ada.id()) > 0, "Ada's selection is shaded on the last page");
+        assert!(marks.iter().flat_map(|m| &m.rects).all(|r| r.intersects(last)), "only what is on it");
+        assert_eq!(rects(ben.id()), 1, "and Ben's after hers");
     }
 
     fn control_inspect(a: &mut WordApp) -> serde_json::Value {
