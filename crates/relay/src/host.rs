@@ -18,6 +18,9 @@ const AT_ONCE: usize = 16;
 /// The longest answer the relay sends: its own refusals, and a poll's requests.
 const MAX_FROM_RELAY: u64 = 64 << 20;
 
+/// How long an answer is offered to the relay when it didn't say how long its agent waits.
+const UNTIL_UNSAID: Duration = Duration::from_secs(60);
+
 /// Why the relay refuses to open a room again: it holds a room with that id for someone else.
 const TAKEN: &str = "the relay gave this room to someone else";
 
@@ -278,16 +281,7 @@ fn answer(s: &Arc<Shared>, id: u64, req: Request, until: Option<Instant>) {
         }
         let resp = (s.handler)(&req);
         let body = wire::reply(id, &resp).to_string();
-        let url = format!("{}/host/r/{}/reply", s.relay, s.room);
-        if let Err(why) = read(
-            s.agent
-                .post(&url)
-                .header("Authorization", &format!("Bearer {}", s.secret))
-                .header("Content-Type", "application/json")
-                .send(body.as_bytes()),
-        ) {
-            log::warn!("relay: an answer didn't reach the relay: {why}");
-        }
+        send_answer(s, &body, until.unwrap_or_else(|| Instant::now() + UNTIL_UNSAID));
     };
     if s.busy.fetch_add(1, Ordering::SeqCst) >= AT_ONCE {
         run(s);
@@ -302,5 +296,39 @@ fn answer(s: &Arc<Shared>, id: u64, req: Request, until: Option<Instant>) {
     if spawned.is_err() {
         s.busy.fetch_sub(1, Ordering::SeqCst);
         log::warn!("relay: no thread for an answer");
+    }
+}
+
+/// Send an answer that has been worked out to the relay. The relay may not take it yet (too
+/// many large answers arriving, or earlier answers still being read by their agents): it is then
+/// sent again, never run again, until its agent stops waiting at `until`.
+fn send_answer(s: &Shared, body: &str, until: Instant) {
+    let url = format!("{}/host/r/{}/reply", s.relay, s.room);
+    let mut wait = Duration::from_millis(250);
+    loop {
+        let sent = read(
+            s.agent
+                .post(&url)
+                .header("Authorization", &format!("Bearer {}", s.secret))
+                .header("Content-Type", "application/json")
+                .send(body.as_bytes()),
+        );
+        let why = match sent {
+            Ok((status, _)) if (200..300).contains(&status) => return,
+            // Not now: send it again.
+            Ok((status @ (429 | 503), text)) => format!("the relay answered {status}: {}", text.trim()),
+            Err(why) => why,
+            // Nobody waits for it any more, or the relay won't ever take it.
+            Ok((status, text)) => {
+                log::warn!("relay: an answer wasn't taken: {status} {}", text.trim());
+                return;
+            }
+        };
+        if s.stop.load(Ordering::SeqCst) || Instant::now() + wait >= until {
+            log::warn!("relay: an answer didn't reach the relay: {why}");
+            return;
+        }
+        pause(s, wait);
+        wait = (wait * 2).min(Duration::from_secs(2));
     }
 }

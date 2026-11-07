@@ -302,10 +302,11 @@ fn the_relay_holds_back_floods_and_large_bodies() {
         peer: None,
     };
     // (A large one only while an agent waits for it: large_answers_arriving_at_once_are_capped_per_token.)
-    assert_eq!(relay.body_limit(&req(&format!("/host/r/{room}/reply"), Some(&secret))), MAX_REQUEST, "no agent waits");
-    assert_eq!(relay.body_limit(&req(&format!("/host/r/{room}/reply"), Some("nope"))), MAX_REQUEST);
-    assert_eq!(relay.body_limit(&req(&format!("/host/r/{room}/reply"), None)), MAX_REQUEST);
-    assert_eq!(relay.body_limit(&req(&format!("/r/{room}/mcp"), Some(&secret))), MAX_REQUEST);
+    let limit = |r: &Request| relay.body_limit(r).map(|(n, _)| n).map_err(|resp| resp.status);
+    assert_eq!(limit(&req(&format!("/host/r/{room}/reply"), Some(&secret))), Err(404), "no agent waits");
+    assert_eq!(limit(&req(&format!("/host/r/{room}/reply"), Some("nope"))), Ok(MAX_REQUEST));
+    assert_eq!(limit(&req(&format!("/host/r/{room}/reply"), None)), Ok(MAX_REQUEST));
+    assert_eq!(limit(&req(&format!("/r/{room}/mcp"), Some(&secret))), Ok(MAX_REQUEST));
     let big = "x".repeat(MAX_REQUEST + 1);
     let (status, _, _) = http(&format!("{base}/r/{room}/mcp"), "POST", &[], &big);
     assert_eq!(status, 413);
@@ -501,8 +502,8 @@ fn large_answers_arriving_at_once_are_capped_per_token() {
     let mut idle = head(&secret);
     let mut out = String::new();
     let _ = idle.read_to_string(&mut out);
-    assert!(out.starts_with("HTTP/1.1 413"), "{out}");
-    // An agent waits: two large answers may begin, the third is refused at once.
+    assert!(out.starts_with("HTTP/1.1 404"), "{out}");
+    // An agent waits: two large answers may begin, the third is told to come again, at once.
     let agent = std::thread::spawn(move || http(&url, "POST", &[], "{}").0);
     std::thread::sleep(Duration::from_millis(200));
     let (_a, _b) = (head(&secret), head(&secret));
@@ -511,8 +512,86 @@ fn large_answers_arriving_at_once_are_capped_per_token() {
     let started = Instant::now();
     let mut out = String::new();
     let _ = third.read_to_string(&mut out);
-    assert!(out.starts_with("HTTP/1.1 413") && started.elapsed() < Duration::from_secs(2), "{out}");
+    assert!(out.starts_with("HTTP/1.1 503") && started.elapsed() < Duration::from_secs(2), "{out}");
     drop(agent);
+}
+
+/// A large answer whose upload breaks off gives its place back at once, not when its time would
+/// have run out: two broken uploads don't keep the token's next large answers out.
+#[test]
+fn a_large_answer_that_never_arrives_gives_its_place_back() {
+    let (base, _relay) = relay(|_| {});
+    let (status, _, body) = http(&format!("{base}/host/rooms"), "POST", &[("Authorization", &format!("Bearer {TOKEN}"))], "{}");
+    assert_eq!(status, 200, "{body}");
+    let opened: Value = serde_json::from_str(&body).unwrap();
+    let (room, secret, url) =
+        (opened["room"].as_str().unwrap().to_string(), opened["secret"].as_str().unwrap().to_string(), opened["url"].as_str().unwrap().to_string());
+    let port = base.rsplit(':').next().unwrap().to_string();
+    let head = || {
+        let mut s = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        let h = format!("POST /host/r/{room}/reply HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {secret}\r\nContent-Length: {MAX_REPLY}\r\n\r\n");
+        s.write_all(h.as_bytes()).unwrap();
+        s
+    };
+    let agent = std::thread::spawn(move || http(&url, "POST", &[], "{}").0);
+    std::thread::sleep(Duration::from_millis(200));
+    // Two uploads begin, send a little, and break off.
+    for _ in 0..2 {
+        let mut s = head();
+        s.write_all(&[b'x'; 1000]).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        drop(s);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    // The next one is taken: the relay waits for its body rather than turning it away.
+    let mut next = head();
+    next.set_read_timeout(Some(Duration::from_millis(700))).unwrap();
+    let mut out = [0u8; 64];
+    let read = next.read(&mut out);
+    assert!(read.is_err(), "turned away: {:?}", read.map(|n| String::from_utf8_lossy(&out[..n]).to_string()));
+    drop(agent);
+}
+
+/// An answer's bytes are counted when it arrives, not only when its request was let in: past the
+/// token's budget the desktop keeps the answer (it has run) and sends it again once earlier
+/// answers have been read, and the request is never run twice.
+#[test]
+fn an_answer_past_the_budget_waits_at_the_desktop_and_is_run_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (base, relay) = relay(|c| c.sending_per_token = 10);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let r = runs.clone();
+    let desktop: wordcraft_http::Handler = Arc::new(move |_: &Request| {
+        r.fetch_add(1, Ordering::SeqCst);
+        // Slow enough that both requests are let in before either answer arrives.
+        std::thread::sleep(Duration::from_millis(300));
+        Response::json(200, json!({"text": "an answer longer than ten bytes"}).to_string())
+    });
+    let hosting = Hosting::start(&base, TOKEN, None, desktop).unwrap();
+    let (room, _) = hosting.claim();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for _ in 0..2 {
+        let (relay, room, tx) = (relay.clone(), room.clone(), tx.clone());
+        std::thread::spawn(move || {
+            let r = relay.handle(&Request {
+                method: "POST".into(),
+                target: format!("/r/{room}/mcp"),
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+                peer: None,
+            });
+            let _ = tx.send(r);
+        });
+    }
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(first.status, 200, "{}", String::from_utf8_lossy(&first.body));
+    // The first agent hasn't read its answer: the second answer waits.
+    assert!(rx.recv_timeout(Duration::from_millis(1000)).is_err(), "both answers were held at once");
+    drop(first);
+    let second = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(second.status, 200, "{}", String::from_utf8_lossy(&second.body));
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "each request ran once");
+    drop(hosting);
 }
 
 /// Answers waiting for agents to read them count against a budget, by token: while it is spent,

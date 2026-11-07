@@ -16,7 +16,8 @@
 //!   again (after the relay restarted) → `{"room", "secret", "url"}`.
 //! - `POST /host/r/<room>/poll` → `{"requests": [{"id", "method", "target", "headers", "body"}]}`,
 //!   waiting up to 25 s for one.
-//! - `POST /host/r/<room>/reply` `{"id", "status", "headers", "body"}` → 204.
+//! - `POST /host/r/<room>/reply` `{"id", "status", "headers", "body"}` → 204 (503: send it again
+//!   later; 404: nobody waits for it any more).
 //! - `DELETE /host/r/<room>` closes the room.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 

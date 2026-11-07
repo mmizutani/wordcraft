@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use wordcraft_http::{Request, Response, bearer, same_secret};
+use wordcraft_http::{Hold, Request, Response, bearer, same_secret};
 
 use crate::{is_hex, random_hex, room_of, wire};
 
@@ -121,7 +121,8 @@ struct Queued {
 
 struct Waiting {
     queue: VecDeque<Queued>,
-    answers: HashMap<u64, Sender<Response>>,
+    /// Who waits for each answer: sent it with its bytes' place in [`Sending`].
+    answers: HashMap<u64, Sender<(Response, Unsent)>>,
     next: u64,
     /// When the desktop last asked for requests, or finished asking.
     seen: Instant,
@@ -157,9 +158,9 @@ pub struct Relay {
     waiting: Arc<Mutex<HashMap<String, usize>>>,
     /// Answers' bytes waiting for agents to read them.
     sending: Arc<Mutex<Sending>>,
-    /// Large answers being received: the token of their room, and when the HTTP server gives up
-    /// on each (the time it gives the body), when its place goes back if it hasn't before.
-    large: Mutex<Vec<(String, Instant)>>,
+    /// Large answers being received, by the token of their room: each place goes back once its
+    /// request is done, however it ends.
+    large: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 /// Answers' bytes waiting for agents to read them, in all and by token.
@@ -190,13 +191,14 @@ impl Drop for Unsent {
     }
 }
 
-/// One request's place in its token's count, given back however its wait ends.
-struct Waits {
+/// One place in a count by token (agents' requests waiting, large answers arriving), given back
+/// when dropped, however the request it belongs to ends.
+struct Place {
     counts: Arc<Mutex<HashMap<String, usize>>>,
     token: String,
 }
 
-impl Drop for Waits {
+impl Drop for Place {
     fn drop(&mut self) {
         if let Ok(mut c) = self.counts.lock()
             && let Some(n) = c.get_mut(&self.token)
@@ -221,7 +223,7 @@ impl Relay {
             rooms: Mutex::new(HashMap::new()),
             sources: Mutex::new(HashMap::new()),
             waiting: Arc::new(Mutex::new(HashMap::new())),
-            large: Mutex::new(Vec::new()),
+            large: Arc::new(Mutex::new(HashMap::new())),
             sending: Arc::new(Mutex::new(Sending::default())),
         }
     }
@@ -238,34 +240,27 @@ impl Relay {
 
     /// How much body `req` may have: a desktop's answer may be large, when it comes with its
     /// room's secret, an agent waits for one, and few large answers are arriving (from this
-    /// token's desktops, and in all); everything else is an MCP request's size.
-    pub fn body_limit(&self, req: &Request) -> usize {
+    /// token's desktops, and in all); everything else is an MCP request's size. A large answer
+    /// that can't be taken now is refused before it is read: 404 when nobody waits for it, 503
+    /// (send it again) when too many are arriving.
+    pub fn body_limit(&self, req: &Request) -> Result<(usize, Hold), Response> {
         let path = req.path();
         let Some(room) = path.strip_prefix("/host/r/").and_then(|r| r.strip_suffix("/reply")).and_then(|id| self.hosts(req, id)) else {
-            return MAX_REQUEST;
+            return Ok((MAX_REQUEST, Hold::default()));
         };
         let size = req.header("Content-Length").and_then(|n| n.trim().parse::<usize>().ok());
-        if size.is_some_and(|n| n <= MAX_REQUEST) || room.lock().is_none_or(|w| w.answers.is_empty()) {
-            return MAX_REQUEST;
+        if size.is_some_and(|n| n <= MAX_REQUEST) {
+            return Ok((MAX_REQUEST, Hold::default()));
         }
-        let Ok(mut large) = self.large.lock() else { return MAX_REQUEST };
-        let now = Instant::now();
-        large.retain(|(_, until)| *until > now);
-        if large.len() >= LARGE_REPLIES || large.iter().filter(|(t, _)| *t == room.token).count() >= LARGE_REPLIES_PER_TOKEN {
-            return MAX_REQUEST;
+        if room.lock().is_none_or(|w| w.answers.is_empty()) {
+            return Err(Response::text(404, "nobody waits for an answer\n"));
         }
-        let secs = 60 + size.unwrap_or(MAX_REPLY).min(MAX_REPLY) / (64 << 10);
-        large.push((room.token.clone(), now + Duration::from_secs(u64::try_from(secs).unwrap_or(u64::MAX))));
-        MAX_REPLY
-    }
-
-    /// A large answer has arrived (or failed to): its place goes to the next.
-    fn large_done(&self, token: &str) {
-        if let Ok(mut large) = self.large.lock()
-            && let Some(i) = large.iter().position(|(t, _)| t == token)
-        {
-            large.remove(i);
+        let Ok(mut large) = self.large.lock() else { return Err(Response::text(500, "internal error\n")) };
+        if large.values().sum::<usize>() >= LARGE_REPLIES || large.get(&room.token).is_some_and(|n| *n >= LARGE_REPLIES_PER_TOKEN) {
+            return Err(Response::text(503, "too many large answers are arriving: send it again\n").with_header("Retry-After", "1"));
         }
+        *large.entry(room.token.clone()).or_insert(0) += 1;
+        Ok((MAX_REPLY, Hold::new(Place { counts: self.large.clone(), token: room.token.clone() })))
     }
 
     pub fn handle(&self, req: &Request) -> Response {
@@ -399,21 +394,38 @@ impl Relay {
     /// `POST /host/r/<room>/reply`: the desktop's answer to one request.
     fn reply(&self, req: &Request, id: &str) -> Response {
         let Some(room) = self.hosts(req, id) else { return Response::text(404, "no such room (or not its secret)\n") };
-        if req.body.len() > MAX_REQUEST {
-            self.large_done(&room.token);
-        }
         let Some((n, resp)) = serde_json::from_slice::<Value>(&req.body).ok().as_ref().and_then(wire::response_from) else {
             return Response::text(400, "an answer is {\"id\", \"status\", \"headers\", \"body\"}\n");
         };
         let Some(mut w) = room.lock() else { return Response::text(500, "internal error\n") };
         w.seen = Instant::now();
-        match w.answers.remove(&n) {
-            Some(tx) => {
-                let _ = tx.send(resp);
-                Response::new(204)
-            }
-            None => Response::text(404, "nobody waits for that answer any more\n"),
+        if !w.answers.contains_key(&n) {
+            return Response::text(404, "nobody waits for that answer any more\n");
         }
+        // Its bytes count from now until its agent has read them: past the budget, the desktop
+        // keeps the answer and sends it again once earlier ones have been read.
+        let Some(unsent) = self.reserve(&room.token, resp.body.len()) else {
+            return Response::text(503, "the relay is still sending earlier answers for this relay user's documents: send it again\n")
+                .with_header("Retry-After", "1");
+        };
+        if let Some(tx) = w.answers.remove(&n) {
+            let _ = tx.send((resp, unsent));
+        }
+        Response::new(204)
+    }
+
+    /// A place for `bytes` of `token`'s answers in [`Sending`], when its budget and the relay's
+    /// have room. One answer always fits when nothing else is waiting to be sent.
+    fn reserve(&self, token: &str, bytes: usize) -> Option<Unsent> {
+        let mut s = self.sending.lock().ok()?;
+        let mine = s.by_token.get(token).copied().unwrap_or(0);
+        let over = |used: usize, cap: usize| used > 0 && used.saturating_add(bytes) > cap;
+        if over(mine, self.config.sending_per_token) || over(s.total, self.config.max_sending) {
+            return None;
+        }
+        s.total = s.total.saturating_add(bytes);
+        *s.by_token.entry(token.to_string()).or_insert(0) += bytes;
+        Some(Unsent { sending: self.sending.clone(), token: token.to_string(), bytes })
     }
 
     /// `DELETE /host/r/<room>`: the desktop stopped sharing.
@@ -480,7 +492,7 @@ impl Relay {
                 return refusal(503, "too many requests are waiting for this relay user's documents").with_header("Retry-After", "1");
             }
             *n += 1;
-            Waits { counts: self.waiting.clone(), token: room.token.clone() }
+            Place { counts: self.waiting.clone(), token: room.token.clone() }
         };
         let (tx, rx) = mpsc::channel();
         let n = {
@@ -509,16 +521,8 @@ impl Relay {
         };
         room.wake.notify_all();
         match rx.recv_timeout(self.config.answer_wait) {
-            Ok(resp) => {
-                // Counted until the agent has read it: the request's place, and its bytes.
-                let bytes = resp.body.len();
-                if let Ok(mut s) = self.sending.lock() {
-                    s.total = s.total.saturating_add(bytes);
-                    *s.by_token.entry(room.token.clone()).or_insert(0) += bytes;
-                }
-                let unsent = Unsent { sending: self.sending.clone(), token: room.token.clone(), bytes };
-                resp.holding((waits, unsent))
-            }
+            // Counted until the agent has read it: the request's place, and its bytes.
+            Ok((resp, unsent)) => resp.holding((waits, unsent)),
             Err(e) => {
                 if let Some(mut w) = room.lock() {
                     w.answers.remove(&n);

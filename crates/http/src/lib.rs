@@ -74,6 +74,13 @@ impl PartialEq for Hold {
 
 impl Eq for Hold {}
 
+impl Hold {
+    /// Keep `what` until the hold is dropped.
+    pub fn new(what: impl std::any::Any + Send + Sync) -> Self {
+        Hold(Some(Arc::new(what)))
+    }
+}
+
 /// One response, written whole with its `Content-Length`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Response {
@@ -93,7 +100,7 @@ impl Response {
 
     /// Keep `what` until this response has been written (or given up on), then drop it.
     pub fn holding(mut self, what: impl std::any::Any + Send + Sync) -> Self {
-        self.hold = Hold(Some(Arc::new(what)));
+        self.hold = Hold::new(what);
         self
     }
 
@@ -386,7 +393,10 @@ pub type Handler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
 
 /// The most body a request may have, decided from its head (method, target and headers): a
 /// server can take large bodies only where they belong, and only from whoever may send them.
-pub type BodyLimit = Arc<dyn Fn(&Request) -> usize + Send + Sync>;
+/// With it, a [`Hold`] kept until the request is done, however it ends (answered, or its body
+/// never arrived): a place among the large bodies arriving at once, say. `Err` answers the
+/// request with that response, unread, and closes the connection.
+pub type BodyLimit = Arc<dyn Fn(&Request) -> Result<(usize, Hold), Response> + Send + Sync>;
 
 /// One of a counted number of places (connections served, connections being turned away),
 /// given back when dropped: when its thread ends, and when the thread never started.
@@ -404,7 +414,7 @@ const MAX_CLOSING: usize = 16;
 /// Accept connections on `listener` until it fails, each on a thread of its own.
 pub fn serve(listener: TcpListener, config: Config, handler: Handler) -> std::io::Result<()> {
     let body = config.limits.body;
-    serve_with(listener, config, Arc::new(move |_: &Request| body), handler)
+    serve_with(listener, config, Arc::new(move |_: &Request| Ok((body, Hold::default()))), handler)
 }
 
 /// [`serve`], with each request's body capped by `body_limit` instead of `config.limits.body`.
@@ -516,7 +526,12 @@ fn after(d: Duration) -> Instant {
 
 /// Answer a request that couldn't be read with why, and close.
 fn refuse(writer: &mut TcpStream, reader: &mut BufReader<Timed>, e: &Refused) {
-    let _ = write_response(writer, &e.response(), true);
+    refuse_with(writer, reader, &e.response());
+}
+
+/// Answer a request with `resp` before its body was read, and close.
+fn refuse_with(writer: &mut TcpStream, reader: &mut BufReader<Timed>, resp: &Response) {
+    let _ = write_response(writer, resp, true);
     reader.get_mut().until = after(Duration::from_secs(1));
     close_gently(writer, reader.get_mut(), Duration::from_secs(1));
 }
@@ -543,11 +558,19 @@ pub fn connection(stream: TcpStream, peer: SocketAddr, config: &Config, body_lim
             }
         };
         req.peer = Some(peer);
+        // Kept until this request is done, however it ends.
+        let (limit, _reserved) = match body_limit(&req) {
+            Ok(l) => l,
+            Err(resp) => {
+                refuse_with(&mut writer, &mut reader, &resp);
+                return;
+            }
+        };
         if req.header("Expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue")) && writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").is_err()
         {
             return;
         }
-        let limits = Limits { body: body_limit(&req), ..config.limits };
+        let limits = Limits { body: limit, ..config.limits };
         if limits.body > config.limits.body {
             // A body allowed to be larger (the relay's desktop sending an answer, its secret
             // checked) gets time for the size it says it has at 64 KiB/s at the least.
