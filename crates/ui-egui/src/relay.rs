@@ -34,6 +34,8 @@ pub(crate) struct Settings {
 }
 
 impl Settings {
+    // The web app opens no room on a relay.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fn claim(&self) -> Option<(String, String)> {
         Some((self.room.clone()?, self.secret.clone()?))
     }
@@ -75,6 +77,9 @@ pub(crate) struct RelayState {
     /// Whether `settings` was read from the settings folder yet.
     loaded: bool,
     connection: Option<Connection>,
+    /// The room last closed on the relay, while the relay hears of it: the next one waits for
+    /// that, so sharing again at once opens the same room (and URL), not one for a second desktop.
+    closing: Option<std::thread::JoinHandle<()>>,
 }
 
 /// The settings file in `dir`.
@@ -248,7 +253,12 @@ impl WordApp {
         let stopped = Arc::new(AtomicBool::new(false));
         let (l, s, shared, ctx) = (link.clone(), stopped.clone(), self.relay.settings.clone(), self.ctx.clone());
         let path = settings_path(self.services.settings_dir.as_deref());
+        let closing = self.relay.closing.take();
         let spawned = std::thread::Builder::new().name("relay connect".into()).spawn(move || {
+            // The room closed last is closed on the relay first (a few seconds at most).
+            if let Some(closing) = closing {
+                let _ = closing.join();
+            }
             // Until it opens, the relay refuses, or sharing stops: the computer may be offline.
             let mut wait = std::time::Duration::from_secs(2);
             let result = loop {
@@ -321,8 +331,8 @@ impl WordApp {
             std::mem::replace(&mut *link, Link::Failed("stopped".into()))
         };
         if let Link::Up(hosted) = up {
-            // The room refuses agents at once; the relay hears it on this thread.
-            hosted.stop_soon();
+            // The room refuses agents at once; the relay hears it on a thread of its own.
+            self.relay.closing = hosted.stop_soon();
         }
     }
 }
@@ -382,14 +392,19 @@ impl Hosted {
         }
     }
 
-    fn stop_soon(self) {
+    /// Close the room on the relay, on a thread of its own when one starts.
+    fn stop_soon(self) -> Option<std::thread::JoinHandle<()>> {
         let hosting = self.0;
         let spawned = std::thread::Builder::new().name("relay stop".into()).spawn({
             let hosting = hosting.clone();
             move || hosting.stop()
         });
-        if spawned.is_err() {
-            hosting.stop();
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(_) => {
+                hosting.stop();
+                None
+            }
         }
     }
 }
@@ -412,7 +427,9 @@ impl Hosted {
     fn status(&self) -> (&'static str, Option<String>) {
         ("stopped", None)
     }
-    fn stop_soon(self) {}
+    fn stop_soon(self) -> Option<std::thread::JoinHandle<()>> {
+        None
+    }
 }
 
 #[cfg(test)]

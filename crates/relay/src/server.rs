@@ -200,6 +200,12 @@ impl Relay {
                     if !same_secret(&secret, &room.secret) {
                         return Response::text(409, "that room is someone else's\n");
                     }
+                    // Another desktop with the same saved room (a second copy of the app on the
+                    // same settings) is asking for it now: two desktops never share a room's
+                    // requests. This one gets a room of its own.
+                    if room.lock().is_none_or(|w| Room::online(&w, self.config.offline_after)) {
+                        return Response::text(409, "that room is in use by another desktop\n");
+                    }
                     return self.opened(&id, &secret);
                 }
                 (id, secret)

@@ -242,6 +242,19 @@ fn a_late_answer_never_answers_another_agent_after_the_room_opens_again() {
     }
 }
 
+/// Two copies of the app with the same saved room (the same settings folder) never share it: the
+/// second gets a room of its own, and stopping it leaves the first's working.
+#[test]
+fn two_desktops_with_the_same_saved_room_get_a_room_each() {
+    let (base, _relay) = relay(|_| {});
+    let first = Hosting::start(&base, TOKEN, None, echo()).unwrap();
+    let second = Hosting::start(&base, TOKEN, Some(first.claim()), echo()).unwrap();
+    assert_ne!(second.url(), first.url());
+    assert_ne!(second.claim(), first.claim());
+    second.stop();
+    assert_eq!(http(first.url(), "POST", &[], "{}").0, 200, "the first room still works");
+}
+
 /// Agents waiting when the person stops sharing hear so at once.
 #[test]
 fn waiting_agents_hear_when_sharing_stops() {
