@@ -10,7 +10,7 @@ use wordcraft_doc::edit::Fragment;
 use wordcraft_doc::props::{CharProps, Highlight, ParaProps};
 use wordcraft_doc::{BlockId, ChangeSet, Document, Path, Pos, StoryRef};
 
-use super::{Accepted, Bounce, MAX_BATCH, Participant, ParticipantId, Room};
+use super::{Accepted, Bounce, MAX_BATCH, Participant, ParticipantId, Presence, Room};
 use crate::cmd::edit::ClipHistory;
 use crate::cmd::moves::PendingMove;
 use crate::scope::{Place, Scope, positions};
@@ -465,6 +465,22 @@ impl Made {
     }
 }
 
+/// Another participant, as a copy sees them ([`Replica::others`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Other {
+    pub who: Participant,
+    /// Which of the room's colours is theirs ([`super::Seen::color`]).
+    pub color: u8,
+    /// Their selection as places in the copy's document; `None` while the room doesn't know it
+    /// (their copy hasn't said yet, or its text is gone), or the copy doesn't have its text.
+    pub at: Option<Selection>,
+    /// The same as anchors, with offsets within the text: as `room.participants` gives them.
+    pub anchors: Option<Presence>,
+    /// Their copy said where they are as of a version this copy doesn't have yet
+    /// ([`super::Seen::later`]): `at` is `None` until it does.
+    pub later: bool,
+}
+
 /// How a copy runs a command in its session: [`Session::run`], or [`Session::run_ime`] for an
 /// input method's.
 type Runner = fn(&mut Session, &str, &Value) -> Result<Value, CmdError>;
@@ -509,6 +525,16 @@ pub struct Replica {
     /// The places in the params of the command Repeat repeats ([`Session::last_command`]), as
     /// anchors moved with the text since; `None` for one that is gone.
     repeat: Vec<(String, Option<Anchor>)>,
+    /// Where the copy last told the room its selection is ([`Replica::present`]), as of which
+    /// version; `None` until it did, and once the room may see it elsewhere (the copy read the
+    /// document again).
+    presented: Option<(u64, Option<Presence>)>,
+    /// Whether the copy has to tell the room where its selection is: it couldn't when it last
+    /// tried ([`Replica::present_if_moved`]).
+    owed: bool,
+    /// Whether a command of the copy's own moved the participant's selection or edited since
+    /// [`Replica::reset_moved`].
+    moved: bool,
 }
 
 impl Replica {
@@ -534,6 +560,9 @@ impl Replica {
             lent: false,
             reborn: BTreeMap::new(),
             repeat: Vec::new(),
+            presented: None,
+            owed: false,
+            moved: false,
         }
     }
 
@@ -739,7 +768,9 @@ impl Replica {
         }
         let move_before = self.session.pending_move.as_ref().map(|m| m.rev);
         let steps = Some(Arc::new(self.session.steps()));
+        let edits_before = self.session.changes().version();
         let result = how(&mut self.session, id, params);
+        let edited = self.session.changes().version() != edits_before;
         if self.session.registry.get(id).is_some_and(|spec| spec.mutates) {
             self.repeat = repeat_places(&self.session);
         }
@@ -747,6 +778,8 @@ impl Replica {
         let comments = new_comments(&comments_before, &self.session.doc);
         self.stay_in_document();
         let after = selection_anchors(&self.session);
+        // The others see where the participant is now ([`Replica::present_if_moved`]).
+        self.moved |= edited || after != before;
         let made = Made {
             command: Some((id.to_string(), kept_params)),
             before,
@@ -830,6 +863,122 @@ impl Replica {
     pub fn sync(&mut self) {
         self.receive();
         self.send();
+    }
+
+    /// Where the participant's selection is, as anchors in the copy's document; `None` when an
+    /// end isn't in a paragraph, or the room's document isn't the session's active one.
+    pub fn presence(&self) -> Option<Presence> {
+        self.on_document().then(|| selection_anchors(&self.session)).flatten().map(|(anchor, focus)| Presence { anchor, focus })
+    }
+
+    /// Tell the room where the participant's selection is, when it isn't where the copy last
+    /// said ([`Room::set_presence`]): the others see it there. As anchors in the document as of
+    /// the version the copy got last, so only once the hub has given back every edit of the
+    /// copy's own (it gets what the hub took first): until then, the room keeps moving the
+    /// place the copy told it before, and the copy tells it at the next call.
+    pub fn present(&mut self) {
+        self.receive();
+        if self.has_unconfirmed() || !self.on_document() {
+            self.owed = true;
+            return;
+        }
+        let at = self.presence();
+        self.tell(at);
+    }
+
+    /// Tell the room the others don't see the participant's selection (the window, while it
+    /// shows another document).
+    pub fn absent(&mut self) {
+        self.tell(None);
+    }
+
+    /// Start counting what the participant's own commands do ([`Replica::present_if_moved`]):
+    /// at the start of each of their requests.
+    pub fn reset_moved(&mut self) {
+        self.moved = false;
+    }
+
+    /// [`Replica::present`], when a command of the copy's own moved the participant's selection
+    /// or edited since [`Replica::reset_moved`], or the copy couldn't tell the room the last
+    /// time. What others' changes do to the selection, and what's put in the copy outside a
+    /// command of its own after the reset, leaves where the others see the participant as it
+    /// is: so a copy that never moved its caret isn't seen at the start of the document, and
+    /// the selection the assistant's copy takes over from the person at the start of a turn
+    /// isn't shown as the assistant's.
+    pub fn present_if_moved(&mut self) {
+        if self.owed || self.moved {
+            self.present();
+        }
+    }
+
+    fn tell(&mut self, at: Option<Presence>) {
+        let told = match self.presented {
+            // Nowhere stays nowhere whatever changed since.
+            Some((_, None)) => at.is_none(),
+            Some((version, was)) => version == self.received && was == at,
+            None => false,
+        };
+        if told {
+            self.owed = false;
+            self.moved = false;
+            return;
+        }
+        let kept = self.room.set_presence(self.who.id, self.received, at);
+        self.owed = !kept;
+        if kept {
+            self.presented = Some((self.received, at));
+            self.moved = false;
+        }
+    }
+
+    /// Which of the room's colours is the participant's ([`super::Seen::color`]).
+    pub fn color(&self) -> u8 {
+        self.room.color_of(self.who.id)
+    }
+
+    /// Everyone else in the room, in the order they joined, with where their selection is in
+    /// the copy's document ([`Room::presences_at`]): the copy gets what the hub took first, the
+    /// hub gives each place as of the version the copy has then, and the copy moves it through
+    /// its edits the hub hasn't given back yet.
+    pub fn others(&mut self) -> Vec<Other> {
+        self.others_after(&[])
+    }
+
+    /// [`Replica::others`], when `before` is what it gave last: their places then lead the way
+    /// to the paragraphs they are in now, which are looked for in the whole document otherwise.
+    pub fn others_after(&mut self, before: &[Other]) -> Vec<Other> {
+        self.receive();
+        let me = self.who.id;
+        let mut seen = self.room.presences_at(self.received).1;
+        // A place told meanwhile, as of a version after the copy's: the copy gets it and asks
+        // again, a few times at most.
+        for _ in 0..2 {
+            if !seen.iter().any(|s| s.later && s.who.id != me) {
+                break;
+            }
+            self.receive();
+            seen = self.room.presences_at(self.received).1;
+        }
+        // Both lists are in the order participants joined.
+        let mut hints = before.iter().peekable();
+        seen.into_iter()
+            .filter(|s| s.who.id != me)
+            .map(|s| {
+                while hints.next_if(|o| o.who.id < s.who.id).is_some() {}
+                let hint = hints.peek().filter(|o| o.who.id == s.who.id).and_then(|o| o.at.as_ref());
+                let placed = s.at.and_then(|p| self.place(p, hint));
+                let (anchors, at) = placed.map_or((None, None), |(p, sel)| (Some(p), Some(sel)));
+                Other { who: s.who, color: s.color, at, anchors, later: s.later }
+            })
+            .collect()
+    }
+
+    /// Where presence `p`, in the document as of the version the copy got last, is in the
+    /// copy's: moved through the copy's edits the hub hasn't given back, in order. `hint`:
+    /// where it was before.
+    fn place(&self, p: Presence, hint: Option<&Selection>) -> Option<(Presence, Selection)> {
+        let p = self.pending.iter().try_fold(p, |p, u| p.through(&u.change, false))?;
+        p.placed_in(&self.session.doc, hint)
     }
 
     /// Make accepted change `a` in the copy.
@@ -946,6 +1095,12 @@ impl Replica {
     /// again on it.
     fn read_again(&mut self) {
         self.stats.read_again = self.stats.read_again.saturating_add(1);
+        // The room moved the place the copy told it through the changes the copy skips; the
+        // copy tells it where its selection is again.
+        if matches!(self.presented, Some((_, Some(_)))) {
+            self.owed = true;
+        }
+        self.presented = None;
         let (version, doc) = self.room.document();
         let mut dropped = std::mem::take(&mut self.pending);
         // The changes the hub accepted are in its document already. The others were made on the
