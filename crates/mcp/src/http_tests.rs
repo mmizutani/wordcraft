@@ -297,6 +297,24 @@ fn hostile_bodies_never_panic() {
     }
 }
 
+/// A batch would run every member and keep every answer: over HTTP, it's refused before it
+/// reaches the app, and so is anything else that isn't one message.
+#[test]
+fn batches_are_refused_and_never_reach_the_app() {
+    let (e, app) = endpoint(Options::default());
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "inspect_document", "arguments": {}}});
+    assert_eq!(e.handle(&post(Some("ana"), &call, &[])).status, 200);
+    let runs = |app: &App| app.calls.lock().unwrap().iter().filter(|(_, m)| m != "auth").count();
+    let before = runs(&app);
+    let batch = Value::Array(vec![call.clone(); 50]);
+    for b in [batch, json!([]), json!(null), json!(5), json!("tools/call")] {
+        let r = e.handle(&post(Some("ana"), &b, &[]));
+        assert_eq!(r.status, 400, "{b}");
+        assert_eq!(body(&r)["error"]["code"], -32600, "{b}");
+    }
+    assert_eq!(runs(&app), before, "nothing ran");
+}
+
 /// An agent sending faster than the app answers: a few requests wait their turn, the rest are
 /// told to try again at once, and a request whose caller was told it timed out never runs later.
 #[test]
