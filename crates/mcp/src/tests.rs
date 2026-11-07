@@ -498,3 +498,27 @@ fn a_2026_07_28_client_needs_no_handshake() {
     assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
     assert!(call(&mut s, 7, "tools/list", json!({}))["result"].get("resultType").is_none());
 }
+
+/// One `batch` call can't run without end or fill memory with answers: past 256 commands it is
+/// refused before any runs, and results past 8 MiB in all are left out (the commands still run).
+#[test]
+fn a_batch_is_bounded_in_commands_and_in_the_answers_it_keeps() {
+    use crate::tools::{MAX_BATCH, MAX_BATCH_ANSWER};
+    let mut s = Server::new(Box::new(Headless::default()));
+    tool(&mut s, "new_document", json!({}));
+    let too_many: Vec<Value> = (0..=MAX_BATCH).map(|_| json!({"command": "text.insert", "params": {"text": "x"}})).collect();
+    let r = call(&mut s, 9, "tools/call", json!({"name": "batch", "arguments": {"commands": too_many}}));
+    assert_eq!(r["result"]["isError"], true, "{}", r["result"]);
+    let text = tool(&mut s, "get_text", json!({})).to_string();
+    assert!(!text.contains("xx"), "nothing ran: {text}");
+    // A document of about 200 KB, read 100 times in one batch: about 20 MB of results.
+    tool(&mut s, "type_text", json!({"text": "word ".repeat(40_000)}));
+    let reads: Vec<Value> = (0..100).map(|_| json!({"command": "document.text"})).collect();
+    let r = call(&mut s, 9, "tools/call", json!({"name": "batch", "arguments": {"commands": reads}}));
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.len() <= MAX_BATCH_ANSWER + 64 * 1024, "{} bytes", text.len());
+    let out: Vec<Value> = serde_json::from_str(text).unwrap();
+    assert_eq!(out.len(), 100, "every command ran");
+    assert!(out.first().unwrap()["result"].is_object() || out.first().unwrap()["result"].is_string());
+    assert!(out.last().unwrap()["leftOut"].is_string(), "{}", out.last().unwrap());
+}
