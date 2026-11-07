@@ -7094,6 +7094,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wordcraft-relay"
+version = "0.15.1"
+dependencies = [
+ "getrandom 0.3.4",
+ "log",
+ "serde_json",
+ "ureq",
+ "wordcraft-http",
+]
+
+[[package]]
 name = "wordcraft-render"
 version = "0.15.1"
 dependencies = [

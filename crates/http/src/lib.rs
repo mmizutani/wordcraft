@@ -326,8 +326,18 @@ impl Default for Config {
 /// What answers each request.
 pub type Handler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
 
+/// The most body a request may have, decided from its head (method, target and headers): a
+/// server can take large bodies only where they belong, and only from whoever may send them.
+pub type BodyLimit = Arc<dyn Fn(&Request) -> usize + Send + Sync>;
+
 /// Accept connections on `listener` until it fails, each on a thread of its own.
 pub fn serve(listener: TcpListener, config: Config, handler: Handler) -> std::io::Result<()> {
+    let body = config.limits.body;
+    serve_with(listener, config, Arc::new(move |_: &Request| body), handler)
+}
+
+/// [`serve`], with each request's body capped by `body_limit` instead of `config.limits.body`.
+pub fn serve_with(listener: TcpListener, config: Config, body_limit: BodyLimit, handler: Handler) -> std::io::Result<()> {
     let open = Arc::new(AtomicUsize::new(0));
     loop {
         let (stream, peer) = match listener.accept() {
@@ -357,9 +367,9 @@ pub fn serve(listener: TcpListener, config: Config, handler: Handler) -> std::io
             close_gently(&s, &mut BufReader::new(&s), Duration::from_millis(200));
             continue;
         }
-        let (open, handler) = (open.clone(), handler.clone());
+        let (open, handler, body_limit) = (open.clone(), handler.clone(), body_limit.clone());
         let spawned = std::thread::Builder::new().name("http connection".into()).spawn(move || {
-            connection(stream, peer, &config, &handler);
+            connection(stream, peer, &config, &body_limit, &handler);
             open.fetch_sub(1, Ordering::SeqCst);
         });
         if spawned.is_err() {
@@ -369,7 +379,7 @@ pub fn serve(listener: TcpListener, config: Config, handler: Handler) -> std::io
 }
 
 /// Serve one connection's requests until it closes, idles out or asks to close.
-pub fn connection(stream: TcpStream, peer: SocketAddr, config: &Config, handler: &Handler) {
+pub fn connection(stream: TcpStream, peer: SocketAddr, config: &Config, body_limit: &BodyLimit, handler: &Handler) {
     let _ = stream.set_read_timeout(Some(config.idle));
     let Ok(read) = stream.try_clone() else { return };
     let mut reader = BufReader::new(read);
@@ -389,7 +399,8 @@ pub fn connection(stream: TcpStream, peer: SocketAddr, config: &Config, handler:
         {
             return;
         }
-        if let Err(e) = read_body(&mut reader, &mut req, &config.limits) {
+        let limits = Limits { body: body_limit(&req), ..config.limits };
+        if let Err(e) = read_body(&mut reader, &mut req, &limits) {
             let _ = write_response(&mut writer, &e.response(), true);
             close_gently(&writer, &mut reader, Duration::from_secs(1));
             return;
