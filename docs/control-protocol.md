@@ -88,7 +88,7 @@ echo '{"text": "Hello"}' | wordcraft-cli call text.insert - --connect 127.0.0.1:
 | `ui.parity` | — | feature-catalog parity |
 | `ui.resize` | `width`, `height` | asks for that window content size in points; sizes that aren't positive and finite are refused, the rest are clamped to the app's minimum (760 × 480) and to the largest surface the GPU can draw (at most 16384; that limit wins over the minimum), and the reply's `width` and `height` are the size asked for |
 | `ui.focus` / `app.quit` | | window control |
-| `room.share`, `room.invite`, `room.revoke`, `room.participants`, `room.stop` | see [Shared documents](#shared-documents) | sharing the document the window shows with agents and people who join with a key |
+| `room.share`, `room.invite`, `room.revoke`, `room.role`, `room.participants`, `room.stop` | see [Shared documents](#shared-documents) | sharing the document the window shows with agents and people who join with a key |
 
 Any other method name is treated as a command id: `{"method": "format.bold"}` works.
 
@@ -255,14 +255,16 @@ to its copy, which makes it again after that change, from the same place. Nobody
 unless another participant's change took its text away, and then its sender is told. The window
 brings in what the others changed every frame.
 
-With the window's key:
+With the window's key (each is a command of the window's too, for `engine.execute`; the app's
+File › Share page runs them):
 
 | Method | Params | Result |
 |---|---|---|
 | `room.share` | `name?` | shares the active document; the window joins its room as its owner, under `name`, else the author name (File › Options › User name), else `Owner`. `{"shared": true, "document", "version", "you", "participants", "agentFiles"}`: the document's id, the number of changes the room took, the window's participant and everyone in the room, each `{"id", "name", "role"}` and, for those who joined with a key, `"files"`: which files their commands can use now (`none`, `folders` or `all`, see [Files participants can use](#files-participants-can-use)); `agentFiles` is what File › Options › Agents gives agents. Sharing the same document again answers the same; another one is an error while one is shared |
 | `room.invite` | `name`, `role?`, `files?` | a key (32 hex digits, random) for a participant called `name`, with `role` ([roles](#roles), `suggester` unless given): `{"key", "name", "role", "files"}`. A name is someone's in the room for good, even after they left, since their comments and tracked changes keep it: up to 128 characters, no control characters, compared without case. `files` (`none`, `folders` or `all`) gives the participant fewer files than File › Options › Agents gives agents, never more; left out (`null`), they get what the setting gives, whenever it changes |
-| `room.revoke` | `key` | takes the invite back: nobody joins with the key any more, and the copies that joined with it are out of the room (the room refuses their changes, and their connections end). `{"revoked": bool}` |
-| `room.participants` | — | `{"shared": false}`, or what `room.share` answers |
+| `room.revoke` | `key` or `name` | takes the invite back, by its key or by the name it was for (compared without case; the key shows once in File › Share): nobody joins with the key any more, and the copies that joined with it are out of the room (the room refuses their changes, and their connections end). `{"revoked": bool}` |
+| `room.role` | `name`, `role` | gives the participant invited as `name` (compared without case) `role` from now on: the room holds their next change to it, their copies' next requests follow it, and a copy that joins with the key later has it. `{"changed": bool, "name", "role"}`. Only invited participants change role: the window keeps its own |
+| `room.participants` | — | `{"shared": false}`, or what `room.share` answers, with `"invited"`: the invites not taken back, each `{"name", "role", "files", "joined"}` (`joined`: how many copies are in the room with its key now), never their keys |
 | `room.stop` | — | stops sharing: the room closes and every participant's connection ends; the window keeps the document as it is, with every change the room took, whether it shows that document or another. `{"stopped": bool}` |
 
 The window keeps the shared document up to date while it shows another one: every frame brings

@@ -186,6 +186,19 @@ impl<'a> Exempt<'a> {
             names.extend(row.tags.iter().cloned());
             names.insert(tag);
         }
+        // File › Share (#33): the names people and agents were invited under, and the key just
+        // given (and the MCP command line with it), as the person typed and the room made them.
+        if let Some(state) = Some(app.share_state()).filter(|s| s["shared"] == true) {
+            for row in crate::share_page::rows(&state) {
+                names.insert(row.name);
+            }
+        }
+        if let Some((name, key)) = &app.share_form.shown {
+            names.extend([name.clone(), key.clone()]);
+            if let Some(addr) = app.lobby.addr() {
+                names.insert(crate::share_page::mcp_line(key, addr));
+            }
+        }
         for m in crate::credits::MODELS {
             names.extend([m.company, m.model, m.version].map(str::to_string));
         }
@@ -290,11 +303,20 @@ fn untranslated_interface_text() {
         record(&app, &format!("tab {tab}"), drawn);
     }
     let _ = app.run("ui.tab", json!({"tab": "Home"}));
-    for page in ["home", "new", "open", "info", "export", "options"] {
+    for page in ["home", "new", "open", "info", "share", "export", "options"] {
         let _ = app.run("ui.backstage", json!({"value": true, "page": page}));
         let drawn = frame(&ctx, &mut app);
         record(&app, &format!("File › {page}"), drawn);
     }
+    // File › Share while the document is shared, with someone invited and their key showing.
+    let _ = app.run("room.share", json!({}));
+    if let Ok(v) = app.run("room.invite", json!({"name": "Researcher", "role": "editor"})) {
+        app.share_form.shown = Some(("Researcher".into(), v["key"].as_str().unwrap_or_default().into()));
+    }
+    let _ = app.run("ui.backstage", json!({"value": true, "page": "share"}));
+    let drawn = frame(&ctx, &mut app);
+    record(&app, "File › Share, shared", drawn);
+    let _ = app.run("room.stop", json!({}));
     for pane in wordcraft_engine::cmd::options::PANES {
         let _ = app.run("ui.backstage", json!({"value": true, "page": "options", "pane": pane}));
         let drawn = frame(&ctx, &mut app);
@@ -737,7 +759,7 @@ fn the_arabic_interface_is_mirrored_and_never_panics() {
         assert!(preview < f32::MAX, "the preview's page indicator is drawn");
         assert!(preview + 100.0 < settings, "print page at {width}: settings {settings}, preview {preview}");
     }
-    for page in ["home", "new", "open", "info", "export", "print", "options"] {
+    for page in ["home", "new", "open", "info", "share", "export", "print", "options"] {
         let _ = app.run("ui.backstage", json!({"value": true, "page": page}));
         frame(&ctx, &mut app);
         frame_at(&ctx, &mut app, 500.0);

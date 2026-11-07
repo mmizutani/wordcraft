@@ -135,7 +135,7 @@ fn answer(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, Str
             }
             Ok(reply)
         }
-        "room.share" | "room.invite" | "room.revoke" | "room.stop" => {
+        "room.share" | "room.invite" | "room.revoke" | "room.role" | "room.stop" => {
             Err(format!("`{method}` is the owner's: {} joined the shared document as a {}", copy.participant().name, copy.participant().role))
         }
         "app.quit" => Err(no_window(method)),

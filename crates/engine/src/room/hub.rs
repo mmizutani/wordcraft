@@ -94,6 +94,20 @@ impl std::fmt::Debug for Invite {
     }
 }
 
+/// An invite as the room's owner sees it ([`Hub::invites`]): who it is for, never its key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invited {
+    /// The participant's name.
+    pub name: String,
+    /// Their role.
+    pub role: Role,
+    /// Which files their commands can use, when the invite chose for them; `None`: what the
+    /// room's setting says.
+    pub files: Option<AgentFiles>,
+    /// How many copies are in the room with its key now: none until they join.
+    pub joined: usize,
+}
+
 /// A participant, with how they joined and whether they're still in the room.
 #[derive(Clone, Debug)]
 struct Member {
@@ -254,6 +268,49 @@ impl Hub {
             }
         }
         !gone.is_empty()
+    }
+
+    /// The invites handed out and not taken back, in the order they were, as the room's owner
+    /// sees them: never their keys.
+    pub fn invites(&self) -> Vec<Invited> {
+        self.invites
+            .iter()
+            .map(|i| Invited {
+                name: i.name.clone(),
+                role: i.role,
+                files: i.files,
+                joined: self.participants.iter().filter(|m| m.here && m.via == Some(i.number)).count(),
+            })
+            .collect()
+    }
+
+    /// [`Hub::revoke`] the invite for the participant called `name` (compared without case), for
+    /// an owner who no longer has the key: the key shows once. Whether there was one.
+    pub fn revoke_named(&mut self, name: &str) -> bool {
+        let Some(key) = self.invites.iter().find(|i| same_name(&i.name, name.trim())).map(|i| i.key.clone()) else { return false };
+        self.revoke(&key)
+    }
+
+    /// Give the participant called `name` (compared without case) `role` from now on: their
+    /// invite, so a copy that joins with its key later has it too, and every copy that joined
+    /// with it, whose next change the hub holds to it (and which takes it with the next changes
+    /// it receives, [`super::Replica::receive`]). Whether it changed. Only invited participants
+    /// change role: the room's own process (the window, its owner) keeps the one it joined with.
+    pub fn set_role(&mut self, name: &str, role: Role) -> Result<bool, RoomError> {
+        self.open()?;
+        let name = name.trim();
+        let Some(invite) = self.invites.iter_mut().find(|i| same_name(&i.name, name)) else {
+            return Err(RoomError::Name(format!("{name} has no invite: only participants invited with a key change role")));
+        };
+        if invite.role == role {
+            return Ok(false);
+        }
+        invite.role = role;
+        let number = invite.number;
+        for m in self.participants.iter_mut().filter(|m| m.via == Some(number)) {
+            m.who.role = role;
+        }
+        Ok(true)
     }
 
     /// Admit the participant the invite with `key` names, with its role. The same key admits

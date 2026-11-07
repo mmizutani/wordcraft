@@ -4,8 +4,9 @@
 //! Participants with a key join through the control channel ([`Lobby`]), each with a copy of
 //! their own on their connection's thread; their changes arrive here every frame.
 //!
-//! The control channel's `room.*` methods are the owner's ([`room_method`]); File › Share and
-//! the participants' carets and names come with presence (milestone A1.5).
+//! The control channel's `room.*` methods are the owner's ([`room_method`]), and commands of the
+//! window's too, which File › Share runs ([`crate::share_page`]); the participants' carets and
+//! names come with presence (milestone A1.5).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +75,10 @@ impl WordApp {
     /// whenever it is saved, closed or shown. Sharing stops when the window no longer has the
     /// document open.
     pub(crate) fn sync_share(&mut self, ctx: &egui::Context) {
+        // File › Share shows an invite's key only while the page stays open.
+        if !(self.ui.backstage && self.ui.backstage_page == "share") {
+            self.share_form.shown = None;
+        }
         let Some(share) = self.share.as_mut() else { return };
         if share.room.is_closed() || !self.session.is_open(share.copy.document()) {
             self.stop_sharing();
@@ -186,8 +191,9 @@ impl WordApp {
 
     /// Whether the window shares a document, which one, its version, who the window is in it and
     /// who else is: for each participant who joined with a key, which files their commands can use
-    /// now (`files`), as File › Options › Agents (`agentFiles`) and their invite say.
-    fn share_state(&self) -> Value {
+    /// now (`files`), as File › Options › Agents (`agentFiles`) and their invite say; and the
+    /// invites not taken back, each with how many copies joined with it (`invited`).
+    pub(crate) fn share_state(&self) -> Value {
         match &self.share {
             None => json!({"shared": false}),
             Some(s) => {
@@ -204,12 +210,19 @@ impl WordApp {
                         v
                     })
                     .collect();
+                let invited: Vec<Value> = s
+                    .room
+                    .invites()
+                    .into_iter()
+                    .map(|i| json!({"name": i.name, "role": i.role, "files": i.files.map(AgentFiles::name), "joined": i.joined}))
+                    .collect();
                 json!({
                     "shared": true,
                     "document": s.copy.document(),
                     "version": s.room.version(),
                     "you": s.copy.participant(),
                     "participants": participants,
+                    "invited": invited,
                     "agentFiles": s.room.agent_files().0.name(),
                 })
             }
@@ -227,8 +240,11 @@ impl WordApp {
 ///   (`docs/control-protocol.md`, Shared documents). Their commands use the files File › Options ›
 ///   Agents allows, or fewer when `files` says so: `none`, `folders` (that pane's folders) or
 ///   `all`, never more than the setting.
-/// - `room.revoke {key}`: take an invite back; the copies that joined with it stop answering.
-/// - `room.participants`: whether a document is shared, its version, and who is in it.
+/// - `room.revoke {key | name}`: take an invite back, by its key or by the name it was for (the key
+///   shows once); the copies that joined with it stop answering.
+/// - `room.role {name, role}`: give an invited participant another role from now on.
+/// - `room.participants`: whether a document is shared, its version, who is in it, and the
+///   invites not taken back (`invited`, without their keys).
 /// - `room.stop`: stop sharing.
 pub(crate) fn room_method(app: &mut WordApp, method: &str, p: &Value) -> Option<Result<Value, String>> {
     let s = |k: &str| p.get(k).and_then(Value::as_str);
@@ -251,8 +267,19 @@ pub(crate) fn room_method(app: &mut WordApp, method: &str, p: &Value) -> Option<
         })(),
         "room.revoke" => (|| {
             let room = room()?;
-            let key = s("key").ok_or("missing `key`")?;
-            Ok(json!({"revoked": room.revoke(key)}))
+            match (s("key"), s("name")) {
+                (Some(key), _) => Ok(json!({"revoked": room.revoke(key)})),
+                (None, Some(name)) => Ok(json!({"revoked": room.revoke_named(name)})),
+                (None, None) => Err("missing `key` or `name`".to_string()),
+            }
+        })(),
+        "room.role" => (|| {
+            let room = room()?;
+            let name = s("name").ok_or("missing `name`")?;
+            let role = s("role").ok_or("missing `role`")?;
+            let role = Role::named(role).ok_or_else(|| format!("`role` {role:?}: viewer, commenter, suggester, editor or owner"))?;
+            let changed = room.set_role(name, role).map_err(|e| e.to_string())?;
+            Ok(json!({"changed": changed, "name": name.trim(), "role": role}))
         })(),
         "room.participants" => Ok(app.share_state()),
         "room.stop" => Ok(json!({"stopped": app.stop_sharing()})),

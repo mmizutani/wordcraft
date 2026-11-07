@@ -159,8 +159,8 @@ pub fn specs() -> Vec<CommandSpec> {
         })
         .pure(),
         CommandSpec::new("file.share", "Share", "File", |s, _| {
-            s.push_ui_request(json!({"open": "saveAs"}));
-            Ok(json!({"hint": "Save or export a copy (PDF, Word document) to share it."}))
+            s.push_ui_request(json!({"open": "share"}));
+            Ok(json!({"hint": "The app's File › Share shares the document with people and agents (room.share, room.invite); file.exportPdf and file.saveAs make a copy to send."}))
         })
         .pure(),
         CommandSpec::new("insert.quickParts", "Quick Parts", "Insert › Text", |s, v| quick_parts(s, v, wordcraft_doc::QUICK_PARTS_GALLERY)).params(

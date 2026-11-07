@@ -742,3 +742,74 @@ fn a_participant_s_copy_renders_pages_follows_changes_and_takes_command_ids_as_m
     settle_all(&mut own, &mut win, std::slice::from_mut(&mut agent));
     window_is_hub(&win, &room);
 }
+
+/// File › Share lists the invites without their keys, and takes one back by its name: the key
+/// shows only once.
+#[test]
+fn the_owner_lists_invites_without_keys_and_revokes_one_by_name() {
+    use crate::room::Invited;
+    let (mut win, _, _) = window();
+    let (room, _own) = Room::host(&mut win, "Minoru").unwrap();
+    let ana_key = room.invite("Ana", Role::Editor).unwrap();
+    room.invite_with("Ben", Role::Viewer, Some(crate::agent_files::AgentFiles::None)).unwrap();
+    let mut ana = room.join_with(&ana_key).unwrap();
+    let _ana_too = room.join_with(&ana_key).unwrap();
+    assert_eq!(
+        room.invites(),
+        [
+            Invited { name: "Ana".into(), role: Role::Editor, files: None, joined: 2 },
+            Invited { name: "Ben".into(), role: Role::Viewer, files: Some(crate::agent_files::AgentFiles::None), joined: 0 },
+        ]
+    );
+    assert!(!format!("{:?}", room.invites()).contains(&ana_key), "no key in what the owner sees");
+    // By name, whatever its case: Ana's copies are out, and no one joins with the key.
+    assert!(room.revoke_named(" ana "));
+    assert!(!room.revoke_named("Ana"), "taken back already");
+    assert!(!room.revoke_named("Minoru"), "the window has no invite");
+    assert!(hosted::ended(&ana).is_some_and(|why| why.contains("taken back")));
+    assert!(execute(&mut ana, "text.insert", json!({"text": "x"})).is_err());
+    assert!(matches!(room.join_with(&ana_key), Err(RoomError::UnknownKey)));
+    let names: Vec<String> = room.invites().into_iter().map(|i| i.name).collect();
+    assert_eq!(names, ["Ben"]);
+    for junk in ["", "   ", "\u{0}", &"x".repeat(10_000)] {
+        assert!(!room.revoke_named(junk));
+    }
+}
+
+/// The owner changes an invited participant's role: the room holds their next change to it, and
+/// their copy's commands follow it from their next request on; a copy that joins later has it.
+#[test]
+fn the_owner_changes_a_participant_s_role() {
+    let (mut win, _, _) = window();
+    let (room, mut own) = Room::host(&mut win, "Minoru").unwrap();
+    let key = room.invite("Ana", Role::Editor).unwrap();
+    let mut ana = room.join_with(&key).unwrap();
+    execute(&mut ana, "text.insert", json!({"text": "Ana "})).unwrap();
+    assert!(ana.session().doc.revisions.is_empty(), "an editor edits directly");
+    // Down to viewer: she changes nothing.
+    assert_eq!(room.set_role("ANA", Role::Viewer), Ok(true));
+    assert_eq!(room.set_role("Ana", Role::Viewer), Ok(false), "no change");
+    let version = room.version();
+    assert!(execute(&mut ana, "text.insert", json!({"text": "more "})).is_err());
+    assert_eq!(ana.participant().role, Role::Viewer);
+    assert_eq!(room.version(), version);
+    let seen = call(&mut ana, "room.participants", json!({})).unwrap();
+    assert_eq!(seen["you"]["role"], "viewer");
+    // Up to suggester: her edits are tracked in her name.
+    room.set_role("Ana", Role::Suggester).unwrap();
+    execute(&mut ana, "text.insert", json!({"text": "tracked "})).unwrap();
+    assert!(room.version() > version);
+    let (_, doc) = room.document();
+    assert!(!doc.revisions.is_empty() && doc.revisions.iter().all(|r| r.author == "Ana"));
+    // Another copy that joins with her key has the new role.
+    let later = room.join_with(&key).unwrap();
+    assert_eq!(later.participant().role, Role::Suggester);
+    // The window keeps its own; a name without an invite is refused, and so is a closed room.
+    assert!(matches!(room.set_role("Minoru", Role::Viewer), Err(RoomError::Name(_))));
+    assert!(matches!(room.set_role("Nobody", Role::Viewer), Err(RoomError::Name(_))));
+    assert_eq!(own.participant().role, Role::Owner);
+    frame(&mut own, &mut win);
+    assert_eq!(own.participant().role, Role::Owner);
+    room.close();
+    assert!(matches!(room.set_role("Ana", Role::Editor), Err(RoomError::Closed)));
+}

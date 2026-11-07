@@ -170,7 +170,7 @@ test source in File › Options › Language and on the bar's Install.
 | `render_page` | a page as PNG |
 | `parity` | feature coverage |
 | `screenshot`, `click`, `key`, `ui_inspect` | app only (`--connect`) |
-| `room` | share the document the app's window shows with other agents, and hand out their keys: `{action: "share" \| "invite" \| "revoke" \| "participants" \| "stop", name?, role?, files?, key?}` (app only; see [Shared documents](#shared-documents)) |
+| `room` | share the document the app's window shows with other agents, and hand out their keys: `{action: "share" \| "invite" \| "revoke" \| "role" \| "participants" \| "stop", name?, role?, files?, key?}` (app only; see [Shared documents](#shared-documents)) |
 
 ### Several documents
 
@@ -324,8 +324,11 @@ agent which files it can use (`files`, and `folders` with `folders`); no agent c
 setting, since `file.options` is refused in its copy (see
 [Files participants can use](control-protocol.md#files-participants-can-use)).
 
-Revoking the key or stopping sharing ends the agent's connection: its next call is an error
-that says why. See [Shared documents](control-protocol.md#shared-documents) for the control
+The owner changes an invited agent's role with `{"action": "role", "name": "Fact checker",
+"role": "editor"}`: its next call is held to the new one. Revoking the key (`{"action": "revoke",
+"key": …}`, or `"name"` for the name it was invited under) or stopping sharing ends the agent's
+connection: its next call is an error that says why. The app's File › Share page does all of this
+with the same commands. See [Shared documents](control-protocol.md#shared-documents) for the control
 channel's side.
 
 ## Character and paragraph properties

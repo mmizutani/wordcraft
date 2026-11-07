@@ -57,7 +57,7 @@ mod hub;
 mod replica;
 pub(crate) mod rules;
 
-pub use hub::{Accepted, Bounce, Hub, MAX_BATCH, MAX_INVITES, MAX_KEPT, MAX_KEPT_BYTES, MAX_PARTICIPANTS, Took};
+pub use hub::{Accepted, Bounce, Hub, Invited, MAX_BATCH, MAX_INVITES, MAX_KEPT, MAX_KEPT_BYTES, MAX_PARTICIPANTS, Took};
 pub use replica::{Replica, Stats};
 
 /// A participant of a room, numbered from 1 in the order they joined.
@@ -469,6 +469,27 @@ impl Room {
             self.withdraw();
         }
         revoked
+    }
+
+    /// The invites handed out and not taken back ([`Hub::invites`]), without their keys.
+    pub fn invites(&self) -> Vec<Invited> {
+        self.hub().invites()
+    }
+
+    /// [`Room::revoke`] the invite for the participant called `name` ([`Hub::revoke_named`]).
+    pub fn revoke_named(&self, name: &str) -> bool {
+        let revoked = self.hub().revoke_named(name);
+        if revoked {
+            self.withdraw();
+        }
+        revoked
+    }
+
+    /// Give the invited participant called `name` `role` from now on ([`Hub::set_role`]): the
+    /// room holds their next change to it, and their copies take it with the next changes they
+    /// receive. Whether it changed.
+    pub fn set_role(&self, name: &str, role: Role) -> Result<bool, RoomError> {
+        self.hub().set_role(name, role)
     }
 
     /// Join the room with a key [`Room::invite`] handed out, under its name and role.
