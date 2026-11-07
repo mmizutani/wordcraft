@@ -187,3 +187,24 @@ fn turned_away_connections_dont_hold_up_the_next_one() {
         t.join().unwrap();
     }
 }
+
+/// A connection's place under the cap is given back when its thread ends, and when no thread
+/// could be started for it (the closure that would have run is dropped).
+#[test]
+fn a_connection_s_place_is_given_back_even_when_its_thread_never_starts() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let open = Arc::new(AtomicUsize::new(2));
+    let never_run = {
+        let slot = super::Slot(open.clone());
+        move || drop(slot)
+    };
+    drop(never_run);
+    assert_eq!(open.load(Ordering::SeqCst), 1);
+    let slot = super::Slot(open.clone());
+    std::thread::spawn(move || {
+        let _slot = slot;
+    })
+    .join()
+    .unwrap();
+    assert_eq!(open.load(Ordering::SeqCst), 0);
+}
