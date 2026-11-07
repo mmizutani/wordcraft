@@ -355,3 +355,24 @@ fn a_key_taken_back_loses_its_place_even_asking_only_for_the_tool_list() {
     assert_eq!(r.status, 401, "{:?}", body(&r));
     assert_eq!(e.keys(), 0, "its place went");
 }
+
+/// Answers waiting to be read by slow clients count against a budget: once it is spent, new
+/// requests are refused before they run (so sending one again is safe), until clients have read
+/// what they were sent.
+#[test]
+fn answers_waiting_to_be_sent_are_bounded() {
+    let (e, app) = endpoint(Options { max_sending: 100, ..Options::default() });
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "inspect_document", "arguments": {}}});
+    let runs = |app: &App| app.calls.lock().unwrap().iter().filter(|(_, m)| m != "auth").count();
+    // A slow client: its answer (over 100 bytes) hasn't been sent yet.
+    let unsent = e.handle(&post(Some("ana"), &call, &[]));
+    assert_eq!(unsent.status, 200);
+    assert!(unsent.body.len() > 100);
+    let before = runs(&app);
+    let r = e.handle(&post(Some("ben"), &call, &[]));
+    assert_eq!(r.status, 503, "{:?}", body(&r));
+    assert_eq!(runs(&app), before, "refused before it ran");
+    // Once it has been sent, requests run again.
+    drop(unsent);
+    assert_eq!(e.handle(&post(Some("ben"), &call, &[])).status, 200);
+}

@@ -54,6 +54,26 @@ impl Request {
     }
 }
 
+/// Something a response keeps until it has been written, or given up on: a share of a budget
+/// for the bytes waiting to be sent, say, which goes back when the response is dropped.
+/// Responses compare equal whatever they hold.
+#[derive(Clone, Default)]
+pub struct Hold(Option<Arc<dyn std::any::Any + Send + Sync>>);
+
+impl std::fmt::Debug for Hold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Hold(..)" } else { "Hold(none)" })
+    }
+}
+
+impl PartialEq for Hold {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Hold {}
+
 /// One response, written whole with its `Content-Length`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Response {
@@ -62,11 +82,19 @@ pub struct Response {
     pub body: Vec<u8>,
     /// Close the connection after this response.
     pub close: bool,
+    /// Kept until the response has been written.
+    pub hold: Hold,
 }
 
 impl Response {
     pub fn new(status: u16) -> Self {
-        Response { status, headers: Vec::new(), body: Vec::new(), close: false }
+        Response { status, headers: Vec::new(), body: Vec::new(), close: false, hold: Hold::default() }
+    }
+
+    /// Keep `what` until this response has been written (or given up on), then drop it.
+    pub fn holding(mut self, what: impl std::any::Any + Send + Sync) -> Self {
+        self.hold = Hold(Some(Arc::new(what)));
+        self
     }
 
     /// A JSON body.
