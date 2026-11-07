@@ -36,29 +36,36 @@
 //! past them, as the hub moves an edit past those it accepted meanwhile, or refuses and names
 //! who changed what the step changed. Edits made again after a clash keep the steps they had.
 //!
-//! Next in milestone A1: presence.
+//! Everyone sees where the others are ([`Presence`]): each copy tells the room where its
+//! caret and selection are, as anchors in the document as of the version it has
+//! ([`Replica::present`]), and reads the others' as places in its own document
+//! ([`Replica::others`]): the hub moves each place through the changes accepted since it was
+//! told, to the version the reader has, so it stays in the text it was in; the copy moves it
+//! on through its own edits the hub hasn't given back yet. Presence holds no text, and costs
+//! nothing until someone reads it.
 
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use wordcraft_doc::change::{Anchor, Mapped};
 use wordcraft_doc::{ChangeSet, Document, StoryRef};
 
 use crate::agent_files::{AgentFiles, AgentFolder, Reach};
 use crate::scope::Scope;
-use crate::{Registry, Session};
+use crate::{Registry, Selection, Session};
 
 pub mod hosted;
 mod hub;
 mod replica;
 pub(crate) mod rules;
 
-pub use hub::{Accepted, Bounce, Hub, MAX_BATCH, MAX_INVITES, MAX_KEPT, MAX_KEPT_BYTES, MAX_PARTICIPANTS, Took};
-pub use replica::{Replica, Stats};
+pub use hub::{Accepted, Bounce, COLORS, Hub, MAX_BATCH, MAX_INVITES, MAX_KEPT, MAX_KEPT_BYTES, MAX_PARTICIPANTS, MAX_PRESENCES, Took};
+pub use replica::{Other, Replica, Stats};
 
 /// A participant of a room, numbered from 1 in the order they joined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -161,6 +168,72 @@ pub struct Participant {
     pub role: Role,
 }
 
+/// Where a participant's selection is in the room's document: where it starts and the caret,
+/// as anchors (a paragraph's id and a byte offset in its text). Both the same when nothing is
+/// selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Presence {
+    pub anchor: Anchor,
+    pub focus: Anchor,
+}
+
+impl Presence {
+    /// Where it is after change `cs`: in the text it was in, or at the start or the end of the
+    /// block it is left beside; `None` when its part is gone. Text put in where it is goes after
+    /// it ([`ChangeSet::map`]), as a copy moves its own caret through another's change, unless
+    /// `own`: the participant's own change, whose typing it goes past ([`ChangeSet::map_past`]).
+    pub fn through(self, cs: &ChangeSet, own: bool) -> Option<Presence> {
+        let moved = |a: Anchor| anchor(if own { cs.map_past(a) } else { cs.map(a) });
+        Some(Presence { anchor: moved(self.anchor)?, focus: moved(self.focus)? })
+    }
+
+    /// Where it is in `doc`: as places, and as anchors with offsets within the text (an anchor
+    /// at a table is in its first or its last paragraph). The paragraphs `hint`'s ends are in,
+    /// where it was before, are looked at first. `None` when an end's paragraph isn't in `doc`.
+    pub fn placed_in(self, doc: &Document, hint: Option<&Selection>) -> Option<(Presence, Selection)> {
+        let anchor = doc.pos_of(self.anchor, hint.map(|h| &h.anchor))?;
+        let focus = doc.pos_of(self.focus, hint.map(|h| &h.focus))?;
+        let anchors = Presence { anchor: doc.anchor_at(&anchor)?, focus: doc.anchor_at(&focus)? };
+        Some((anchors, Selection { anchor, focus }))
+    }
+}
+
+/// A participant in the room, and where they are as the hub has it for a version of the
+/// document ([`Room::presences_at`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seen {
+    pub who: Participant,
+    /// Which of the [`COLORS`] is theirs, from 0: the same for every copy of theirs while the
+    /// room is open, and as few as can be shared by those in the room at once.
+    pub color: u8,
+    /// Where their selection is as of that version; `None` while the room doesn't know (their
+    /// copy hasn't said, or the text it was in is gone).
+    pub at: Option<Presence>,
+    /// Their copy said where they are as of a later version than the one asked for: the reader
+    /// learns it once it has that version.
+    pub later: bool,
+}
+
+/// What `room.participants` says of participant `who`, whose colour is `color` ([`Seen::color`]):
+/// their number, name and role, and where their selection is (`selection`, `null` while
+/// unknown): `anchor` and `focus` (the caret) as anchors (a paragraph's id and an offset in its
+/// text, as `select.range` takes them), the story the caret is in (`story`, as a place's: `"body"`,
+/// or `{"part": id}` with the id `document.inspect` lists the part under), and the block it is in
+/// there (`index`: the top-level block's index in that story, a table's for a caret in a cell).
+/// No text.
+pub fn participant_json(who: &Participant, color: u8, at: Option<(&Presence, &Selection)>) -> Value {
+    let mut v = json!(who);
+    v["color"] = json!(color);
+    v["selection"] = match at {
+        None => Value::Null,
+        Some((p, sel)) => {
+            json!({"anchor": p.anchor, "focus": p.focus, "story": sel.focus.story, "index": sel.focus.path.0.first()})
+        }
+    };
+    v
+}
+
 /// Why a room didn't let someone in.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RoomError {
@@ -192,10 +265,15 @@ pub struct Room {
     /// an invite was taken back, the room closed. The reach of a request running then gives no
     /// file from then on ([`Room::reach`]).
     withdrawn: Mutex<Arc<AtomicBool>>,
-    /// Signalled when the hub accepts a change, and when the room closes.
+    /// Signalled when the hub accepts a change, when the room closes, and when who is in it or
+    /// where they are changes.
     changed: Condvar,
+    /// Counts the changes to who is in the room and where they are ([`Room::presence_stamp`]).
+    presence: AtomicU64,
     /// Called after that ([`Room::on_change`]).
     on_change: Mutex<Option<OnChange>>,
+    /// Called when where a participant is changed, and nothing else ([`Room::on_presence`]).
+    on_presence: Mutex<Option<OnChange>>,
     /// The commands, shared by the copies' sessions.
     registry: Arc<Registry>,
 }
@@ -217,7 +295,9 @@ impl Room {
             agent_files: Mutex::new((AgentFiles::None, Vec::new())),
             withdrawn: Mutex::new(Arc::new(AtomicBool::new(false))),
             changed: Condvar::new(),
+            presence: AtomicU64::new(0),
             on_change: Mutex::new(None),
+            on_presence: Mutex::new(None),
             registry,
         })
     }
@@ -248,11 +328,34 @@ impl Room {
         Ok((room, copy))
     }
 
-    /// Call `f` whenever the hub accepted changes, and when the room closes, on the thread that
-    /// made that happen (in place of what was called before). The room holds no lock of its own
-    /// while `f` runs, so `f` may use the room, even close it.
+    /// Call `f` whenever the hub accepted changes, when someone joins or leaves, and when the
+    /// room closes, on the thread that made that happen (in place of what was called before).
+    /// The room holds no lock of its own while `f` runs, so `f` may use the room, even close it.
     pub fn on_change(&self, f: impl Fn() + Send + Sync + 'static) {
         *self.on_change.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(f));
+    }
+
+    /// Call `f` whenever where a participant is changed and nothing else did
+    /// ([`Room::set_presence`]), as [`Room::on_change`] calls its own: an agent moving its caret
+    /// may tell the room many times a second, so a window can wait a little to show it.
+    pub fn on_presence(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_presence.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(f));
+    }
+
+    /// Who is in the room, or what the document holds, changed: count it
+    /// ([`Room::presence_stamp`]) and wake whoever waits for a change.
+    fn moved(&self) {
+        self.presence.fetch_add(1, Ordering::AcqRel);
+        self.changed();
+    }
+
+    /// A number that changes whenever who is in the room or where they are may have: someone
+    /// joined or left, a participant's selection moved ([`Room::set_presence`]), the hub accepted
+    /// a change (which moves everyone's), or the room closed. Read without a lock, so a window can
+    /// look every frame whether to read [`Room::presences_at`] again: read it before, so a change
+    /// while it reads leads to one more read, never to one missed.
+    pub fn presence_stamp(&self) -> u64 {
+        self.presence.load(Ordering::Acquire)
     }
 
     /// Wake whoever waits for a change ([`Room::wait_past`], [`Room::on_change`]).
@@ -270,7 +373,7 @@ impl Room {
     pub fn close(&self) {
         self.hub().close();
         self.withdraw();
-        self.changed();
+        self.moved();
     }
 
     /// The reach of the requests running now gives no file from now on ([`Room::reach`]): it
@@ -286,9 +389,13 @@ impl Room {
         self.hub().is_closed()
     }
 
-    /// Participant `id` leaves the room ([`Hub::leave`]); a copy does when it's dropped.
+    /// Participant `id` leaves the room ([`Hub::leave`]); a copy does when it's dropped. The
+    /// others stop seeing them.
     pub fn leave(&self, id: ParticipantId) {
-        self.hub().leave(id);
+        let left = self.hub().leave(id);
+        if left {
+            self.moved();
+        }
     }
 
     /// Whether participant `id` is in the room: they joined, didn't leave, the invite they
@@ -384,6 +491,7 @@ impl Room {
             let who = hub.admit(name, role)?;
             (who, hub.version(), hub.document().clone())
         };
+        self.moved();
         Ok(self.copy_for(who, version, doc))
     }
 
@@ -467,6 +575,7 @@ impl Room {
         let revoked = self.hub().revoke(key);
         if revoked {
             self.withdraw();
+            self.moved();
         }
         revoked
     }
@@ -478,12 +587,60 @@ impl Room {
             let who = hub.admit_with(key)?;
             (who, hub.version(), hub.document().clone())
         };
+        self.moved();
         Ok(self.copy_for(who, version, doc))
     }
 
     /// The participants in the room, in the order they joined.
     pub fn participants(&self) -> Vec<Participant> {
         self.hub().participants().cloned().collect()
+    }
+
+    /// Participant `id`'s selection is `at` in the document as of `version` ([`Hub::set_presence`]):
+    /// the others see it there, moved with the text through the changes the hub accepts
+    /// (`None`: they don't see it). Whether the room keeps it: not when they aren't in the room,
+    /// `version` is ahead of the document or too far behind it, or the text it is in is gone.
+    pub fn set_presence(&self, id: ParticipantId, version: u64, at: Option<Presence>) -> bool {
+        let told = self.hub().set_presence(id, version, at);
+        if told == Some(true) {
+            self.presence.fetch_add(1, Ordering::AcqRel);
+            let f = self.on_presence.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            if let Some(f) = f {
+                f();
+            }
+        }
+        told.is_some()
+    }
+
+    /// [`Room::presence_stamp`] (read first), and the participants in the room, in the order they
+    /// joined, each with where their selection is in the document as of `version`
+    /// ([`Hub::presences_at`]).
+    pub fn presences_at(&self, version: u64) -> (u64, Vec<Seen>) {
+        let stamp = self.presence_stamp();
+        let seen = self.hub().presences_at(version);
+        (stamp, seen)
+    }
+
+    /// The document's latest version, and what `room.participants` says of each participant in
+    /// the room as of that version ([`participant_json`]), in the order they joined.
+    pub fn participants_now(&self) -> (u64, Vec<Value>) {
+        let mut hub = self.hub();
+        let version = hub.version();
+        let seen = hub.presences_at(version);
+        let doc = hub.document();
+        let all = seen
+            .iter()
+            .map(|s| {
+                let at = s.at.and_then(|p| p.placed_in(doc, None));
+                participant_json(&s.who, s.color, at.as_ref().map(|(p, sel)| (p, sel)))
+            })
+            .collect();
+        (version, all)
+    }
+
+    /// Which of the [`COLORS`] participant `id` has ([`Seen::color`]).
+    pub fn color_of(&self, id: ParticipantId) -> u8 {
+        self.hub().color_of(id).unwrap_or(0)
     }
 
     /// A copy of version `version` of the document, `doc`, for participant `who`.
@@ -511,7 +668,8 @@ impl Room {
     fn submit(&self, base: u64, changes: &[ChangeSet], by: ParticipantId) -> Result<Took, Bounce> {
         let took = self.hub().submit_all(base, changes, by);
         if took.is_ok() {
-            self.changed();
+            // Everyone's selection moved with the text.
+            self.moved();
         }
         took
     }

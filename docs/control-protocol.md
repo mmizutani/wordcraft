@@ -259,7 +259,7 @@ With the window's key:
 
 | Method | Params | Result |
 |---|---|---|
-| `room.share` | `name?` | shares the active document; the window joins its room as its owner, under `name`, else the author name (File › Options › User name), else `Owner`. `{"shared": true, "document", "version", "you", "participants", "agentFiles"}`: the document's id, the number of changes the room took, the window's participant and everyone in the room, each `{"id", "name", "role"}` and, for those who joined with a key, `"files"`: which files their commands can use now (`none`, `folders` or `all`, see [Files participants can use](#files-participants-can-use)); `agentFiles` is what File › Options › Agents gives agents. Sharing the same document again answers the same; another one is an error while one is shared |
+| `room.share` | `name?` | shares the active document; the window joins its room as its owner, under `name`, else the author name (File › Options › User name), else `Owner`. `{"shared": true, "document", "version", "you", "participants", "agentFiles"}`: the document's id, the number of changes the room took, the window's participant and everyone in the room, each `{"id", "name", "role", "color", "selection"}` (see [Where everyone is](#where-everyone-is)) and, for those who joined with a key, `"files"`: which files their commands can use now (`none`, `folders` or `all`, see [Files participants can use](#files-participants-can-use)); `agentFiles` is what File › Options › Agents gives agents. Sharing the same document again answers the same; another one is an error while one is shared |
 | `room.invite` | `name`, `role?`, `files?` | a key (32 hex digits, random) for a participant called `name`, with `role` ([roles](#roles), `suggester` unless given): `{"key", "name", "role", "files"}`. A name is someone's in the room for good, even after they left, since their comments and tracked changes keep it: up to 128 characters, no control characters, compared without case. `files` (`none`, `folders` or `all`) gives the participant fewer files than File › Options › Agents gives agents, never more; left out (`null`), they get what the setting gives, whenever it changes |
 | `room.revoke` | `key` | takes the invite back: nobody joins with the key any more, and the copies that joined with it are out of the room (the room refuses their changes, and their connections end). `{"revoked": bool}` |
 | `room.participants` | — | `{"shared": false}`, or what `room.share` answers |
@@ -299,7 +299,7 @@ the same key or none. The copy answers:
 | `engine.commands` | `search?` | every command, as for the window; `enabled` says whether this participant may run it now |
 | `ui.render` | `page?`, `scale?` | a page of the document as base64 `png`, as for the window; `path` is refused (`file.exportPng` writes a page to a file the participant may write) |
 | `ui.parity` | — | as for the window |
-| `room.participants` | — | `{"you", "participants", "version", "files"}`: the caller, everyone in the room, the version of the document the copy has, and which files the caller's commands can use now (`none`, `folders` or `all`; with `folders`, also `"folders"`, each `{"path", "write"}`) |
+| `room.participants` | — | `{"you", "participants", "version", "files"}`: the caller, everyone in the room (the caller too), each with their colour and where their selection is in the copy's document (see [Where everyone is](#where-everyone-is)), the version of the document the copy has, and which files the caller's commands can use now (`none`, `folders` or `all`; with `folders`, also `"folders"`, each `{"path", "write"}`) |
 
 Any other method name is a command id, as for the window. Each request the copy doesn't refuse
 first sends the participant's changes the room hasn't taken yet, if an earlier command left
@@ -319,6 +319,36 @@ document is shared.
 
 `wordcraft-cli mcp --connect 127.0.0.1:7981` with `WORDCRAFT_CONTROL_KEY` set to the invite's
 key gives an agent its copy through MCP's tools (see [MCP](mcp.md#shared-documents)).
+
+### Where everyone is
+
+Each participant in `room.participants` (and `room.share`) says where their selection is, so an
+agent can keep clear of where a person or another agent is working:
+
+```json
+{"id": 2, "name": "Fact checker", "role": "suggester", "color": 1,
+ "selection": {"anchor": {"block": "3f2a…", "off": 12}, "focus": {"block": "3f2a…", "off": 18},
+               "story": "body", "index": 4}}
+```
+
+- `anchor` and `focus` (the caret) are anchors: a paragraph's id and a byte offset in its text,
+  as `select.range` takes them, in the document as the asking copy has it (the window's key: as
+  of `version`). They follow the text: when someone types before a caret, it moves on with its
+  text; when its paragraph is deleted, it goes to where the paragraph was.
+- `story` is the story the caret is in, as positions name it: `"body"`, or `{"part": n}` with
+  the id `document.inspect` lists a part (a header, a note, a comment) under; `index` is the
+  top-level block the caret is in there, as `document.inspect` numbers them: a table's, for a
+  caret in one of its cells.
+- `color` is a number from 0 to 7. Copies with the same name (any case) share one; a participant
+  who leaves and comes back gets theirs again unless someone else in the room has it by then;
+  and those in the room at once have different ones while there are eight to go round.
+- `selection` is `null` while nobody knows: the participant hasn't moved their caret yet, the
+  text it was in is gone, the window shows another document, or the room keeps the places of
+  64 participants at most (the window's is always kept).
+
+The window's place is the person's caret whenever the window shows the shared document. An
+agent's is where its last command that moved its caret or edited left it: a request that only
+reads (`document.inspect`, `room.participants`) doesn't move it. No text is sent with a place.
 
 ### Files participants can use
 
