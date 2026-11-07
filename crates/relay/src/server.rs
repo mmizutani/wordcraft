@@ -513,7 +513,7 @@ impl Relay {
         }
         // Its bytes count from now until its agent has read them: past the budget, the desktop
         // keeps the answer and sends it again once earlier ones have been read.
-        let Some(unsent) = self.reserve(&room.token, resp.body.len()) else {
+        let Some(unsent) = self.reserve(&room.token, wire::size(&resp)) else {
             return Response::text(503, "the relay is still sending earlier answers for this relay user's documents: send it again\n")
                 .with_header("Retry-After", "1");
         };

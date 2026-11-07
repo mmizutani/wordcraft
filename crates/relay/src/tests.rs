@@ -712,6 +712,47 @@ fn polls_are_bounded_in_bytes() {
     drop(agents);
 }
 
+/// An answer's headers count with its body in the token's answers waiting to be read, and a
+/// header too long to be one an MCP endpoint sends is dropped, not kept.
+#[test]
+fn an_answers_headers_count_and_long_ones_are_dropped() {
+    let (_base, relay) = relay(|c| {
+        c.poll_wait = Duration::from_millis(200);
+        c.answer_wait = Duration::from_secs(5);
+        c.sending_per_token = 50;
+    });
+    let call = |method: &str, target: &str, auth: Option<&str>, body: Vec<u8>| {
+        let headers = auth.map(|a| vec![("Authorization".to_string(), format!("Bearer {a}"))]).unwrap_or_default();
+        relay.handle(&Request { method: method.into(), target: target.into(), headers, body, peer: None })
+    };
+    let opened: Value = serde_json::from_slice(&call("POST", "/host/rooms", Some(TOKEN), b"{}".to_vec()).body).unwrap();
+    let (room, secret) = (opened["room"].as_str().unwrap().to_string(), opened["secret"].as_str().unwrap().to_string());
+    let poll = || serde_json::from_slice::<Value>(&call("POST", &format!("/host/r/{room}/poll"), Some(&secret), Vec::new()).body).unwrap();
+    poll();
+    let ask = || {
+        let (relay, room) = (relay.clone(), room.clone());
+        std::thread::spawn(move || {
+            relay.handle(&Request { method: "POST".into(), target: format!("/r/{room}/mcp"), headers: Vec::new(), body: b"{}".to_vec(), peer: None })
+        })
+    };
+    let first = ask();
+    std::thread::sleep(Duration::from_millis(200));
+    let id = poll()["requests"][0]["id"].as_u64().unwrap();
+    // An empty body, a Content-Type of 100 bytes and one far too long to be real.
+    let answer = json!({"id": id, "status": 200, "body": "", "headers": [["Content-Type", "x".repeat(100)], ["Content-Type", "y".repeat(super::wire::MAX_HEADER_VALUE + 1)]]});
+    assert_eq!(call("POST", &format!("/host/r/{room}/reply"), Some(&secret), answer.to_string().into_bytes()).status, 204);
+    let held = first.join().unwrap();
+    assert_eq!(held.status, 200);
+    assert_eq!(held.headers.iter().filter(|(n, _)| n == "Content-Type").map(|(_, v)| v.len()).collect::<Vec<_>>(), vec![100]);
+    // Its 100 bytes of header are past the budget: the next request waits until it's read.
+    assert_eq!(ask().join().unwrap().status, 503);
+    drop(held);
+    let next = ask();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(poll()["requests"].as_array().map(Vec::len), Some(1));
+    drop(next);
+}
+
 /// A large answer whose upload breaks off gives its place back at once, not when its time would
 /// have run out: two broken uploads don't keep the token's next large answers out.
 #[test]

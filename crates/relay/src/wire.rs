@@ -20,12 +20,16 @@ fn headers_json(headers: &[(String, String)], list: &[&str]) -> Value {
     Value::Array(headers.iter().filter(|(n, _)| passed(n, list)).map(|(n, v)| json!([n, v])).collect())
 }
 
+/// The longest header value passed on: longer ones are dropped (the headers passed are short).
+pub const MAX_HEADER_VALUE: usize = 8 << 10;
+
 fn headers_from(v: &Value, list: &[&str]) -> Vec<(String, String)> {
     v.as_array()
         .map(|a| {
             a.iter()
-                .filter_map(|h| Some((h.get(0)?.as_str()?.to_string(), h.get(1)?.as_str()?.to_string())))
-                .filter(|(n, _)| passed(n, list))
+                .filter_map(|h| Some((h.get(0)?.as_str()?, h.get(1)?.as_str()?)))
+                .filter(|(n, v)| v.len() <= MAX_HEADER_VALUE && passed(n, list))
+                .map(|(n, v)| (n.to_string(), v.to_string()))
                 .take(32)
                 .collect()
         })
@@ -66,6 +70,11 @@ pub fn reply(id: u64, resp: &Response) -> Value {
         Ok(body) => json!({"id": id, "status": resp.status, "headers": headers_json(&resp.headers, RESPONSE_HEADERS), "body": body}),
         Err(_) => json!({"id": id, "status": 502, "headers": [["Content-Type", "text/plain; charset=utf-8"]], "body": "the answer wasn't text\n"}),
     }
+}
+
+/// The bytes a response takes as written: its headers as well as its body.
+pub fn size(resp: &Response) -> usize {
+    resp.headers.iter().fold(resp.body.len(), |n, (k, v)| n.saturating_add(k.len()).saturating_add(v.len()).saturating_add(4))
 }
 
 /// The desktop's answer back as a response for the agent, and the request it answers.
