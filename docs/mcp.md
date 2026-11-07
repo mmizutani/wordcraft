@@ -52,7 +52,7 @@ back, or past its time, is refused (401), and the request that finds it out says
 - **This computer only.** It listens on loopback and refuses another address. A request is
   refused (403) unless its `Host` is that address (`--allow-host` adds names, comma-separated,
   for a tunnel in front), and when it has an `Origin` (a web page), unless `--allow-origin`
-  lists it. Bodies are capped at 1 MiB, connections at 64, keys at 64. A POST carries one
+  lists it. Bodies are capped at 1 MiB, connections at 64, keys at 64, and answers waiting for slow clients to read them at 256 MiB in all (past that, new requests get 503 before they run). A POST carries one
   JSON-RPC message: a batch (an array) gets 400, as MCP over HTTP has had none since 2025-06-18.
 
 Agents in sandboxes don't need a tunnel: the app dials out to a relay, which gives the shared

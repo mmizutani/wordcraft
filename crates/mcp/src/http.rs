@@ -48,6 +48,9 @@ pub struct Options {
     pub idle: Duration,
     /// How long one request may take.
     pub timeout: Duration,
+    /// Answers' bytes waiting to be sent, in all: more are refused (503) until clients have read
+    /// some, so slow readers can't make the endpoint hold copy after copy of a large document.
+    pub max_sending: usize,
     /// How often a key's connection asks the app again whether it still takes the key. Some
     /// requests (tools/list, server/discover) are answered without the app, so a key taken back
     /// would otherwise keep its connection, and its place, for as long as it kept asking.
@@ -63,6 +66,7 @@ impl Default for Options {
             idle: Duration::from_secs(30 * 60),
             timeout: Duration::from_secs(150),
             recheck: Duration::from_secs(15),
+            max_sending: 256 << 20,
         }
     }
 }
@@ -99,6 +103,20 @@ pub struct Endpoint {
     /// Keys being checked with the app right now (each may wait for the app's slowdown of wrong
     /// keys); more than a few at once are refused rather than queued.
     opening: AtomicUsize,
+    /// Answers' bytes waiting to be sent.
+    sending: Arc<AtomicUsize>,
+}
+
+/// An answer's share of [`Options::max_sending`], given back once it has been sent.
+struct Sending {
+    counter: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for Sending {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
 }
 
 /// A JSON-RPC error with no id, as the body of a refused request.
@@ -141,7 +159,13 @@ fn check_headers(req: &Request, msg: &Value) -> Result<(), String> {
 
 impl Endpoint {
     pub fn new(options: Options, open: Opener) -> Self {
-        Endpoint { options, open: Arc::new(open), seats: Mutex::new(HashMap::new()), opening: AtomicUsize::new(0) }
+        Endpoint {
+            options,
+            open: Arc::new(open),
+            seats: Mutex::new(HashMap::new()),
+            opening: AtomicUsize::new(0),
+            sending: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// An endpoint whose keys reach the app's room port at `connect` (File › Share's line).
@@ -212,6 +236,11 @@ impl Endpoint {
             e["error"]["data"] = json!({"supported": ALL_VERSIONS, "requested": v});
             return Response::json(400, e.to_string());
         }
+        // While clients are slow to read what was already answered, nothing new runs: refused
+        // before it runs, a request is safe to send again.
+        if self.sending.load(Ordering::SeqCst) >= self.options.max_sending {
+            return refusal(503, -32603, "the endpoint is still sending earlier answers: try again").with_header("Retry-After", "1");
+        }
         // A request that waited on the way here (a relay's desktop side says how long is left)
         // waits only what's left: it never runs after its caller was told it timed out.
         let wait = req
@@ -225,8 +254,12 @@ impl Endpoint {
         match answer {
             None => Response::new(202),
             Some(reply) => {
+                // Counted until it has been sent (the request ran: its answer is never dropped).
+                let bytes = reply.len();
+                self.sending.fetch_add(bytes, Ordering::SeqCst);
+                let share = Sending { counter: self.sending.clone(), bytes };
                 let status = if stateless { status_of(&reply) } else { 200 };
-                Response::json(status, reply)
+                Response::json(status, reply).holding(share)
             }
         }
     }

@@ -67,5 +67,5 @@ pub fn response_from(v: &Value) -> Option<(u64, Response)> {
     let id = v.get("id")?.as_u64()?;
     let status = v.get("status")?.as_u64().and_then(|s| u16::try_from(s).ok()).filter(|s| (200..600).contains(s))?;
     let body = v.get("body").and_then(Value::as_str).unwrap_or_default().as_bytes().to_vec();
-    Some((id, Response { status, headers: headers_from(v.get("headers").unwrap_or(&Value::Null), RESPONSE_HEADERS), body, close: false }))
+    Some((id, Response { status, headers: headers_from(v.get("headers").unwrap_or(&Value::Null), RESPONSE_HEADERS), body, ..Response::new(status) }))
 }
