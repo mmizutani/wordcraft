@@ -1,9 +1,12 @@
 # Co-editing: people and agents edit one document at once
 
-> **Last reviewed:** 2026-11-07 · **Last updated:** 2026-11-07 · **Change:** major (first version: the design as built on `main` through A1.4 and the agents' file setting, what comes next by milestone, and the decisions; presence is a placeholder until A1.5 lands, #40) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+> **Last reviewed:** 2026-11-07 · **Last updated:** 2026-11-07 · **Change:** minor (the built-in assistant in the Assistant pane as a co-editor: who takes part, how a conversation joins and leaves, roles in the pane, tracked changes in its name, editing at the same time as the person and other agents, what comes next for it); previously major (first version: the design as built on `main` through A1.4 and the agents' file setting, what comes next by milestone, and the decisions; presence is a placeholder until A1.5 lands, #40) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
 
 This is the design of co-editing in WordCraft: several people and AI agents edit one document at
-the same time, each change carries its author, and nothing is lost or corrupted. It is the
+the same time, each change carries its author, and nothing is lost or corrupted. The agents are
+both the built-in assistant in the Assistant pane, which edits beside the person in real time
+as a suggester, an editor or another role, and outside agents that join over MCP or the control
+channel. It is the
 reference the co-editing pull requests cite. It describes what is built on `main`, what comes
 next, and the decisions behind both. Work is tracked in issue #28 and its sub-issues; the gap is
 #22 in [gaps.md](gaps.md).
@@ -11,6 +14,17 @@ next, and the decisions behind both. Work is tracked in issue #28 and its sub-is
 Related: [architecture.md](architecture.md) (data flow), [control-protocol.md](control-protocol.md#shared-documents)
 and [mcp.md](mcp.md#shared-documents) (how agents join), [assistant.md](assistant.md) (the
 built-in assistant, which joins as a participant).
+
+## Who edits together
+
+| Participant | How it joins | Its copy | Its role |
+|---|---|---|---|
+| The person, in the app's window | The window shares the document it shows (`room.share`, or the Assistant pane's first prompt) | The window's own session, lent to the room's owner copy | Owner |
+| The built-in assistant, in the Assistant pane (ChatGPT, Claude Code, Codex, Pi or a custom ACP agent) | Each conversation takes an invite of its own from the window's room, under its backend's name | A hosted copy the conversation holds (ChatGPT), or one its agent process reaches through the room's port (ACP) | Suggester by default; viewer, commenter or editor when the person picks one in the pane or in File › Options › Assistant; never owner |
+| Outside agents (any MCP client, or a program on the control channel) | An invite's key from the owner (`room.invite`), then `wordcraft-cli mcp --connect` or the control port | A hosted copy on their connection's thread | The invite's: suggester unless the owner chose another |
+
+All three go through the same room, hub and rules: the assistant is not a special path. What
+differs is only where its copy runs and who starts it.
 
 ## The design in one paragraph
 
@@ -223,12 +237,83 @@ who changed it. What the participant types after another's change is a step of i
 that makes its edits again after a clash puts back the steps it had before them.
 `tests/room_undo.rs` pins this.
 
-### The built-in assistant (#15)
+### The built-in assistant: a co-editor in the pane (#15)
 
-The assistant is one more participant. A conversation takes an invite of its own from the
-window's room, under its backend's name and the role from `assistant.defaultRole` (suggester
-unless the person chose another; never owner), and works on a hosted copy, so scopes, roles and
-the file setting hold for it as for any agent. See [assistant.md](assistant.md).
+The Assistant pane on the right of the window is a conversation with an AI assistant that edits
+the document **while the person keeps editing it**. It is a participant of the room like any
+other (`crates/assist`, `crates/ui-egui/src/assist.rs`), so everything above holds for it: its
+own copy, its changes ordered by the hub, its role held by its copy and by the hub, its own undo.
+The person never waits for it, and it never waits for the person's frame. The pane, its backends
+and its settings are in [assistant.md](assistant.md); this section is how it co-edits.
+
+**Joining and leaving.** The first prompt in the pane shares the document if it isn't shared
+yet (`WordApp::share_document`), then starts a conversation (`Assistant::start`). The
+conversation takes an invite of its own from the room, under its backend's name: "ChatGPT",
+"Claude Code", "Codex", "Pi"…, or "ChatGPT (2)" when the room already had a "ChatGPT"
+(`Room::invite_numbered`). That name is the author of its comments and tracked changes. When the
+conversation ends (a new conversation, another role, Use this document, closing the window), the
+invite is taken back (`Room::revoke`): its copy is out of the room and an agent's key opens
+nothing from then on. One document is shared at a time; if another open document is shared, the
+pane offers **Use this document** (`assist.useDocument`) instead of starting.
+
+**Roles in the pane.** The pane's Role box picks the conversation's role, and says what it means
+(`role_note`): Viewer ("It reads the document and answers here; it changes nothing"), Commenter,
+Suggester ("Its edits are tracked changes in its name, for you to accept or reject") or Editor
+("Its edits won't be tracked: it changes the document directly"). Left alone, a conversation
+takes File › Options › Assistant's setting (`assistant.defaultRole`), suggester unless the person
+chose another. A prompt for another role starts a new conversation with a new invite, since a
+participant's role is fixed by its invite. Owner is never offered: an assistant can't change
+WordCraft's settings, and a setting of `owner` is read as suggester.
+
+**Where its copy runs.** Two kinds of backend, one room:
+
+- **ChatGPT** runs its model loop in WordCraft (OpenAI's Responses API, with the person's ChatGPT
+  sign-in). Its tool calls (WordCraft's MCP tools, `wordcraft_mcp::tools`) run on a copy the
+  conversation holds on its own thread (`CopyTools`, a `room::hosted` copy).
+- **ACP agents** (Claude Code, Codex, Pi, a custom agent) are processes WordCraft starts and talks
+  to over the Agent Client Protocol. The agent runs its own model loop and reaches its copy
+  through WordCraft's MCP server (`wordcraft-cli mcp --connect`) on the room's own port with the
+  conversation's key. That port takes only invites' keys; the agent never sees the window's.
+
+Either way the assistant can do only what its role and the command scopes allow, and reach only
+the files File › Options › Agents lets agents use.
+
+**A turn, while the person types.** Each turn starts with the assistant's copy selecting what
+the person selected in the window, found by block id and offset, so edits the copy hasn't had yet
+don't move it (`Assistant::ask_at`), and each of its tool calls first brings in what others
+changed since (`room::hosted`). The prompt carries the selection, the
+paragraphs around it and the outline as text, within fixed caps (`assist::Context`). The
+assistant's edits change its copy at once and go to the hub as they are made. Meanwhile the
+person types, and other agents edit; the hub orders all of it. When the assistant and the person
+change the same characters, whichever the hub took second is made again after the other, from
+the same places, so neither's edit is lost unless the other took its text away. The window draws
+the assistant's changes as they arrive, between frames.
+
+**Tracked changes in its name.** As a suggester, every edit the assistant makes is a tracked
+change by its name, whatever the document's Track Changes setting; the hub refuses any change
+from it that isn't. The pane's **Accept all** and **Reject all** act on its changes only
+(`review.acceptAll`/`review.rejectAll` with `author`), in the body, headers, notes and text
+boxes, and **Review changes one by one** opens the Review tab. A tool call's row in the pane links
+to exactly what that call changed (**Show the change**, `assist.showChange`, from the room's
+record of who changed which versions, `Room::where_changed`). As an editor, its edits are direct
+and untracked. Either way, Undo in the window takes back only the person's own steps, never the
+assistant's.
+
+**Stopping.** Stop ends a turn at once; an agent that doesn't stop within 10 seconds is ended and
+starts again on the next turn. Edits the assistant made before Stop stay, as tracked changes in
+its name when it is a suggester. The window's frames never wait for any of this.
+
+**Several assistants at once.** The pane shows one conversation, but the room takes any number of
+participants: a second assistant (another backend, or the same one as "ChatGPT (2)") or outside
+agents can edit at the same time, each with a name, a role and a copy of its own.
+`apps/wordcraft-cli/tests/it/gate.rs` has a person, ChatGPT and an ACP agent edit one document at
+once and checks that every copy ends with the hub's document, each assistant's edits are tracked
+in its name, the person's Undo takes back only the person's typing, and stopping or killing one
+assistant leaves the other going. `the_window_never_waits_for_its_assistants`
+(`crates/ui-egui`) times the real window's frames while two assistants hold their turns.
+
+**Desktop only.** The web app has the pane and the commands but no backend: ChatGPT's sign-in
+needs a loopback port and ACP agents are programs a web page can't start.
 
 ### Presence (A1.5, #32): in progress
 
@@ -266,6 +351,11 @@ where everyone is from `room.participants`. Presence sends no document text.
   and a tracked step can't be undone after anyone else's tracked change. Text-level undo is A4.
 - **No agent API yet.** Agents use the same commands as people, addressed by places; guarded,
   content-addressed edits, leases and events are A2.
+- **The assistant's place isn't drawn.** The person sees the assistant's edits but not its caret,
+  selection or name in the text until presence lands (#32), and the assistant learns of the
+  person's typing only from the changes, not from where the person is.
+- **The assistant doesn't wake on its own.** It works when the person asks in the pane (or a
+  script asks through `assist.*`); a comment that mentions it doesn't reach it until A2.
 - **No File › Share yet.** Sharing starts from the control channel or MCP (`room.share`); the
   app's menu comes with #33.
 
@@ -301,6 +391,22 @@ agents. Issues: #28 (parent) and one sub-issue per milestone.
    Suggest mode, his edits to that sentence come back as his suggestions. Nothing is lost.
 6. The hub is killed and restarted mid-session. No acknowledged edit is lost, and the saved
    .docx re-opens with every tracked change and comment attributed.
+
+### What comes next for the assistant
+
+The assistant gains with each milestone, as every agent does:
+
+- **A1.5 presence (#32):** its caret, selection and name drawn in the text in its own colour while
+  it works, and the person's place visible to it, so it can keep away from where the person is
+  typing.
+- **A1.6 gate (#34):** two agents and a person edit at once with no stalls, the pane's assistant
+  among them.
+- **A2 (#35):** guarded, content-addressed edits, so a stale rewrite is refused with the current
+  text instead of landing; rewrites as word-level tracked changes with a rationale; room chat;
+  leases on a range; a person's paragraph kept free while they type in it; mentions in comments
+  ("@ChatGPT tighten this") waking the assistant through MCP Events.
+- **A3 (#36):** the assistant works in a draft copy and merges it back, and follows the room over
+  the network like any participant.
 
 ### Events for agents (A2, A3)
 
@@ -353,4 +459,5 @@ ids included.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-07 | minor | The built-in assistant as a co-editor: a "Who edits together" table (the person, the pane's assistant, outside agents), and how the pane's assistant joins and leaves, its roles, where its copy runs, a turn while the person types, tracked changes in its name, Stop, several assistants at once, its known limits and what comes next for it (Minoru's review of #68) |
 | 2026-11-07 | major | First version (#40): the design as built on `main` (block ids, changes, rebasing and mapping, scopes, rooms, roles and keys, agents' copies, the agents' file setting, undo per participant, the assistant), presence as a placeholder (#32), known limits, milestones A0–A6, the scenario, events and the decisions |
