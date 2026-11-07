@@ -3,9 +3,13 @@
 //! every frame ([`crate::WordApp::others_here`]) as places in the window's document, so they are
 //! drawn where the text they are at is now.
 
+use std::ops::RangeInclusive;
+
 use egui::{Color32, Painter, Pos2, Rect, Stroke, pos2, vec2};
+use wordcraft_doc::Pos;
 use wordcraft_engine::room::{Other, ParticipantId};
 use wordcraft_layout::DocLayout;
+use wordcraft_layout::hit::page_lines;
 
 use super::pages::page_screen_scale;
 use crate::share::FLAG_MS;
@@ -64,15 +68,22 @@ pub(crate) fn marks(pages: &Pages<'_>, others: &[(&Other, f64)], now: f64, point
         let sr = Rect::from_min_size(pos2(pr.min.x + r.x * s, pr.min.y + r.y * s), vec2(r.w * s, r.h * s)).intersect(band(pi, pr));
         (sr.height() > 0.0).then_some(sr)
     };
+    // The pages on screen, with one either side, so a selection cut to them ends off screen.
+    let mut seen = (0..rects.len()).filter(|&pi| rects.get(pi).is_some_and(|pr| band(pi, pr).intersects(visible)));
+    let shown_pages = seen.next().map(|first| {
+        let last = seen.next_back().unwrap_or(first);
+        first.saturating_sub(1)..=last.saturating_add(1).min(rects.len().saturating_sub(1))
+    });
     let mut budget = MAX_RECTS;
     let mut out = Vec::new();
     for (o, moved) in others.iter().filter(|(o, _)| o.at.is_some()).take(MAX_DRAWN) {
         let Some(sel) = o.at.as_ref() else { continue };
         let mut sel_rects = Vec::new();
-        if sel.anchor != sel.focus && budget > 0 {
-            // Only what is on screen counts: a long selection, or one far off, leaves the budget
-            // to the selections the person sees.
-            let shown = layout.selection_rects(doc, &sel.anchor, &sel.focus, page_hint);
+        let on_screen = shown_pages.clone().and_then(|pages| cut_to_pages(layout, &sel.anchor, &sel.focus, pages));
+        if let Some((from, to)) = on_screen.filter(|_| budget > 0) {
+            // Only what is on screen counts: a long selection, or one far off, costs the pages
+            // the person sees, and leaves the budget to the selections there.
+            let shown = layout.selection_rects(doc, &from, &to, page_hint);
             sel_rects.extend(shown.iter().filter_map(|(pi, r)| to_screen(*pi, r)).filter(|sr| sr.intersects(visible)).take(budget));
             budget = budget.saturating_sub(sel_rects.len());
         }
@@ -93,6 +104,31 @@ pub(crate) fn marks(pages: &Pages<'_>, others: &[(&Other, f64)], now: f64, point
         out.push(Mark { who: o.who.id, name: o.who.name.clone(), color: o.color, rects: sel_rects, caret, flag });
     }
     out
+}
+
+/// Of the selection `a..b`, the part on `pages`: from the first line there it holds to the last.
+/// None when it holds none of their lines (or is a caret). Others' selections are laid out only
+/// there, so a participant selecting a whole long document costs the window the pages on screen
+/// each frame, not every line.
+fn cut_to_pages(layout: &DocLayout, a: &Pos, b: &Pos, pages: RangeInclusive<usize>) -> Option<(Pos, Pos)> {
+    let (a, b) = if a <= b { (a, b) } else { (b, a) };
+    let (mut lo, mut hi): (Option<Pos>, Option<Pos>) = (None, None);
+    for page in layout.pages.get(pages)? {
+        for l in page_lines(page, a.story) {
+            let Some(line) = l.para.lines.get(l.li) else { continue };
+            let at = |off| Pos { story: a.story, path: l.path.clone(), off };
+            let (start, stop) = (at(line.start), at(line.stop));
+            if lo.as_ref().is_none_or(|lo| start < *lo) {
+                lo = Some(start);
+            }
+            if hi.as_ref().is_none_or(|hi| stop > *hi) {
+                hi = Some(stop);
+            }
+        }
+    }
+    let from = lo?.max(a.clone());
+    let to = hi?.min(b.clone());
+    (from < to).then_some((from, to))
 }
 
 /// Others' selections, under the person's own.
@@ -463,6 +499,34 @@ mod tests {
         assert!(rects(ada.id()) > 0, "Ada's selection is shaded on the last page");
         assert!(marks.iter().flat_map(|m| &m.rects).all(|r| r.intersects(last)), "only what is on it");
         assert_eq!(rects(ben.id()), 1, "and Ben's after hers");
+    }
+
+    #[test]
+    fn a_long_selection_is_laid_out_only_on_the_pages_on_screen() {
+        // Codex's security review: a participant selecting the whole of a long document must
+        // not cost the window every line of it each frame.
+        let text = (0..2600).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut s = Session::new(Document::from_text(&text));
+        let layout = s.layout();
+        let n = layout.pages.len();
+        assert!(n > 20, "{n} pages");
+        let all = |s: &mut Session| {
+            s.run("select.all", &json!({})).unwrap();
+            s.sel.ordered()
+        };
+        let (start, end) = all(&mut s);
+        let (from, to) = super::cut_to_pages(&layout, &start, &end, n - 2..=n - 1).unwrap();
+        assert!(layout.page_of(&from).is_some_and(|p| p >= n - 2), "from {from:?}, on {:?}", layout.page_of(&from));
+        assert_eq!(to, end, "to the end of the selection, on the last page");
+        let rects = layout.selection_rects(&s.doc, &from, &to, 0);
+        assert!(!rects.is_empty() && rects.iter().all(|(pi, _)| *pi >= n - 2), "only those pages are laid out");
+        // Backwards is the same selection; one off those pages, or pages past the end, is none.
+        assert_eq!(super::cut_to_pages(&layout, &end, &start, n - 2..=n - 1), Some((from, to)));
+        s.run("select.text", &json!({"text": "line 3"})).unwrap();
+        let (a, b) = s.sel.ordered();
+        assert_eq!(super::cut_to_pages(&layout, &a, &b, n - 2..=n - 1), None);
+        assert_eq!(super::cut_to_pages(&layout, &start, &end, n..=n + 1), None);
+        assert!(super::cut_to_pages(&layout, &a, &b, 0..=0).is_some(), "it is on the first page");
     }
 
     fn control_inspect(a: &mut WordApp) -> serde_json::Value {
