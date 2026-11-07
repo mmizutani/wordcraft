@@ -30,8 +30,8 @@ mod handler;
 mod screenshots;
 
 pub(crate) use geometry::{CaptureGeometry, SurfaceGeometry};
-pub(crate) use handler::close_refused;
 pub use handler::{Outcome, handle, inspect};
+pub(crate) use handler::{close_refused, close_refused_for};
 pub use screenshots::save_screenshot;
 #[cfg(test)]
 use screenshots::{ImageCheck, base64_upper_bound, dimensions_are_a_rounded_variant, png_upper_bound, validate_image, working_set};

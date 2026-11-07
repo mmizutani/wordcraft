@@ -26,6 +26,7 @@ impl Session {
         self.pending = None;
         self.typing = None;
         self.also_selected.clear();
+        self.member = None;
         self.column = None;
         self.column_mode = false;
         self.widened = None;
@@ -85,6 +86,7 @@ impl Session {
             pending_move: _,
             clipboard_text: _,
             clipboard_html: _,
+            clipboard_rtf: _,
             clip_history: _,
             find: _,
             goal_x: _,
@@ -164,6 +166,7 @@ impl Session {
             #[cfg(not(target_arch = "wasm32"))]
                 recovery_slot: _,
             also_selected: _,
+            member: _,
             // Column selection and a widened selection's ends, like `sel`'s shape: valid only while
             // `sel` matches them.
             column: _,
@@ -227,6 +230,7 @@ impl Session {
         }
         self.sel = sel;
         self.also_selected.clear();
+        self.member = None;
         self.history.truncate(history_len);
         self.redo = redo;
         self.typing_open = typing_open;

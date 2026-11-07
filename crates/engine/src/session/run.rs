@@ -213,7 +213,10 @@ impl Session {
         let no_files =
             (self.confined && crate::scope::Scope::of(id) == Some(crate::scope::Scope::App)).then(crate::file_access::AutomationRoots::none);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::file_access::confine(no_files.as_ref(), || crate::cmd::column::dispatch(self, id, mutates, run, params))
+            crate::file_access::confine(no_files.as_ref(), || match crate::cmd::canvas::member_command(self, id, params) {
+                Some(r) => r,
+                None => crate::cmd::column::dispatch(self, id, mutates, run, params),
+            })
         }));
         self.command_docs.pop();
         let mut result = match result {
@@ -426,6 +429,15 @@ impl Session {
         // them keeps them selected, as in Word.
         if !matches!(id, "select.addObject" | "arrange.ungroup" | "shape.fill" | "shape.effects") && (spec.mutates || self.sel != *sel_before) {
             self.also_selected.clear();
+        }
+        // A canvas member stays picked while its canvas does and nothing else is selected.
+        if id != "select.member"
+            && (self.sel != *sel_before
+                || id.starts_with("select.")
+                || id.starts_with("caret.")
+                || matches!(id, "edit.undo" | "edit.undoTo" | "edit.redo"))
+        {
+            self.member = None;
         }
         self.note_typing(id, before_doc.as_ref().map(|b| &b.0), sel_before);
     }
