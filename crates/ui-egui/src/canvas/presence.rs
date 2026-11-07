@@ -67,12 +67,7 @@ pub(crate) fn marks(pages: &Pages<'_>, others: &[(&Other, f64)], now: f64, point
         let sr = Rect::from_min_size(pos2(pr.min.x + r.x * s, pr.min.y + r.y * s), vec2(r.w * s, r.h * s)).intersect(band(pi, pr));
         (sr.height() > 0.0).then_some(sr)
     };
-    // The pages on screen, with one either side, so a selection cut to them ends off screen.
-    let mut seen = (0..rects.len()).filter(|&pi| rects.get(pi).is_some_and(|pr| band(pi, pr).intersects(visible)));
-    let shown_pages = seen.next().map(|first| {
-        let last = seen.next_back().unwrap_or(first);
-        first.saturating_sub(1)..=last.saturating_add(1).min(rects.len().saturating_sub(1))
-    });
+    let shown_pages = pages_on_screen(rects, bands, visible);
     let mut budget = MAX_RECTS;
     let mut out = Vec::new();
     for (o, moved) in others.iter().filter(|(o, _)| o.at.is_some()).take(MAX_DRAWN) {
@@ -103,6 +98,20 @@ pub(crate) fn marks(pages: &Pages<'_>, others: &[(&Other, f64)], now: f64, point
         out.push(Mark { who: o.who.id, name: o.who.name.clone(), color: o.color, rects: sel_rects, caret, flag });
     }
     out
+}
+
+/// The pages of `rects` (each showing its `bands`) that `visible` reaches, across as well as
+/// down (Read Mode sets every page in one row), with one either side, so a selection cut to them
+/// ends off screen. None when no page is on screen.
+fn pages_on_screen(rects: &[Rect], bands: &[(f32, f32)], visible: Rect) -> Option<RangeInclusive<usize>> {
+    let on = |pi: usize, pr: &Rect| {
+        let (top, bot) = bands.get(pi).copied().unwrap_or((0.0, pr.height()));
+        Rect::from_x_y_ranges(pr.x_range(), pr.min.y + top..=pr.min.y + bot).intersects(visible)
+    };
+    let mut seen = rects.iter().enumerate().filter(|(pi, pr)| on(*pi, pr)).map(|(pi, _)| pi);
+    let first = seen.next()?;
+    let last = seen.next_back().unwrap_or(first);
+    Some(first.saturating_sub(1)..=last.saturating_add(1).min(rects.len().saturating_sub(1)))
 }
 
 /// Of the selection `a..b`, the part on `pages`: from the first line there it holds to the last.
@@ -554,6 +563,22 @@ mod tests {
         let (from, to) = super::cut_to_pages(&layout, &start, &end, last.saturating_sub(1)..=last).unwrap();
         assert_eq!(to, end);
         assert!(!layout.selection_rects(&s.doc, &from, &to, 0).is_empty(), "and shaded");
+    }
+
+    #[test]
+    fn the_pages_on_screen_are_those_the_view_reaches_across_too() {
+        // Read Mode sets the pages in one row: only those across the view count, not all.
+        let row: Vec<Rect> = (0..100).map(|i| Rect::from_min_size(egui::pos2(i as f32 * 500.0, 0.0), egui::vec2(480.0, 700.0))).collect();
+        let bands = vec![(0.0, 700.0); row.len()];
+        let view = Rect::from_min_size(egui::pos2(10_000.0, 0.0), egui::vec2(900.0, 700.0));
+        assert_eq!(super::pages_on_screen(&row, &bands, view), Some(19..=22), "pages 20 and 21, and one either side");
+        // Down a column, a page's hidden margins (Hide White Space) don't count.
+        let column: Vec<Rect> = (0..10).map(|i| Rect::from_min_size(egui::pos2(0.0, i as f32 * 600.0), egui::vec2(480.0, 700.0))).collect();
+        let bands = vec![(50.0, 600.0); column.len()];
+        let view = Rect::from_min_max(egui::pos2(0.0, 1260.0), egui::pos2(480.0, 1290.0));
+        assert_eq!(super::pages_on_screen(&column, &bands, view), Some(1..=3), "only page 2's band, not page 1's rect");
+        assert_eq!(super::pages_on_screen(&column, &bands, Rect::from_min_size(egui::pos2(0.0, 9000.0), egui::Vec2::splat(10.0))), None);
+        assert_eq!(super::pages_on_screen(&[], &[], view), None);
     }
 
     fn control_inspect(a: &mut WordApp) -> serde_json::Value {
