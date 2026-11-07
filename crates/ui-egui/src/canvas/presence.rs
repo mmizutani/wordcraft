@@ -8,7 +8,7 @@ use std::ops::RangeInclusive;
 use egui::{Color32, Painter, Pos2, Rect, Stroke, pos2, vec2};
 use wordcraft_doc::{Pos, StoryRef};
 use wordcraft_engine::room::{Other, ParticipantId};
-use wordcraft_layout::{DocLayout, Placed};
+use wordcraft_layout::{DocLayout, Placed, turn_rect};
 
 use super::pages::page_screen_scale;
 use crate::share::FLAG_MS;
@@ -138,8 +138,8 @@ fn pages_on_screen(rects: &[Rect], bands: &[(f32, f32)], visible: Rect) -> Optio
 /// bottom on it in page points): from the first such line it holds to the last. None when it
 /// holds none of them (or is a caret). Others' selections are laid out only there, so a
 /// participant selecting a whole long document costs the window the lines near the screen each
-/// frame, not every line, even where one page holds the whole document (Web Layout). Turned
-/// text (a cell's text direction) is kept or cut a piece at a time.
+/// frame, not every line, even where one page holds the whole document (Web Layout), turned
+/// text (a cell's text direction) too.
 #[cfg(test)]
 fn cut_to_pages(layout: &DocLayout, a: &Pos, b: &Pos, pages: RangeInclusive<usize>, near: &dyn Fn(usize, f32, f32) -> bool) -> Option<(Pos, Pos)> {
     cut(a, b, screen_span(layout, a.story, pages, near)?)
@@ -164,12 +164,18 @@ fn screen_span(layout: &DocLayout, story: StoryRef, pages: RangeInclusive<usize>
             StoryRef::Part(_) => [&page.header, &page.footer, &page.items],
         };
         for it in parts.into_iter().flatten() {
-            let Placed::Lines { story: theirs, path, para, l0, l1, y, turn, .. } = it else { continue };
+            let Placed::Lines { story: theirs, path, para, l0, l1, x, y, turn } = it else { continue };
             if *theirs != story {
                 continue;
             }
             let Some(top) = para.lines.get(*l0).map(|l| l.top) else { continue };
-            let kept = |li: &usize| para.lines.get(*li).is_some_and(|l| turn.is_turned() || near(pi, y + l.top - top, y + l.top - top + l.height));
+            // Each line where it is on the page, turned text (a cell's text direction) too.
+            let kept = |li: &usize| {
+                para.lines.get(*li).is_some_and(|l| {
+                    let r = turn_rect(*turn, *x, *y, wordcraft_geom::Rect::new(0.0, l.top - top, l.right.max(0.0), l.height));
+                    near(pi, r.y, r.y + r.h)
+                })
+            };
             let (Some(first), Some(last)) = ((*l0..*l1).find(kept), (*l0..*l1).rev().find(kept)) else { continue };
             let (Some(first), Some(last)) = (para.lines.get(first), para.lines.get(last)) else { continue };
             let at = |off| Pos { story, path: path.clone(), off };
@@ -642,6 +648,41 @@ mod tests {
         assert!(rects.iter().all(|(_, r)| r.y + r.h >= 1000.0 - 1.0 && r.y <= 1100.0 + 1.0), "{rects:?}");
         assert!(from > start && to < end);
         assert_eq!(super::cut_to_pages(&layout, &start, &end, 0..=0, &|_, _, _| false), None);
+    }
+
+    #[test]
+    fn where_one_page_holds_the_whole_document_only_the_turned_lines_near_the_screen_are_laid_out() {
+        // Codex's security review: turned text (a cell's text direction) on Web Layout's one
+        // page is bounded by where it is too, or a selection over it all would be laid out.
+        let mut s = Session::new(Document::from_text("before"));
+        s.run("view.webLayout", &json!({})).unwrap();
+        s.run("insert.table", &json!({"rows": 300, "cols": 1})).unwrap();
+        for i in 0..300 {
+            s.run("text.insert", &json!({"text": format!("cell {i}")})).unwrap();
+            s.run("table.textDirection", &json!({"value": "down"})).unwrap();
+            if i < 299 {
+                s.run("text.tab", &json!({})).unwrap();
+            }
+        }
+        let layout = s.layout();
+        assert_eq!(layout.pages.len(), 1, "Web Layout is one page");
+        let turned = layout
+            .pages
+            .iter()
+            .flat_map(|p| &p.items)
+            .filter(|it| matches!(it, wordcraft_layout::Placed::Lines { turn, .. } if turn.is_turned()))
+            .count();
+        assert!(turned >= 300, "the cells' text is laid out turned: {turned}");
+        // The whole document: Select All in a cell selects the cell first, then everything.
+        s.run("caret.docStart", &json!({})).unwrap();
+        s.run("select.all", &json!({})).unwrap();
+        s.run("select.all", &json!({})).unwrap();
+        let (start, end) = s.sel.ordered();
+        let near = |_: usize, top: f32, bottom: f32| bottom >= 3000.0 && top <= 3100.0;
+        let (from, to) = super::cut_to_pages(&layout, &start, &end, 0..=0, &near).unwrap();
+        let rects = layout.selection_rects(&s.doc, &from, &to, 0);
+        assert!(!rects.is_empty() && rects.len() < 20, "only the cells there: {}", rects.len());
+        assert!(from > start && to < end);
     }
 
     fn control_inspect(a: &mut WordApp) -> serde_json::Value {
