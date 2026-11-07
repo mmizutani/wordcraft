@@ -470,3 +470,31 @@ fn the_room_tool_calls_the_app_s_room_methods() {
     assert_eq!(r["result"]["isError"], true);
     assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("needs the desktop app"), "{r}");
 }
+
+/// A 2026-07-28 client on stdio: no `initialize`, each request names its version in `_meta`, and
+/// the results say they are complete and who answered; a version the server doesn't speak is
+/// refused with the ones it does, and an older client on the same server still initializes.
+#[test]
+fn a_2026_07_28_client_needs_no_handshake() {
+    let mut s = Server::new(Box::new(Headless::default()));
+    let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}});
+    let d = call(&mut s, 1, "server/discover", json!({"_meta": meta}));
+    assert_eq!(d["result"]["resultType"], "complete");
+    assert_eq!(d["result"]["supportedVersions"][0], "2026-07-28");
+    assert_eq!(d["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "wordcraft");
+    assert!(!s.is_initialized(), "nothing was initialized");
+    let r = call(&mut s, 2, "tools/call", json!({"name": "type_text", "arguments": {"text": "Hello"}, "_meta": meta}));
+    assert_eq!((r["result"]["isError"].clone(), r["result"]["resultType"].clone()), (json!(false), json!("complete")), "{r}");
+    let read = call(&mut s, 3, "resources/read", json!({"uri": "wordcraft://document", "_meta": meta}));
+    assert!(read["result"]["contents"][0]["text"].as_str().unwrap().contains("Hello"));
+    assert_eq!(read["result"]["ttlMs"], 0);
+    // `ping` and `initialize` belong to the older revisions.
+    assert_eq!(call(&mut s, 4, "ping", json!({"_meta": meta}))["error"]["code"], -32601);
+    let old = call(&mut s, 5, "tools/list", json!({"_meta": {"io.modelcontextprotocol/protocolVersion": "2020-01-01"}}));
+    assert_eq!(old["error"]["code"], -32022);
+    assert_eq!(old["error"]["data"]["requested"], "2020-01-01");
+    assert!(old["error"]["data"]["supported"].as_array().unwrap().iter().any(|v| v == "2025-06-18"));
+    let init = call(&mut s, 6, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    assert!(call(&mut s, 7, "tools/list", json!({}))["result"].get("resultType").is_none());
+}

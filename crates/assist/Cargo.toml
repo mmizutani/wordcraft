@@ -36,3 +36,7 @@ rustix = { version = "1", features = ["process"] }
 # Safe ownership of the agent's whole process tree; no Windows FFI in this crate.
 process-wrap = { version = "10.0.1", default-features = false, features = ["std", "job-object", "creation-flags"] }
 windows = { version = "0.62.2", features = ["Win32_System_Threading"] }
+
+[dev-dependencies]
+# Requests for the MCP endpoint in front of the room's port, end to end (#75).
+wordcraft-http = { workspace = true }

@@ -391,9 +391,10 @@ bound resource use; a continuous local connection flood can still deny availabil
 
 An agent in a sandbox (E2B, a Kubernetes agent sandbox, any cloud runner) is invited with
 `remote: true`. Nobody runs a tunnel to let it in: this computer will dial out to a relay
-(self-hosted, or the project's), and the agent will reach the room at a URL with its invite's key,
-from any MCP client (MCP over Streamable HTTP, #75, through the relay, #76). Until then a remote
-invite sets the rules below, which every way in keeps.
+(self-hosted, or the project's, #76), and the agent reaches the room at a URL with its invite's
+key, from any MCP client: `wordcraft-cli mcp --http` serves MCP over Streamable HTTP in front of
+the room's port ([MCP over HTTP](mcp.md#mcp-over-http), #75), refusing the window's key. A
+remote invite sets the rules below, which every way in keeps.
 
 - Never put the window's key in a sandbox: whoever holds it acts as the person, in the window,
   with every file the person can use. Only an invite's key leaves this computer. `auth` says which

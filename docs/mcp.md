@@ -1,7 +1,8 @@
 # MCP server
 
-WordCraft speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio, so
-Claude and other agents can write and edit documents.
+WordCraft speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio, and
+over Streamable HTTP for agents on other machines ([MCP over HTTP](#mcp-over-http)), so Claude
+and other agents can write and edit documents.
 
 ```sh
 wordcraft-cli mcp                          # headless session (no window)
@@ -17,6 +18,44 @@ loopback addresses; see [Keys](control-protocol.md#keys). The bridge serves even
 isn't open yet: tool calls return "not reachable … will retry on each call" and succeed once the
 app's port opens (#4078), so a client that starts before WordCraft doesn't lose the server for
 its whole session.
+
+## MCP over HTTP
+
+An agent on another machine joins a shared document with nothing but a URL and an invite's key,
+from any MCP client that speaks Streamable HTTP (#75):
+
+```sh
+wordcraft-cli mcp --http 127.0.0.1:8765 --connect 127.0.0.1:<room port>
+# the agent's MCP config: url http://127.0.0.1:8765/mcp, header Authorization: Bearer <invite key>
+```
+
+`--connect` is the shared document's room port, as File › Share's line shows it. Every request
+carries an invite's key (`room.invite`, with `remote: true` for a sandbox) in
+`Authorization: Bearer`; the key opens one connection to the app, and so one copy of the
+document, held to the invite's role and files, for as long as requests keep coming (30 minutes
+without one closes it). The window's key is refused (403): it acts as the person. A key taken
+back, or past its time, is refused (401), and the request that finds it out says so.
+
+- **Both revisions on one endpoint.** A 2026-07-28 client sends no `initialize`: each request
+  names its version in `_meta` (`io.modelcontextprotocol/protocolVersion`) and in the
+  `MCP-Protocol-Version` header, with `Mcp-Method` (and `Mcp-Name` for `tools/call` and
+  `resources/read`) saying what the body does. A header that doesn't match is 400 with
+  `-32020`; a version the server doesn't speak is 400 with `-32022` and the versions it does;
+  an unknown method is 404. `server/discover` says what the server is, results carry
+  `resultType`, and lists carry `ttlMs` and `cacheScope` (the document itself, `ttlMs: 0`). A
+  2025-06-18 (or 2025-03-26) client starts with `initialize` as before. The stdio server takes
+  both kinds of request too.
+- **No sessions.** The key is the only identity: WordCraft mints no `Mcp-Session-Id` and
+  ignores one a client sends. Replies are `application/json`; nothing streams, so `GET` and
+  `DELETE` are 405.
+- **This computer only.** It listens on loopback and refuses another address. A request is
+  refused (403) unless its `Host` is that address (`--allow-host` adds names, comma-separated,
+  for a tunnel in front), and when it has an `Origin` (a web page), unless `--allow-origin`
+  lists it. Bodies are capped at 1 MiB, connections at 64, keys at 64.
+
+Agents in sandboxes won't need a tunnel: the app will dial out to a relay that serves this
+endpoint at a public URL (#76). Until then, putting a tunnel in front of the port is a
+developer's test, not how people connect.
 
 ## Scripts from the command line
 
@@ -316,8 +355,9 @@ with `file.exportPdf` or `file.exportPng` and no `path` hands the PDF or page ba
 An agent on another machine (a sandbox) is invited with
 `{"action": "invite", "name": "Sandbox", "remote": true}`: never the owner, no file unless
 `files` names some, and a key that stops working after a day unless `expiresIn` (seconds) says
-otherwise; `uses: 1` lets it join once. It will reach the room through a relay this computer
-dials out to, with no tunnel to run (#75, #76); see
+otherwise; `uses: 1` lets it join once. It reaches the room over HTTP with the key
+([MCP over HTTP](#mcp-over-http)), and will through a relay this computer dials out to, with no
+tunnel to run (#76); see
 [Agents on other machines](control-protocol.md#agents-on-other-machines). Only an invite's key
 goes to a sandbox, never the window's.
 

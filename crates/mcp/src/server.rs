@@ -7,9 +7,17 @@ use serde_json::{Value, json};
 use crate::backend::Backend;
 use crate::tools::{call_tool, tool_definitions};
 
-/// The MCP revision we implement.
+/// The MCP revision a client gets from `initialize` (the handshake era, up to 2025-06-18).
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_VERSIONS: &[&str] = &[PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
+/// The stateless revision: no `initialize`, every request names its version in `_meta`
+/// (`io.modelcontextprotocol/protocolVersion`), and `server/discover` says what the server is.
+pub const STATELESS_VERSION: &str = "2026-07-28";
+/// Every revision served, newest first (`server/discover`'s `supportedVersions`).
+pub const ALL_VERSIONS: &[&str] = &[STATELESS_VERSION, PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
+/// The `_meta` key a 2026-07-28 request names its revision with.
+pub const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -17,6 +25,8 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 const RESOURCE_NOT_FOUND: i64 = -32002;
+/// A request naming a revision the server doesn't speak (2026-07-28).
+pub const UNSUPPORTED_VERSION: i64 = -32022;
 
 const INSTRUCTIONS: &str = "WordCraft is a word processor (a Microsoft Word clone). Every action is a command: find ids and \
 parameters with list_commands and run them with execute (or several with batch). Positions are \
@@ -91,6 +101,20 @@ fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}})
 }
 
+/// The revision a 2026-07-28-style request names in its `_meta`, if it names one: such a request
+/// is answered statelessly, whatever came before it.
+pub fn stateless_version(params: &Value) -> Option<&str> {
+    params.get("_meta").and_then(|m| m.get(META_VERSION)).and_then(Value::as_str)
+}
+
+fn server_info() -> Value {
+    json!({"name": "wordcraft", "title": "WordCraft", "version": env!("CARGO_PKG_VERSION"), "websiteUrl": "https://getartcraft.com/apps/wordcraft"})
+}
+
+/// How long a 2026-07-28 client may keep a list: the tools and resources a build has don't
+/// change while it runs, unlike the document, which is never cached.
+const STATIC_TTL_MS: u64 = 60 * 60 * 1000;
+
 impl Server {
     pub fn new(backend: Box<dyn Backend>) -> Self {
         Self { backend, initialized: false }
@@ -164,6 +188,17 @@ impl Server {
         if !(id.is_string() || id.is_number()) {
             return Some(error(Value::Null, INVALID_REQUEST, "`id` must be a string or number"));
         }
+        if let Some(version) = stateless_version(&params) {
+            if version != STATELESS_VERSION {
+                let mut e = error(id, UNSUPPORTED_VERSION, format!("protocol version {version} is not supported"));
+                e["error"]["data"] = json!({"supported": ALL_VERSIONS, "requested": version});
+                return Some(e);
+            }
+            return Some(match self.stateless(method, &params) {
+                Ok(r) => response(id, r),
+                Err((code, m)) => error(id, code, m),
+            });
+        }
         Some(match self.request(method, &params) {
             Ok(r) => response(id, r),
             Err((code, m)) => error(id, code, m),
@@ -178,6 +213,86 @@ impl Server {
         }
     }
 
+    fn instructions(&self) -> String {
+        format!(
+            "{INSTRUCTIONS} Backend: {}. Community: https://discord.gg/artcraft · https://getartcraft.com/apps/wordcraft · https://github.com/storytold/wordcraft",
+            self.backend.describe()
+        )
+    }
+
+    fn resources() -> Value {
+        json!([
+            {"uri": DOC_URI, "name": "document", "title": "Active document", "description": "Blocks, text, formatting, sections, parts and selection of the document (document.inspect)", "mimeType": "application/json"},
+            {"uri": COMMANDS_URI, "name": "commands", "title": "Commands", "description": "Every command: id, label, ribbon location, shortcut, params, enabled (engine.commands)", "mimeType": "application/json"},
+        ])
+    }
+
+    /// The contents of resource `uri`, or `None` when there is none.
+    fn read_resource(&mut self, uri: &str) -> Option<Result<Value, String>> {
+        let v = match uri {
+            DOC_URI => self.backend.call("document.inspect", json!({})),
+            COMMANDS_URI => self.backend.call("engine.commands", json!({})),
+            _ => return None,
+        };
+        Some(v.map(|v| json!([{"uri": uri, "mimeType": "application/json", "text": serde_json::to_string_pretty(&v).unwrap_or_default()}])))
+    }
+
+    /// A 2026-07-28 request: no handshake before it, and nothing kept from one request to the
+    /// next. Each result says it is complete (`resultType`) and names the server in its `_meta`;
+    /// lists and reads say how long they may be kept (`ttlMs`, `cacheScope`).
+    fn stateless(&mut self, method: &str, params: &Value) -> Result<Value, (i64, String)> {
+        let cache = |ttl: u64, scope: &str| json!({"ttlMs": ttl, "cacheScope": scope});
+        let mut result = match method {
+            "server/discover" => {
+                let mut r = json!({
+                    "supportedVersions": ALL_VERSIONS,
+                    "capabilities": {"tools": {}, "resources": {}},
+                    "instructions": self.instructions(),
+                });
+                merge(&mut r, cache(STATIC_TTL_MS, "private"));
+                r
+            }
+            "tools/list" => {
+                let mut r = json!({"tools": tool_definitions()});
+                merge(&mut r, cache(STATIC_TTL_MS, "public"));
+                r
+            }
+            "tools/call" => {
+                let name = params.get("name").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing tool `name`".to_string()))?;
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                call_tool(self.backend.as_mut(), name, &args).to_value()
+            }
+            "resources/list" => {
+                let mut r = json!({"resources": Self::resources()});
+                merge(&mut r, cache(STATIC_TTL_MS, "public"));
+                r
+            }
+            "resources/templates/list" => {
+                let mut r = json!({"resourceTemplates": []});
+                merge(&mut r, cache(STATIC_TTL_MS, "public"));
+                r
+            }
+            "resources/read" => {
+                let uri = params.get("uri").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing `uri`".to_string()))?;
+                // The document changes from one moment to the next: never kept.
+                let contents =
+                    self.read_resource(uri).ok_or((INVALID_PARAMS, format!("resource not found: {uri}")))?.map_err(|e| (INTERNAL_ERROR, e))?;
+                let mut r = json!({"contents": contents});
+                merge(&mut r, cache(0, "private"));
+                r
+            }
+            other => return Err((METHOD_NOT_FOUND, format!("method not found: {other}"))),
+        };
+        merge(&mut result, json!({"resultType": "complete"}));
+        if let Some(o) = result.as_object_mut() {
+            let meta = o.entry("_meta").or_insert_with(|| json!({}));
+            if let Some(m) = meta.as_object_mut() {
+                m.insert(META_SERVER_INFO.into(), server_info());
+            }
+        }
+        Ok(result)
+    }
+
     fn request(&mut self, method: &str, params: &Value) -> Result<Value, (i64, String)> {
         match method {
             "initialize" => {
@@ -186,11 +301,8 @@ impl Server {
                 Ok(json!({
                     "protocolVersion": version,
                     "capabilities": {"tools": {}, "resources": {}},
-                    "serverInfo": {"name": "wordcraft", "title": "WordCraft", "version": env!("CARGO_PKG_VERSION"), "websiteUrl": "https://getartcraft.com/apps/wordcraft"},
-                    "instructions": format!(
-                        "{INSTRUCTIONS} Backend: {}. Community: https://discord.gg/artcraft · https://getartcraft.com/apps/wordcraft · https://github.com/storytold/wordcraft",
-                        self.backend.describe()
-                    ),
+                    "serverInfo": server_info(),
+                    "instructions": self.instructions(),
                 }))
             }
             "ping" => Ok(json!({})),
@@ -200,22 +312,22 @@ impl Server {
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
                 Ok(call_tool(self.backend.as_mut(), name, &args).to_value())
             }
-            "resources/list" => Ok(json!({"resources": [
-                {"uri": DOC_URI, "name": "document", "title": "Active document", "description": "Blocks, text, formatting, sections, parts and selection of the document (document.inspect)", "mimeType": "application/json"},
-                {"uri": COMMANDS_URI, "name": "commands", "title": "Commands", "description": "Every command: id, label, ribbon location, shortcut, params, enabled (engine.commands)", "mimeType": "application/json"},
-            ]})),
+            "resources/list" => Ok(json!({"resources": Self::resources()})),
             "resources/templates/list" => Ok(json!({"resourceTemplates": []})),
             "resources/read" => {
                 let uri = params.get("uri").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing `uri`".to_string()))?;
-                let v = match uri {
-                    DOC_URI => self.backend.call("document.inspect", json!({})),
-                    COMMANDS_URI => self.backend.call("engine.commands", json!({})),
-                    _ => return Err((RESOURCE_NOT_FOUND, format!("resource not found: {uri}"))),
-                }
-                .map_err(|e| (INTERNAL_ERROR, e))?;
-                Ok(json!({"contents": [{"uri": uri, "mimeType": "application/json", "text": serde_json::to_string_pretty(&v).unwrap_or_default()}]}))
+                let contents =
+                    self.read_resource(uri).ok_or((RESOURCE_NOT_FOUND, format!("resource not found: {uri}")))?.map_err(|e| (INTERNAL_ERROR, e))?;
+                Ok(json!({"contents": contents}))
             }
             other => Err((METHOD_NOT_FOUND, format!("method not found: {other}"))),
         }
+    }
+}
+
+/// Add `extra`'s fields to the object `v`.
+fn merge(v: &mut Value, extra: Value) {
+    if let (Some(o), Value::Object(e)) = (v.as_object_mut(), extra) {
+        o.extend(e);
     }
 }

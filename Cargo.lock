@@ -6860,6 +6860,7 @@ dependencies = [
  "windows",
  "wordcraft-doc",
  "wordcraft-engine",
+ "wordcraft-http",
  "wordcraft-mcp",
 ]
 
@@ -7024,6 +7025,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "wordcraft-http"
+version = "0.15.1"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "wordcraft-layout"
 version = "0.15.1"
 dependencies = [
@@ -7052,6 +7060,7 @@ dependencies = [
  "wordcraft-control-key",
  "wordcraft-doc",
  "wordcraft-engine",
+ "wordcraft-http",
  "wordcraft-render",
 ]
 

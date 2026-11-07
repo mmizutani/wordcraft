@@ -13,5 +13,7 @@ wordcraft-doc = { workspace = true }
 wordcraft-engine = { workspace = true }
 wordcraft-render = { workspace = true }
 wordcraft-control-key = { workspace = true }
+# The Streamable HTTP endpoint's server (#75).
+wordcraft-http = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }

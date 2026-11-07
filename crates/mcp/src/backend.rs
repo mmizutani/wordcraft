@@ -21,6 +21,11 @@ pub trait Backend {
     fn has_ui(&self) -> bool;
     /// Short human description ("headless", "connected to 127.0.0.1:7981").
     fn describe(&self) -> String;
+    /// Why this backend can't answer any more, once it can't: the app refused its key (taken
+    /// back, or its time was up). A server holding it for others (`http::Endpoint`) lets it go.
+    fn ended(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Looks up the control key for an address (`HOST:PORT`).
@@ -38,6 +43,8 @@ pub struct Remote {
     /// The control key, looked up once per connection (the app picks a new one at every start).
     key: Option<String>,
     find_key: KeyFinder,
+    /// The app refused the key on a new connection too.
+    refused: bool,
 }
 
 /// The control key: `env` (`WORDCRAFT_CONTROL_KEY`) when set, else the app's key file for
@@ -118,7 +125,7 @@ impl Remote {
     }
 
     fn connect_with(addr: &str, find_key: KeyFinder) -> std::io::Result<Self> {
-        let mut r = Self { addr: addr.to_string(), conn: None, next_id: 1, connected: false, send_key: false, key: None, find_key };
+        let mut r = Self { addr: addr.to_string(), conn: None, next_id: 1, connected: false, send_key: false, key: None, find_key, refused: false };
         r.reconnect()?;
         if let Some(w) = r.key_warning() {
             log::warn!("{w}");
@@ -129,7 +136,16 @@ impl Remote {
     /// A remote that connects on first use: the app may start after the MCP server, and a
     /// server that exits at once reads as failed for the client's whole session (#4078).
     pub fn lazy(addr: &str) -> Self {
-        Self { addr: addr.to_string(), conn: None, next_id: 1, connected: false, send_key: false, key: None, find_key: Box::new(find_key) }
+        Self {
+            addr: addr.to_string(),
+            conn: None,
+            next_id: 1,
+            connected: false,
+            send_key: false,
+            key: None,
+            find_key: Box::new(find_key),
+            refused: false,
+        }
     }
 
     /// The address the app is reached at, as given.
@@ -258,6 +274,7 @@ impl Backend for Remote {
             Ok(v.get("result").cloned().unwrap_or(Value::Null))
         } else if unauthorized(&v) {
             self.conn = None;
+            self.refused = true;
             Err(self.key_warning().map_or_else(
                 || {
                     format!(
@@ -274,6 +291,10 @@ impl Backend for Remote {
 
     fn has_ui(&self) -> bool {
         true
+    }
+
+    fn ended(&self) -> Option<String> {
+        self.refused.then(|| format!("the WordCraft app at {} no longer takes this key: it was taken back, or its time was up", self.addr))
     }
 
     fn describe(&self) -> String {
