@@ -38,7 +38,7 @@ pub(crate) fn write_parts(doc: &Document, flavor: Flavor) -> Result<Vec<(String,
         linked_headers: Default::default(),
         wm_header: (0..=u32::MAX).rev().find(|id| !doc.parts.contains_key(id)).unwrap_or(u32::MAX),
         pending_watermark: None,
-        para_ids: HashMap::new(),
+        para_ids: Default::default(),
         pending_mark: None,
         current_note: None,
         toc_hold_end: false,
@@ -72,8 +72,7 @@ pub(crate) fn write_parts(doc: &Document, flavor: Flavor) -> Result<Vec<(String,
         if let Some(part) = doc.parts.get(&c.part)
             && let Some(last) = part.blocks.iter().rev().find_map(|b| b.as_para())
         {
-            let pid = format!("{:08X}", 0x1000_0000u32 + i as u32 + 1);
-            wr.para_ids.insert(last as *const _ as usize, pid.clone());
+            let pid = wr.para_ids.for_comment(last, 0x1000_0000u32.saturating_add(i as u32).saturating_add(1));
             comment_paras.push((*cid, pid));
         }
     }
