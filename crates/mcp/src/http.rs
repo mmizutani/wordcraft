@@ -48,11 +48,22 @@ pub struct Options {
     pub idle: Duration,
     /// How long one request may take.
     pub timeout: Duration,
+    /// How often a key's connection asks the app again whether it still takes the key. Some
+    /// requests (tools/list, server/discover) are answered without the app, so a key taken back
+    /// would otherwise keep its connection, and its place, for as long as it kept asking.
+    pub recheck: Duration,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { hosts: Some(Vec::new()), origins: Vec::new(), max_keys: 64, idle: Duration::from_secs(30 * 60), timeout: Duration::from_secs(150) }
+        Options {
+            hosts: Some(Vec::new()),
+            origins: Vec::new(),
+            max_keys: 64,
+            idle: Duration::from_secs(30 * 60),
+            timeout: Duration::from_secs(150),
+            recheck: Duration::from_secs(15),
+        }
     }
 }
 
@@ -286,7 +297,7 @@ impl Endpoint {
     fn open_seat(&self, key: &str) -> Result<SyncSender<Job>, Response> {
         let (jobs, inbox) = mpsc::sync_channel::<Job>(QUEUE);
         let (ready_tx, ready) = mpsc::channel::<Result<(), Response>>();
-        let (open, key, idle) = (self.open.clone(), key.to_string(), self.options.idle);
+        let (open, key, idle, recheck) = (self.open.clone(), key.to_string(), self.options.idle, self.options.recheck);
         let spawned = std::thread::Builder::new().name("mcp http key".into()).spawn(move || {
             let mut backend = match open(&key) {
                 Ok(b) => b,
@@ -328,7 +339,7 @@ impl Endpoint {
                 }
             }
             let _ = ready_tx.send(Ok(()));
-            serve_key(Server::new(backend), &inbox, idle);
+            serve_key(Server::new(backend), &inbox, idle, recheck);
         });
         if spawned.is_err() {
             return Err(refusal(503, -32603, "no thread for this participant"));
@@ -342,10 +353,20 @@ impl Endpoint {
 }
 
 /// A key's thread: answer its requests in turn until it idles out or the app refuses the key.
-fn serve_key(mut server: Server, inbox: &Receiver<Job>, idle: Duration) {
+fn serve_key(mut server: Server, inbox: &Receiver<Job>, idle: Duration, recheck: Duration) {
+    let mut checked = Instant::now();
     while let Ok(job) = inbox.recv_timeout(idle) {
         if Instant::now() >= job.until {
             continue;
+        }
+        // Every so often, whatever the request: is the key still the app's?
+        if checked.elapsed() >= recheck {
+            checked = Instant::now();
+            let refused = server.backend().call("auth", json!({})).is_err_and(|e| e.starts_with("unauthorized"));
+            if refused || server.backend().ended().is_some() {
+                let _ = job.answer.send(Answer { reply: None, ended: true });
+                return;
+            }
         }
         let reply = server.handle_line(&job.body);
         // A failed request may be the first sign that the key was taken back (the copy says so
