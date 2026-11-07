@@ -42,6 +42,9 @@ pub(crate) struct Pages<'a> {
     pub(crate) doc: &'a wordcraft_doc::Document,
     pub(crate) page_hint: usize,
     pub(crate) rects: &'a [Rect],
+    /// Per page, the part shown ([`super::Geometry::bands`]): with Hide White Space a page's
+    /// rect overlaps its neighbours' in the hidden margins, so nothing outside it is drawn.
+    pub(crate) bands: &'a [(f32, f32)],
     pub(crate) scale: f32,
     pub(crate) visible: Rect,
 }
@@ -49,11 +52,17 @@ pub(crate) struct Pages<'a> {
 /// Where everyone else in `others` (with when their place last changed) is on `pages`; `now` and
 /// the `pointer` say whose names show, and `follow` whom the person follows.
 pub(crate) fn marks(pages: &Pages<'_>, others: &[(&Other, f64)], now: f64, pointer: Option<Pos2>, follow: Option<ParticipantId>) -> Vec<Mark> {
-    let Pages { layout, doc, page_hint, rects, scale, visible } = *pages;
+    let Pages { layout, doc, page_hint, rects, bands, scale, visible } = *pages;
+    // The screen band page `pi` shows: all of it across, its band down.
+    let band = |pi: usize, pr: &Rect| -> Rect {
+        let (top, bot) = bands.get(pi).copied().unwrap_or((0.0, pr.height()));
+        Rect::from_x_y_ranges(egui::Rangef::EVERYTHING, pr.min.y + top..=pr.min.y + bot)
+    };
     let to_screen = |pi: usize, r: &wordcraft_geom::Rect| -> Option<Rect> {
         let pr = rects.get(pi)?;
         let s = layout.pages.get(pi).map_or(scale, |page| page_screen_scale(*pr, page, scale));
-        Some(Rect::from_min_size(pos2(pr.min.x + r.x * s, pr.min.y + r.y * s), vec2(r.w * s, r.h * s)))
+        let sr = Rect::from_min_size(pos2(pr.min.x + r.x * s, pr.min.y + r.y * s), vec2(r.w * s, r.h * s)).intersect(band(pi, pr));
+        (sr.height() > 0.0).then_some(sr)
     };
     let mut budget = MAX_RECTS;
     let mut out = Vec::new();
@@ -71,7 +80,13 @@ pub(crate) fn marks(pages: &Pages<'_>, others: &[(&Other, f64)], now: f64, point
             let pr = rects.get(c.page)?;
             let s = layout.pages.get(c.page).map_or(scale, |page| page_screen_scale(*pr, page, scale));
             let (x, y0) = (pr.min.x + c.x * s, pr.min.y + c.top * s);
-            Some(if c.width > 0.0 { [pos2(x, y0), pos2(x + c.width * s, y0)] } else { [pos2(x, y0), pos2(x, y0 + c.height * s)] })
+            let shown = band(c.page, pr).y_range();
+            if c.width > 0.0 {
+                shown.contains(y0).then(|| [pos2(x, y0), pos2(x + c.width * s, y0)])
+            } else {
+                let (top, bottom) = (y0.max(shown.min), (y0 + c.height * s).min(shown.max));
+                (top < bottom).then(|| [pos2(x, top), pos2(x, bottom)])
+            }
         });
         let hovered = caret.zip(pointer).is_some_and(|(bar, p)| Rect::from_two_pos(bar[0], bar[1]).expand(6.0).contains(p));
         let flag = caret.is_some() && (now - moved < FLAG_MS || hovered || follow == Some(o.who.id));
@@ -185,6 +200,7 @@ mod tests {
             doc: &a.session.doc,
             page_hint: a.session.page_hint,
             rects: &a.canvas.page_rects,
+            bands: &a.canvas.page_bands,
             scale: a.canvas.scale,
             visible,
         };
@@ -285,6 +301,71 @@ mod tests {
         h.run_steps(2);
         assert_eq!(h.state().canvas.follow, None);
         assert_eq!(h.state_mut().run("ui.follow", json!({})).unwrap(), json!({"following": null}));
+    }
+
+    #[test]
+    fn typing_through_an_input_method_stops_following() {
+        // An input method's text comes as its own events, not as keys or text: composing,
+        // committing and deleting around the caret each take the view back.
+        let text: Vec<String> = (0..300).map(|i| format!("Line {i} of a long document")).collect();
+        let (mut h, lobby) = harness(&text.join("\n"));
+        owner(h.state_mut(), "room.share", json!({}));
+        let mut ada = agent(h.state_mut(), &lobby, "Ada");
+        runs(&mut ada, "select.text", json!({"text": "Line 290 "}));
+        h.run_steps(3);
+        let events = [
+            egui::Event::Ime(egui::ImeEvent::Preedit { text: "か".into(), active_range_chars: None }),
+            egui::Event::Ime(egui::ImeEvent::Commit("漢字".into())),
+            egui::Event::Ime(egui::ImeEvent::DeleteSurrounding { before_chars: 1, after_chars: 0 }),
+        ];
+        for event in events {
+            h.state_mut().run("ui.follow", json!({"participant": ada.id()})).unwrap();
+            h.run_steps(3);
+            assert_eq!(h.state().canvas.follow, Some(ada.id()));
+            h.input_mut().events.push(event.clone());
+            h.run_steps(2);
+            assert_eq!(h.state().canvas.follow, None, "{event:?} stops following");
+        }
+        // A composition ending with nothing types nothing.
+        h.state_mut().run("ui.follow", json!({"participant": ada.id()})).unwrap();
+        h.input_mut().events.push(egui::Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None }));
+        h.run_steps(2);
+        assert_eq!(h.state().canvas.follow, Some(ada.id()));
+    }
+
+    #[test]
+    fn with_white_space_hidden_others_in_a_hidden_header_are_not_drawn_over_the_text() {
+        // Hide White Space overlaps each page's rect with its neighbours' in the hidden margins:
+        // a header there would land on the page before's text.
+        let text: Vec<String> = (0..300).map(|i| format!("Line {i} of a long document")).collect();
+        let (mut h, lobby) = harness(&text.join("\n"));
+        owner(h.state_mut(), "room.share", json!({}));
+        let mut ada = agent(h.state_mut(), &lobby, "Ada");
+        runs(&mut ada, "insert.header", json!({"text": "Running head"}));
+        runs(&mut ada, "select.all", json!({}));
+        owner(h.state_mut(), "select.text", json!({"text": "Line 150 "}));
+        h.run_steps(3);
+        let page = h.state().session.page_hint;
+        assert!(page > 0, "the person is past the first page, whose top always shows");
+        let now = crate::now_ms();
+        let shown = drawn(h.state_mut(), now, None);
+        let [m] = shown.as_slice() else { panic!("{shown:?}") };
+        let pr = h.state().canvas.page_rects[page];
+        assert!(m.caret.is_some() && !m.rects.is_empty(), "Ada's header selection is drawn: {m:?}");
+        assert!(m.rects.iter().all(|r| r.min.y >= pr.min.y && r.max.y < pr.min.y + pr.height() / 4.0), "in the header: {m:?}");
+        owner(h.state_mut(), "view.hideWhiteSpace", json!({"value": true}));
+        h.run_steps(3);
+        assert!(h.state().session.view.hide_white_space);
+        let shown = drawn(h.state_mut(), now, None);
+        let [m] = shown.as_slice() else { panic!("{shown:?}") };
+        assert_eq!((m.caret, m.rects.len()), (None, 0), "nothing of Ada's hidden header is drawn: {m:?}");
+        // Body text is still drawn where it shows.
+        runs(&mut ada, "insert.closeHeader", json!({}));
+        runs(&mut ada, "select.text", json!({"text": "Line 151 "}));
+        h.run_steps(3);
+        let shown = drawn(h.state_mut(), now, None);
+        let [m] = shown.as_slice() else { panic!("{shown:?}") };
+        assert!(m.caret.is_some() && m.rects.len() == 1, "{m:?}");
     }
 
     #[test]
