@@ -6,7 +6,9 @@ use std::sync::Arc;
 use wordcraft_doc::change::Side;
 use wordcraft_doc::{ChangeSet, Document};
 
-use super::{Participant, ParticipantId, Role, RoomError, rules};
+use wordcraft_doc::change::Anchor;
+
+use super::{Participant, ParticipantId, Presence, Role, RoomError, Seen, rules};
 use crate::agent_files::AgentFiles;
 
 /// Most changes a hub keeps for copies that are behind; a copy further behind reads the document
@@ -28,6 +30,13 @@ pub const MAX_INVITES: usize = 4096;
 
 /// Most characters in a participant's name.
 const MAX_NAME: usize = 128;
+
+/// Most participants whose place the hub keeps at once ([`Hub::set_presence`]): past them, a
+/// place told last pushes out the one told longest ago.
+pub const MAX_PRESENCES: usize = 64;
+
+/// How many colours tell participants apart ([`Seen::color`]).
+pub const COLORS: u8 = 8;
 
 /// What an invite allows besides its participant's name and role ([`Hub::invite_on`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -157,6 +166,19 @@ struct Member {
     /// Whether they're in the room: not once they left ([`Hub::leave`]), or the invite they
     /// joined with was taken back ([`Hub::revoke`]).
     here: bool,
+    /// Which of the [`COLORS`] is theirs: the one their name got when it first joined.
+    color: u8,
+    /// Where their selection is, once their copy said ([`Hub::set_presence`]).
+    at: Option<Placed>,
+}
+
+/// Where a participant's selection is in the document as of a version.
+#[derive(Clone, Copy, Debug)]
+struct Placed {
+    version: u64,
+    at: Presence,
+    /// When it was told: how many places the hub had been told before it.
+    order: u64,
 }
 
 /// The hub of a shared document: the document as of its latest version, the changes that made
@@ -182,6 +204,8 @@ pub struct Hub {
     next_expiry: Option<u64>,
     /// Whether the room was closed ([`Hub::close`]).
     closed: bool,
+    /// How many places participants' copies told the hub ([`Hub::set_presence`]).
+    told: u64,
 }
 
 impl Hub {
@@ -201,6 +225,7 @@ impl Hub {
             invited: 0,
             next_expiry: None,
             closed: false,
+            told: 0,
         }
     }
 
@@ -344,6 +369,7 @@ impl Hub {
         for m in &mut self.participants {
             if m.via.is_some_and(|n| gone.contains(&n)) {
                 m.here = false;
+                m.at = None;
             }
         }
         !gone.is_empty()
@@ -440,8 +466,34 @@ impl Hub {
         }
         let n = u32::try_from(self.participants.len()).map_err(|_| RoomError::Full("too many participants".into()))?;
         let who = Participant { id: ParticipantId(n.saturating_add(1)), name: name.to_string(), role };
-        self.participants.push(Member { who: who.clone(), via, here: true });
+        // Another copy of theirs has the colour they have; back after they left, they have the
+        // one they had, unless someone in the room took it meanwhile.
+        let theirs = |m: &&Member| same_name(&m.who.name, name);
+        let had = self.participants.iter().filter(theirs).map(|m| m.color).next_back();
+        let taken = |c: u8| self.participants.iter().any(|m| m.here && m.color == c && !same_name(&m.who.name, name));
+        let color = match self.participants.iter().filter(|m| m.here).find(theirs) {
+            Some(m) => m.color,
+            None => had.filter(|c| !taken(*c)).unwrap_or_else(|| self.free_color()),
+        };
+        self.participants.push(Member { who: who.clone(), via, here: true, color, at: None });
         Ok(who)
+    }
+
+    /// The colour for a name that joins for the first time: the first of the [`COLORS`] no one
+    /// in the room has, else the one fewest have.
+    fn free_color(&self) -> u8 {
+        let mut used = [0usize; COLORS as usize];
+        for m in self.participants.iter().filter(|m| m.here) {
+            if let Some(n) = used.get_mut(usize::from(m.color)) {
+                *n = n.saturating_add(1);
+            }
+        }
+        (0..COLORS).min_by_key(|c| used.get(usize::from(*c)).copied().unwrap_or(0)).unwrap_or(0)
+    }
+
+    /// Which of the [`COLORS`] participant `id` has, also after they left.
+    pub fn color_of(&self, id: ParticipantId) -> Option<u8> {
+        self.member(id).map(|m| m.color)
     }
 
     /// Participant `id`, while they're in the room.
@@ -463,10 +515,152 @@ impl Hub {
         self.participants.iter().filter(|m| m.here).map(|m| &m.who)
     }
 
+    /// Participant `id`'s selection is `at` in the document as of `version`, as their copy has
+    /// it (`None`: the others don't see it): the others see it there, moved with the text
+    /// through the changes accepted since ([`Presence::through`]) and those the hub accepts from
+    /// now on. `None` when the hub keeps nothing: they aren't in the room, `version` is ahead of
+    /// the document, the hub no longer keeps the changes since it, or the text `at` is in is
+    /// gone (the hub keeps moving the place their copy told it before). Otherwise whether that
+    /// changed where the others see them. The hub keeps the places of [`MAX_PRESENCES`]
+    /// participants: past them, the place told longest ago of one who joined with a key goes
+    /// (theirs is told again when it moves).
+    pub fn set_presence(&mut self, id: ParticipantId, version: u64, at: Option<Presence>) -> Option<bool> {
+        let i = self.here_at(id)?;
+        let now = self.version;
+        if version > now {
+            return None;
+        }
+        let at = match at {
+            Some(p) => Some(self.moved(id, p, version, now)?),
+            None => None,
+        };
+        let was = self.place_at(i, now);
+        let order = self.told;
+        self.told = self.told.saturating_add(1);
+        let m = self.participants.get_mut(i)?;
+        m.at = at.map(|at| Placed { version: now, at, order });
+        if at.is_some() {
+            self.keep_at_most(i);
+        }
+        Some(was != at)
+    }
+
+    /// The participants in the room, in the order they joined, each with where their selection
+    /// is in the document as of `version` ([`Seen`]), when the hub knows. Each place is moved
+    /// to `version` once, through the changes accepted since it was told, and kept there. A
+    /// place told as of a later version is [`Seen::later`]; none is known when `version` is
+    /// ahead of the document.
+    pub fn presences_at(&mut self, version: u64) -> Vec<Seen> {
+        let ahead = version > self.version;
+        let mut seen = Vec::new();
+        for i in 0..self.participants.len() {
+            let Some(m) = self.participants.get(i).filter(|m| m.here) else { continue };
+            let (who, color, placed) = (m.who.clone(), m.color, m.at);
+            let (at, later) = match placed {
+                None => (None, false),
+                Some(_) if ahead => (None, false),
+                Some(p) if p.version > version => (None, true),
+                Some(p) if p.version == version => (Some(p.at), false),
+                Some(p) => {
+                    let at = self.moved(who.id, p.at, p.version, version);
+                    if let Some(m) = self.participants.get_mut(i) {
+                        m.at = at.map(|at| Placed { version, at, order: p.order });
+                    }
+                    (at, false)
+                }
+            };
+            seen.push(Seen { who, color, at, later });
+        }
+        seen
+    }
+
+    /// Presence `p` of participant `id`, as of version `from`, moved through the changes accepted
+    /// after it up to version `to`: past text `id` put in where it is, before text others put in
+    /// there. An end a change leaves at the end of a paragraph (where a deleted paragraph left
+    /// it, [`Mapped::After`](wordcraft_doc::change::Mapped::After)) is at that paragraph's end as
+    /// it was then, as a copy has it, so text typed there later goes after it. `None` when its
+    /// text is gone, or the hub doesn't keep those changes.
+    fn moved(&self, id: ParticipantId, p: Presence, from: u64, to: u64) -> Option<Presence> {
+        if from > to || to > self.version {
+            return None;
+        }
+        // The kept changes made versions `first`, `first + 1`… in turn.
+        let first = self.kept.front().map_or(self.version.saturating_add(1), |a| a.version);
+        if from.saturating_add(1) < first {
+            return None;
+        }
+        let skip = usize::try_from(from.saturating_add(1).saturating_sub(first)).ok()?;
+        let take = usize::try_from(to.saturating_sub(from)).ok()?;
+        let mut p = p;
+        for (k, a) in self.kept.iter().enumerate().skip(skip).take(take) {
+            let moved = p.through(&a.change, a.by == id)?;
+            p = Presence { anchor: self.end_after(moved.anchor, k), focus: self.end_after(moved.focus, k) };
+        }
+        if to < self.version {
+            return Some(p);
+        }
+        // One whose paragraph's length then couldn't be worked out is at its end now.
+        let settle = |a: Anchor| if a.off == usize::MAX { self.doc.anchor_at(&self.doc.pos_of(a, None)?) } else { Some(a) };
+        Some(Presence { anchor: settle(p.anchor)?, focus: settle(p.focus)? })
+    }
+
+    /// Anchor `a` as kept change `k` (by place in the kept list) left it, with an end of its
+    /// paragraph as an offset ([`super::end_before`], through the changes kept after `k`).
+    fn end_after(&self, a: Anchor, k: usize) -> Anchor {
+        super::end_before(a, self.kept.iter().skip(k.saturating_add(1)).map(|later| &*later.change), &self.doc)
+    }
+
+    /// Where participant `i` (by place in the list) is as of `version`, as the hub knows it.
+    fn place_at(&self, i: usize, version: u64) -> Option<Presence> {
+        let m = self.participants.get(i)?;
+        let p = m.at.filter(|p| p.version <= version)?;
+        self.moved(m.who.id, p.at, p.version, version)
+    }
+
+    /// Where participant `id` is in the list, while they're in the room.
+    fn here_at(&self, id: ParticipantId) -> Option<usize> {
+        let i = usize::try_from(id.0.checked_sub(1)?).ok()?;
+        self.participants.get(i).filter(|m| m.here).map(|_| i)
+    }
+
+    /// At most [`MAX_PRESENCES`] places, now that participant `keep` (by place in the list) told
+    /// theirs: past them, the one told longest ago of a participant who joined with a key goes
+    /// (of anyone's, when only those the room's own process let in are left).
+    fn keep_at_most(&mut self, keep: usize) {
+        if self.participants.iter().filter(|m| m.at.is_some()).count() <= MAX_PRESENCES {
+            return;
+        }
+        let oldest = self
+            .participants
+            .iter()
+            .enumerate()
+            .filter(|(j, m)| *j != keep && m.at.is_some())
+            .min_by_key(|(_, m)| (m.via.is_none(), m.at.map_or(0, |p| p.order)))
+            .map(|(j, _)| j);
+        if let Some(m) = oldest.and_then(|j| self.participants.get_mut(j)) {
+            m.at = None;
+        }
+    }
+
+    /// Every place moved to the latest version, before the changes it is at are let go.
+    fn bring_places_up(&mut self) {
+        let now = self.version;
+        for i in 0..self.participants.len() {
+            let Some((id, p)) = self.participants.get(i).and_then(|m| Some((m.who.id, m.at?))).filter(|(_, p)| p.version < now) else {
+                continue;
+            };
+            let at = self.moved(id, p.at, p.version, now);
+            if let Some(m) = self.participants.get_mut(i) {
+                m.at = at.map(|at| Placed { version: now, at, order: p.order });
+            }
+        }
+    }
+
     /// Participant `id` leaves the room: the hub accepts no change of theirs any more (their
     /// name stays theirs). Whether they were in it.
     pub fn leave(&mut self, id: ParticipantId) -> bool {
         let Some(m) = id.0.checked_sub(1).and_then(|n| self.participants.get_mut(usize::try_from(n).ok()?)) else { return false };
+        m.at = None;
         std::mem::replace(&mut m.here, false)
     }
 
@@ -592,6 +786,10 @@ impl Hub {
             self.kept.push_back(Accepted { version: self.version, by, change: Arc::new(c) });
         }
         self.doc = doc;
+        // Participants' places are moved through the changes about to go first.
+        if self.kept.len() > self.most || (self.bytes > MAX_KEPT_BYTES && self.kept.len() > 1) {
+            self.bring_places_up();
+        }
         while self.kept.len() > self.most || (self.bytes > MAX_KEPT_BYTES && self.kept.len() > 1) {
             if let Some(old) = self.kept.pop_front() {
                 self.bytes = self.bytes.saturating_sub(crate::session::change_weight(&old.change));

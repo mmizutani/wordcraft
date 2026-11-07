@@ -25,6 +25,7 @@ mod links;
 mod margins;
 mod navigation;
 mod pages;
+mod presence;
 mod reading;
 mod rulers;
 mod story;
@@ -119,6 +120,11 @@ pub struct CanvasState {
     /// An animated column-turn destination; intermediate offsets are allowed during the motion.
     read_target_page: Option<usize>,
     pub caret_visible_since: f64,
+    /// Follow someone (#32): the view keeps the caret of this participant of the shared document
+    /// in sight, until the person scrolls, clicks the page or types (`ui.follow`).
+    pub(crate) follow: Option<wordcraft_engine::room::ParticipantId>,
+    /// What of each story others' selections are cut to, kept while the layout and view stay.
+    pub(crate) presence_spans: presence::Spans,
     /// The caret's colour and the fingerprint of where it was worked out ([`caret_color_at`]).
     caret_bg: Option<(u64, Color32)>,
     dragging: bool,
@@ -139,6 +145,8 @@ pub struct CanvasState {
     pub open_url: Option<String>,
     /// Screen rects of pages last frame (for the control channel: page ↔ screen coordinates).
     pub page_rects: Vec<Rect>,
+    /// Per page of [`Self::page_rects`], the part shown ([`geometry::Geometry::bands`]).
+    pub page_bands: Vec<(f32, f32)>,
     /// While the vertical scrollbar is dragged: the page at the top of the window (0-based),
     /// which a tip beside the pointer names (#2551).
     pub scrollbar_page: Option<usize>,
@@ -354,6 +362,7 @@ impl Default for CanvasState {
             tiles: HashMap::new(),
             page_keys: PageKeys::default(),
             markup_facts: std::cell::Cell::new(None),
+            presence_spans: presence::Spans::default(),
             scroll_to_caret: true,
             keep_view: false,
             nav_to_caret: false,
@@ -364,6 +373,7 @@ impl Default for CanvasState {
             read_first_visible: None,
             read_target_page: None,
             caret_visible_since: 0.0,
+            follow: None,
             caret_bg: None,
             dragging: false,
             column_drag: None,
@@ -375,6 +385,7 @@ impl Default for CanvasState {
             last_shading: "FFF2CC".into(),
             open_url: None,
             page_rects: Vec::new(),
+            page_bands: Vec::new(),
             scrollbar_page: None,
             viewed_page: None,
             scale: PX_PER_PT,
@@ -505,6 +516,8 @@ struct CanvasView {
     dim_body: bool,
     grid_story: Option<StoryRef>,
     caret: Option<wordcraft_layout::hit::Caret>,
+    /// The caret of the participant the person follows (`ui.follow`), when it is known.
+    followed: Option<wordcraft_layout::hit::Caret>,
 }
 
 fn prepare_view(app: &mut WordApp, ui: &Ui, full: Rect, layout: &DocLayout) -> CanvasView {
@@ -582,7 +595,65 @@ fn prepare_view(app: &mut WordApp, ui: &Ui, full: Rect, layout: &DocLayout) -> C
     {
         app.session.page_hint = c.page;
     }
-    CanvasView { area, hruler, vruler, paper, animate, opts, geo, dim_body, grid_story, caret }
+    // Read Mode's wheel turns pages over the whole canvas, its margins too ([`scroll_motion`]).
+    stop_following_on_input(app, ui, if read_mode { full } else { area });
+    let followed = app.canvas.follow.and_then(|id| {
+        let others = app.others_here();
+        let (o, _) = others.into_iter().find(|(o, _)| o.who.id == id)?;
+        layout.caret_on(&o.at.as_ref()?.focus, app.session.page_hint)
+    });
+    CanvasView { area, hruler, vruler, paper, animate, opts, geo, dim_body, grid_story, caret, followed }
+}
+
+/// Where the others in the shared document are on the pages at `rects` ([`presence::marks`]).
+fn others_marks(app: &WordApp, ui: &Ui, layout: &std::sync::Arc<DocLayout>, rects: &[Rect], geo: &Geometry) -> Vec<presence::Mark> {
+    let others = app.others_here();
+    // A preview lays out another document than the one their places are in.
+    if others.is_empty() || preview_sel(app).is_some() {
+        return Vec::new();
+    }
+    let pages = presence::Pages {
+        layout,
+        doc: &app.session.doc,
+        page_hint: app.session.page_hint,
+        rects,
+        bands: &geo.bands,
+        scale: geo.scale,
+        visible: ui.clip_rect(),
+        spans: &app.canvas.presence_spans,
+    };
+    presence::marks(&pages, &others, crate::now_ms(), ui.input(|i| i.pointer.hover_pos()), app.canvas.follow)
+}
+
+/// Following someone stops when the person takes the view or the caret back: a press or a
+/// scroll over the page, or a key, a paste or a cut, or text an input method types, composes or
+/// deletes.
+fn stop_following_on_input(app: &mut WordApp, ui: &Ui, area: Rect) {
+    if app.canvas.follow.is_none() {
+        return;
+    }
+    let over = ui.rect_contains_pointer(area);
+    let took = ui.input(|i| {
+        (over
+            && (i.pointer.any_pressed()
+                || i.smooth_scroll_delta != egui::Vec2::ZERO
+                || i.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. }))))
+            || i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key { pressed: true, .. }
+                        | egui::Event::Text(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Cut
+                        | egui::Event::Ime(
+                            egui::ImeEvent::Commit(_) | egui::ImeEvent::DeleteSurrounding { .. } | egui::ImeEvent::DeleteSurroundingBytes { .. }
+                        )
+                ) || matches!(e, egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if !text.is_empty())
+            })
+    });
+    if took {
+        app.canvas.follow = None;
+    }
 }
 
 fn update_caret_scroll(app: &mut WordApp, view: &CanvasView) -> Option<Rect> {
@@ -619,6 +690,18 @@ fn update_caret_scroll(app: &mut WordApp, view: &CanvasView) -> Option<Rect> {
         target = Some(r.expand2(vec2(40.0, 60.0)));
     }
     app.canvas.scroll_to_caret = false;
+    // Following someone: their caret stays in sight, wherever the person's own is.
+    if target.is_none()
+        && app.canvas.scroll_request.is_none()
+        && let Some(c) = view.followed
+        && let Some(pr) = view.geo.rects.get(c.page)
+    {
+        let r = Rect::from_min_size(
+            pos2(pr.min.x + c.x * view.geo.scale, pr.min.y + c.top * view.geo.scale),
+            vec2((c.width * view.geo.scale).max(2.0), c.height * view.geo.scale),
+        );
+        target = Some(r.expand2(vec2(40.0, 60.0)));
+    }
     target
 }
 
@@ -1434,6 +1517,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         app.canvas.textures.retain(|k, _| *k < n && geo.rects.get(*k).is_some_and(|r| r.translate(content_origin.to_vec2()).intersects(near)));
         app.canvas.tiles.retain(|id, _| visible_tile_keys.contains(id));
         app.canvas.page_rects = rects.clone();
+        app.canvas.page_bands.clone_from(&geo.bands);
         let view_rect = ui.clip_rect();
         if floating_comments(app) {
             // Its own layer, so presses on the card never reach the canvas under it.
@@ -1488,6 +1572,10 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         } else {
             Vec::new()
         };
+        // Others in the shared document: their selections under the person's own, their carets
+        // and names over it (#32).
+        let marks = others_marks(app, ui, &layout, &rects, &geo);
+        presence::paint_selections(&painter, &t, &marks);
         let visible_clip = ui.clip_rect();
         let mut screen_rects: Vec<Rect> = Vec::with_capacity(selected.len());
         for (pi, r) in selected {
@@ -1506,6 +1594,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         // it can move out from under the pointer and flicker between preview and live layouts.
         let anchor_rects = if app.canvas.command_previewed.is_some() { live_selection_screen_rects(app, &rects, geo.scale) } else { screen_rects };
         app.canvas.mini_anchor = crate::mini_toolbar::visible_anchor(anchor_rects, visible_clip);
+        presence::paint_carets(&painter, &t, &marks);
         // Content controls: the frame of the one the caret is in (all of them in Design Mode).
         crate::content_controls::paint(app, &painter, &t, &layout, &rects, geo.scale);
         paint_read_aloud_highlight(app, &painter, &layout, &rects, &geo, &t);

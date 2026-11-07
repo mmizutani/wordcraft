@@ -66,7 +66,7 @@ pub struct Table {
     /// Content controls whose content starts or ends with this table (see [`crate::control`]).
     #[serde(default, skip_serializing_if = "ControlWrap::is_empty")]
     pub controls: ControlWrap,
-    /// Which table this is ([`BlockId`]): not part of equality, never saved.
+    /// Which table this is ([`BlockId`]): not part of equality, not in the document's JSON (Word files keep it).
     #[serde(skip)]
     pub id: BlockId,
 }

@@ -341,7 +341,11 @@ claude mcp add fact-checker -e WORDCRAFT_CONTROL_KEY=<the invite's key> -- wordc
 Its tools then work on a copy of the shared document of its own, inside the app: `execute`,
 `batch`, `type_text`, `select_text`, `get_text`, `inspect_document`, `get_changes`,
 `render_page`, `list_commands`, `parity` and `room {"action": "participants"}`. Its caret and
-selection are its own, and its commands are held to its role (see
+selection are its own: the others see where they are once a command of its own moved them or
+edited, and `room {"action": "participants"}` says where everyone's are (`selection`, anchors as
+`select.range` takes them, with `story`, `"body"` or `{"part": n}`, and `index`, as `inspect_document` numbers blocks; see
+[Where everyone is](control-protocol.md#where-everyone-is)), so it can keep clear of where a
+person types. Its commands are held to its role (see
 [Roles](control-protocol.md#roles)): a suggester's edits are tracked changes in its name. Each
 call first brings in what the others changed since, and returns once the room took all of the
 agent's edit, a long macro's too; an edit whose text another participant took away meanwhile

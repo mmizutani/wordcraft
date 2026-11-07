@@ -596,15 +596,24 @@ fn the_room_tells_the_window_when_it_has_changes() {
     room.on_change(move || {
         seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     });
+    // Someone joining is a change of who is in the room.
     let mut ana = join(&room, "Ana");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     run(&mut ana, "text.insert", json!({"text": "Hi "}));
     ana.sync();
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     // Nothing to send: no call.
     ana.sync();
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    room.close();
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // Nor for where Ana is: that wakes whoever waits for presence (`Room::on_presence`).
+    run(&mut ana, "caret.set", json!({"pos": wordcraft_doc::Pos::body(0, 1)}));
+    ana.present();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let bo = join(&room, "Bo");
+    drop(bo);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4, "a join and a leave");
+    room.close();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 5);
 }
 
 #[test]

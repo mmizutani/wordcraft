@@ -818,6 +818,23 @@ impl WordApp {
                 self.canvas.open_url = Some("https://discord.gg/artcraft".into());
                 json!({})
             }
+            "ui.follow" => {
+                // Follow someone in the shared document the window shows (#32): `participant`, the
+                // id `room.participants` gives, keeps their caret in view until the person
+                // scrolls, clicks the page or types; `null` stops; no value reads it.
+                match p.get("participant") {
+                    None => {}
+                    Some(Value::Null) => self.canvas.follow = None,
+                    Some(v) => {
+                        let id = v.as_u64().and_then(|n| u32::try_from(n).ok()).map(wordcraft_engine::room::ParticipantId);
+                        let Some(id) = id.filter(|id| self.others_here().iter().any(|(o, _)| o.who.id == *id)) else {
+                            return Some(Err(format!("`participant` {v}: no one else with that id is in the shared document the window shows")));
+                        };
+                        self.canvas.follow = Some(id);
+                    }
+                }
+                json!({"following": self.canvas.follow})
+            }
             "ui.caretAnimation" => {
                 // File › Options › Advanced › Animation: `value` true or false turns the caret's
                 // glide and fading blink on or off; no value reads it.
