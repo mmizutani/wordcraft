@@ -170,6 +170,8 @@ impl WordApp {
             control_rx: _,
             lobby: _,
             share: _,
+            // The assistant's conversation is about a document, not a window's.
+            assist: _,
             updates_rt: _,
             packs_rt: _,
             // The control channel's screenshots and input go to the active window, whichever it is.
@@ -297,6 +299,7 @@ impl WordApp {
             print_backgrounds: _,
             update_fields_before_print: _,
             dictionary: _,
+            assistant: _,
             // Where each task pane sits, and their order.
             styles_pane_dock: _,
             styles_pane_float: _,

@@ -1465,3 +1465,179 @@ fn a_tracked_paste_made_again_still_moves_what_was_cut() {
     smooth(&copies);
     same_everywhere(&copies).unwrap();
 }
+
+/// A tool call's changes are found by the versions they made and the participant who made
+/// them: every one of theirs in the range, none of the others' among them; text put in right
+/// before them later isn't theirs, and once their text is gone, nothing is found.
+#[test]
+fn a_participants_changes_are_found_by_their_versions() {
+    let room = Room::new(Document::from_text("one two three"));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    run(&mut a, "caret.docStart", json!({}));
+    run(&mut a, "text.insert", json!({"text": "Intro. "}));
+    a.send();
+    b.receive();
+    run(&mut b, "caret.docEnd", json!({}));
+    run(&mut b, "text.insert", json!({"text": " Ben."}));
+    b.send();
+    a.receive();
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "text.insert", json!({"text": "2"}));
+    a.send();
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    let (_, doc) = room.document();
+    assert_eq!(doc.plain_text(StoryRef::Body), "Intro. one 2 three Ben.");
+    let text = |r: Option<(wordcraft_doc::change::Anchor, wordcraft_doc::change::Anchor)>| {
+        let (s, e) = r.unwrap();
+        let (s, e) = (doc.pos_of(s, None).unwrap(), doc.pos_of(e, None).unwrap());
+        doc.plain_text(StoryRef::Body).get(s.off..e.off).unwrap().to_string()
+    };
+    assert_eq!(text(room.where_changed(1..=3, Some("Ana"))), "Intro. one 2");
+    assert_eq!(text(room.where_changed(1..=3, None)), "Intro. one 2 three Ben.");
+    assert!(room.where_changed(2..=2, Some("Ana")).is_none(), "Ben's");
+    assert_eq!(room.changes_by(0, "Ana"), Some((1, 3)));
+    assert_eq!(room.changes_by(1, "Ben"), Some((2, 2)));
+    assert_eq!(room.changes_by(3, "Ana"), None);
+    assert_eq!(room.changes_by(9, "Ana"), None, "a version the hub doesn't have");
+    // Ben types right before Ana's "Intro. ", then takes her "2" out: her first change is still
+    // just "Intro. ", and her last, whose text is gone, isn't shown as a caret.
+    let [_, mut b] = copies;
+    b.receive();
+    run(&mut b, "caret.docStart", json!({}));
+    run(&mut b, "text.insert", json!({"text": "So. "}));
+    run(&mut b, "select.text", json!({"text": "2"}));
+    run(&mut b, "text.delete", json!({}));
+    b.send();
+    let mut copies = [b];
+    settle(&mut copies).unwrap();
+    let (_, doc) = room.document();
+    assert_eq!(doc.plain_text(StoryRef::Body), "So. Intro. one  three Ben.");
+    let (s, e) = room.where_changed(1..=1, Some("Ana")).unwrap();
+    let (s, e) = (doc.pos_of(s, None).unwrap(), doc.pos_of(e, None).unwrap());
+    assert_eq!(doc.plain_text(StoryRef::Body).get(s.off..e.off), Some("Intro. "));
+    assert!(room.where_changed(3..=3, Some("Ana")).is_none(), "its text is gone");
+}
+
+/// Once a change's text is all taken out, the change is gone: text someone puts in at that place
+/// afterwards isn't shown as it (its ends were carried apart by that text before).
+#[test]
+fn text_put_in_where_a_change_was_taken_out_isnt_that_change() {
+    let room = Room::new(Document::from_text("one three"));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    // "big " can only have gone in at 4 ("two " could read as "wo t" at 5).
+    run(&mut a, "caret.set", json!({"pos": Pos::body(0, 4)}));
+    run(&mut a, "text.insert", json!({"text": "big "}));
+    a.send();
+    let put_in = room.version();
+    b.receive();
+    run(&mut b, "select.text", json!({"text": "big "}));
+    run(&mut b, "text.delete", json!({}));
+    b.send();
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    assert!(room.where_changed(put_in..=put_in, Some("Ana")).is_none(), "its text is gone");
+    let [a, mut b] = copies;
+    run(&mut b, "caret.set", json!({"pos": Pos::body(0, 4)}));
+    run(&mut b, "text.insert", json!({"text": "XY"}));
+    b.send();
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    let (_, doc) = room.document();
+    assert_eq!(doc.plain_text(StoryRef::Body), "one XYthree");
+    assert!(room.where_changed(put_in..=put_in, Some("Ana")).is_none(), "Ben's XY isn't Ana's change");
+    assert!(room.where_changed(put_in..=put_in, None).is_none());
+}
+
+/// A change is found again by the version it made, where its text is now: past the changes made
+/// after it, in its paragraph or across the paragraphs it put in, or where it took text out; a
+/// version the hub no longer keeps, or never had, finds nothing.
+#[test]
+fn a_change_is_found_by_the_version_it_made() {
+    let room = Room::new(Document::from_text("one two three\nfour\nfive"));
+    let mut a = join(&room, "Ana");
+    let mut b = join(&room, "Ben");
+    run(&mut a, "review.trackChanges", json!({"value": true}));
+    run(&mut a, "select.text", json!({"text": "two"}));
+    run(&mut a, "text.insert", json!({"text": "2"}));
+    a.send();
+    let replaced = room.version();
+    // Ben types before it, and after it in the same paragraph.
+    b.receive();
+    run(&mut b, "caret.docStart", json!({}));
+    run(&mut b, "text.insert", json!({"text": "zero "}));
+    run(&mut b, "caret.set", json!({"pos": Pos::body(0, "zero one 2two three".len())}));
+    run(&mut b, "text.insert", json!({"text": " and on"}));
+    b.send();
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    let [a, mut b] = copies;
+    let (_, doc) = room.document();
+    let found = |v: u64| room.where_changed(v..=v, None).map(|(s, e)| (doc.pos_of(s, None).unwrap(), doc.pos_of(e, None).unwrap()));
+    // The "2" put in and the tracked deletion of "two", still together after "zero one ".
+    let (start, end) = found(replaced).unwrap();
+    let para = doc.body[0].as_para().unwrap();
+    assert_eq!(&para.text[start.off..end.off], "2two", "{start:?} {end:?} in {:?}", para.text);
+    // Paragraphs put in: from the start of the first to the end of the last.
+    run(&mut b, "caret.set", json!({"pos": Pos::body(1, 4)}));
+    run(&mut b, "text.insert", json!({"text": "\nsix\nseven", "paragraphs": true}));
+    b.send();
+    let split = room.version();
+    let mut copies = [a, b];
+    settle(&mut copies).unwrap();
+    let [mut a, b] = copies;
+    let (_, doc) = room.document();
+    let found = |v: u64| room.where_changed(v..=v, None).map(|(s, e)| (doc.pos_of(s, None).unwrap(), doc.pos_of(e, None).unwrap()));
+    let (start, end) = found(split).unwrap();
+    assert_eq!(start.story, StoryRef::Body);
+    // From the end of the text it went after, not the start of that paragraph: the paragraph
+    // break it put in is its own, the text before it isn't.
+    assert_eq!((start.path.clone(), start.off), (Pos::body(1, 0).path, 4), "{start:?}");
+    assert!(end.path == Pos::body(3, 0).path && end.off == 5, "{start:?} {end:?}");
+    // Text taken out (untracked): the place it was.
+    run(&mut a, "review.trackChanges", json!({"value": false}));
+    a.receive();
+    run(&mut a, "select.range", json!({"anchor": Pos::body(4, 0), "focus": Pos::body(4, 4)}));
+    run(&mut a, "text.delete", json!({}));
+    a.send();
+    let deleted = room.version();
+    let (_, doc) = room.document();
+    let (start, end) =
+        room.where_changed(deleted..=deleted, None).map(|(s, e)| (doc.pos_of(s, None).unwrap(), doc.pos_of(e, None).unwrap())).unwrap();
+    assert_eq!((start.path.clone(), start.off), (Pos::body(4, 0).path, 0), "{start:?}");
+    assert!(start <= end);
+    // Versions the hub doesn't have.
+    assert!(room.where_changed(0..=0, None).is_none());
+    assert!(room.where_changed(room.version() + 1..=room.version() + 1, None).is_none());
+    assert!(room.where_changed(u64::MAX..=u64::MAX, None).is_none());
+    let (later, earlier) = (2, 1);
+    assert!(room.where_changed(later..=earlier, None).is_none(), "an empty range");
+    drop((a, b));
+    // Nor one it no longer keeps.
+    let small = Room::with_hub(Hub::new(Document::from_text("one")).keeping(1));
+    let mut c = join(&small, "Cy");
+    for word in [" two", " three"] {
+        run(&mut c, "caret.docEnd", json!({}));
+        run(&mut c, "text.insert", json!({"text": word}));
+        for _ in 0..10 {
+            c.sync();
+        }
+    }
+    assert_eq!(small.version(), 2);
+    assert!(small.where_changed(1..=1, None).is_none(), "no longer kept");
+    assert!(small.where_changed(1..=2, None).is_none(), "its first no longer kept");
+    assert!(small.where_changed(2..=2, None).is_some());
+    // A change across hundreds of paragraphs: from the first to the last.
+    let text: Vec<String> = (0..400).map(|n| format!("Line {n}")).collect();
+    let big = Room::new(Document::from_text(&text.join("\n")));
+    let mut d = join(&big, "Di");
+    run(&mut d, "select.all", json!({}));
+    run(&mut d, "format.bold", json!({}));
+    d.send();
+    let (_, doc) = big.document();
+    let (start, end) =
+        big.where_changed(big.version()..=big.version(), None).map(|(s, e)| (doc.pos_of(s, None).unwrap(), doc.pos_of(e, None).unwrap())).unwrap();
+    assert_eq!((start, end), (Pos::body(0, 0), Pos::body(399, "Line 399".len())));
+}

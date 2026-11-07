@@ -21,3 +21,7 @@ wordcraft-mcp = { workspace = true }
 wordcraft-zotero = { workspace = true }
 serde_json = { workspace = true }
 sys-locale = "0.3"
+
+[dev-dependencies]
+# The built-in assistant's ACP backend and its scripted agent, end to end through `mcp --connect`.
+wordcraft-assist = { workspace = true }

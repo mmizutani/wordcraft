@@ -482,3 +482,66 @@ fn length_units_follow_the_interface_language() {
     h.run_steps(4);
     assert_eq!(length(72.0), "25,4 mm", "English keeps the English names");
 }
+
+/// File › Options › Assistant (#23): the checkbox is the `assist.allowUnattended` setting, off
+/// until the person turns it on.
+#[test]
+fn assistant_unattended_requests_are_refused_until_allowed() {
+    let mut a = app();
+    a.run("file.options", json!({"pane": "assistant"})).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    assert!(!h.state().session.prefs.assistant.allow_unattended);
+    h.get_by_label("Allow what agents ask when no one can answer").click();
+    h.run_steps(4);
+    assert!(h.state().session.prefs.assistant.allow_unattended, "the checkbox allows them");
+    h.get_by_label("Allow what agents ask when no one can answer").click();
+    h.run_steps(4);
+    assert!(!h.state().session.prefs.assistant.allow_unattended, "and refuses them again");
+}
+
+/// The setting is the person's consent: a click the control channel made (MCP's `click`)
+/// leaves it off and says why. Such a click may still turn it off.
+#[test]
+fn only_the_person_allows_unattended_requests() {
+    let mut a = app();
+    a.run("file.options", json!({"pane": "assistant"})).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    let faked_click = |h: &mut egui_kittest::Harness<'_, WordApp>| {
+        let pos = h.get_by_label("Allow what agents ask when no one can answer").rect().center();
+        let (req, _rx) = crate::control::ControlRequest::new("ui.click", json!({"x": pos.x, "y": pos.y}));
+        let ctx = h.ctx.clone();
+        assert!(matches!(crate::control::handle(h.state_mut(), &ctx, &req), crate::control::Outcome::Done(_)));
+        for _ in 0..20 {
+            let ctx = h.ctx.clone();
+            let mut raw = std::mem::take(h.input_mut());
+            h.state_mut().raw_input_hook(&ctx, &mut raw);
+            *h.input_mut() = raw;
+            h.step();
+        }
+    };
+    faked_click(&mut h);
+    assert!(!h.state().session.prefs.assistant.allow_unattended, "a faked click doesn't allow them");
+    let said = h.state().status_msg.as_ref().map(|(s, _)| s.clone()).unwrap_or_default();
+    assert!(said.contains("Only you"), "{said}");
+    h.get_by_label("Allow what agents ask when no one can answer").click();
+    h.run_steps(4);
+    assert!(h.state().session.prefs.assistant.allow_unattended, "the person's click does");
+    faked_click(&mut h);
+    assert!(!h.state().session.prefs.assistant.allow_unattended, "and a faked one may turn it off");
+}

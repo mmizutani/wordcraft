@@ -36,7 +36,7 @@ People trust WordCraft with their writing; a crash loses their work. **This outr
 | L2 | `layout`, `docx`, `formats` | line breaking, pagination, tables, headers/footers, hit testing; OOXML I/O; TXT/MD/HTML/RTF/ODT |
 | L3 | `render`, `pdf` | vello_cpu rasteriser; krilla PDF |
 | L4 | `engine` | Session, undo, **command registry**, Word feature catalog, samples, I/O dispatch |
-| L5 | `mcp` | MCP server (headless or bridged to the app) |
+| L5 | `mcp`, `assist` | MCP server (headless or bridged to the app); built-in writing assistant (a room participant using the MCP tools) |
 | L6 | `ui-egui` | Word-style egui front end (swappable) |
 | apps | `apps/wordcraft`, `apps/wordcraft-cli`, `apps/wordcraft-web` | binaries |
 | external | `craft-proof` (craft-libs, used as `wordcraft-proof`, sits at L1) | proofing: spelling, grammar, hyphenation; its word lists and patterns are craft-i18n's `language-data/` (`CRAFT_I18N_DIR`) |
@@ -61,6 +61,7 @@ Typing, Enter, Backspace, Tab, lists, AutoCorrect and AutoFormat follow Word's o
 - MCP: `wordcraft-cli mcp` (headless) or `wordcraft-cli mcp --connect 127.0.0.1:7981` (drives the running app). See `docs/mcp.md`.
 - Shell gotcha: `mv`/`cp` may be aliased interactive — use `/bin/mv -f` / `/bin/cp -f`.
 - Parallel agents: separate `CARGO_TARGET_DIR` per agent; edit only the crates you own; delete your target dir when done (disk).
+- Build speed ([`docs/build-speed.md`](docs/build-speed.md)): no test-only Cargo features; a test helper is a `#[doc(hidden)]` item, so `cargo build` and `cargo test` share one build (`cargo xtask unified` checks it).
 
 ## Roadmap
 Progress docs: `ROADMAP.md` (stage, headline numbers, progress log), `docs/target-app-parity.md` (the assessment), `docs/gaps.md` (ranked work list), `docs/roadmap.md` (milestones, Current focus), `docs/architecture.md`, and the parity checklists `docs/file-format-parity.md`, `docs/layout-parity.md`, `docs/typing-parity.md`, `docs/ui-parity.md`, `docs/hardware-parity.md`, `docs/localization-parity.md`. When work lands, update the gap, the parity doc and the progress log, and bump each touched doc's status line and revision history.
@@ -69,5 +70,6 @@ Progress docs: `ROADMAP.md` (stage, headline numbers, progress log), `docs/targe
 - Workflows in `.github/workflows/` call the shared workflows in [`storytold/craft-common-actions`](https://github.com/storytold/craft-common-actions) at `@main`, with their inputs and secrets. No other jobs: if no shared workflow does what's needed, it doesn't go here.
 - Don't add or change CI in a feature or fix PR. If the existing workflows can't build or test a change, link an existing craft-common-actions issue or PR, or open a new issue, or a PR only for a small fix that is safe for every app and does not increase CI time.
 - Some workflow files here still run their own jobs. Don't add to them. Moving a job into craft-common-actions is its own task, never part of another PR, and the job stays here until a shared workflow runs it.
+- This fork's exception: `.github/workflows/pages.yml` runs its own jobs to deploy the web build to GitHub Pages, because no shared workflow does that (owner's decision, #43). Keep it lean; don't add other jobs to it.
 
 @.claude/pstack-models.md

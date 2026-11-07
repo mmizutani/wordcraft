@@ -509,6 +509,17 @@ fn a_lobby_opened_on_another_room_closes_the_one_before() {
 }
 
 #[test]
+fn a_lobby_says_where_participants_reach_it() {
+    let lobby = Lobby::default();
+    assert_eq!(lobby.addr(), None);
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 4567));
+    lobby.set_addr(Some(addr));
+    assert_eq!(lobby.clone().addr(), Some(addr), "clones are the same lobby");
+    lobby.set_addr(None);
+    assert_eq!(lobby.addr(), None);
+}
+
+#[test]
 fn the_room_tells_the_window_when_it_has_changes() {
     let room = Room::new(Document::from_text("Hello"));
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));

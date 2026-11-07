@@ -6,7 +6,9 @@
 //! Keys are written like the registry's shortcuts (`Mod+Shift+K`, `Alt+F7`, `F2`; `Mod` is Ctrl,
 //! or ⌘ on macOS) and compared in one canonical form ([`normalize`]). The map is saved with the
 //! front end's preferences; reading a saved map never fails: entries that aren't a valid key or
-//! command are dropped.
+//! command are dropped. A command only the person runs from its button
+//! ([`crate::cmd::assist::person_only`]: signing in to ChatGPT or out of it) takes no key: it
+//! can't be assigned one, and a saved one runs nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -97,7 +99,8 @@ impl KeyMap {
         let mut map = KeyMap::default();
         if let Some(a) = v.get("assigned").and_then(Value::as_object) {
             for (k, id) in a.iter().take(MAX_ENTRIES) {
-                if let (Some(k), Some(id)) = (normalize(k), id.as_str().filter(|id| !id.is_empty() && id.len() <= 128)) {
+                let id = id.as_str().filter(|id| !id.is_empty() && id.len() <= 128 && !crate::cmd::assist::person_only(id));
+                if let (Some(k), Some(id)) = (normalize(k), id) {
                     map.assigned.insert(k, id.to_string());
                 }
             }
@@ -123,7 +126,8 @@ impl KeyMap {
     pub fn resolve<'a>(&self, reg: &'a Registry, key: &str) -> Option<&'a CommandSpec> {
         let key = normalize(key)?;
         if let Some(spec) = self.assigned.get(&key).and_then(|id| reg.get(id)) {
-            return Some(spec);
+            // A key someone gave a button-only command (an older settings file) runs nothing.
+            return (!crate::cmd::assist::person_only(spec.id)).then_some(spec);
         }
         if self.removed.contains(&key) {
             return None;
@@ -154,6 +158,9 @@ impl KeyMap {
     pub fn assign(&mut self, reg: &Registry, id: &str, key: &str) -> Result<Option<String>, String> {
         if reg.get(id).is_none() {
             return Err(format!("unknown command `{id}`"));
+        }
+        if crate::cmd::assist::person_only(id) {
+            return Err(format!("`{id}` takes no key: only you run it, from its button (File › Options › Account)"));
         }
         let key = normalize(key).ok_or_else(|| format!("`{key}` isn't a key (e.g. Mod+Shift+K, Alt+F7, F2)"))?;
         let previous = self.resolve(reg, &key).map(|s| s.id.to_string()).filter(|p| p != id);
@@ -271,5 +278,36 @@ mod tests {
         for v in [json!(null), json!(5), json!("x"), json!({"assigned": [1], "removed": {"a": 1}})] {
             assert!(serde_json::from_value::<KeyMap>(v).unwrap().is_empty());
         }
+    }
+
+    /// #19: signing in to ChatGPT or out of it takes no key, so no one can arrange for a key the
+    /// person presses (Ctrl+S, say) to sign them out: assigning one is refused, through the
+    /// command too, and a saved one runs nothing.
+    #[test]
+    fn button_only_commands_take_no_key() {
+        let reg = crate::cmd::registry();
+        let mut m = KeyMap::default();
+        for id in ["assist.chatgpt.signIn", "assist.chatgpt.cancelSignIn", "assist.chatgpt.signOut"] {
+            assert!(reg.get(id).is_some(), "{id}");
+            let e = m.assign(&reg, id, "Mod+S").unwrap_err();
+            assert!(e.contains("takes no key"), "{e}");
+            assert!(m.assign(&reg, id, "F2").is_err());
+        }
+        assert_eq!(m.resolve(&reg, "Mod+S").map(|s| s.id), Some("file.save"), "Save keeps its key");
+        let mut s = crate::Session::new(wordcraft_doc::Document::new());
+        let r = s.run("tools.customizeKeyboard", &json!({"assign": {"command": "assist.chatgpt.signOut", "key": "Mod+S"}}));
+        assert!(r.is_err(), "{r:?}");
+        assert_eq!(s.keymap.resolve(&reg, "Mod+S").map(|sp| sp.id), Some("file.save"));
+        // A settings file that gives them keys anyway: the keys run nothing.
+        let saved = KeyMap::from_value(&json!({"assigned": {"F2": "assist.chatgpt.signOut", "F3": "format.bold"}}));
+        assert!(!saved.assigned.contains_key("F2"), "dropped when read");
+        assert_ne!(saved.resolve(&reg, "F2").map(|sp| sp.id), Some("assist.chatgpt.signOut"));
+        assert_eq!(saved.resolve(&reg, "F3").map(|sp| sp.id), Some("format.bold"));
+        let mut forced = KeyMap::default();
+        forced.assigned.insert("Mod+S".into(), "assist.chatgpt.signOut".into());
+        forced.removed.insert("Mod+S".into());
+        assert!(forced.resolve(&reg, "Mod+S").is_none(), "a key given to Sign Out runs nothing");
+        assert!(crate::cmd::assist::person_only("assist.chatgpt.signIn"));
+        assert!(!crate::cmd::assist::person_only("assist.ask"));
     }
 }

@@ -104,6 +104,9 @@ pub struct ViewState {
     /// carries it to the window.
     #[serde(default)]
     pub full_screen: bool,
+    /// The Assistant pane (`assist.pane`, #15): the conversation with the built-in assistant.
+    #[serde(default)]
+    pub assistant_pane: bool,
 }
 
 /// Where the Styles pane sits (`view.stylesPaneDock`, #1756).
@@ -205,6 +208,7 @@ impl Default for ViewState {
             outline: Default::default(),
             design_mode: false,
             full_screen: false,
+            assistant_pane: false,
         }
     }
 }

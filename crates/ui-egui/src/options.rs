@@ -130,6 +130,8 @@ fn pane_label(id: &str) -> &'static str {
         "accessibility" => "Accessibility",
         "advanced" => "Advanced",
         "agents" => "Agents",
+        "account" => "Account",
+        "assistant" => "Assistant",
         _ => "General",
     }
 }
@@ -182,6 +184,8 @@ pub fn page(app: &mut WordApp, ui: &mut Ui) {
                 "accessibility" => accessibility(app, ui),
                 "advanced" => advanced(app, ui),
                 "agents" => agents(ui),
+                "account" => account(app, ui),
+                "assistant" => assistant(app, ui),
                 _ => general(app, ui),
             }
         });
@@ -702,6 +706,87 @@ fn agents(ui: &mut Ui) {
     ui.label(tl!("Every command is available to scripts and AI agents: run `wordcraft-cli mcp` for an MCP server, or start the app with `--control <port>` for the JSON control channel."));
 }
 
+/// The accounts the assistant signs in with (#19): ChatGPT's, with who is signed in, whether
+/// they let WordCraft use their plan, and Continue with ChatGPT or Sign Out. Desktop only, as
+/// the sign-in is (#26).
+fn account(app: &mut WordApp, ui: &mut Ui) {
+    section(ui, "ChatGPT");
+    if !crate::assist::desktop(app) {
+        note(ui, "Signing in to ChatGPT takes the WordCraft desktop app: a web page can't keep a sign-in safe.");
+        return;
+    }
+    if app.services.settings_dir.is_none() {
+        note(ui, "WordCraft has no settings folder here to keep a sign-in in.");
+        return;
+    }
+    crate::assist::chatgpt::controls(app, ui, false);
+    ui.add_space(8.0);
+    note(
+        ui,
+        "WordCraft keeps your sign-in in a file in its settings folder that only you can read, never in a document. Signing out deletes it and asks ChatGPT to end it.",
+    );
+}
+
+/// The built-in assistant (#15): the role assistants join a shared document with
+/// (`assist.defaultRole`); a conversation may choose its own in the Assistant pane. Whether an
+/// agent goes ahead when it asks permission in a turn no one can answer
+/// (`assist.allowUnattended`, off by default, #23). And the agents, each with the command,
+/// arguments and environment it starts with (`agent_setup`, #24). The web app runs no
+/// assistant (#26), so there the page has none of these, only why.
+fn assistant(app: &mut WordApp, ui: &mut Ui) {
+    use crate::assist::{role_label, role_note};
+    use wordcraft_engine::AssistantPrefs;
+    section(ui, "Assistant");
+    // On the web there is no assistant to give a role or a permission to, as its pane has no
+    // role to choose: the page says what the pane says (#26).
+    if !crate::assist::desktop(app) {
+        note(ui, "The assistant needs the desktop app");
+        section(ui, "Agents");
+        note(ui, "Agents are programs WordCraft starts on your computer, so they are set up in the desktop app.");
+        return;
+    }
+    let role = app.session.prefs.assistant.default_role();
+    ui.horizontal(|ui| {
+        let label = ui.label(tl!("Assistants join as:"));
+        let combo = craft_ui::ComboBox::from_id_salt("assistant_default_role").selected_text(tl!(role_label(role))).width(220.0).show_ui(ui, |ui| {
+            for r in AssistantPrefs::ROLES {
+                if ui.selectable_label(r == role, tl!(role_label(r))).clicked() {
+                    let _ = app.run("assist.defaultRole", json!({"value": r.name()}));
+                }
+            }
+        });
+        combo.response.labelled_by(label.id);
+    });
+    note(ui, role_note(role));
+    note(
+        ui,
+        "An assistant works in the document like a person you share it with: its role says what it may do. Each conversation in the Assistant pane may choose another.",
+    );
+    ui.add_space(8.0);
+    // What an agent asks when no one is there to answer (#23): refused unless allowed. Allowing
+    // it is the person's consent: a click the control channel made (an agent's `click`) leaves
+    // it off and says why; no command turns it on.
+    let mut allow = app.session.prefs.assistant.allow_unattended;
+    if ui.checkbox(&mut allow, tl!("Allow what agents ask when no one can answer")).changed() {
+        if !allow {
+            let _ = app.run("assist.allowUnattended", json!({"value": false}));
+        } else if app.input_from_control(ui.ctx()) {
+            app.status(tl!("Only you can allow what agents ask when no one can answer: click it yourself."));
+        } else {
+            app.session.prefs.assistant.allow_unattended = true;
+            crate::assist::sync_unattended(app);
+        }
+    }
+    note(
+        ui,
+        "When you ask, the Assistant pane asks you before an agent goes ahead. A script or another app that asks the assistant (the control channel, MCP) has no one to ask: its agent's requests are refused unless this is on. Each answer is logged.",
+    );
+    ui.add_space(8.0);
+    // The agents and what each starts with (#24): desktop only, as agents are programs (#26).
+    #[cfg(not(target_arch = "wasm32"))]
+    agent_setup::show(app, ui);
+}
+
 /// Interface theme: Light, Dark, or follow the system's appearance (#115).
 fn theme_picker(app: &mut WordApp, ui: &mut Ui) {
     use crate::theme::Appearance;
@@ -913,5 +998,8 @@ fn numeral_picker(app: &mut WordApp, ui: &mut Ui) {
     });
 }
 
+/// File › Options › Assistant › Agents (#24).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod agent_setup;
 #[cfg(test)]
 mod tests;

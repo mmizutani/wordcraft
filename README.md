@@ -199,8 +199,12 @@ the text it quotes.
 By default WordCraft's own crates log at `info` and everything else at `warn`. `RUST_LOG` replaces
 that with env_logger-style directives, for example `RUST_LOG=debug`,
 `RUST_LOG=warn,wordcraft_docx=trace` or `RUST_LOG=info,wgpu_core=warn`; a directive ending in `*`
-covers every target starting with it (`wordcraft*=debug`). The logger is
-`apps/wordcraft/src/logging.rs`.
+covers every target starting with it (`wordcraft*=debug`). The HTTP client's targets (`ureq`,
+`ureq_proto`) never log past `debug`, whatever `RUST_LOG` says: their `trace` output is the raw
+bytes of each request and answer, sign-in tokens included. The browser opener's (`webbrowser`)
+never logs past `info`: its `debug` and `trace` output is the address it opens, and the ChatGPT
+sign-in's can carry your account's email and last sign-in. Only the file's owner can read it
+(mode 0600 on Unix). The logger is `apps/wordcraft/src/logging.rs`.
 
 ## Architecture
 

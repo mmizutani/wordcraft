@@ -1,6 +1,6 @@
 //! [`Hub`]: the one place that puts a shared document's changes in order.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use wordcraft_doc::change::Side;
@@ -180,6 +180,37 @@ impl Hub {
         self.invited = self.invited.saturating_add(1);
         self.invites.push(Invite { key: key.clone(), name: name.to_string(), role, number });
         Ok(key)
+    }
+
+    /// [`Hub::invite`] under `name`, or, when someone has had it, under the first of "name (2)",
+    /// "name (3)"… no one has had (the name shortened so the number fits): the name it got, and
+    /// the key. Someone has had a name when an invite or a participant has it, and when a tracked
+    /// change or a comment in the document is in it: the role rules give a participant everything
+    /// in their name, so a newcomer under it could take back or rewrite those as their own (an
+    /// assistant's suggestions from a room since closed, or another person's assistant's). One
+    /// pass over the names, however many are taken.
+    pub fn invite_numbered(&mut self, name: &str, role: Role) -> Result<(String, String), RoomError> {
+        self.open()?;
+        let name = valid_name(name)?;
+        let authors: HashSet<&str> =
+            self.doc.revisions.iter().map(|r| r.author.as_str()).chain(self.doc.comments.values().map(|c| c.author.as_str())).collect();
+        let taken: HashSet<String> = self
+            .invites
+            .iter()
+            .map(|i| i.name.as_str())
+            .chain(self.participants.iter().map(|m| m.who.name.as_str()))
+            .chain(authors)
+            .map(str::to_lowercase)
+            .collect();
+        // A free name is among the first `taken.len() + 1`; " (n)" takes at most 2 + 20 characters.
+        let short: String = name.chars().take(MAX_NAME.saturating_sub(22)).collect();
+        let short = short.trim_end();
+        let free = (1..=taken.len().saturating_add(1))
+            .map(|n| if n == 1 { name.to_string() } else { format!("{short} ({n})") })
+            .find(|candidate| !taken.contains(&candidate.to_lowercase()))
+            .ok_or_else(|| RoomError::Name(format!("no name like {name} is free in this room")))?;
+        let key = self.invite(&free, role)?;
+        Ok((free, key))
     }
 
     /// Take back the invite with `key`: no one joins with it any more, and those who joined

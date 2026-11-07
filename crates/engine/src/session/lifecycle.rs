@@ -107,6 +107,7 @@ impl Session {
             registry,
             author: "WordCraft User".into(),
             role: None,
+            assistant: Default::default(),
             initials: String::new(),
             painter: None,
             status: String::new(),
@@ -130,7 +131,6 @@ impl Session {
             ime_state_revision: None,
             ime_state_seen: None,
             ime_edit_outcome: ImeEditOutcome::default(),
-            #[cfg(any(test, feature = "test-support"))]
             ime_state_exhausted: false,
             pending_ime_application_change: false,
             ime_origin: false,

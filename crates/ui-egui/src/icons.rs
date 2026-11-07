@@ -1361,6 +1361,14 @@ fn paint_file_and_tools(pen: &Pen, name: &str) -> bool {
             pen.line(&[(2.5, 5.0), (2.5, 16.0)]);
             pen.closed(&[(2.5, 16.0), (5.0, 9.0), (18.0, 9.0), (15.5, 16.0)], a);
         }
+        // The assistant (#15): a speech bubble with a spark beside it.
+        "assistant" => {
+            pen.closed(&[(2.5, 5.5), (13.0, 5.5), (13.0, 14.0), (8.5, 14.0), (5.0, 17.5), (5.5, 14.0), (2.5, 14.0)], c);
+            pen.lines(5.0, 10.5, &[8.5, 11.0]);
+            // Two thin diamonds make the four-pointed spark (each convex, so it fills cleanly).
+            pen.fill(&[(16.5, 0.8), (17.3, 4.0), (16.5, 7.2), (15.7, 4.0)], a);
+            pen.fill(&[(13.3, 4.0), (16.5, 3.2), (19.7, 4.0), (16.5, 4.8)], a);
+        }
         // Print: a printer with a sheet coming out.
         "print" => {
             pen.rect(6.0, 2.5, 14.0, 7.0, c);

@@ -47,6 +47,39 @@ fn directives_follow_env_logger_and_the_most_specific_one_wins() {
 }
 
 #[test]
+fn http_wire_dumps_never_reach_the_log_whatever_rust_log_says() {
+    for spec in ["trace", "ureq_proto=trace", "ureq*=trace", "u*=trace", "ureq_proto", "ureq", "warn,ureq_proto::util=trace,ureq=trace"] {
+        let f = Filter::parse(spec);
+        for target in ["ureq_proto", "ureq_proto::util", "ureq", "ureq::run", "ureq::unversioned::transport"] {
+            assert!(f.level_for(target) <= LevelFilter::Debug, "{spec} lets {target} log at trace");
+        }
+    }
+    // Quieter levels for them, and every other target, stay as RUST_LOG says.
+    assert_eq!(Filter::parse("ureq=debug").level_for("ureq::run"), LevelFilter::Debug);
+    assert_eq!(Filter::parse("trace,ureq=warn").level_for("ureq::run"), LevelFilter::Warn);
+    assert_eq!(Filter::parse("trace").level_for("wordcraft_docx"), LevelFilter::Trace);
+    assert_eq!(Filter::parse("trace").level_for("ureq_extra"), LevelFilter::Trace);
+    // A token in a trace record of theirs never reaches the file; others' trace records do.
+    use log::Log;
+    let dir = temp_dir("wire");
+    let logger = AppLogger::new(Filter::parse("trace"), false);
+    let path = logger.attach_dir(&dir).expect("attach");
+    let record = |target: &'static str, msg: &'static str| {
+        logger.log(&log::Record::builder().level(log::Level::Trace).target(target).args(format_args!("{msg}")).build());
+    };
+    record("ureq_proto::util", "Authorization: Bearer secret-access-token");
+    record("wordcraft", "still traced");
+    let text = read(&path);
+    assert!(!text.contains("secret-access-token") && text.contains("still traced"), "{text}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777, 0o600, "only its owner reads the log");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn hostile_specs_never_panic_and_fall_back_sensibly() {
     let long = "x".repeat(100_000);
     let many = "a=info,".repeat(10_000);
@@ -329,4 +362,40 @@ fn a_panic_report_names_the_place_and_the_redacted_message() {
     );
     assert_eq!(panic_report(None, None, None), "panic at an unknown place: (no message)");
     assert_eq!(panic_report(Some("a.rs:1:1"), Some("boom"), Some("   0: main\n")), "panic at a.rs:1:1: boom\n   0: main");
+}
+
+/// #19: webbrowser logs the command line that opens the browser (the ChatGPT sign-in's address,
+/// with the last id token and email as hints) at `debug` on Linux and the BSDs
+/// (`webbrowser::common`) and at `trace` on macOS (`webbrowser::os`): never in the log.
+#[test]
+fn browser_command_lines_never_reach_the_log_whatever_rust_log_says() {
+    for spec in ["debug", "trace", "webbrowser=trace", "webbrowser::common=debug", "web*=trace", "webbrowser", "warn,webbrowser::os=trace"] {
+        let f = Filter::parse(spec);
+        for target in ["webbrowser", "webbrowser::common", "webbrowser::os"] {
+            assert!(f.level_for(target) <= LevelFilter::Info, "{spec} lets {target} log at debug");
+        }
+    }
+    // Quieter levels for it, and other targets, stay as RUST_LOG says.
+    assert_eq!(Filter::parse("webbrowser=warn").level_for("webbrowser::common"), LevelFilter::Warn);
+    assert_eq!(Filter::parse("debug").level_for("webbrowser_extra"), LevelFilter::Debug);
+    assert_eq!(Filter::parse("debug").level_for("wordcraft_ui_egui"), LevelFilter::Debug);
+    // A spawn record with a sign-in address never reaches the file; others' debug records do.
+    use log::Log;
+    let dir = temp_dir("browser");
+    let logger = AppLogger::new(Filter::parse("debug"), false);
+    let path = logger.attach_dir(&dir).expect("attach");
+    let url = "https://auth.example/authorize?id_token_hint=eyJhbGciOiJSUzI1NiJ9.secret.sig&login_hint=a%40b.c";
+    logger.log(
+        &log::Record::builder()
+            .level(log::Level::Debug)
+            .target("webbrowser::common")
+            .args(format_args!("background spawn: \"/usr/bin/firefox\" \"{url}\""))
+            .build(),
+    );
+    logger.log(&log::Record::builder().level(log::Level::Debug).target("wordcraft_ui_egui").args(format_args!("a debug line")).build());
+    logger.flush();
+    let text = read(&path);
+    assert!(!text.contains("id_token_hint") && !text.contains("a%40b.c"), "{text}");
+    assert!(text.contains("a debug line"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

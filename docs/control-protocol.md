@@ -53,6 +53,21 @@ any other host it sends no key, says so, and the app refuses its requests: to dr
 another machine, forward its port to `127.0.0.1` (for example `ssh -L 7981:127.0.0.1:7981 host`)
 and set `WORDCRAFT_CONTROL_KEY` to that app's key.
 
+## One request from the command line
+
+`wordcraft-cli call <method> [<params> | -] [--connect HOST:PORT]` sends one request and prints
+its result as JSON, for scripts and for agents that work through a shell. `params` is a JSON
+object (`-` reads it from standard input, which saves quoting); without it the request has `{}`.
+The address is `--connect`'s, else `WORDCRAFT_CONTROL_ADDR`'s, and the key is found as for
+`wordcraft-cli mcp --connect`. It refuses any address but `127.0.0.1` or `localhost` before it
+connects. An error, from the app or on the way, goes to standard error on one line (with the
+app's control characters shown escaped) and the exit status is 1.
+
+```sh
+wordcraft-cli call document.text --connect 127.0.0.1:7981
+echo '{"text": "Hello"}' | wordcraft-cli call text.insert - --connect 127.0.0.1:7981
+```
+
 ## Methods
 
 | Method | Params | Result |
@@ -89,7 +104,11 @@ Language packs (see [MCP](mcp.md#language-packs)) are commands like any other: `
 `proof.installPack {"locale": "nl"}` and `proof.removePack {"locale": "nl"}`. Through the control
 channel they act on the running app's packs, and install only while its downloading setting is on;
 they never turn it on, and neither does a `ui.click` or `ui.key` on the app's Install, Add a
-language… or Refresh buttons. An install or a refresh runs in the background
+language… or Refresh buttons. The assistant's consent is kept the same way: `ui.click` and
+`ui.key` never answer its permission or sign-in questions, never turn on File › Options ›
+Assistant › Allow what agents ask when no one can answer (`assist.allowUnattended` turns it off
+but not on), and a prompt they send from the Assistant pane is a program's, not the person's:
+its agent's requests are answered per that setting. An install or a refresh runs in the background
 (`"started": true`); `proof.packs` reports its progress, then the result.
 `ui.dialog {"name": "languageData"}` opens About › Language data.
 
@@ -276,6 +295,27 @@ document is shared.
 
 `wordcraft-cli mcp --connect 127.0.0.1:7981` with `WORDCRAFT_CONTROL_KEY` set to the invite's
 key gives an agent its copy through MCP's tools (see [MCP](mcp.md#shared-documents)).
+
+### The room's own port
+
+The desktop app also listens for the shared document's room alone, on `127.0.0.1` and a port
+the system picks, whether or not it runs with `--control`. The built-in assistant's agents reach
+their copies there: an agent gets `wordcraft-cli mcp --connect 127.0.0.1:<port>` with its
+invite's key in `WORDCRAFT_CONTROL_KEY`, and nothing else.
+
+It speaks this protocol, and only invites' keys open it: a connection's first request must carry
+one, and from then on it is served as above. Every connection with the same key works on the
+same copy, one request at a time, so an agent that connects for each request
+(`wordcraft-cli call` in its shell) finds what it selected still selected, and stays one
+participant; the port lets the copy go once the invite is taken back or sharing stops. The window's key opens nothing there (the port
+doesn't know it, and no key file names the port), nor does any other key, and while no document
+is shared no key does: the request gets `{"ok": false, "error": "unauthorized"}` and the
+connection closes. The limits are the control channel's: a line over 1 MiB, a line that isn't
+UTF-8 or JSON, or no request with an invite's key within 30 s of the connection being accepted
+closes it. At most 64 connections are served at once. Each response has a two-second total
+write deadline, including clients that read only a few bytes at a time. A failed write closes
+the connection; revocation and room closure also end idle authenticated reads. These limits
+bound resource use; a continuous local connection flood can still deny availability.
 
 ### Roles
 

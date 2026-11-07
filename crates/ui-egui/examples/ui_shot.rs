@@ -12,14 +12,26 @@
 //! `{"demoPacks": true}` lists a few sample Language packs (installs only record themselves), and
 //! (with `{"network": true}` on a line, downloading is already on) `{"demoPacks": "store"}` uses a real font store, as the desktop app does, in a new temporary
 //! folder rather than the person's, or in `"storeDir"` given on the same line (with
-//! `CRAFT_LANGUAGE_PACK_INDEX` for a local pack index).
+//! `CRAFT_LANGUAGE_PACK_INDEX` for a local pack index). `{"assistScript": [[step, …], …]}` has the
+//! next assistant conversation use the scripted assistant, one list of steps per turn: `{"say":
+//! text}`, `{"think": text}`, `{"tool": name, "args": {…}}`, `{"plan": [text, …]}` (an entry
+//! may be `{"content": text, "status": "completed|in_progress|pending"}`) or `{"ask": title}` (a
+//! permission request: the pane asks it in a turn the person asked for, such as one started with
+//! `{"run": "assist.ask", "params": {"prompt": …}}`, and answers it per `assist.allowUnattended`
+//! in a program's: one from `engine.execute`, or typed with `ui.text` and sent with `ui.key`,
+//! which the window doesn't take as the person's). `{"run": id, "params": {…}}` runs command `id`
+//! as the person's own click does (`WordApp::run`), for what a script may not do, such as
+//! signing in to ChatGPT (`assist.chatgpt.signIn`, #19; no browser opens here).
+//! `{"settingsDir": "/abs/dir"}` gives the window a settings folder (the agents' settings in
+//! File › Options › Assistant read and save there, and a ChatGPT sign-in is kept there), and
+//! `{"web": true}` has it offer what the web app does: no assistant.
 
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{ControlRequest, Services, WordApp};
 
 static READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn main() {
+fn main() -> Result<(), String> {
     let path = std::env::args().nth(1).expect("usage: ui_shot script.jsonl");
     let script = std::fs::read_to_string(&path).expect("read script");
     let (tx, rx) = std::sync::mpsc::channel::<ControlRequest>();
@@ -50,7 +62,10 @@ fn main() {
         }
         None => {}
     }
-    let mut app = WordApp::new(Session::new(doc), Services::default()).with_control(rx);
+    // `{"settingsDir": "/abs/dir"}`: the settings folder, where File › Options › Assistant keeps
+    // the agents' settings (#24); none otherwise, as in tests.
+    let settings_dir = lines.iter().find_map(|l| l.get("settingsDir").and_then(|v| v.as_str())).map(std::path::PathBuf::from);
+    let mut app = WordApp::new(Session::new(doc), Services { settings_dir, ..Services::default() }).with_control(rx);
     app.integrated_titlebar = true;
     if lines.first().is_some_and(|l| l.get("startScreen").is_some()) {
         app.start_screen();
@@ -82,6 +97,19 @@ fn main() {
                 }
                 Err(e) => eprintln!("render failed: {e}"),
             }
+        } else if l.get("web") == Some(&serde_json::Value::Bool(true)) {
+            // The pane as the web app has it: no assistant (#26).
+            harness.state_mut().assist_as_web();
+            step_n(&mut harness, 2);
+        } else if let Some(turns) = l.get("assistScript").and_then(|v| v.as_array()) {
+            harness.state_mut().assist_with(Box::new(scripted_assistant(turns)?));
+            step_n(&mut harness, 2);
+        } else if let Some(id) = l.get("run").and_then(|v| v.as_str()) {
+            // A command as the person runs it, which a script can't: a prompt whose agent's
+            // permission requests the pane asks (#23), Continue with ChatGPT (#19).
+            let r = harness.state_mut().run(id, l.get("params").cloned().unwrap_or_else(|| serde_json::json!({})));
+            println!("{id}: {}", r.map_or_else(|e| e, |v| v.to_string()));
+            step_n(&mut harness, 2);
         } else if let Some(n) = l.get("steps").and_then(|v| v.as_u64()) {
             step_n(&mut harness, n as usize);
         } else if let Some(ms) = l.get("wait").and_then(|v| v.as_u64()) {
@@ -106,6 +134,47 @@ fn main() {
             step_n(&mut harness, 2);
         }
     }
+    Ok(())
+}
+
+/// The scripted assistant `{"assistScript": …}` describes.
+fn scripted_assistant(turns: &[serde_json::Value]) -> Result<wordcraft_assist::Fake, String> {
+    use wordcraft_assist::{PlanEntry, PlanStatus, Priority, Step};
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    let step = |s: &serde_json::Value| {
+        Ok(if let Some(t) = s.get("say") {
+            Step::Say(text(t))
+        } else if let Some(t) = s.get("think") {
+            Step::Think(text(t))
+        } else if let Some(name) = s.get("tool") {
+            Step::tool(&text(name), s.get("args").cloned().unwrap_or_default())
+        } else if let Some(entries) = s.get("plan").and_then(|v| v.as_array()) {
+            // An entry is its text (the first done, the rest to come) or `{"content", "status"}`.
+            let status = |i: usize, e: &serde_json::Value| match e.get("status").and_then(|s| s.as_str()) {
+                Some("completed") => PlanStatus::Completed,
+                Some("in_progress") => PlanStatus::InProgress,
+                Some(_) => PlanStatus::Pending,
+                None if i == 0 => PlanStatus::Completed,
+                None => PlanStatus::Pending,
+            };
+            let content = |e: &serde_json::Value| e.get("content").map_or_else(|| text(e), text);
+            Step::Plan(
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| PlanEntry { content: content(e), priority: Priority::Medium, status: status(i, e) })
+                    .collect(),
+            )
+        } else if let Some(t) = s.get("ask") {
+            Step::Ask(text(t))
+        } else {
+            return Err(format!("an assistScript step is say, think, tool, plan or ask: {s}"));
+        })
+    };
+    turns.iter().try_fold(wordcraft_assist::Fake::new(), |fake, turn| {
+        let steps = turn.as_array().ok_or("an assistScript turn must be an array of steps")?;
+        Ok(fake.then(steps.iter().map(step).collect::<Result<Vec<_>, String>>()?))
+    })
 }
 
 /// Applies the harness's pending raw input and advances one UI frame.
@@ -120,5 +189,16 @@ fn step(harness: &mut egui_kittest::Harness<'_, WordApp>) {
 fn step_n(harness: &mut egui_kittest::Harness<'_, WordApp>, n: usize) {
     for _ in 0..n {
         step(harness);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unsupported_assistant_steps_do_not_panic() {
+        let turns = vec![serde_json::json!([{}])];
+        assert!(super::scripted_assistant(&turns).is_err());
+        assert!(super::scripted_assistant(&[serde_json::json!(null)]).is_err());
+        assert!(super::scripted_assistant(&[serde_json::json!([{"say": "Hello"}])]).is_ok());
     }
 }

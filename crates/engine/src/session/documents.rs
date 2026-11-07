@@ -256,6 +256,8 @@ impl Session {
             author: _,
             // The participant's role in a shared document, like their name.
             role: _,
+            // The window's assistant: one for the window, whichever document it shows.
+            assistant: _,
             initials: _,
             painter: _,
             status: _,
@@ -281,8 +283,7 @@ impl Session {
             ime_state_revision: _,
             ime_state_seen: _,
             ime_edit_outcome: _,
-            #[cfg(any(test, feature = "test-support"))]
-                ime_state_exhausted: _,
+            ime_state_exhausted: _,
             pending_ime_application_change: _,
             ime_origin: _,
             others: _,

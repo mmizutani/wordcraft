@@ -143,6 +143,15 @@ Home|Editing|Select Objects|select.objects
 Home|Editing|Select Similar Formatting|select.similar
 Home|Voice|Dictate|tools.dictate
 Home|Editor|Editor|review.editor
+Home|Copilot|Copilot Pane|assist.pane
+Home|Copilot|Prompt|assist.ask
+Home|Copilot|Stop Generating|assist.cancel
+Home|Copilot|Draft with Copilot|assist.draft
+Home|Copilot|Rewrite|assist.rewrite
+Home|Copilot|Make Shorter|assist.shorten
+Home|Copilot|Make Longer|assist.expand
+Home|Copilot|Proofread|assist.proofread
+Home|Copilot|Summarize|assist.summarize
 Insert|Pages|Cover Page|insert.coverPage
 Insert|Pages|Blank Page|insert.blankPage
 Insert|Pages|Page Break|insert.pageBreak
@@ -593,7 +602,7 @@ mod tests {
         let p = parity(&reg);
         let pct = p["percent"].as_f64().unwrap();
         // The floor only ever rises.
-        assert!(pct >= 90.4, "parity {pct}%");
+        assert!(pct >= 97.2, "parity {pct}%");
     }
 
     #[test]

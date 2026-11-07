@@ -40,7 +40,7 @@ use doc_state::{TypedWord, Undo, doc_bib_style};
 use ime_state::ImeCaretState;
 pub use locale::set_system_locale;
 pub(crate) use locale::system_locale;
-pub use prefs::Prefs;
+pub use prefs::{AssistantPrefs, Prefs};
 pub use query::blank_document;
 pub(crate) use shared::Steps;
 pub use snapshot_types::EditSnapshot;
@@ -92,6 +92,9 @@ pub struct Session {
     /// document's Track Changes setting, and a command that changes more than the role lets
     /// them is undone and refused. `None` outside a room.
     pub role: Option<crate::room::Role>,
+    /// What the window's assistant can do now (`assist.*`, #15), which the window keeps up to
+    /// date; a session without a window has none.
+    pub assistant: crate::cmd::assist::AssistantStatus,
     /// Initials for comments (File › Options › General); empty = the name's initials.
     pub initials: String,
     /// Format painter: copied formatting waiting to be applied (and whether it stays on).
@@ -155,9 +158,8 @@ pub struct Session {
     /// The current command's explicit IME effect classification.
     ime_edit_outcome: ImeEditOutcome,
     /// Simulation of a globally exhausted IME revision allocator for front-end producer tests.
-    /// Only [`Self::exhaust_ime_state_revision`] sets it; production builds do not compile it,
-    /// and it only makes receipt classification fail closed.
-    #[cfg(any(test, feature = "test-support"))]
+    /// Only [`Self::exhaust_ime_state_revision`] sets it (tests only), and it only makes receipt
+    /// classification fail closed.
     ime_state_exhausted: bool,
     /// A successful non-IME command changed document state since the last IME observation. It is
     /// drained before publishing a receipt and at observation time; it is never cleared by a later

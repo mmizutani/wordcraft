@@ -176,19 +176,24 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("file.privacy", "Privacy Settings", "File › Options › Save", |s, _| Ok(privacy(s)))
             .params(r#"{} → {"removePersonalInfo": bool, "removeDateTime": bool} (file.privacyOptions changes them)"#)
             .pure(),
-        CommandSpec::new("document.inspect", "Inspect Document", "Agents", inspect).params(r#"{"text"?: bool}"#).pure(),
+        CommandSpec::new("document.inspect", "Inspect Document", "Agents", inspect)
+            .params(r#"{"text"?: bool, "maxInputBytes"?: number (refuse oversized read inputs before copying them)}"#).pure(),
         CommandSpec::new("document.changes", "Document Changes", "Agents", changes)
             .params(
-                r#"{"since"?: number (a version of this document, as document.inspect or an earlier call gave it; the current one when left out), "limit"?: number (most changes to give, oldest first: 100 when left out, at most 1024), "full"?: bool (each change whole, as another copy of the document applies it)} → {"document": id, "version": number (the current one), "changes": [{"version", "edits": [{"in", "after"?, "before"?, "removed": [block id], "inserted": [block id], "at", "deleted", "text"}], "tables"?: [table id], "parts"?: [{"added"|"removed"|"changed": id}], "fields"?: [name], "change"?: ChangeSet}], "more"?: true (ask again from the last version given)}; an error when `since` is ahead of the document or older than the changes it keeps (read the document again)"#,
+                r#"{"maxInputBytes"?: number (refuse oversized read inputs before copying them), "since"?: number (a version of this document, as document.inspect or an earlier call gave it; the current one when left out), "limit"?: number (most changes to give, oldest first: 100 when left out, at most 1024), "full"?: bool (each change whole, as another copy of the document applies it)} → {"document": id, "version": number (the current one), "changes": [{"version", "edits": [{"in", "after"?, "before"?, "removed": [block id], "inserted": [block id], "at", "deleted", "text"}], "tables"?: [table id], "parts"?: [{"added"|"removed"|"changed": id}], "fields"?: [name], "change"?: ChangeSet}], "more"?: true (ask again from the last version given)}; an error when `since` is ahead of the document or older than the changes it keeps (read the document again)"#,
             )
             .pure(),
         CommandSpec::new("document.text", "Document Text", "Agents", |s, v| {
             let story = super::story_param(s, v);
+            check_read_size(v, &s.doc.story(story))?;
             Ok(json!({"text": s.doc.final_text(story)}))
         })
+        .params(r#"{"story"?: Story, "maxInputBytes"?: number (refuse oversized read inputs before copying them)}"#)
         .pure(),
-        CommandSpec::new("document.paragraph", "Paragraph Details", "Agents", paragraph).params(r#"{"path": [n], "story"?: Story}"#).pure(),
-        CommandSpec::new("document.selection", "Selection", "Agents", |s, _| {
+        CommandSpec::new("document.paragraph", "Paragraph Details", "Agents", paragraph)
+            .params(r#"{"path": [n], "story"?: Story, "maxInputBytes"?: number (refuse oversized read inputs before copying them)}"#).pure(),
+        CommandSpec::new("document.selection", "Selection", "Agents", |s, v| {
+            check_selection_size(s, v)?;
             let mut r = sel_result(s)?;
             if let Some(o) = r.as_object_mut() {
                 o.insert("text".into(), json!(s.selected_text()));
@@ -196,6 +201,7 @@ pub fn specs() -> Vec<CommandSpec> {
             }
             Ok(r)
         })
+        .params(r#"{"maxInputBytes"?: number (refuse oversized read inputs before copying them)}"#)
         .pure(),
         CommandSpec::new("document.layout", "Layout Summary", "Agents", layout_summary).pure(),
         CommandSpec::new("document.setText", "Replace Document Text", "Agents", |s, v| {
@@ -551,6 +557,7 @@ fn info(s: &mut Session, _: &Value) -> CmdResult {
 
 /// Structure for agents: blocks with text and formatting summary, selection, stats.
 fn inspect(s: &mut Session, v: &Value) -> CmdResult {
+    check_read_size(v, &(&s.doc.body, &s.doc.parts, &s.doc.core, &s.doc.last_section))?;
     let with_text = p::bool(v, "text").unwrap_or(true);
     let mut blocks = Vec::new();
     for (i, b) in s.doc.body.iter().enumerate().take(2000) {
@@ -631,6 +638,7 @@ fn changes(s: &mut Session, v: &Value) -> CmdResult {
     let since = whole("since")?.unwrap_or(log.version());
     let limit = whole("limit")?.map_or(100, |n| usize::try_from(n).unwrap_or(usize::MAX)).clamp(1, MAX_CHANGES);
     let full = p::bool(v, "full").unwrap_or(false);
+    check_changes_size(v, log, since, limit, full)?;
     let after = log.since(since).map_err(CmdError::Params)?;
     let mut out = Vec::with_capacity(after.len().min(limit));
     for (version, cs) in after.iter().take(limit) {
@@ -734,6 +742,7 @@ fn paragraph(s: &mut Session, v: &Value) -> CmdResult {
     let path: Vec<u32> = serde_json::from_value(v.get("path").cloned().unwrap_or(json!([0]))).map_err(|e| CmdError::Params(e.to_string()))?;
     let story = super::story_param(s, v);
     let p = s.doc.para(story, &wordcraft_doc::Path(path)).ok_or_else(|| CmdError::Params("no paragraph there".into()))?;
+    check_read_size(v, p)?;
     let resolved = s.doc.styles.resolve_para(&p.props);
     Ok(json!({"paragraph": p, "resolved": resolved}))
 }
@@ -750,4 +759,185 @@ fn layout_summary(s: &mut Session, _: &Value) -> CmdResult {
         .collect();
     let caret = l.caret_on(&s.sel.focus, s.page_hint).map(|c| json!({"page": c.page, "x": c.x, "y": c.top, "h": c.height}));
     Ok(json!({"pages": pages, "caret": caret, "ms": l.ms}))
+}
+
+/// Refuse a bounded read before building its result, on the same synchronized session.
+fn check_read_size(params: &Value, input: &impl serde::Serialize) -> Result<(), CmdError> {
+    match ReadBudget::from_params(params)? {
+        Some(mut budget) => budget.check(input),
+        None => Ok(()),
+    }
+}
+
+/// Count the blocks a fragment copies, including the text-box stories it follows.
+fn check_selection_size(s: &Session, params: &Value) -> Result<(), CmdError> {
+    let Some(mut budget) = ReadBudget::from_params(params)? else { return Ok(()) };
+    if s.sel.is_collapsed() && s.column.is_none() {
+        return Ok(());
+    }
+    let (a, b) = s.sel.ordered();
+    let Some(story) = s.doc.story(a.story).filter(|_| a.story == b.story) else { return Ok(()) };
+    let same_container = a.path.parent() == b.path.parent();
+    let source = if same_container { s.doc.container(a.story, &a.path).unwrap_or(story) } else { story };
+    let (from, to) = if same_container {
+        (a.path.last(), b.path.last().saturating_add(1))
+    } else {
+        (a.path.0.first().copied().unwrap_or(0) as usize, (b.path.0.first().copied().unwrap_or(0) as usize).saturating_add(1))
+    };
+    // Copying a slice clones its whole edge paragraphs before trimming them.
+    let blocks = if s.column.is_some() { story.as_slice() } else { source.get(from..to.min(source.len())).unwrap_or_default() };
+    budget.check(&blocks)?;
+    let mut boxes = Vec::new();
+    box_references(blocks, &mut boxes, 0);
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(id) = boxes.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(part) = s.doc.parts.get(&id).filter(|p| p.kind == wordcraft_doc::PartKind::TextBox) {
+            budget.check(&(id, part))?;
+            box_references(&part.blocks, &mut boxes, 0);
+        }
+    }
+    Ok(())
+}
+
+fn box_references(blocks: &[Arc<Block>], out: &mut Vec<u32>, depth: usize) {
+    if depth > 16 {
+        return;
+    }
+    for block in blocks {
+        match &**block {
+            Block::Para(p) => out.extend(p.objects.iter().flat_map(wordcraft_doc::InlineObject::text_boxes)),
+            Block::Table(t) => {
+                for row in &t.rows {
+                    for cell in &row.cells {
+                        box_references(&cell.blocks, out, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Count borrowed entries before `since` clones them and summaries copy their text.
+fn check_changes_size(params: &Value, log: &crate::ChangeLog, since: u64, limit: usize, full: bool) -> Result<(), CmdError> {
+    let Some(mut budget) = ReadBudget::from_params(params)? else { return Ok(()) };
+    for (version, cs) in log.borrowed_since(since).map_err(CmdError::Params)?.take(limit) {
+        budget.check(version)?;
+        if full {
+            // NewBlock collects descendant ids: bound its blocks before invoking that serializer.
+            for splice in &cs.splices {
+                for block in &splice.inserted {
+                    budget.check(&block.0)?;
+                }
+            }
+            for part in &cs.parts {
+                if let PartChange::Added { blocks, .. } = part {
+                    for block in blocks {
+                        budget.check(&block.0)?;
+                    }
+                }
+            }
+            budget.check(&**cs)?;
+            continue;
+        }
+        for edit in &cs.edits {
+            budget.check(&(&edit.container, edit.id, edit.chars.as_ref().map(|c| (c.at, c.removed, &c.inserted.text))))?;
+        }
+        for splice in &cs.splices {
+            budget.check(&(&splice.container, &splice.text, splice.after, splice.before))?;
+            for block in &splice.removed {
+                budget.check(&block.id)?;
+            }
+            for block in &splice.inserted {
+                budget.check(&block.0.id())?;
+            }
+        }
+        for table in &cs.tables {
+            budget.check(&table.id)?;
+        }
+        for part in &cs.parts {
+            let (PartChange::Added { id, .. } | PartChange::Removed { id, .. } | PartChange::Changed { id, .. }) = part;
+            budget.check(&("changed", id))?;
+        }
+        for field in &cs.fields {
+            match field {
+                FieldChange::Media { key, .. } | FieldChange::Passthrough { key, .. } => budget.check(&("passthrough", key))?,
+                // Summaries keep only fixed field names, never their payloads.
+                _ => budget.check(&"footnoteSeparators")?,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Count borrowed serialized input without keeping bytes; stop at the first oversized write.
+struct ReadBudget {
+    left: usize,
+}
+
+impl ReadBudget {
+    fn from_params(params: &Value) -> Result<Option<Self>, CmdError> {
+        let Some(limit) = params.get("maxInputBytes") else { return Ok(None) };
+        let limit = limit.as_u64().ok_or_else(|| CmdError::Params("`maxInputBytes` must be a nonnegative whole number".into()))?;
+        Ok(Some(Self { left: usize::try_from(limit).unwrap_or(usize::MAX) }))
+    }
+
+    fn check(&mut self, input: &impl serde::Serialize) -> Result<(), CmdError> {
+        serde_json::to_writer(self, input).map_err(|_| {
+            CmdError::Failed("This read's input is too large; use execute with document.paragraph and a specific path to read less.".into())
+        })
+    }
+}
+
+impl std::io::Write for ReadBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.left = self.left.checked_sub(bytes.len()).ok_or_else(|| std::io::Error::other("read input budget exceeded"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod read_budget_tests {
+    use super::*;
+    use serde::ser::SerializeSeq;
+    use std::cell::Cell;
+
+    #[test]
+    fn change_summaries_do_not_budget_unreturned_field_payloads() {
+        let mut s = Session::new(Document::from_text("small"));
+        s.run("file.properties", &json!({"title": "x".repeat(1024)})).unwrap();
+        let out = s.run("document.changes", &json!({"since": 0, "maxInputBytes": 128})).unwrap();
+        assert_eq!(out["changes"][0]["fields"], json!(["core"]));
+        assert!(s.run("document.changes", &json!({"since": 0, "maxInputBytes": 128, "full": true})).is_err());
+    }
+
+    #[test]
+    fn a_capped_read_stops_serializing_before_the_tail() {
+        struct Probe<'a> {
+            text: &'a str,
+            tail: &'a Cell<bool>,
+        }
+        impl serde::Serialize for Probe<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut seq = serializer.serialize_seq(Some(2))?;
+                seq.serialize_element(self.text)?;
+                self.tail.set(true);
+                seq.serialize_element(&"tail")?;
+                seq.end()
+            }
+        }
+        let text = "x".repeat(1024);
+        let tail = Cell::new(false);
+        let probe = Probe { text: &text, tail: &tail };
+        let result = check_read_size(&json!({"maxInputBytes": 32}), &probe);
+        assert!(!tail.get(), "the oversized first field must stop traversal before later fields");
+        assert!(result.is_err());
+        assert!(check_read_size(&json!({"maxInputBytes": 2048}), &probe).is_ok());
+        assert!(tail.get());
+    }
 }

@@ -47,6 +47,7 @@ pub const TABLE: &[(&str, Class)] = &[
     ("engine", Class::Layer(4)),
     ("mcp", Class::Layer(5)),
     ("zotero", Class::Layer(5)),
+    ("assist", Class::Layer(5)),
     ("ui-egui", Class::Layer(6)),
     ("testkit", Class::Testkit),
     // apps and tooling
@@ -59,8 +60,10 @@ pub const TABLE: &[(&str, Class)] = &[
 /// Explicit orderings *within* a layer (earlier may be used by later).
 /// The L0 foundation is a small chain: `raster` builds on `color` and
 /// `geom`, which the §3 diagram draws on one line. The GPU backend (`gpu`)
-/// reuses the CPU reference (`compose`) for LUTs and parity tests.
-pub const INTRA_LAYER_ORDER: &[&[&str]] = &[&["doc", "fonts"]];
+/// reuses the CPU reference (`compose`) for LUTs and parity tests. The
+/// built-in assistant (`assist`) calls the MCP server's tools (`mcp`), so the
+/// model in the app and agents outside it share one tool list.
+pub const INTRA_LAYER_ORDER: &[&[&str]] = &[&["doc", "fonts"], &["mcp", "assist"]];
 
 fn intra_layer_allowed(from: &str, to: &str) -> bool {
     let (from, to) = (short_name(from), short_name(to));
@@ -268,6 +271,15 @@ mod tests {
         assert!(check(&[c("wordcraft-doc", &[("wordcraft-geom", Normal, true)])]).is_empty());
         let v = check(&[c("wordcraft-geom", &[("wordcraft-doc", Normal, true)])]);
         assert!(matches!(v[..], [Violation::Upward { from: 0, to: 1, .. }]));
+    }
+
+    /// The assistant calls the MCP server's tools; the MCP server never reaches the assistant.
+    #[test]
+    fn the_assistant_may_use_mcp_one_way() {
+        assert!(check(&[c("wordcraft-assist", &[("wordcraft-mcp", Normal, true), ("wordcraft-engine", Normal, true)])]).is_empty());
+        let v = check(&[c("wordcraft-mcp", &[("wordcraft-assist", Normal, true)])]);
+        assert!(matches!(v[..], [Violation::Upward { from: 5, to: 5, .. }]));
+        assert!(!check(&[c("wordcraft-zotero", &[("wordcraft-assist", Normal, true)])]).is_empty());
     }
 
     #[test]
