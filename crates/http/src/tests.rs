@@ -93,6 +93,19 @@ fn exchange(port: u16, raw: &[u8]) -> String {
     out
 }
 
+/// [`exchange`], once the server has a place for it: with one connection allowed, the one before
+/// may still hold its place for a moment after it closed (its thread hasn't ended yet).
+fn exchange_served(port: u16, raw: &[u8]) -> String {
+    for _ in 0..200 {
+        let out = exchange(port, raw);
+        if !out.starts_with("HTTP/1.1 503") {
+            return out;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("never served");
+}
+
 #[test]
 fn serves_keep_alive_requests_expect_continue_and_a_connection_cap() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -102,18 +115,36 @@ fn serves_keep_alive_requests_expect_continue_and_a_connection_cap() {
         serve(listener, config, Arc::new(|r: &Request| Response::text(200, format!("{} {}", r.method, String::from_utf8_lossy(&r.body)))))
     });
     // Two requests on one connection, the second closing it.
-    let out = exchange(port, b"POST /a HTTP/1.1\r\nContent-Length: 2\r\n\r\nhiGET /b HTTP/1.1\r\nConnection: close\r\n\r\n");
+    let out = exchange_served(port, b"POST /a HTTP/1.1\r\nContent-Length: 2\r\n\r\nhiGET /b HTTP/1.1\r\nConnection: close\r\n\r\n");
     assert_eq!(out.matches("HTTP/1.1 200 OK").count(), 2, "{out}");
     assert!(out.contains("POST hi") && out.ends_with("GET "), "{out}");
     // Expect: 100-continue gets its interim answer before the body is read.
-    let out = exchange(port, b"POST /a HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    let out = exchange_served(port, b"POST /a HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
     assert!(out.starts_with("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK"), "{out}");
     // A bad request closes the connection after its answer.
-    let out = exchange(port, b"POST /a HTTP/1.1\r\nContent-Length: x\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
+    let out = exchange_served(port, b"POST /a HTTP/1.1\r\nContent-Length: x\r\n\r\nGET /b HTTP/1.1\r\n\r\n");
     assert!(out.starts_with("HTTP/1.1 400") && out.matches("HTTP/1.1").count() == 1, "{out}");
-    // One connection at a time: a second, while the first is open, is answered 503.
-    let first = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // One connection at a time: a second, while the first is open (and was served, so it holds
+    // the place), is answered 503.
+    let first = (0..200)
+        .find_map(|_| {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(b"GET /hold HTTP/1.1\r\n\r\n").unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 256];
+            while !got.ends_with(b"\r\n\r\nGET ") {
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            if got.starts_with(b"HTTP/1.1 200") {
+                return Some(c);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            None
+        })
+        .expect("the first connection is served");
     let out = exchange(port, b"GET / HTTP/1.1\r\n\r\n");
     assert!(out.starts_with("HTTP/1.1 503"), "{out}");
     drop(first);
