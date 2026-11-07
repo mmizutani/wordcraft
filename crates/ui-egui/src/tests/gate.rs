@@ -15,10 +15,13 @@
 //!   - a formatter, an editor, centres the headings of the first copies, the third copy's first,
 //!     at the same moment as the copy editor rewrites that heading.
 //!
-//! Every call an agent makes is timed too.
+//! The person types a key only once an agent edit came in since their last one, until the
+//! agents are done, so their typing and the agents' edits meet in the same frames on a runner of
+//! any speed. Every call an agent makes is timed too.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -154,32 +157,53 @@ impl Agent {
     }
 }
 
+/// How the agents start together, and how many edits they made: each agent counts an edit once
+/// the room has it (an agent's call answers after its copy sent the change).
+#[derive(Clone)]
+struct Cue {
+    start: Arc<Barrier>,
+    edits: Arc<AtomicUsize>,
+}
+
+impl Cue {
+    fn edited(&self) {
+        self.edits.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn edits(&self) -> usize {
+        self.edits.load(Ordering::SeqCst)
+    }
+}
+
 /// The copy editor: each rewrite selects its text and types over it (tracked, as a suggester's).
-fn copy_editor(mut a: Agent, start: Arc<Barrier>) -> Agent {
-    start.wait();
+fn copy_editor(mut a: Agent, cue: Cue) -> Agent {
+    cue.start.wait();
     for (text, occurrence, new) in REWRITES {
         a.run("select.text", json!({"text": text, "occurrence": occurrence}));
         a.run("text.insert", json!({"text": new}));
+        cue.edited();
     }
     a
 }
 
 /// The fact checker: each comment selects its text and comments on it.
-fn fact_checker(mut a: Agent, start: Arc<Barrier>) -> Agent {
-    start.wait();
+fn fact_checker(mut a: Agent, cue: Cue) -> Agent {
+    cue.start.wait();
     for (text, occurrence, comment) in COMMENTS {
         a.run("select.text", json!({"text": text, "occurrence": occurrence}));
         a.run("review.newComment", json!({"text": comment}));
+        cue.edited();
     }
     a
 }
 
 /// The formatter: each heading is selected by its first words and centred.
-fn formatter(mut a: Agent, start: Arc<Barrier>) -> Agent {
-    start.wait();
+fn formatter(mut a: Agent, cue: Cue) -> Agent {
+    cue.start.wait();
     for occurrence in CENTRED {
         a.run("select.text", json!({"text": HEADING, "occurrence": occurrence}));
         a.run("para.alignCenter", json!({}));
+        cue.edited();
     }
     a
 }
@@ -284,31 +308,39 @@ fn caret_stays(h: &Window, opening: BlockId, typed: usize, frame: usize) {
 }
 
 /// The agents start together, and the person types [`TYPED`] at the end of paragraph `opening`,
-/// a key a frame, until they and the agents are done. Each frame is timed, and the caret checked.
+/// a key a frame, until they and the agents are done. While the agents work, each key waits for
+/// an agent edit made since the last key, so the frame that types it brings that edit in too.
+/// Each frame is timed, and the caret checked.
 fn type_while_agents_work(h: &mut Window, opening: BlockId, agents: [Agent; 3]) -> Vec<Agent> {
-    let start = Arc::new(Barrier::new(4));
+    let cue = Cue { start: Arc::new(Barrier::new(4)), edits: Arc::new(AtomicUsize::new(0)) };
     let [ce, fc, fm] = agents;
     let threads = [
         std::thread::spawn({
-            let s = start.clone();
-            move || copy_editor(ce, s)
+            let c = cue.clone();
+            move || copy_editor(ce, c)
         }),
         std::thread::spawn({
-            let s = start.clone();
-            move || fact_checker(fc, s)
+            let c = cue.clone();
+            move || fact_checker(fc, c)
         }),
         std::thread::spawn({
-            let s = start.clone();
-            move || formatter(fm, s)
+            let c = cue.clone();
+            move || formatter(fm, c)
         }),
     ];
-    start.wait();
+    cue.start.wait();
+    let mut seen = 0;
     let mut typing = TYPED.chars();
     let (mut typed, mut frames, mut came_in, mut slowest) = (0usize, 0usize, 0usize, Duration::ZERO);
     let began = Instant::now();
     let theirs = |h: &Window| h.state().share.as_ref().map(|s| s.copy.stats().received);
     while typed < TYPED.chars().count() || threads.iter().any(|t| !t.is_finished()) {
         assert!(began.elapsed() < Duration::from_secs(300), "the agents never finished");
+        while cue.edits() == seen && threads.iter().any(|t| !t.is_finished()) {
+            assert!(began.elapsed() < Duration::from_secs(300), "the agents stopped editing");
+            std::thread::sleep(FRAME_GAP);
+        }
+        seen = cue.edits();
         let key = typing.next();
         if let Some(c) = key {
             h.event(egui::Event::Text(c.to_string()));
@@ -320,14 +352,14 @@ fn type_while_agents_work(h: &mut Window, opening: BlockId, agents: [Agent; 3]) 
         slowest = slowest.max(took);
         assert!(took < FRAME_BUDGET, "frame {frames} took {took:?}: the person's typing waited");
         typed += usize::from(key.is_some());
-        came_in += usize::from(theirs(h) != before);
+        came_in += usize::from(key.is_some() && theirs(h) != before);
         caret_stays(h, opening, typed, frames);
         frames += 1;
         std::thread::sleep(FRAME_GAP);
     }
     let agents: Vec<Agent> = threads.into_iter().map(|t| t.join().unwrap()).collect();
-    eprintln!("gate: {frames} frames, slowest {slowest:?}, {came_in} brought agents' changes in, {:?} in all", began.elapsed());
-    assert!(came_in >= 6, "agents' changes came in while the person typed ({came_in} frames)");
+    eprintln!("gate: {frames} frames, slowest {slowest:?}, {came_in} typed a key and brought agents' changes in, {:?} in all", began.elapsed());
+    assert!(came_in >= 6, "agents' changes came in with the person's keys ({came_in} frames)");
     for a in &agents {
         let (method, took) = a.slowest();
         eprintln!("gate: {}'s slowest call: {method} {took:?}", a.name);
