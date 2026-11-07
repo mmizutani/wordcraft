@@ -16,6 +16,7 @@ mod changes;
 mod documents;
 mod font_sizes;
 mod fonts;
+mod hub_spike;
 mod ime_noop;
 mod revision_checks;
 mod room;
