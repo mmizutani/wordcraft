@@ -1324,3 +1324,24 @@ fn the_window_never_waits_for_its_assistants() {
     other.end();
     assert!(started.elapsed() < BUDGET);
 }
+
+/// File › Share doesn't change the assistant's role (#70, Codex): its conversation was started
+/// and told with that role, and asking for the role again reuses it, so a suggester changed to an
+/// editor there would edit untracked when asked as a suggester. The Assistant pane chooses it.
+#[test]
+fn the_share_page_leaves_the_assistant_s_role_to_the_assistant_pane() {
+    let mut a = window("one two three");
+    a.execute("assist.backend", json!({"id": wordcraft_assist::FAKE_ID})).unwrap();
+    let first = ask(&mut a, "Hello", Some("suggester"));
+    let name = first["assistant"].as_str().unwrap().to_string();
+    let e = a.execute("room.role", json!({"name": name.to_uppercase(), "role": "editor"})).unwrap_err();
+    assert!(e.contains("Assistant pane"), "{e}");
+    let state = a.share_state();
+    let row = crate::share_page::rows(&state).into_iter().find(|r| r.name == name).unwrap();
+    assert_eq!(row.role, wordcraft_engine::room::Role::Suggester, "its role in the room is unchanged");
+    let again = ask(&mut a, "Again", Some("suggester"));
+    assert_eq!((again["role"].as_str(), again["tracked"].as_bool()), (Some("suggester"), Some(true)));
+    // Another participant's role still changes.
+    a.execute("room.invite", json!({"name": "Ana", "role": "viewer"})).unwrap();
+    assert_eq!(a.execute("room.role", json!({"name": "Ana", "role": "editor"})).unwrap()["changed"], true);
+}

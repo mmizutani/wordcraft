@@ -170,6 +170,8 @@ impl WordApp {
             control_rx: _,
             lobby: _,
             share: _,
+            // File › Share's form is about the one shared document.
+            share_form: _,
             // The assistant's conversation is about a document, not a window's.
             assist: _,
             updates_rt: _,

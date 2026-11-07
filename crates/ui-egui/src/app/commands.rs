@@ -491,9 +491,9 @@ impl WordApp {
                 "insertPicture" => self.pick_picture(),
                 "addFont" => self.pick_font(),
                 "loadSystemFonts" => self.load_system_fonts(),
-                "print" => {
+                "print" | "share" => {
                     self.ui.backstage = true;
-                    self.ui.backstage_page = "print".into();
+                    self.ui.backstage_page = what.into();
                 }
                 "options" => {
                     self.ui.backstage = true;
@@ -549,6 +549,11 @@ impl WordApp {
 
     /// Commands that live in the UI layer.
     pub(crate) fn ui_command(&mut self, id: &str, p: &Value) -> Option<Result<Value, String>> {
+        // Sharing the document (`room.*`): the window's, as on the control channel; File › Share
+        // runs them.
+        if let Some(r) = crate::share::room_method(self, id, p) {
+            return Some(r);
+        }
         let s = |k: &str| p.get(k).and_then(Value::as_str);
         Some(Ok(match id {
             "ui.checkForUpdates" | "help.checkForUpdates" => {
@@ -1112,6 +1117,8 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "view.numeral"
             | "ui.tab"
             | "ui.backstage"
+            | "room.participants"
+            | "room.stop"
             | "ui.dialog"
             | "ui.closeDialog"
             | "ui.collapseRibbon"
