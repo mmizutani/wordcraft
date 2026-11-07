@@ -848,7 +848,18 @@ impl Replica {
         if !self.on_document() {
             return;
         }
-        let got = self.room.hub().since(self.received);
+        let (got, role) = {
+            let hub = self.room.hub();
+            (hub.since(self.received), hub.participant(self.who.id).map(|p| p.role))
+        };
+        // The owner gave them another role ([`super::Room::set_role`]): their commands are held
+        // to it from now on, as the hub holds their changes.
+        if let Some(role) = role.filter(|r| *r != self.who.role) {
+            self.who.role = role;
+            if !self.lent {
+                self.session.role = Some(role);
+            }
+        }
         match got {
             Ok(changes) => {
                 for a in &changes {
