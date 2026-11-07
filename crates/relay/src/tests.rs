@@ -206,6 +206,42 @@ fn a_forgotten_room_is_opened_again_with_the_same_url() {
     assert!(matches!(Hosting::open("http://127.0.0.1:9", TOKEN, None, echo()), Err(Status::Retrying(_))));
 }
 
+/// A room opened again (the relay restarted, or it was closed behind the desktop's back) numbers
+/// its requests anew: an answer the desktop sends late, for a request of the room before, never
+/// answers an agent's request in the room now.
+#[test]
+fn a_late_answer_never_answers_another_agent_after_the_room_opens_again() {
+    let (base, _relay) = relay(|_| {});
+    // Answers what it was sent, the first after 1.5 s and the second after 3 s.
+    let slow: wordcraft_http::Handler = Arc::new(|req: &Request| {
+        let body = String::from_utf8_lossy(&req.body).to_string();
+        std::thread::sleep(Duration::from_millis(if body.contains("first") { 1500 } else { 3000 }));
+        Response::json(200, body)
+    });
+    let hosting = Hosting::start(&base, TOKEN, None, slow).unwrap();
+    let url = hosting.url().to_string();
+    let (room, secret) = hosting.claim();
+    let u = url.clone();
+    let first = std::thread::spawn(move || http(&u, "POST", &[], r#"{"agent": "first"}"#));
+    std::thread::sleep(Duration::from_millis(300));
+    // The relay forgets the room while the desktop is still answering the first agent.
+    let (status, _, _) = http(&format!("{base}/host/r/{room}"), "DELETE", &[("Authorization", &format!("Bearer {secret}"))], "");
+    assert_eq!(status, 204);
+    assert_eq!(first.join().unwrap().0, 503, "the first agent hears the room went");
+    // The second agent asks as soon as the room is back; its answer comes after the first's late
+    // one reached the relay, and it is its own.
+    let started = Instant::now();
+    loop {
+        let (status, _, body) = http(&url, "POST", &[], r#"{"agent": "second"}"#);
+        if status == 200 {
+            assert_eq!(body, r#"{"agent": "second"}"#);
+            break;
+        }
+        assert!([404, 503].contains(&status) && started.elapsed() < Duration::from_secs(10), "{status} {body}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Agents waiting when the person stops sharing hear so at once.
 #[test]
 fn waiting_agents_hear_when_sharing_stops() {

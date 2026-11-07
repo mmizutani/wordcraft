@@ -20,6 +20,8 @@ const SECRET_HEX: usize = 64;
 pub const MAX_REQUEST: usize = 1 << 20;
 /// A desktop's answer: a PDF of up to 32 MB, as base64 in JSON.
 pub const MAX_REPLY: usize = 96 << 20;
+/// Request ids stay below 2^53, a whole number in any JSON reader.
+const ID_MASK: u64 = (1 << 53) - 1;
 /// Requests a desktop takes in one poll.
 const PER_POLL: usize = 16;
 
@@ -213,10 +215,15 @@ impl Relay {
         if rooms.values().filter(|r| r.token == token).count() >= self.config.rooms_per_token {
             return Response::text(429, "this token holds as many rooms as it may\n");
         }
+        // Request ids start somewhere new each time a room opens, again after a restart or a
+        // close, so a late answer to a request of the room before can't answer one of this.
+        let Ok(start) = random_hex(8).map(|h| u64::from_str_radix(&h, 16).unwrap_or(0) & ID_MASK) else {
+            return Response::text(503, "no room could be made\n");
+        };
         let waiting = Waiting {
             queue: VecDeque::new(),
             answers: HashMap::new(),
-            next: 1,
+            next: start,
             seen: Instant::now(),
             polling: 0,
             closed: false,
@@ -345,7 +352,7 @@ impl Relay {
                 return refusal(503, "too many requests are waiting for this room").with_header("Retry-After", "1");
             }
             let n = w.next;
-            w.next = w.next.wrapping_add(1);
+            w.next = w.next.wrapping_add(1) & ID_MASK;
             w.queue.push_back(wire::forward(n, req, target, body));
             w.answers.insert(n, tx);
             n
