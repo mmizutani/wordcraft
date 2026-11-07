@@ -42,7 +42,7 @@ pub struct Paragraph {
     /// Change counter for caches (not part of equality).
     #[serde(skip, default = "next_rev")]
     pub rev: u64,
-    /// Which paragraph this is ([`BlockId`]): not part of equality, never saved.
+    /// Which paragraph this is ([`BlockId`]): not part of equality, not in the document's JSON (Word files keep it).
     #[serde(skip)]
     pub id: BlockId,
 }
