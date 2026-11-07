@@ -9,8 +9,11 @@
 //! which blocks it touched, and another copy applies it to the same blocks. So the ids are
 //! random, not counted from 1: copies that add blocks at the same time don't make the same ids.
 //!
-//! An id isn't part of what a block holds: `==` ignores it, files don't store it (a document read
-//! from one gets new ids), and the markup kept from a file doesn't depend on it.
+//! An id isn't part of what a block holds: `==` ignores it, the document's JSON doesn't hold it,
+//! and the markup kept from a file doesn't depend on it. Word files keep it: the docx writer saves
+//! it as the paragraph's id (`w14:paraId`, with the whole id beside it when that can't hold it),
+//! and the reader gives the paragraph that id back. A document read from a file without them gets
+//! new ids.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -65,6 +68,17 @@ impl BlockId {
     /// Whether the block has an id (not [`BlockId::UNSET`]).
     pub fn is_set(self) -> bool {
         self != BlockId::UNSET
+    }
+
+    /// The id with these 64 bits: one a file saved ([`BlockId::bits`]). 0 is
+    /// [`BlockId::UNSET`].
+    pub const fn from_bits(bits: u64) -> BlockId {
+        BlockId(bits)
+    }
+
+    /// The id's 64 bits, as a file saves them.
+    pub const fn bits(self) -> u64 {
+        self.0
     }
 }
 
