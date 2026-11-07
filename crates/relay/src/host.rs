@@ -265,22 +265,19 @@ fn poll_until_stopped(s: &Arc<Shared>) {
             Ok((200, text)) => {
                 set(s, Status::Connected);
                 backoff = Duration::from_secs(1);
-                let polled = serde_json::from_str::<Value>(&text).ok();
-                let requests = polled.as_ref().and_then(|v| v.get("requests").and_then(Value::as_array).cloned()).unwrap_or_default();
+                let (requests, waited) = wire::polled_from(text.as_bytes()).unwrap_or_default();
                 // Each request's time counts from when the relay sent it: at the latest, when this
                 // call began plus the time the poll waited there. The rest of the call (the trip
                 // there and back, however slow) comes out of it.
-                let waited = polled.as_ref().and_then(wire::waited).unwrap_or_default().min(asked.elapsed());
+                let waited = waited.unwrap_or_default().min(asked.elapsed());
                 let sent = asked.checked_add(waited).unwrap_or(asked);
-                for r in requests {
-                    if let Some((id, req)) = wire::request_from(&r) {
-                        // A tenth less than the relay says, for the answer's trip back.
-                        let until = wire::ttl(&r).map(|t| {
-                            let t = t.min(MAX_TTL);
-                            sent.checked_add(t.saturating_sub((t / 10).min(Duration::from_secs(2)))).unwrap_or(sent)
-                        });
-                        answer(s, id, req, until);
-                    }
+                for (id, req, ttl) in requests {
+                    // A tenth less than the relay says, for the answer's trip back.
+                    let until = ttl.map(|t| {
+                        let t = t.min(MAX_TTL);
+                        sent.checked_add(t.saturating_sub((t / 10).min(Duration::from_secs(2)))).unwrap_or(sent)
+                    });
+                    answer(s, id, req, until);
                 }
                 None
             }

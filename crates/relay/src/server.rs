@@ -509,7 +509,7 @@ impl Relay {
     /// `POST /host/r/<room>/reply`: the desktop's answer to one request.
     fn reply(&self, req: &Request, id: &str) -> Response {
         let Some(room) = self.hosts(req, id) else { return Response::text(404, "no such room (or not its secret)\n") };
-        let Some((n, resp)) = serde_json::from_slice::<Value>(&req.body).ok().as_ref().and_then(wire::response_from) else {
+        let Some((n, resp)) = wire::response_from(&req.body) else {
             return Response::text(400, "an answer is {\"id\", \"status\", \"headers\", \"body\"}\n");
         };
         let Some(mut w) = room.lock() else { return Response::text(500, "internal error\n") };

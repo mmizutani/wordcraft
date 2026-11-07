@@ -339,8 +339,8 @@ fn hostile_frames_never_panic() {
         json!({"id": u64::MAX, "status": 200, "headers": "x"}),
         json!({"id": 1, "status": 70000}),
     ] {
-        assert!(crate::wire::response_from(&v).is_none_or(|(_, r)| (200..600).contains(&r.status)), "{v}");
-        let _ = crate::wire::request_from(&v);
+        assert!(crate::wire::response_from(v.to_string().as_bytes()).is_none_or(|(_, r)| (200..600).contains(&r.status)), "{v}");
+        let _ = crate::wire::polled_from(json!({"requests": [v]}).to_string().as_bytes());
     }
 }
 
@@ -884,7 +884,7 @@ fn an_answer_is_written_within_the_relays_limit() {
     // 450 quotes are 900 bytes once escaped: it fits 1,000, in no more than 1,000.
     let fits = super::wire::reply_within(7, &quotes(450), 1000);
     assert!(fits.len() <= 1000 && fits.capacity() <= 1000, "{} bytes in {}", fits.len(), fits.capacity());
-    let (id, resp) = super::wire::response_from(&serde_json::from_slice(&fits).unwrap()).unwrap();
+    let (id, resp) = super::wire::response_from(&fits).unwrap();
     assert_eq!((id, resp.status, resp.body.len()), (7, 200, 450));
     // 600 are 1,200: a short error instead.
     let over: Value = serde_json::from_slice(&super::wire::reply_within(7, &quotes(600), 1000)).unwrap();
@@ -924,4 +924,52 @@ fn large_answers_are_written_out_two_at_a_time() {
     }
     assert_eq!(hosting.most_large_answers_at_once(), 2);
     hosting.stop();
+}
+
+/// An answer is read as the fields a desktop sends and nothing else: one carrying a field of
+/// millions of tiny values, or more headers than any answer has, is refused before it becomes
+/// a tree many times its size.
+#[test]
+fn an_answer_is_read_as_its_fields_only() {
+    let (_base, relay) = relay(|c| c.poll_wait = Duration::from_millis(200));
+    let call = |method: &str, target: &str, auth: Option<&str>, body: Vec<u8>| {
+        let headers = auth.map(|a| vec![("Authorization".to_string(), format!("Bearer {a}"))]).unwrap_or_default();
+        relay.handle(&Request { method: method.into(), target: target.into(), headers, body, peer: None })
+    };
+    let opened: Value = serde_json::from_slice(&call("POST", "/host/rooms", Some(TOKEN), b"{}".to_vec()).body).unwrap();
+    let (room, secret) = (opened["room"].as_str().unwrap().to_string(), opened["secret"].as_str().unwrap().to_string());
+    let asking = {
+        let (relay, room) = (relay.clone(), room.clone());
+        std::thread::spawn(move || {
+            relay.handle(&Request { method: "POST".into(), target: format!("/r/{room}/mcp"), headers: Vec::new(), body: b"{}".to_vec(), peer: None })
+        })
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    let polled: Value = serde_json::from_slice(&call("POST", &format!("/host/r/{room}/poll"), Some(&secret), Vec::new()).body).unwrap();
+    let id = polled["requests"][0]["id"].as_u64().unwrap();
+    let reply = |body: String| call("POST", &format!("/host/r/{room}/reply"), Some(&secret), body.into_bytes()).status;
+    let junk = vec!["0"; 1 << 20].join(",");
+    assert_eq!(reply(format!(r#"{{"id":{id},"status":200,"body":"{{}}","junk":[{junk}]}}"#)), 400);
+    let headers = vec![r#"["Allow","POST"]"#; 65].join(",");
+    assert_eq!(reply(format!(r#"{{"id":{id},"status":200,"body":"{{}}","headers":[{headers}]}}"#)), 400);
+    // The answer as a desktop writes it still goes through.
+    assert_eq!(reply(format!(r#"{{"id":{id},"status":200,"headers":[["Content-Type","application/json"]],"body":"{{}}"}}"#)), 204);
+    assert_eq!(asking.join().unwrap().status, 200);
+}
+
+/// The desktop reads a poll's answer as its fields only, too: a relay can't make it hold a tree
+/// many times the answer's size, or more requests or headers than a relay ever sends.
+#[test]
+fn a_polls_answer_is_read_as_its_fields_only() {
+    let request = |headers: usize| json!({"id": 1, "method": "POST", "target": "/mcp", "headers": vec![["Accept", "application/json"]; headers], "body": "{}", "ttlMs": 1000});
+    let (requests, waited) = super::wire::polled_from(json!({"requests": [request(2)], "waitedMs": 5}).to_string().as_bytes()).unwrap();
+    assert_eq!((requests.len(), waited), (1, Some(Duration::from_millis(5))));
+    assert_eq!((requests[0].0, requests[0].1.headers.len(), requests[0].2), (1, 2, Some(Duration::from_secs(1))));
+    // A field it doesn't know is skipped as it is read, not kept.
+    let junk = vec!["0"; 1 << 20].join(",");
+    let with_junk = format!(r#"{{"requests":[],"junk":[{junk}]}}"#);
+    assert_eq!(super::wire::polled_from(with_junk.as_bytes()).map(|(r, _)| r.len()), Some(0));
+    // Too many requests, or headers, and the answer is refused.
+    assert!(super::wire::polled_from(json!({"requests": vec![request(0); 65]}).to_string().as_bytes()).is_none());
+    assert!(super::wire::polled_from(json!({"requests": [request(65)]}).to_string().as_bytes()).is_none());
 }

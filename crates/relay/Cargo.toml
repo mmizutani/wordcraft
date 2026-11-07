@@ -15,6 +15,8 @@ workspace = true
 [dependencies]
 wordcraft-http = { workspace = true }
 serde_json = { workspace = true }
+# A desktop's answer is read as its fields only (a typed envelope), never as a whole JSON tree.
+serde = { workspace = true }
 log = { workspace = true }
 getrandom = { workspace = true }
 # A room's id is a hash of its secret, so only its secret opens it again, even after a restart.

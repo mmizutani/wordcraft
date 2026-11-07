@@ -23,17 +23,9 @@ fn headers_json(headers: &[(String, String)], list: &[&str]) -> Value {
 /// The longest header value passed on: longer ones are dropped (the headers passed are short).
 pub const MAX_HEADER_VALUE: usize = 8 << 10;
 
-fn headers_from(v: &Value, list: &[&str]) -> Vec<(String, String)> {
-    v.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|h| Some((h.get(0)?.as_str()?, h.get(1)?.as_str()?)))
-                .filter(|(n, v)| v.len() <= MAX_HEADER_VALUE && passed(n, list))
-                .map(|(n, v)| (n.to_string(), v.to_string()))
-                .take(32)
-                .collect()
-        })
-        .unwrap_or_default()
+/// The headers kept from `pairs`: those `list` passes, with values of a sensible length.
+fn headers_kept(pairs: Vec<(String, String)>, list: &[&str]) -> Vec<(String, String)> {
+    pairs.into_iter().filter(|(n, v)| v.len() <= MAX_HEADER_VALUE && passed(n, list)).take(32).collect()
 }
 
 /// An agent's request as the relay hands it to the desktop: `target` is what follows the room's
@@ -42,26 +34,57 @@ pub fn forward(id: u64, req: &Request, target: &str, body: &str) -> Value {
     json!({"id": id, "method": req.method, "target": target, "headers": headers_json(&req.headers, REQUEST_HEADERS), "body": body})
 }
 
-/// A forwarded request back as the request the desktop's endpoint answers, and its id.
-pub fn request_from(v: &Value) -> Option<(u64, Request)> {
-    let id = v.get("id")?.as_u64()?;
-    let method = v.get("method")?.as_str()?.to_string();
-    let target = v.get("target")?.as_str()?.to_string();
-    let body = v.get("body").and_then(Value::as_str).unwrap_or_default().as_bytes().to_vec();
-    Some((id, Request { method, target, headers: headers_from(v.get("headers").unwrap_or(&Value::Null), REQUEST_HEADERS), body, peer: None }))
+/// One forwarded request as the desktop takes it from a poll's answer: its id, the request, and
+/// how long its agent still waits from when the relay handed it on (`ttlMs`; None from a relay
+/// that doesn't say).
+pub type Forwarded = (u64, Request, Option<std::time::Duration>);
+
+/// A poll's answer: its requests, and how long the poll waited at the relay (`waitedMs`; None
+/// from a relay that doesn't say). Read as exactly those fields, never as a whole JSON tree, so a
+/// relay can't make the desktop hold a tree many times the size of its answer.
+pub fn polled_from(bytes: &[u8]) -> Option<(Vec<Forwarded>, Option<std::time::Duration>)> {
+    let p: Polled = serde_json::from_slice(bytes).ok()?;
+    let requests = p
+        .requests
+        .0
+        .into_iter()
+        .map(|f| {
+            let req = Request {
+                method: f.method,
+                target: f.target,
+                headers: headers_kept(f.headers.0, REQUEST_HEADERS),
+                body: f.body.into_bytes(),
+                peer: None,
+            };
+            (f.id, req, f.ttl_ms.map(std::time::Duration::from_millis))
+        })
+        .collect();
+    Some((requests, p.waited_ms.map(std::time::Duration::from_millis)))
 }
 
-/// How long the agent still waits for its answer, from when the relay handed the request on
-/// (`ttlMs`). None from a relay that doesn't say.
-pub fn ttl(v: &Value) -> Option<std::time::Duration> {
-    v.get("ttlMs").and_then(Value::as_u64).map(std::time::Duration::from_millis)
+#[derive(serde::Deserialize)]
+struct Polled {
+    #[serde(default)]
+    requests: Few<ForwardedRequest, MAX_POLLED>,
+    #[serde(rename = "waitedMs")]
+    waited_ms: Option<u64>,
 }
 
-/// How long a poll waited at the relay for requests (`waitedMs`). None from a relay that
-/// doesn't say.
-pub fn waited(v: &Value) -> Option<std::time::Duration> {
-    v.get("waitedMs").and_then(Value::as_u64).map(std::time::Duration::from_millis)
+#[derive(serde::Deserialize)]
+struct ForwardedRequest {
+    id: u64,
+    method: String,
+    target: String,
+    #[serde(default)]
+    headers: Few<(String, String), MAX_HEADERS>,
+    #[serde(default)]
+    body: String,
+    #[serde(rename = "ttlMs")]
+    ttl_ms: Option<u64>,
 }
+
+/// The most requests a poll's answer may carry (a relay sends at most 16).
+const MAX_POLLED: usize = 64;
 
 /// The desktop's answer to request `id`. A body that isn't UTF-8 (MCP's are JSON) is refused
 /// rather than mangled.
@@ -145,10 +168,58 @@ pub fn size(resp: &Response) -> usize {
     resp.headers.iter().fold(resp.body.len(), |n, (k, v)| n.saturating_add(k.len()).saturating_add(v.len()).saturating_add(4))
 }
 
-/// The desktop's answer back as a response for the agent, and the request it answers.
-pub fn response_from(v: &Value) -> Option<(u64, Response)> {
-    let id = v.get("id")?.as_u64()?;
-    let status = v.get("status")?.as_u64().and_then(|s| u16::try_from(s).ok()).filter(|s| (200..600).contains(s))?;
-    let body = v.get("body").and_then(Value::as_str).unwrap_or_default().as_bytes().to_vec();
-    Some((id, Response { status, headers: headers_from(v.get("headers").unwrap_or(&Value::Null), RESPONSE_HEADERS), body, ..Response::new(status) }))
+/// The desktop's answer back as a response for the agent, and the request it answers. Read as
+/// exactly the fields [`reply`] writes, never as a whole JSON tree: an answer of up to 96 MiB
+/// with a field of millions of tiny values would take many times that as a tree. A field the
+/// desktop doesn't send, or more headers than any MCP answer has, is refused unread.
+pub fn response_from(bytes: &[u8]) -> Option<(u64, Response)> {
+    let a: Answer = serde_json::from_slice(bytes).ok()?;
+    let status = u16::try_from(a.status).ok().filter(|s| (200..600).contains(s))?;
+    Some((a.id, Response { status, headers: headers_kept(a.headers.0, RESPONSE_HEADERS), body: a.body.into_bytes(), ..Response::new(status) }))
+}
+
+/// The most headers a request or an answer may carry; MCP's have a handful.
+const MAX_HEADERS: usize = 64;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Answer {
+    id: u64,
+    status: u64,
+    #[serde(default)]
+    headers: Few<(String, String), MAX_HEADERS>,
+    #[serde(default)]
+    body: String,
+}
+
+/// A JSON array of at most `MAX` items, refused past that as it is read.
+struct Few<T, const MAX: usize>(Vec<T>);
+
+impl<T, const MAX: usize> Default for Few<T, MAX> {
+    fn default() -> Self {
+        Few(Vec::new())
+    }
+}
+
+impl<'de, T: serde::Deserialize<'de>, const MAX: usize> serde::Deserialize<'de> for Few<T, MAX> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Seq<T, const MAX: usize>(std::marker::PhantomData<T>);
+        impl<'de, T: serde::Deserialize<'de>, const MAX: usize> serde::de::Visitor<'de> for Seq<T, MAX> {
+            type Value = Few<T, MAX>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "an array of at most {MAX} items")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Few<T, MAX>, A::Error> {
+                let mut out = Vec::new();
+                while let Some(item) = seq.next_element::<T>()? {
+                    if out.len() == MAX {
+                        return Err(serde::de::Error::custom("too many items"));
+                    }
+                    out.push(item);
+                }
+                Ok(Few(out))
+            }
+        }
+        d.deserialize_seq(Seq::<T, MAX>(std::marker::PhantomData))
+    }
 }
