@@ -94,7 +94,10 @@ fn the_page_s_controls_share_invite_remove_and_stop() {
     h.get_by_role_and_label(A11y::Button, "Invite").click();
     h.run_steps(3);
     let invited = state(h.state())["invited"].clone();
-    assert_eq!(invited, json!([{"name": "Fact checker", "role": "suggester", "files": null, "joined": 0}]));
+    assert_eq!(
+        invited,
+        json!([{"name": "Fact checker", "role": "suggester", "files": null, "joined": 0, "remote": false, "expires": null, "usesLeft": null}])
+    );
     let (name, key) = h.state().share_form.shown.clone().expect("the key shows");
     assert_eq!(name, "Fact checker");
     assert_eq!(key.len(), 32);

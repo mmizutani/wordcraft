@@ -757,8 +757,16 @@ fn the_owner_lists_invites_without_keys_and_revokes_one_by_name() {
     assert_eq!(
         room.invites(),
         [
-            Invited { name: "Ana".into(), role: Role::Editor, files: None, joined: 2 },
-            Invited { name: "Ben".into(), role: Role::Viewer, files: Some(crate::agent_files::AgentFiles::None), joined: 0 },
+            Invited { name: "Ana".into(), role: Role::Editor, files: None, joined: 2, expires: None, uses_left: None, remote: false },
+            Invited {
+                name: "Ben".into(),
+                role: Role::Viewer,
+                files: Some(crate::agent_files::AgentFiles::None),
+                joined: 0,
+                expires: None,
+                uses_left: None,
+                remote: false
+            },
         ]
     );
     assert!(!format!("{:?}", room.invites()).contains(&ana_key), "no key in what the owner sees");

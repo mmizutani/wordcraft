@@ -170,7 +170,7 @@ test source in File › Options › Language and on the bar's Install.
 | `render_page` | a page as PNG |
 | `parity` | feature coverage |
 | `screenshot`, `click`, `key`, `ui_inspect` | app only (`--connect`) |
-| `room` | share the document the app's window shows with other agents, and hand out their keys: `{action: "share" \| "invite" \| "revoke" \| "role" \| "participants" \| "stop", name?, role?, files?, key?}` (app only; see [Shared documents](#shared-documents)) |
+| `room` | share the document the app's window shows with other agents, and hand out their keys: `{action: "share" \| "invite" \| "revoke" \| "role" \| "participants" \| "stop", name?, role?, files?, key?, remote?, expiresIn?, uses?}` (app only; see [Shared documents](#shared-documents)) |
 
 ### Several documents
 
@@ -309,7 +309,17 @@ everyone else's edits in; when someone changed what the step changed since, they
 who. `get_changes` shows the window's changes and other agents' alike. Files,
 other documents and the window (`open_document`, `save_document`, `list_documents`,
 `screenshot`, `click`, `key`, `ui_inspect`) and the room's other actions are the owner's, but
-`save_document` with a `.pdf` or `.png` path exports a copy of the shared document.
+`save_document` with a `.pdf` or `.png` path exports a copy of the shared document. `execute`
+with `file.exportPdf` or `file.exportPng` and no `path` hands the PDF or page back in the reply
+(base64 `pdf` or `png`, up to 32 MB), for an agent with no file to write to.
+
+An agent on another machine (a sandbox reaching this computer through a tunnel) is invited with
+`{"action": "invite", "name": "Sandbox", "remote": true}`: never the owner, no file unless
+`files` names some, and a key that stops working after a day unless `expiresIn` (seconds) says
+otherwise; `uses: 1` lets it join once. The reply's `connect` and `tunnel` are the lines to run in
+the sandbox and on this computer; see
+[Agents on other machines](control-protocol.md#agents-on-other-machines). Only an invite's key
+goes to a sandbox, never the window's.
 
 Which files the agent's commands can use is the person's choice, in the app's File › Options ›
 Agents: none (the default), only the folders listed there, each read-only or read and write, or

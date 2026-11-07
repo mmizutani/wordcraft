@@ -57,7 +57,7 @@ mod hub;
 mod replica;
 pub(crate) mod rules;
 
-pub use hub::{Accepted, Bounce, Hub, Invited, MAX_BATCH, MAX_INVITES, MAX_KEPT, MAX_KEPT_BYTES, MAX_PARTICIPANTS, Took};
+pub use hub::{Accepted, Bounce, Hub, Invited, MAX_BATCH, MAX_INVITES, MAX_KEPT, MAX_KEPT_BYTES, MAX_PARTICIPANTS, Terms, Took};
 pub use replica::{Replica, Stats};
 
 /// A participant of a room, numbered from 1 in the order they joined.
@@ -164,8 +164,8 @@ pub struct Participant {
 /// Why a room didn't let someone in.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RoomError {
-    /// No invite has the key, or it was taken back.
-    #[error("no invite has this key")]
+    /// No invite has the key: it was taken back, its time was up, or there never was one.
+    #[error("no invite has this key: it was taken back, its time was up, or it was never handed out")]
     UnknownKey,
     /// The name can't be a participant's, or an invite has it already.
     #[error("{0}")]
@@ -176,6 +176,10 @@ pub enum RoomError {
     /// The room was closed: its document isn't shared any more.
     #[error("the document isn't shared any more")]
     Closed,
+    /// What an invite asks for isn't allowed: the owner's role for a participant on another
+    /// machine, or another join with a key that has joined as many times as it may.
+    #[error("{0}")]
+    NotAllowed(String),
 }
 
 /// What a room calls when its hub accepted changes or it closed: the app's window asks to be
@@ -300,8 +304,14 @@ impl Room {
 
     /// The hub, whatever a thread that panicked while holding it left (the hub changes its
     /// state only once a change is accepted whole).
+    /// Invites whose time is up are taken back first ([`Hub::expire`]), so whoever reads or
+    /// changes the room sees them gone.
     fn hub(&self) -> MutexGuard<'_, Hub> {
-        self.hub.lock().unwrap_or_else(PoisonError::into_inner)
+        let mut hub = self.hub.lock().unwrap_or_else(PoisonError::into_inner);
+        if hub.expire(crate::cmd::now_unix()) {
+            self.withdraw();
+        }
+        hub
     }
 
     /// The document's latest version: how many changes the hub has accepted.
@@ -406,6 +416,12 @@ impl Room {
     /// than the room's setting allows ([`Room::set_agent_files`]); `None`: what the setting says.
     pub fn invite_with(&self, name: &str, role: Role, files: Option<AgentFiles>) -> Result<String, RoomError> {
         self.hub().invite_with(name, role, files)
+    }
+
+    /// [`Room::invite`] on `terms` ([`Hub::invite_on`]): which files, until when, how many joins,
+    /// and whether the participant is on another machine.
+    pub fn invite_on(&self, name: &str, role: Role, terms: Terms) -> Result<String, RoomError> {
+        self.hub().invite_on(name, role, terms)
     }
 
     /// From now on, agents' commands can use `files` (with `folders` for

@@ -170,7 +170,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .params(r#"{"name"?: your name in the document (the author name by default)} → {"shared", "document", "version", "you", "participants", "invited", "agentFiles"}"#)
             .pure(),
         CommandSpec::new("room.invite", "Invite to Shared Document", "File › Share", |_, _| Err(window_only("room.invite")))
-            .params(r#"{"name": who, "role"?: "viewer"|"commenter"|"suggester" (default)|"editor"|"owner", "files"?: "none"|"folders"|"all"} → {"key", "name", "role", "files"}"#)
+            .params(r#"{"name": who, "role"?: "viewer"|"commenter"|"suggester" (default)|"editor"|"owner", "files"?: "none"|"folders"|"all", "remote"?: bool (an agent on another machine: never owner, no files unless named, a day unless expiresIn), "expiresIn"?: seconds (60 to 30 days), "uses"?: n (joins)} → {"key", "name", "role", "files", "remote", "expires", "uses", "connect"?, "tunnel"?}"#)
             .pure(),
         CommandSpec::new("room.role", "Change Participant's Role", "File › Share", |_, _| Err(window_only("room.role")))
             .params(r#"{"name": an invited participant, "role": "viewer"|"commenter"|"suggester"|"editor"|"owner"} → {"changed", "name", "role"}"#)

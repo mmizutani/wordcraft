@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use wordcraft_engine::agent_files::AgentFiles;
-use wordcraft_engine::room::{Lobby, Replica, Role, Room};
+use wordcraft_engine::room::{Lobby, Replica, Role, Room, Terms};
 use wordcraft_engine::scope::Scope;
 use wordcraft_engine::{CmdError, Session};
 
@@ -221,7 +221,17 @@ impl WordApp {
                     .room
                     .invites()
                     .into_iter()
-                    .map(|i| json!({"name": i.name, "role": i.role, "files": i.files.map(AgentFiles::name), "joined": i.joined}))
+                    .map(|i| {
+                        json!({
+                            "name": i.name,
+                            "role": i.role,
+                            "files": i.files.map(AgentFiles::name),
+                            "joined": i.joined,
+                            "remote": i.remote,
+                            "expires": i.expires,
+                            "usesLeft": i.uses_left,
+                        })
+                    })
                     .collect();
                 json!({
                     "shared": true,
@@ -237,16 +247,26 @@ impl WordApp {
     }
 }
 
+/// How long a remote invite's key works when `room.invite` doesn't say: a day.
+const DEFAULT_REMOTE_EXPIRY: u64 = 24 * 60 * 60;
+/// The shortest and longest `expiresIn`: a minute, and 30 days.
+const MIN_EXPIRY: u64 = 60;
+const MAX_EXPIRY: u64 = 30 * 24 * 60 * 60;
+
 /// The control channel's methods for the document the window shares, which only its owner (the
 /// window's key) calls; `None` for other methods.
 ///
 /// - `room.share {name?}`: share the active document; the window joins as its owner, under
 ///   `name` or the author name.
-/// - `room.invite {name, role?, files?}`: a key for a participant called `name` with `role`
-///   (viewer, commenter, suggester (the default), editor or owner), who joins with it
-///   (`docs/control-protocol.md`, Shared documents). Their commands use the files File › Options ›
-///   Agents allows, or fewer when `files` says so: `none`, `folders` (that pane's folders) or
-///   `all`, never more than the setting.
+/// - `room.invite {name, role?, files?, remote?, expiresIn?, uses?}`: a key for a participant
+///   called `name` with `role` (viewer, commenter, suggester (the default), editor or owner), who
+///   joins with it (`docs/control-protocol.md`, Shared documents). Their commands use the files
+///   File › Options › Agents allows, or fewer when `files` says so: `none`, `folders` (that pane's
+///   folders) or `all`, never more than the setting. `remote` (an agent on another machine): never
+///   the owner, no files unless `files` names some, and the key stops working after a day unless
+///   `expiresIn` says otherwise; the reply then carries the lines to connect through an SSH tunnel.
+///   `expiresIn`: seconds until the key stops working (60 to 30 days). `uses`: how many times it
+///   joins.
 /// - `room.revoke {key | name}`: take an invite back, by its key or by the name it was for (the key
 ///   shows once); the copies that joined with it stop answering.
 /// - `room.role {name, role}`: give an invited participant another role from now on.
@@ -269,8 +289,43 @@ pub(crate) fn room_method(app: &mut WordApp, method: &str, p: &Value) -> Option<
                 None => None,
                 Some(v) => Some(v.as_str().and_then(AgentFiles::named).ok_or("`files`: none, folders or all")?),
             };
-            let key = room.invite_with(name, role, files).map_err(|e| e.to_string())?;
-            Ok(json!({"key": key, "name": name.trim(), "role": role, "files": files.map(AgentFiles::name)}))
+            let remote = match p.get("remote").filter(|v| !v.is_null()) {
+                None => false,
+                Some(v) => v.as_bool().ok_or("`remote`: true or false")?,
+            };
+            let expires_in = match p.get("expiresIn").filter(|v| !v.is_null()) {
+                // A key that leaves this computer stops working within a day unless the owner says otherwise.
+                None => remote.then_some(DEFAULT_REMOTE_EXPIRY),
+                Some(v) => Some(
+                    v.as_u64()
+                        .filter(|n| (MIN_EXPIRY..=MAX_EXPIRY).contains(n))
+                        .ok_or(format!("`expiresIn`: whole seconds from {MIN_EXPIRY} to {MAX_EXPIRY} (30 days)"))?,
+                ),
+            };
+            let uses = match p.get("uses").filter(|v| !v.is_null()) {
+                None => None,
+                Some(v) => Some(v.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| *n >= 1).ok_or("`uses`: a whole number from 1")?),
+            };
+            let expires = expires_in.map(|secs| wordcraft_engine::cmd::now_unix().saturating_add(secs));
+            let terms = Terms { files, expires, uses, remote };
+            let key = room.invite_on(name, role, terms).map_err(|e| e.to_string())?;
+            // A remote invite's files are none unless it named some (`Hub::invite_on`).
+            let files = if remote { Some(files.unwrap_or(AgentFiles::None)) } else { files };
+            let mut reply = json!({
+                "key": key,
+                "name": name.trim(),
+                "role": role,
+                "files": files.map(AgentFiles::name),
+                "remote": remote,
+                "expires": expires,
+                "uses": uses,
+            });
+            if remote && let Some(addr) = app.lobby.addr() {
+                let port = addr.port();
+                reply["connect"] = json!(format!("WORDCRAFT_CONTROL_KEY={key} wordcraft-cli mcp --connect 127.0.0.1:{port}"));
+                reply["tunnel"] = json!(format!("ssh -N -R {port}:127.0.0.1:{port} <sandbox>"));
+            }
+            Ok(reply)
         })(),
         "room.revoke" => (|| {
             let room = room()?;
@@ -304,6 +359,7 @@ mod tests {
     use serde_json::{Value, json};
     use wordcraft_doc::{Document, StoryRef};
     use wordcraft_engine::Session;
+    use wordcraft_engine::agent_files::AgentFiles;
     use wordcraft_engine::room::{Lobby, Replica, hosted};
 
     use crate::control::{self, ControlRequest, Outcome};
@@ -404,6 +460,54 @@ mod tests {
         assert_eq!(files, [("Minoru", &Value::Null), ("Researcher", &json!("folders")), ("Proofreader", &json!("none"))]);
         assert_eq!(state["agentFiles"], "folders");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An invite for an agent on another machine (#74): never the owner, no files unless it
+    /// names some, a day unless it says, the lines to connect through a tunnel; junk terms are
+    /// refused.
+    #[test]
+    fn a_remote_invite_is_held_back_and_says_how_to_connect() {
+        let lobby = Lobby::default();
+        lobby.set_addr(Some("127.0.0.1:43210".parse().unwrap()));
+        let mut a = window(&lobby);
+        result(&mut a, "room.share", json!({}));
+        result(&mut a, "engine.execute", json!({"command": "file.options", "params": {"agentFiles": "all"}}));
+        let now = wordcraft_engine::cmd::now_unix();
+        let r = result(&mut a, "room.invite", json!({"name": "Sandbox", "remote": true}));
+        assert_eq!((r["remote"].clone(), r["files"].clone(), r["role"].clone()), (json!(true), json!("none"), json!("suggester")));
+        let expires = r["expires"].as_u64().unwrap();
+        assert!((now + 86_400..=now + 86_402).contains(&expires), "a day: {expires}");
+        let key = r["key"].as_str().unwrap();
+        assert_eq!(r["connect"], format!("WORDCRAFT_CONTROL_KEY={key} wordcraft-cli mcp --connect 127.0.0.1:43210"));
+        assert_eq!(r["tunnel"], "ssh -N -R 43210:127.0.0.1:43210 <sandbox>");
+        let copy = lobby.join_with(key).unwrap();
+        assert_eq!(a.shared_room().unwrap().files_for(copy.id()).0, AgentFiles::None, "the setting says all, a remote invite none");
+
+        let r = result(&mut a, "room.invite", json!({"name": "Hour", "expiresIn": 3600, "uses": 1}));
+        assert_eq!((r["remote"].clone(), r["uses"].clone()), (json!(false), json!(1)));
+        assert!(r["expires"].as_u64().unwrap() >= now + 3600);
+        assert_eq!(r.get("connect"), None, "only remote invites get the lines");
+        let invited = result(&mut a, "room.participants", json!({}))["invited"].clone();
+        let hour = invited.as_array().unwrap().iter().find(|i| i["name"] == "Hour").unwrap().clone();
+        assert_eq!((hour["usesLeft"].clone(), hour["remote"].clone()), (json!(1), json!(false)));
+        assert_eq!(hour.get("key"), None);
+
+        let e = call(&mut a, "room.invite", json!({"name": "Boss", "role": "owner", "remote": true}));
+        assert!(e["error"].as_str().unwrap().contains("can't be the owner"), "{e}");
+        for (k, junk, says) in [
+            ("expiresIn", json!(59), "expiresIn"),
+            ("expiresIn", json!(2_592_001), "expiresIn"),
+            ("expiresIn", json!(-1), "expiresIn"),
+            ("expiresIn", json!("1h"), "expiresIn"),
+            ("uses", json!(0), "uses"),
+            ("uses", json!(1.5), "uses"),
+            ("uses", json!(u64::MAX), "uses"),
+            ("remote", json!("yes"), "remote"),
+        ] {
+            let e = call(&mut a, "room.invite", json!({"name": "Eve", k: junk}));
+            assert!(e["error"].as_str().is_some_and(|m| m.contains(says)), "{k} {junk}: {e}");
+        }
+        assert!(result(&mut a, "room.participants", json!({}))["invited"].as_array().unwrap().iter().all(|i| i["name"] != "Eve"));
     }
 
     #[test]
