@@ -197,6 +197,32 @@ fn a_place_left_at_a_paragraph_s_end_moves_as_in_its_copy_when_the_paragraph_mov
 }
 
 #[test]
+fn a_place_left_at_a_cell_paragraph_s_end_stays_there_when_a_row_is_put_in() {
+    // As above, in a table cell, and Bob then puts a row in, which replaces the table whole:
+    // the paragraph's text is the same in the table put back, so Ada is still before "!!".
+    let mut s = Session::new(Document::from_text("before\nr1\tx\nr2\ty"));
+    s.run("select.range", &json!({"anchor": Pos::body(1, 0), "focus": Pos::body(2, 4)})).unwrap();
+    s.run("table.fromText", &json!({})).unwrap();
+    let cell = |para: u32, off: usize| Pos { story: StoryRef::Body, path: Path(vec![1, 0, 1, para]), off };
+    s.run("caret.set", &json!({"pos": cell(0, 1)})).unwrap();
+    s.run("text.newParagraph", &json!({})).unwrap();
+    s.run("text.insert", &json!({"text": "last one"})).unwrap();
+    let room = Room::new(s.doc.clone());
+    let mut ada = join(&room, "Ada");
+    let mut bob = join(&room, "Bob");
+    run(&mut ada, "caret.set", json!({"pos": cell(1, 4)}));
+    ada.present();
+    run(&mut bob, "select.range", json!({"anchor": cell(0, 1), "focus": cell(1, 8)}));
+    run(&mut bob, "text.delete", json!({}));
+    run(&mut bob, "text.insert", json!({"text": "!!"}));
+    run(&mut bob, "table.insertRowBelow", json!({}));
+    bob.send();
+    ada.receive();
+    assert_eq!(ada.session().sel.focus, cell(0, 1));
+    assert_eq!(seen(&mut bob, ada.id()), Some(mine(&ada)));
+}
+
+#[test]
 fn a_new_selection_with_the_numbers_of_an_old_place_reaches_the_others() {
     // Ada selects "two"; Bob types before it, so the room has her further on; she then selects
     // "one", which has the offsets "two" had: the others see her on "one".

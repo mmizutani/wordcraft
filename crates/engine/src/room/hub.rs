@@ -441,9 +441,8 @@ impl Hub {
     /// paragraph had then (the end of a table's last paragraph, for a table). Worked out from
     /// the paragraph's length at the first change after `k` that took it out whole (moved or
     /// replaced it: the change says how long it was), else as it is now, less what the changes
-    /// after `k` before that put in it and plus what they took out. `a` as it is when a change
-    /// after `k` took out the table the paragraph is in, put the paragraph in without taking it
-    /// out, or it isn't in the document.
+    /// after `k` before that put in it and plus what they took out. `a` as it is when the
+    /// paragraph isn't in the document.
     fn end_after(&self, a: Anchor, k: usize) -> Anchor {
         if a.off != usize::MAX {
             return a;
@@ -461,14 +460,11 @@ impl Hub {
                     took = took.saturating_add(chars.removed);
                 }
             }
-            for s in &c.splices {
-                if let Some(old) = s.removed.iter().find(|o| o.id == block) {
-                    len = Some(old.len);
-                    break 'later;
-                }
-                if s.removed.iter().any(|o| o.inside.contains(&block)) || s.inserted.iter().any(|b| b.0.id() == block) {
-                    return a;
-                }
+            // A table taken out whole and put back (a row put in) keeps the paragraph's text,
+            // or the place went with it ([`ChangeSet::map`]), so it changes no length.
+            if let Some(old) = c.splices.iter().find_map(|s| s.removed.iter().find(|o| o.id == block)) {
+                len = Some(old.len);
+                break 'later;
             }
         }
         let len = len.unwrap_or_else(|| para.len());
