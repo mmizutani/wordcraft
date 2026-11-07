@@ -357,6 +357,34 @@ fn a_key_taken_back_loses_its_place_even_asking_only_for_the_tool_list() {
     assert_eq!(e.keys(), 0, "its place went");
 }
 
+/// A request takes the most its answer may hold before it runs, not only once it has run:
+/// requests let in together while little is held can't, between them, hold more than the
+/// budget. One that can't get its share before its caller gives up never runs.
+#[test]
+fn a_running_request_holds_its_answers_room_before_it_runs() {
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "inspect_document", "arguments": {}}});
+    let size = endpoint(Options::default()).0.handle(&post(Some("ana"), &call, &[])).body.len();
+    // Room for one answer and a half; each request may take one.
+    let options = Options { max_sending: size * 3 / 2, max_answer: size + 10, timeout: Duration::from_millis(300), ..Options::default() };
+    let (e, app) = endpoint(options);
+    let runs = |app: &App| app.calls.lock().unwrap().iter().filter(|(_, m)| m != "auth").count();
+    let unsent = e.handle(&post(Some("ana"), &call, &[]));
+    assert_eq!(unsent.status, 200);
+    let before = runs(&app);
+    // Less than the budget is held, so it is let in, but its answer's room isn't there.
+    let r = e.handle(&post(Some("ben"), &call, &[]));
+    assert_eq!(r.status, 503, "{:?}", body(&r));
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(runs(&app), before, "it never ran");
+    drop(unsent);
+    assert_eq!(e.handle(&post(Some("ben"), &call, &[])).status, 200);
+    // An answer larger than the most one may be is an error that says so.
+    let (small, _) = endpoint(Options { max_answer: 10, ..Options::default() });
+    let r = small.handle(&post(Some("ana"), &call, &[]));
+    assert_eq!(body(&r)["error"]["code"], -32603, "{:?}", body(&r));
+    assert_eq!(body(&r)["id"], 1);
+}
+
 /// A refused request closes its connection, so a client without a key can't hold one of the
 /// endpoint's connections by sending a request now and then; a served one keeps it open.
 #[test]

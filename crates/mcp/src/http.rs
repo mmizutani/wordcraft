@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -50,7 +50,11 @@ pub struct Options {
     pub timeout: Duration,
     /// Answers' bytes waiting to be sent, in all: more are refused (503) until clients have read
     /// some, so slow readers can't make the endpoint hold copy after copy of a large document.
+    /// A request takes [`Options::max_answer`] of it while it runs, and its answer's size once
+    /// it has run, so what is held never passes it.
     pub max_sending: usize,
+    /// The largest answer sent over HTTP; a larger one is answered with an error saying so.
+    pub max_answer: usize,
     /// How often a key's connection asks the app again whether it still takes the key. Some
     /// requests (tools/list, server/discover) are answered without the app, so a key taken back
     /// would otherwise keep its connection, and its place, for as long as it kept asking.
@@ -67,6 +71,8 @@ impl Default for Options {
             timeout: Duration::from_secs(150),
             recheck: Duration::from_secs(15),
             max_sending: 256 << 20,
+            // A 32 MB PDF as base64, in JSON.
+            max_answer: 64 << 20,
         }
     }
 }
@@ -76,6 +82,10 @@ struct Answer {
     reply: Option<String>,
     /// The app refused the key: the thread has ended.
     ended: bool,
+    /// The reply's share of [`Options::max_sending`], kept until it has been sent.
+    share: Option<Share>,
+    /// The request didn't run: earlier answers were still being sent until its caller gave up.
+    busy: bool,
 }
 
 /// Requests one key may have waiting for its connection; more are answered 503 at once, so a
@@ -103,19 +113,59 @@ pub struct Endpoint {
     /// Keys being checked with the app right now (each may wait for the app's slowdown of wrong
     /// keys); more than a few at once are refused rather than queued.
     opening: AtomicUsize,
-    /// Answers' bytes waiting to be sent.
-    sending: Arc<AtomicUsize>,
+    /// Answers' bytes waiting to be sent, and requests running.
+    budget: Arc<Budget>,
 }
 
-/// An answer's share of [`Options::max_sending`], given back once it has been sent.
-struct Sending {
-    counter: Arc<AtomicUsize>,
+/// [`Options::max_sending`]: the bytes held now, by answers waiting to be sent and requests
+/// running.
+struct Budget {
+    used: Mutex<usize>,
+    freed: Condvar,
+    max: usize,
+}
+
+impl Budget {
+    fn used(&self) -> usize {
+        self.used.lock().map(|u| *u).unwrap_or(usize::MAX)
+    }
+
+    /// Take `bytes`, waiting until `until` for others to give some back. One taker always fits
+    /// when nothing else is held.
+    fn take(self: &Arc<Self>, bytes: usize, until: Instant) -> Option<Share> {
+        let mut used = self.used.lock().ok()?;
+        while *used > 0 && used.saturating_add(bytes) > self.max {
+            let left = until.checked_duration_since(Instant::now()).filter(|l| !l.is_zero())?;
+            used = self.freed.wait_timeout(used, left).ok()?.0;
+        }
+        *used = used.saturating_add(bytes);
+        Some(Share { budget: self.clone(), bytes })
+    }
+}
+
+/// A share of the [`Budget`], given back when dropped.
+struct Share {
+    budget: Arc<Budget>,
     bytes: usize,
 }
 
-impl Drop for Sending {
+impl Share {
+    /// Make it `bytes`: what the answer it was taken for turned out to hold.
+    fn resize(&mut self, bytes: usize) {
+        if let Ok(mut used) = self.budget.used.lock() {
+            *used = used.saturating_sub(self.bytes).saturating_add(bytes);
+        }
+        self.bytes = bytes;
+        self.budget.freed.notify_all();
+    }
+}
+
+impl Drop for Share {
     fn drop(&mut self) {
-        self.counter.fetch_sub(self.bytes, Ordering::SeqCst);
+        if let Ok(mut used) = self.budget.used.lock() {
+            *used = used.saturating_sub(self.bytes);
+        }
+        self.budget.freed.notify_all();
     }
 }
 
@@ -159,12 +209,13 @@ fn check_headers(req: &Request, msg: &Value) -> Result<(), String> {
 
 impl Endpoint {
     pub fn new(options: Options, open: Opener) -> Self {
+        let max = options.max_sending;
         Endpoint {
             options,
             open: Arc::new(open),
             seats: Mutex::new(HashMap::new()),
             opening: AtomicUsize::new(0),
-            sending: Arc::new(AtomicUsize::new(0)),
+            budget: Arc::new(Budget { used: Mutex::new(0), freed: Condvar::new(), max }),
         }
     }
 
@@ -245,7 +296,7 @@ impl Endpoint {
         }
         // While clients are slow to read what was already answered, nothing new runs: refused
         // before it runs, a request is safe to send again.
-        if self.sending.load(Ordering::SeqCst) >= self.options.max_sending {
+        if self.budget.used() >= self.options.max_sending {
             return refusal(503, -32603, "the endpoint is still sending earlier answers: try again").with_header("Retry-After", "1");
         }
         let answer = match self.ask(key, body.to_string()) {
@@ -253,12 +304,9 @@ impl Endpoint {
             Err(resp) => return resp,
         };
         match answer {
-            None => Response::new(202),
-            Some(reply) => {
+            (None, _) => Response::new(202),
+            (Some(reply), share) => {
                 // Counted until it has been sent (the request ran: its answer is never dropped).
-                let bytes = reply.len();
-                self.sending.fetch_add(bytes, Ordering::SeqCst);
-                let share = Sending { counter: self.sending.clone(), bytes };
                 let status = if stateless { status_of(&reply) } else { 200 };
                 Response::json(status, reply).holding(share)
             }
@@ -266,7 +314,7 @@ impl Endpoint {
     }
 
     /// Run `body` on `key`'s thread, opening it first when it has none.
-    fn ask(&self, key: &str, body: String) -> Result<Option<String>, Response> {
+    fn ask(&self, key: &str, body: String) -> Result<(Option<String>, Option<Share>), Response> {
         for _ in 0..2 {
             let jobs = self.seat(key)?;
             let (tx, rx) = mpsc::channel();
@@ -288,7 +336,10 @@ impl Endpoint {
                     Err(refusal(401, -32600, "the WordCraft app no longer takes this key: it was taken back, or its time was up")
                         .with_header("WWW-Authenticate", "Bearer realm=\"wordcraft\", error=\"invalid_token\""))
                 }
-                Ok(a) => Ok(a.reply),
+                Ok(a) if a.busy => {
+                    Err(refusal(503, -32603, "the endpoint is still sending earlier answers: try again").with_header("Retry-After", "1"))
+                }
+                Ok(a) => Ok((a.reply, a.share)),
                 Err(mpsc::RecvTimeoutError::Timeout) => Err(refusal(504, -32603, "the WordCraft app took too long to answer")),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.forget(key);
@@ -338,6 +389,7 @@ impl Endpoint {
         let (jobs, inbox) = mpsc::sync_channel::<Job>(QUEUE);
         let (ready_tx, ready) = mpsc::channel::<Result<(), Response>>();
         let (open, key, idle, recheck) = (self.open.clone(), key.to_string(), self.options.idle, self.options.recheck);
+        let (budget, max_answer) = (self.budget.clone(), self.options.max_answer);
         let spawned = std::thread::Builder::new().name("mcp http key".into()).spawn(move || {
             let mut backend = match open(&key) {
                 Ok(b) => b,
@@ -379,7 +431,7 @@ impl Endpoint {
                 }
             }
             let _ = ready_tx.send(Ok(()));
-            serve_key(Server::new(backend), &inbox, idle, recheck);
+            serve_key(Server::new(backend), &inbox, idle, recheck, &budget, max_answer);
         });
         if spawned.is_err() {
             return Err(refusal(503, -32603, "no thread for this participant"));
@@ -393,7 +445,7 @@ impl Endpoint {
 }
 
 /// A key's thread: answer its requests in turn until it idles out or the app refuses the key.
-fn serve_key(mut server: Server, inbox: &Receiver<Job>, idle: Duration, recheck: Duration) {
+fn serve_key(mut server: Server, inbox: &Receiver<Job>, idle: Duration, recheck: Duration, budget: &Arc<Budget>, max_answer: usize) {
     let mut checked = Instant::now();
     while let Ok(job) = inbox.recv_timeout(idle) {
         if Instant::now() >= job.until {
@@ -404,7 +456,7 @@ fn serve_key(mut server: Server, inbox: &Receiver<Job>, idle: Duration, recheck:
             checked = Instant::now();
             let refused = server.backend().call("auth", json!({})).is_err_and(|e| e.starts_with("unauthorized"));
             if refused || server.backend().ended().is_some() {
-                let _ = job.answer.send(Answer { reply: None, ended: true });
+                let _ = job.answer.send(Answer { reply: None, ended: true, share: None, busy: false });
                 return;
             }
             // Asking took time: the caller may have stopped waiting meanwhile.
@@ -412,18 +464,36 @@ fn serve_key(mut server: Server, inbox: &Receiver<Job>, idle: Duration, recheck:
                 continue;
             }
         }
-        let reply = server.handle_line(&job.body);
+        // The most its answer may hold, taken before it runs: what running requests and unsent
+        // answers hold together never passes the budget. Until there's room, it waits, and once
+        // its caller has given up it is dropped unrun.
+        // It stops waiting a little before its caller does, so the caller hears why.
+        let left = job.until.saturating_duration_since(Instant::now());
+        let give_up = job.until.checked_sub((left / 2).min(Duration::from_millis(250))).unwrap_or(job.until);
+        let Some(mut share) = budget.take(max_answer.min(budget.max), give_up) else {
+            let _ = job.answer.send(Answer { reply: None, ended: false, share: None, busy: true });
+            continue;
+        };
+        let reply = server.handle_line(&job.body).map(|r| if r.len() > max_answer { too_large(&job.body, r.len(), max_answer) } else { r });
+        share.resize(reply.as_ref().map_or(0, String::len));
         // A failed request may be the first sign that the key was taken back (the copy says so
         // and its connection closes): ask the app whether it still takes the key.
         if reply.as_deref().is_some_and(failed) && server.backend().ended().is_none() {
             let _ = server.backend().call("auth", json!({}));
         }
         let ended = server.backend().ended().is_some();
-        let _ = job.answer.send(Answer { reply, ended });
+        let _ = job.answer.send(Answer { reply, ended, share: Some(share), busy: false });
         if ended {
             return;
         }
     }
+}
+
+/// The error that stands for an answer of `len` bytes, more than `max` (the request ran).
+fn too_large(body: &str, len: usize, max: usize) -> String {
+    let id = serde_json::from_str::<Value>(body).ok().and_then(|v| v.get("id").cloned()).unwrap_or(Value::Null);
+    let message = format!("the answer is {} MiB, more than this endpoint sends at once ({} MiB): ask for less", len >> 20, max >> 20);
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": message}}).to_string()
 }
 
 /// Whether a reply is an error, or a tool's result that says it failed.
