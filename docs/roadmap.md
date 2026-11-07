@@ -1,6 +1,6 @@
 # WordCraft roadmap: milestones and what's next
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-11-07 · **Change:** minor (co-editing milestones A0–A6, with [collaboration.md](collaboration.md) as their design, #40); previously minor (M15: Arabic mirrored UI #1195; 28 UI languages; Hebrew UI and native IME acceptance remain open); previously trivial (HTML import keeps preformatted lines with CR, CRLF or LF input newlines (#4810); numeric character references retain their separate meaning; readiness estimates unchanged; previously trivial: egui 0.37 migration: 27 interface languages remain pinned by `craft-i18n.rev` (9205108…), and the input-method handling has synthetic regressions while managed CI passed and native acceptance (#155–#164) remains open; previously trivial: M6: Manage Sources imports Word's `Sources.xml`, #2640; previously minor: Czech proofing review fixes; previously minor: Portuguese proofing; previously minor: Polish interface and Polish proofing; previously trivial: M7: formatting revisions landed, #41; previously trivial: M5: Draw Table and Eraser landed, #303; previously minor: beta distance restated: ~15 points, ~150–230 h; previously: alpha gate checked: six core workflows pass; previously major: milestones moved here from ROADMAP.md; Current focus set from the re-measured gaps) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-11-07 · **Change:** trivial (co-editing A1: presence done, #32); previously minor (co-editing milestones A0–A6, with [collaboration.md](collaboration.md) as their design, #40); previously minor (M15: Arabic mirrored UI #1195; 28 UI languages; Hebrew UI and native IME acceptance remain open); previously trivial (HTML import keeps preformatted lines with CR, CRLF or LF input newlines (#4810); numeric character references retain their separate meaning; readiness estimates unchanged; previously trivial: egui 0.37 migration: 27 interface languages remain pinned by `craft-i18n.rev` (9205108…), and the input-method handling has synthetic regressions while managed CI passed and native acceptance (#155–#164) remains open; previously trivial: M6: Manage Sources imports Word's `Sources.xml`, #2640; previously minor: Czech proofing review fixes; previously minor: Portuguese proofing; previously minor: Polish interface and Polish proofing; previously trivial: M7: formatting revisions landed, #41; previously trivial: M5: Draw Table and Eraser landed, #303; previously minor: beta distance restated: ~15 points, ~150–230 h; previously: alpha gate checked: six core workflows pass; previously major: milestones moved here from ROADMAP.md; Current focus set from the re-measured gaps) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4
 
 Forward-looking plan. The summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work list is
 [`gaps.md`](gaps.md); the numbers are in [`target-app-parity.md`](target-app-parity.md). Hours are
@@ -74,7 +74,7 @@ milestone's gate are in [collaboration.md](collaboration.md).
 | Milestone | Status | Gate |
 |---|---|---|
 | A0 Foundations: block ids, changes any copy applies, command scopes, hub spike, design doc | done | A second copy follows a person's edits exactly |
-| A1 Shared instance, in one process (#29) | rooms, roles and keys, agents' copies, agents' file setting, undo per participant, File › Share (#33) done; presence (#32) and the gate test (#34) left | Two agents and a person edit at once, with no stalls |
+| A1 Shared instance, in one process (#29) | rooms, roles and keys, agents' copies, agents' file setting, undo per participant, File › Share (#33), presence (#32) done; the gate test (#34) left | Two agents and a person edit at once, with no stalls |
 | A2 Agent API (#35) | not started | Scenario steps 1 to 4 with scripted agents |
 | A3 Network rooms, offline editing (#36) | remote-safe invites done (#74); MCP over HTTP (#75) and an outbound relay (#76) next | Hub killed or a laptop offline for an hour: nothing lost |
 | A4 Hardening (#37) | not started | Simulation clean, latency targets met |
@@ -90,6 +90,7 @@ languages, screen-reader access, ecosystem decisions (VBA, add-ins, cloud), an i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-07 | trivial | Co-editing A1: presence (#32) done |
 | 2026-11-07 | minor | Co-editing milestones A0–A6 with their status and gates; design in [collaboration.md](collaboration.md) (#40) |
 | 2026-11-03 | trivial | DOCX text-frame anchor locks survive JSON and two save/reopen cycles, including position and size edits |
 | 2026-11-03 | minor | M15: Arabic mirrored interface (#1195); 28 UI languages from craft-i18n; Hebrew UI, native-speaker review and native IME acceptance (#155–#164) remain open |
