@@ -52,9 +52,11 @@ impl Writer<'_> {
     }
 
     fn para_inner(&mut self, w: &mut W, p: &Paragraph, rels: &mut PartRels, top: bool, depth: usize, framed: bool) {
-        let para_id = self.take_para_id(p);
-        match &para_id {
-            Some(id) => w.open("w:p", &[("w14:paraId", id), ("w14:textId", "77777777")]),
+        match self.take_para_id(p) {
+            Some(crate::write::para_ids::ParaTag { para_id, block_id: Some(full) }) => {
+                w.open("w:p", &[("w14:paraId", &para_id), ("w14:textId", "77777777"), ("wc:blockId", &full)])
+            }
+            Some(tag) => w.open("w:p", &[("w14:paraId", &tag.para_id), ("w14:textId", "77777777")]),
             None => w.open("w:p", &[]),
         }
         let mut pp = p.props.clone();

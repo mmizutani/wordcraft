@@ -210,6 +210,7 @@ impl Reader<'_> {
     fn read_para(&mut self, sc: &mut StoryCtx, e: &El, rels: &Rels, depth: usize) -> Paragraph {
         let mut pb = PB::default();
         let mut para = Paragraph::new();
+        para.id = block_id(e, true);
         let mut mark_moves: [Option<&El>; 2] = [None, None];
         self.moves.closed_here = [None, None];
         for o in std::mem::take(&mut sc.pending) {
@@ -315,7 +316,7 @@ impl Reader<'_> {
     // ---- tables ----
 
     fn read_table(&mut self, sc: &mut StoryCtx, t: &El, rels: &Rels, depth: usize) -> Option<Table> {
-        let mut table = Table::default();
+        let mut table = Table { id: block_id(t, false), ..Table::default() };
         if let Some(p) = t.child("w:tblPr") {
             table.props = self.pc.tblpr(p);
             if let Some(ch) = p.child("w:tblPrChange") {
@@ -372,4 +373,17 @@ impl Reader<'_> {
         }
         Some(table)
     }
+}
+
+/// The block id a paragraph (`w:p`) or table (`w:tbl`) was saved with (`write::para_ids`): its
+/// `wc:blockId`, else a paragraph's `w14:paraId` (Word's, or WordCraft's that held the whole id),
+/// else none. Two blocks read with one id, or with a paragraph id Word gave a copy of another,
+/// are told apart when the document is opened (`Document::ensure_block_ids`).
+pub(crate) fn block_id(e: &El, para: bool) -> wordcraft_doc::BlockId {
+    let hex = |v: &str, digits: usize| {
+        (!v.is_empty() && v.len() <= digits && v.bytes().all(|b| b.is_ascii_hexdigit())).then(|| u64::from_str_radix(v, 16).ok()).flatten()
+    };
+    let whole = e.attr("wc:blockId").and_then(|v| hex(v, 16));
+    let short = || if para { e.attr("w14:paraId").and_then(|v| hex(v, 8)) } else { None };
+    wordcraft_doc::BlockId::from_bits(whole.filter(|b| *b != 0).or_else(short).unwrap_or(0))
 }

@@ -279,3 +279,33 @@ fn text_moved_to_another_story_keeps_its_id() {
     assert_eq!(d.parts[&part].blocks[0].id(), boxed);
     assert!(all_own(&d));
 }
+
+#[test]
+fn ids_from_a_file_that_differ_only_in_their_high_bits_spread_over_the_buckets() {
+    // A file's `wc:blockId` values are its own: `k << 32` shares every low bit, which an
+    // identity hash puts in one bucket (quadratic sets when the document opens).
+    use std::hash::BuildHasher;
+    let hasher = BuildHasherDefault::<IdHasher>::default();
+    let low: HashSet<u64> = (1..=4096u64).map(|k| hasher.hash_one(k << 32) & 0xFFF).collect();
+    assert!(low.len() > 2048, "{} of 4096 buckets", low.len());
+    let top: HashSet<u64> = (1..=4096u64).map(|k| hasher.hash_one(k) >> 52).collect();
+    assert!(top.len() > 2048, "{} of 4096 tags", top.len());
+}
+
+#[test]
+fn a_document_of_ids_sharing_their_low_bits_gets_its_ids_in_linear_time() {
+    let n = 60_000u64;
+    let mut d = Document::new();
+    d.body = (1..=n)
+        .map(|k| {
+            let mut p = crate::Paragraph::with_text("x", CharProps::default());
+            p.id = BlockId::from_bits(k << 32);
+            para_block(p)
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    assert_eq!(d.ensure_block_ids(None), 0, "every id is set and distinct");
+    assert_eq!(d.repeated_id(&[BlockId::from_bits(1 << 32)]), None);
+    // Quadratic work took 2 s here; linear takes about 0.1 s.
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+}
