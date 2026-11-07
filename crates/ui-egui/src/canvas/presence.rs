@@ -475,6 +475,26 @@ mod tests {
     }
 
     #[test]
+    fn cutting_stops_following_and_copying_does_not() {
+        // Codex: a cut can come as its own event, without a key, and edits the document.
+        let text: Vec<String> = (0..300).map(|i| format!("Line {i} of a long document")).collect();
+        let (mut h, lobby) = harness(&text.join("\n"));
+        owner(h.state_mut(), "room.share", json!({}));
+        let mut ada = agent(h.state_mut(), &lobby, "Ada");
+        runs(&mut ada, "select.text", json!({"text": "Line 290 "}));
+        owner(h.state_mut(), "select.text", json!({"text": "Line 3 "}));
+        h.run_steps(3);
+        h.state_mut().run("ui.follow", json!({"participant": ada.id()})).unwrap();
+        h.run_steps(3);
+        h.input_mut().events.push(egui::Event::Copy);
+        h.run_steps(2);
+        assert_eq!(h.state().canvas.follow, Some(ada.id()), "copying edits nothing");
+        h.input_mut().events.push(egui::Event::Cut);
+        h.run_steps(2);
+        assert_eq!(h.state().canvas.follow, None, "cutting stops following");
+    }
+
+    #[test]
     fn with_white_space_hidden_others_in_a_hidden_header_are_not_drawn_over_the_text() {
         // Hide White Space overlaps each page's rect with its neighbours' in the hidden margins:
         // a header there would land on the page before's text.
