@@ -576,7 +576,7 @@ mod tests {
         let mut c = Conn::open(port);
         // `auth` says what the key reaches: a participant's copy, whose (#74).
         let r = c.call(&format!(r#"{{"id":1,"method":"auth","params":{{"key":"{key}"}}}}"#));
-        assert_eq!(r["result"], json!({"as": "participant", "name": "Agent", "role": "editor"}), "{r}");
+        assert_eq!(r["result"], json!({"as": "participant", "name": "Agent", "role": "editor", "remote": false}), "{r}");
         assert_eq!(c.call(r#"{"id":2,"method":"engine.execute","params":{"command":"caret.docEnd"}}"#)["ok"], true);
         assert_eq!(room.participants().len(), 1);
         // The window's key still reaches the window.

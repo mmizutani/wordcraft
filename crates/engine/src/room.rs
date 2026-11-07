@@ -467,6 +467,11 @@ impl Room {
         (self.hub().files_for(id, setting), folders)
     }
 
+    /// Whether participant `id` joined with a remote invite's key ([`Hub::is_remote`]).
+    pub fn is_remote(&self, id: ParticipantId) -> bool {
+        self.hub().is_remote(id)
+    }
+
     /// Which files participant `id`'s commands can use now ([`Room::files_for`]), for those who
     /// joined with a key; `None` for those who didn't: the window, whose commands are the
     /// person's, and the room's own process.

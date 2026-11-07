@@ -13,13 +13,15 @@ use crate::agent_files::AgentFiles;
 const MAX_SENDS: usize = 4;
 
 /// What `auth` answers a connection whose key is an invite's: that it reaches a participant's
-/// copy (`"as": "participant"`), whose name and role. A bridge serving agents on other machines
-/// can tell from it that it isn't holding the window's key, which acts as the person.
+/// copy (`"as": "participant"`), whose name and role, and whether its invite was a remote one. A
+/// bridge serving agents on other machines can tell from it that it isn't holding the window's
+/// key, which acts as the person, nor an invite meant for this computer, which may be the owner
+/// and use the files File › Options › Agents allows.
 pub fn auth_reply(copy: &Replica) -> Value {
     // The room's, not the copy's: the owner may have changed the role since the copy last
     // received changes (`room.role`), and `auth` brings none in.
     let who = copy.room().participants().into_iter().find(|p| p.id == copy.id()).unwrap_or_else(|| copy.participant().clone());
-    json!({"as": "participant", "name": who.name, "role": who.role})
+    json!({"as": "participant", "name": who.name, "role": who.role, "remote": copy.room().is_remote(copy.id())})
 }
 
 /// Wrong keys a port was given lately, to slow down whoever tries them ([`Refusals::refused`]).

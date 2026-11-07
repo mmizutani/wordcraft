@@ -291,7 +291,15 @@ impl Endpoint {
                 }
             };
             match backend.call("auth", json!({})) {
-                Ok(v) if v.get("as").and_then(Value::as_str) == Some("participant") => {}
+                Ok(v) if v.get("as").and_then(Value::as_str) == Some("participant") && v.get("remote") == Some(&Value::Bool(true)) => {}
+                Ok(v) if v.get("as").and_then(Value::as_str) == Some("participant") => {
+                    let _ = ready_tx.send(Err(refusal(
+                        403,
+                        -32600,
+                        "this invite is for an agent on this computer: invite the agent as one on another machine (room.invite with remote: true) and use that key",
+                    )));
+                    return;
+                }
                 Ok(_) => {
                     let _ = ready_tx.send(Err(refusal(
                         403,

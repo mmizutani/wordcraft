@@ -346,9 +346,15 @@ impl Default for Config {
 /// What answers each request.
 pub type Handler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
 
+/// Connections turned away (503) that are closed gently at once; more are dropped.
+const MAX_CLOSING: usize = 16;
+
 /// Accept connections on `listener` until it fails, each on a thread of its own.
 pub fn serve(listener: TcpListener, config: Config, handler: Handler) -> std::io::Result<()> {
     let open = Arc::new(AtomicUsize::new(0));
+    // Connections turned away and still being closed, each on a thread of its own, so that a
+    // client trickling bytes into one never holds up the next accept.
+    let closing = Arc::new(AtomicUsize::new(0));
     loop {
         let (stream, peer) = match listener.accept() {
             Ok(s) => s,
@@ -373,8 +379,23 @@ pub fn serve(listener: TcpListener, config: Config, handler: Handler) -> std::io
         if open.fetch_add(1, Ordering::SeqCst) >= config.max_connections {
             open.fetch_sub(1, Ordering::SeqCst);
             let mut s = stream;
-            let _ = write_response(&mut s, &Response::text(503, "too many connections\n").with_header("Retry-After", "1"), true);
-            close_gently(&s, &mut BufReader::new(&s), Duration::from_millis(200));
+            if closing.fetch_add(1, Ordering::SeqCst) >= MAX_CLOSING {
+                // Too many being closed already: drop this one at once.
+                closing.fetch_sub(1, Ordering::SeqCst);
+                let _ = s.shutdown(std::net::Shutdown::Both);
+                continue;
+            }
+            let done = closing.clone();
+            let spawned = std::thread::Builder::new().name("http turned away".into()).spawn(move || {
+                let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+                let _ = write_response(&mut s, &Response::text(503, "too many connections\n").with_header("Retry-After", "1"), true);
+                close_gently(&s, &mut BufReader::new(&s), Duration::from_millis(200));
+                done.fetch_sub(1, Ordering::SeqCst);
+            });
+            if spawned.is_err() {
+                // The closure (and the connection) went with the failed spawn.
+                closing.fetch_sub(1, Ordering::SeqCst);
+            }
             continue;
         }
         let (open, handler) = (open.clone(), handler.clone());

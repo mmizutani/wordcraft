@@ -31,7 +31,7 @@ cat ~/.config/wordcraft/control-key.local-7981   # Linux, outside Flatpak, port 
 
 - Send the key as top-level `"key"` with every request, or once per connection with
   `{"method": "auth", "key": "…"}` (reply `{"ok": true, "result": {"as": "window"}}`, or for an
-  invite's key `{"as": "participant", "name", "role"}`); later requests on that
+  invite's key `{"as": "participant", "name", "role", "remote"}`, `remote` saying whether the invite was for an agent on another machine); later requests on that
   connection may leave `key` out. Only `auth` reads `params.key`; for other methods `params.key`
   is an ordinary parameter (`ui.key {"key": "Enter"}` presses Enter).
 - The key is checked on every request. A missing or wrong key gets
