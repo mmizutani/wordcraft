@@ -223,6 +223,45 @@ fn a_place_left_at_a_cell_paragraph_s_end_stays_there_when_a_row_is_put_in() {
 }
 
 #[test]
+fn a_place_left_at_a_paragraph_s_end_stays_put_when_the_paragraph_is_then_joined_to_another() {
+    // As above, and Bob then joins the paragraph to the one before, all before anybody reads
+    // where Ada is: the paragraph is gone, and the join says how long it was.
+    let room = Room::new(Document::from_text("zero\nfirst\nlast one"));
+    let mut ada = join(&room, "Ada");
+    let mut bob = join(&room, "Bob");
+    run(&mut ada, "caret.set", json!({"pos": Pos::body(2, 4)}));
+    ada.present();
+    run(&mut bob, "select.range", json!({"anchor": Pos::body(1, 5), "focus": Pos::body(2, 8)}));
+    run(&mut bob, "text.delete", json!({}));
+    run(&mut bob, "text.insert", json!({"text": "!!"}));
+    run(&mut bob, "caret.set", json!({"pos": Pos::body(1, 0)}));
+    run(&mut bob, "text.backspace", json!({}));
+    bob.send();
+    ada.receive();
+    assert_eq!(super::room::text(&ada), "zerofirst!!");
+    assert_eq!(mine(&ada).focus.off, 9);
+    assert_eq!(seen(&mut bob, ada.id()), Some(mine(&ada)));
+}
+
+#[test]
+fn a_reader_s_own_typing_at_a_paragraph_s_end_it_left_another_at_goes_after_them() {
+    // Bob deletes Ada's paragraph from the end of the one before and types there, and hasn't
+    // sent either edit: he sees her before what he typed, as the room will once he sends them.
+    let room = Room::new(Document::from_text("first\nlast one"));
+    let mut ada = join(&room, "Ada");
+    let mut bob = join(&room, "Bob");
+    run(&mut ada, "caret.set", json!({"pos": Pos::body(1, 4)}));
+    ada.present();
+    run(&mut bob, "select.range", json!({"anchor": Pos::body(0, 5), "focus": Pos::body(1, 8)}));
+    run(&mut bob, "text.delete", json!({}));
+    run(&mut bob, "text.insert", json!({"text": "!!"}));
+    assert_eq!(seen(&mut bob, ada.id()).map(|p| p.focus.off), Some(5));
+    bob.send();
+    ada.receive();
+    assert_eq!(seen(&mut bob, ada.id()), Some(mine(&ada)));
+}
+
+#[test]
 fn a_new_selection_with_the_numbers_of_an_old_place_reaches_the_others() {
     // Ada selects "two"; Bob types before it, so the room has her further on; she then selects
     // "one", which has the offsets "two" had: the others see her on "one".

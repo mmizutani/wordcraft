@@ -977,8 +977,16 @@ impl Replica {
     /// copy's: moved through the copy's edits the hub hasn't given back, in order. `hint`:
     /// where it was before.
     fn place(&self, p: Presence, hint: Option<&Selection>) -> Option<(Presence, Selection)> {
-        let p = self.pending.iter().try_fold(p, |p, u| p.through(&u.change, false))?;
-        p.placed_in(&self.session.doc, hint)
+        let doc = &self.session.doc;
+        let mut p = p;
+        for (i, u) in self.pending.iter().enumerate() {
+            let moved = p.through(&u.change, false)?;
+            // An end of a paragraph is where that paragraph ended then, not after what the
+            // edits after this one type there.
+            let later = || self.pending.iter().skip(i.saturating_add(1)).map(|u| &u.change);
+            p = Presence { anchor: super::end_before(moved.anchor, later(), doc), focus: super::end_before(moved.focus, later(), doc) };
+        }
+        p.placed_in(doc, hint)
     }
 
     /// Make accepted change `a` in the copy.

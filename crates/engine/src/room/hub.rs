@@ -436,39 +436,10 @@ impl Hub {
         Some(Presence { anchor: settle(p.anchor)?, focus: settle(p.focus)? })
     }
 
-    /// Anchor `a` as kept change `k` (by place in the kept list) left it: at the end of its block
-    /// when its offset is past every text ([`super::anchor`]), as an offset, the length the
-    /// paragraph had then (the end of a table's last paragraph, for a table). Worked out from
-    /// the paragraph's length at the first change after `k` that took it out whole (moved or
-    /// replaced it: the change says how long it was), else as it is now, less what the changes
-    /// after `k` before that put in it and plus what they took out. `a` as it is when the
-    /// paragraph isn't in the document.
+    /// Anchor `a` as kept change `k` (by place in the kept list) left it, with an end of its
+    /// paragraph as an offset ([`super::end_before`], through the changes kept after `k`).
     fn end_after(&self, a: Anchor, k: usize) -> Anchor {
-        if a.off != usize::MAX {
-            return a;
-        }
-        let Some(para) = self.doc.pos_of(a, None).and_then(|pos| self.doc.para_at(&pos)) else { return a };
-        let block = para.id;
-        // What the changes after `k` put in the paragraph, less what they took out of it.
-        let (mut put, mut took) = (0usize, 0usize);
-        let mut len = None;
-        'later: for later in self.kept.iter().skip(k.saturating_add(1)) {
-            let c = &later.change;
-            for e in c.edits.iter().filter(|e| e.id == block) {
-                if let Some(chars) = &e.chars {
-                    put = put.saturating_add(chars.inserted.text.len());
-                    took = took.saturating_add(chars.removed);
-                }
-            }
-            // A table taken out whole and put back (a row put in) keeps the paragraph's text,
-            // or the place went with it ([`ChangeSet::map`]), so it changes no length.
-            if let Some(old) = c.splices.iter().find_map(|s| s.removed.iter().find(|o| o.id == block)) {
-                len = Some(old.len);
-                break 'later;
-            }
-        }
-        let len = len.unwrap_or_else(|| para.len());
-        len.checked_sub(put).and_then(|n| n.checked_add(took)).map_or(a, |off| Anchor { block, off })
+        super::end_before(a, self.kept.iter().skip(k.saturating_add(1)).map(|later| &*later.change), &self.doc)
     }
 
     /// Where participant `i` (by place in the list) is as of `version`, as the hub knows it.

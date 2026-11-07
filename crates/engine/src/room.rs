@@ -754,6 +754,42 @@ fn carry(start: Anchor, end: Anchor, after: &[hub::Accepted]) -> Option<(Anchor,
     Some((s, e))
 }
 
+/// Anchor `a` with an end of its paragraph ([`anchor`]: an offset past every text) as an
+/// offset: the length the paragraph had (the end of a table's last paragraph, for a table)
+/// before `later`, the changes made after it in turn, the last of them making `doc`. Worked out
+/// from the length the first of them that took the paragraph out whole (moved, replaced or
+/// joined it to another) says it had, else from its length in `doc`, less what the changes
+/// before that put in it and plus what they took out. `a` as it is when neither says: the
+/// paragraph is gone from `doc` and no change says how long it was, or its table went whole.
+fn end_before<'a>(a: Anchor, later: impl IntoIterator<Item = &'a ChangeSet>, doc: &Document) -> Anchor {
+    if a.off != usize::MAX {
+        return a;
+    }
+    // An anchor at a table is at the end of its last paragraph.
+    let now = doc.pos_of(a, None).and_then(|pos| doc.para_at(&pos));
+    let block = now.map_or(a.block, |p| p.id);
+    // What the changes put in the paragraph, less what they took out of it.
+    let (mut put, mut took) = (0usize, 0usize);
+    let mut len = None;
+    'later: for c in later {
+        for e in c.edits.iter().filter(|e| e.id == block) {
+            if let Some(chars) = &e.chars {
+                put = put.saturating_add(chars.inserted.text.len());
+                took = took.saturating_add(chars.removed);
+            }
+        }
+        // A table taken out whole and put back (a row put in) keeps the paragraph's text, or
+        // the place went with it ([`ChangeSet::map`]), so it changes no length.
+        if let Some(old) = c.splices.iter().find_map(|s| s.removed.iter().find(|o| o.id == block)) {
+            // A table's own length in the text is a mark, not a paragraph's.
+            len = old.inside.is_empty().then_some(old.len);
+            break 'later;
+        }
+    }
+    let Some(len) = len.or_else(|| now.map(|p| p.len())) else { return a };
+    len.checked_sub(put).and_then(|n| n.checked_add(took)).map_or(a, |off| Anchor { block, off })
+}
+
 /// Mapped place `m` as an anchor: the start or the end of a block it is before or after.
 fn anchor(m: Mapped) -> Option<Anchor> {
     match m {
