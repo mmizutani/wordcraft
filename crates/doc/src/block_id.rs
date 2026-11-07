@@ -107,14 +107,16 @@ fn mix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Hashes an id as it is: ids are random already, and the set of them is built after every
-/// command.
+/// Hashes an id cheaply, scrambled with this process's random key: the set of ids is built after
+/// every command, and ids read from a file (`wc:blockId`) are whatever the file says, so they
+/// can't be trusted to be random (ids that differ only in their high bits would otherwise all
+/// fall in one bucket).
 #[derive(Default)]
 struct IdHasher(u64);
 
 impl Hasher for IdHasher {
     fn finish(&self) -> u64 {
-        self.0
+        mix(self.0 ^ seed())
     }
     fn write(&mut self, bytes: &[u8]) {
         for b in bytes {
