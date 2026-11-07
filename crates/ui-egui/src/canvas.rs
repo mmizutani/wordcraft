@@ -626,7 +626,8 @@ fn others_marks(app: &WordApp, ui: &Ui, layout: &std::sync::Arc<DocLayout>, rect
 }
 
 /// Following someone stops when the person takes the view or the caret back: a press or a
-/// scroll over the page, or a key, or text an input method types, composes or deletes.
+/// scroll over the page, or a key, a paste or a cut, or text an input method types, composes or
+/// deletes.
 fn stop_following_on_input(app: &mut WordApp, ui: &Ui, area: Rect) {
     if app.canvas.follow.is_none() {
         return;
@@ -643,6 +644,7 @@ fn stop_following_on_input(app: &mut WordApp, ui: &Ui, area: Rect) {
                     egui::Event::Key { pressed: true, .. }
                         | egui::Event::Text(_)
                         | egui::Event::Paste(_)
+                        | egui::Event::Cut
                         | egui::Event::Ime(
                             egui::ImeEvent::Commit(_) | egui::ImeEvent::DeleteSurrounding { .. } | egui::ImeEvent::DeleteSurroundingBytes { .. }
                         )
