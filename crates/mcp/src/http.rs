@@ -266,10 +266,17 @@ impl Endpoint {
 
     /// Run `body` on `key`'s thread, opening it first when it has none.
     fn ask(&self, key: &str, body: String, wait: Duration) -> Result<Option<String>, Response> {
+        // The deadline starts now: opening the key's connection (checking the key with the app)
+        // comes out of the same time, never added to it.
+        let until = Instant::now().checked_add(wait).unwrap_or_else(Instant::now);
+        let too_long = || refusal(504, -32603, "the WordCraft app took too long to answer");
         for _ in 0..2 {
             let jobs = self.seat(key)?;
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(too_long());
+            }
             let (tx, rx) = mpsc::channel();
-            let until = Instant::now().checked_add(wait).unwrap_or_else(Instant::now);
             match jobs.try_send(Job { body: body.clone(), answer: tx, until }) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
@@ -281,7 +288,7 @@ impl Endpoint {
                     continue;
                 }
             }
-            return match rx.recv_timeout(wait) {
+            return match rx.recv_timeout(left) {
                 Ok(a) if a.ended => {
                     self.forget(key);
                     Err(refusal(401, -32600, "the WordCraft app no longer takes this key: it was taken back, or its time was up")

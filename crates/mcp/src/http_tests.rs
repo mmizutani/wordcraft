@@ -17,6 +17,8 @@ struct App {
     opened: AtomicUsize,
     /// How long each call other than `auth` takes, in milliseconds.
     slow_ms: AtomicU64,
+    /// How long opening a connection to the app takes, in milliseconds.
+    open_ms: AtomicU64,
 }
 
 /// A connection to the stand-in app with one key: `window` is the window's key, `stranger` is a
@@ -65,6 +67,7 @@ fn endpoint(options: Options) -> (Endpoint, Arc<App>) {
         options,
         Box::new(move |key| {
             a.opened.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(a.open_ms.load(Ordering::SeqCst)));
             Ok(Box::new(Fake { key: key.to_string(), app: a.clone(), refused: AtomicBool::new(false) }) as Box<dyn Backend + Send>)
         }),
     );
@@ -402,4 +405,19 @@ fn answers_waiting_to_be_sent_are_bounded() {
     // Once it has been sent, requests run again.
     drop(unsent);
     assert_eq!(e.handle(&post(Some("ben"), &call, &[])).status, 200);
+}
+
+/// The time a caller has left counts from when its request arrived: opening the key's
+/// connection to the app comes out of it, so a request that would start after its caller gave
+/// up never runs.
+#[test]
+fn opening_a_keys_connection_comes_out_of_the_callers_time() {
+    let (e, app) = endpoint(Options::default());
+    app.open_ms.store(400, Ordering::SeqCst);
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "inspect_document", "arguments": {}}});
+    let r = e.handle(&post(Some("ana"), &call, &[(wordcraft_http::WAIT_HEADER, "150")]));
+    assert_eq!(r.status, 504, "{:?}", body(&r));
+    std::thread::sleep(Duration::from_millis(300));
+    let ran = app.calls.lock().unwrap().iter().filter(|(_, m)| m != "auth").count();
+    assert_eq!(ran, 0, "it never ran");
 }
