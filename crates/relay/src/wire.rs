@@ -5,13 +5,15 @@ use wordcraft_http::{Request, Response};
 
 /// The request headers the relay passes on to the desktop: what MCP over HTTP uses, nothing
 /// about the connection (`Host`, `Cookie`, proxies' headers…).
-pub const REQUEST_HEADERS: &[&str] = &["Authorization", "Content-Type", "Accept", "MCP-Protocol-Version", "Mcp-Method", "Mcp-Name", "Mcp-Session-Id", "Origin", "Last-Event-ID"];
+pub const REQUEST_HEADERS: &[&str] =
+    &["Authorization", "Content-Type", "Accept", "MCP-Protocol-Version", "Mcp-Method", "Mcp-Name", "Mcp-Session-Id", "Origin", "Last-Event-ID"];
 
 /// The answer headers the relay passes back to the agent.
 pub const RESPONSE_HEADERS: &[&str] = &["Content-Type", "WWW-Authenticate", "Allow", "Retry-After", "Mcp-Session-Id"];
 
 fn passed(name: &str, list: &[&str]) -> bool {
-    list.iter().any(|h| h.eq_ignore_ascii_case(name)) || (list == REQUEST_HEADERS && name.len() > 10 && name.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("Mcp-Param-")))
+    list.iter().any(|h| h.eq_ignore_ascii_case(name))
+        || (list == REQUEST_HEADERS && name.len() > 10 && name.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("Mcp-Param-")))
 }
 
 fn headers_json(headers: &[(String, String)], list: &[&str]) -> Value {

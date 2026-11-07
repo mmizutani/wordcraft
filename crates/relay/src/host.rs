@@ -71,7 +71,12 @@ fn read(result: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result
         other => format!("the relay can't be reached: {other}"),
     })?;
     let status = resp.status().as_u16();
-    let body = resp.into_body().into_with_config().limit(MAX_FROM_RELAY).read_to_string().map_err(|e| format!("the relay's answer couldn't be read: {e}"))?;
+    let body = resp
+        .into_body()
+        .into_with_config()
+        .limit(MAX_FROM_RELAY)
+        .read_to_string()
+        .map_err(|e| format!("the relay's answer couldn't be read: {e}"))?;
     Ok((status, body))
 }
 
@@ -81,7 +86,11 @@ fn open_room(agent: &ureq::Agent, relay: &str, token: &str, claim: Option<(&str,
         Some((room, secret)) => json!({"room": room, "secret": secret}),
         None => json!({}),
     };
-    let sent = agent.post(&format!("{relay}/host/rooms")).header("Authorization", &format!("Bearer {token}")).header("Content-Type", "application/json").send(body.to_string().as_bytes());
+    let sent = agent
+        .post(&format!("{relay}/host/rooms"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .send(body.to_string().as_bytes());
     let (status, text) = read(sent).map_err(Status::Retrying)?;
     match status {
         200 => {}
@@ -126,7 +135,10 @@ impl Hosting {
         });
         for _ in 0..POLLERS {
             let s = shared.clone();
-            std::thread::Builder::new().name("relay poll".into()).spawn(move || poll_loop(&s)).map_err(|e| format!("no thread for the relay: {e}"))?;
+            std::thread::Builder::new()
+                .name("relay poll".into())
+                .spawn(move || poll_loop(&s))
+                .map_err(|e| format!("no thread for the relay: {e}"))?;
         }
         Ok(Hosting { shared })
     }
@@ -192,7 +204,8 @@ fn poll_loop(s: &Arc<Shared>) {
             Ok((200, text)) => {
                 set(s, Status::Connected);
                 backoff = Duration::from_secs(1);
-                let requests = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("requests").and_then(Value::as_array).cloned()).unwrap_or_default();
+                let requests =
+                    serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("requests").and_then(Value::as_array).cloned()).unwrap_or_default();
                 for r in requests {
                     if let Some((id, req)) = wire::request_from(&r) {
                         answer(s, id, req);
@@ -234,7 +247,13 @@ fn answer(s: &Arc<Shared>, id: u64, req: Request) {
         let resp = (s.handler)(&req);
         let body = wire::reply(id, &resp).to_string();
         let url = format!("{}/host/r/{}/reply", s.relay, s.room);
-        if let Err(why) = read(s.agent.post(&url).header("Authorization", &format!("Bearer {}", s.secret)).header("Content-Type", "application/json").send(body.as_bytes())) {
+        if let Err(why) = read(
+            s.agent
+                .post(&url)
+                .header("Authorization", &format!("Bearer {}", s.secret))
+                .header("Content-Type", "application/json")
+                .send(body.as_bytes()),
+        ) {
             log::warn!("relay: an answer didn't reach the relay: {why}");
         }
     };

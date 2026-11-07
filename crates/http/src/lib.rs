@@ -1,7 +1,8 @@
 //! A small HTTP/1.1 server on `std`, for WordCraft's MCP endpoint (`wordcraft-cli mcp --http`)
 //! and the relay (`wordcraft-relay`). One thread per connection, a cap on connections, and every
 //! read bounded: the request head, the number of headers, the body (by `Content-Length` or
-//! chunked), and the time a connection may sit idle. Requests and responses are whole bodies;
+//! chunked), the time a connection may sit idle, and the time one request may take to arrive
+//! whole. Requests and responses are whole bodies;
 //! nothing streams.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -9,7 +10,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Bounds on what one request may make the server read.
 #[derive(Clone, Copy, Debug)]
@@ -135,7 +136,8 @@ pub fn read_head(reader: &mut impl BufRead, limits: &Limits) -> Result<Head, Ref
         match read {
             Ok(0) => return Ok(None),
             Ok(_) => {}
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) && buf.is_empty() => return Ok(None),
+            Err(e) if timed_out(&e) && buf.is_empty() && *used == 0 => return Ok(None),
+            Err(e) if timed_out(&e) => return Err(refused(408, "the request took too long to arrive")),
             Err(e) => return Err(refused(400, format!("could not read the request: {e}"))),
         }
         *used = used.saturating_add(buf.len());
@@ -206,7 +208,7 @@ pub fn read_body(reader: &mut impl BufRead, req: &mut Request, limits: &Limits) 
                 return Err(refused(413, format!("body over {} bytes", limits.body)));
             }
             let mut body = vec![0u8; n];
-            reader.read_exact(&mut body).map_err(|_| refused(400, "body ended early"))?;
+            reader.read_exact(&mut body).map_err(body_error)?;
             req.body = body;
             Ok(())
         }
@@ -214,10 +216,18 @@ pub fn read_body(reader: &mut impl BufRead, req: &mut Request, limits: &Limits) 
     }
 }
 
+fn timed_out(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+}
+
+fn body_error(e: std::io::Error) -> Refused {
+    if timed_out(&e) { refused(408, "the request took too long to arrive") } else { refused(400, "body ended early") }
+}
+
 fn read_chunked(reader: &mut impl BufRead, body: &mut Vec<u8>, max: usize) -> Result<(), Refused> {
     let size_line = |reader: &mut dyn BufRead| -> Result<String, Refused> {
         let mut buf = Vec::new();
-        reader.take(256).read_until(b'\n', &mut buf).map_err(|_| refused(400, "body ended early"))?;
+        reader.take(256).read_until(b'\n', &mut buf).map_err(body_error)?;
         if buf.last() != Some(&b'\n') {
             return Err(refused(400, "bad chunk"));
         }
@@ -242,7 +252,7 @@ fn read_chunked(reader: &mut impl BufRead, body: &mut Vec<u8>, max: usize) -> Re
         let start = body.len();
         body.resize(start + n, 0);
         let Some(chunk) = body.get_mut(start..) else { return Err(refused(400, "bad chunk")) };
-        reader.read_exact(chunk).map_err(|_| refused(400, "body ended early"))?;
+        reader.read_exact(chunk).map_err(body_error)?;
         if !size_line(reader)?.is_empty() {
             return Err(refused(400, "bad chunk end"));
         }
@@ -309,8 +319,11 @@ pub struct Config {
     pub limits: Limits,
     /// Connections served at once; more are answered 503 and closed.
     pub max_connections: usize,
-    /// How long a connection may wait between requests, and for the rest of one.
+    /// How long a connection may wait between requests.
     pub idle: Duration,
+    /// How long one request, its head and body, may take to arrive once it began: a client
+    /// sending a byte now and then can't hold a connection longer.
+    pub request: Duration,
     /// How long writing one response may take.
     pub write: Duration,
     /// Requests on one connection before it closes.
@@ -319,7 +332,14 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { limits: Limits::default(), max_connections: 64, idle: Duration::from_secs(30), write: Duration::from_secs(30), max_requests: 1000 }
+        Config {
+            limits: Limits::default(),
+            max_connections: 64,
+            idle: Duration::from_secs(30),
+            request: Duration::from_secs(60),
+            write: Duration::from_secs(30),
+            max_requests: 1000,
+        }
     }
 }
 
@@ -378,19 +398,52 @@ pub fn serve_with(listener: TcpListener, config: Config, body_limit: BodyLimit, 
     }
 }
 
+/// The read side of a connection: each read waits only until `until`, so a slow drip of bytes
+/// can't make a request take longer than its deadline.
+struct Timed {
+    stream: TcpStream,
+    until: Instant,
+}
+
+impl Read for Timed {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.until.checked_duration_since(Instant::now()).filter(|l| !l.is_zero()).ok_or(std::io::ErrorKind::TimedOut)?;
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
+}
+
+/// `d` from now (far ahead when that doesn't fit an [`Instant`]).
+fn after(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d).or_else(|| now.checked_add(Duration::from_secs(365 * 24 * 60 * 60))).unwrap_or(now)
+}
+
+/// Answer a request that couldn't be read with why, and close.
+fn refuse(writer: &mut TcpStream, reader: &mut BufReader<Timed>, e: &Refused) {
+    let _ = write_response(writer, &e.response(), true);
+    reader.get_mut().until = after(Duration::from_secs(1));
+    close_gently(writer, reader.get_mut(), Duration::from_secs(1));
+}
+
 /// Serve one connection's requests until it closes, idles out or asks to close.
 pub fn connection(stream: TcpStream, peer: SocketAddr, config: &Config, body_limit: &BodyLimit, handler: &Handler) {
-    let _ = stream.set_read_timeout(Some(config.idle));
     let Ok(read) = stream.try_clone() else { return };
-    let mut reader = BufReader::new(read);
+    let mut reader = BufReader::new(Timed { stream: read, until: Instant::now() });
     let mut writer = stream;
     for _ in 0..config.max_requests.max(1) {
+        // Wait up to `idle` for the next request to begin, then up to `request` for all of it.
+        reader.get_mut().until = after(config.idle);
+        match reader.fill_buf() {
+            Ok([]) | Err(_) => return,
+            Ok(_) => {}
+        }
+        reader.get_mut().until = after(config.request);
         let (mut req, http10) = match read_head(&mut reader, &config.limits) {
             Ok(Head::Closed) => return,
             Ok(Head::Request(r, http10)) => (r, http10),
             Err(e) => {
-                let _ = write_response(&mut writer, &e.response(), true);
-                close_gently(&writer, &mut reader, Duration::from_secs(1));
+                refuse(&mut writer, &mut reader, &e);
                 return;
             }
         };
@@ -400,9 +453,14 @@ pub fn connection(stream: TcpStream, peer: SocketAddr, config: &Config, body_lim
             return;
         }
         let limits = Limits { body: body_limit(&req), ..config.limits };
+        if limits.body > config.limits.body {
+            // A body allowed to be larger (the relay's desktop sending an answer, its secret
+            // checked) gets time for its size at 64 KiB/s at the least.
+            let more = Duration::from_secs(u64::try_from(limits.body / (64 << 10)).unwrap_or(u64::MAX));
+            reader.get_mut().until = after(config.request.saturating_add(more));
+        }
         if let Err(e) = read_body(&mut reader, &mut req, &limits) {
-            let _ = write_response(&mut writer, &e.response(), true);
-            close_gently(&writer, &mut reader, Duration::from_secs(1));
+            refuse(&mut writer, &mut reader, &e);
             return;
         }
         let close = http10 || req.header("Connection").is_some_and(|c| c.eq_ignore_ascii_case("close"));

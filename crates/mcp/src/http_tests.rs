@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,6 +15,8 @@ struct App {
     revoked: Mutex<Vec<String>>,
     calls: Mutex<Vec<(String, String)>>,
     opened: AtomicUsize,
+    /// How long each call other than `auth` takes, in milliseconds.
+    slow_ms: AtomicU64,
 }
 
 /// A connection to the stand-in app with one key: `window` is the window's key, `stranger` is a
@@ -28,6 +30,9 @@ struct Fake {
 impl Backend for Fake {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         self.app.calls.lock().unwrap().push((self.key.clone(), method.to_string()));
+        if method != "auth" {
+            std::thread::sleep(Duration::from_millis(self.app.slow_ms.load(Ordering::SeqCst)));
+        }
         if self.key == "stranger" || self.app.revoked.lock().unwrap().contains(&self.key) {
             self.refused.store(true, Ordering::SeqCst);
             return Err("unauthorized: refused".into());
@@ -281,4 +286,29 @@ fn hostile_bodies_never_panic() {
         let r = e.handle(&post(Some("k1"), &b, &[("Mcp-Method", "tools/call"), ("MCP-Protocol-Version", STATELESS_VERSION)]));
         assert!(r.status >= 200, "{b}");
     }
+}
+
+/// An agent sending faster than the app answers: a few requests wait their turn, the rest are
+/// told to try again at once, and a request whose caller was told it timed out never runs later.
+#[test]
+fn a_flood_on_one_key_is_bounded_and_late_requests_never_run() {
+    let (e, app) = endpoint(Options { timeout: Duration::from_millis(150), ..Options::default() });
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "inspect_document", "arguments": {}}});
+    assert_eq!(e.handle(&post(Some("ana"), &call, &[])).status, 200);
+    app.slow_ms.store(400, Ordering::SeqCst);
+    let e = Arc::new(e);
+    let runs = |app: &App| app.calls.lock().unwrap().iter().filter(|(_, m)| m != "auth").count();
+    let before = runs(&app);
+    let floods: Vec<_> = (0..30)
+        .map(|_| {
+            let (e, call) = (e.clone(), call.clone());
+            std::thread::spawn(move || e.handle(&post(Some("ana"), &call, &[])).status)
+        })
+        .collect();
+    let statuses: Vec<u16> = floods.into_iter().map(|t| t.join().unwrap()).collect();
+    assert!(statuses.iter().all(|s| [503, 504].contains(s)), "{statuses:?}");
+    assert!(statuses.iter().filter(|s| **s == 503).count() >= 30 - super::QUEUE - 1, "{statuses:?}");
+    // Every caller has its answer; wait for what was begun to finish, then check nothing late ran.
+    std::thread::sleep(Duration::from_millis(1200));
+    assert!(runs(&app) - before <= 2, "{} ran after their callers stopped waiting", runs(&app) - before);
 }

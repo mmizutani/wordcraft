@@ -180,7 +180,8 @@ impl Relay {
     /// `POST /host/rooms`: open a room for a desktop with a token, or open its room again.
     fn open_room(&self, req: &Request) -> Response {
         let Some(token) = bearer(req).and_then(|t| self.config.tokens.iter().find(|k| same_secret(t, k))).cloned() else {
-            return Response::text(401, "a relay token goes in Authorization: Bearer\n").with_header("WWW-Authenticate", "Bearer realm=\"wordcraft-relay\"");
+            return Response::text(401, "a relay token goes in Authorization: Bearer\n")
+                .with_header("WWW-Authenticate", "Bearer realm=\"wordcraft-relay\"");
         };
         let asked: Value = if req.body.is_empty() { json!({}) } else { serde_json::from_slice(&req.body).unwrap_or(Value::Null) };
         let claim = match (asked.get("room").and_then(Value::as_str), asked.get("secret").and_then(Value::as_str)) {
@@ -212,7 +213,15 @@ impl Relay {
         if rooms.values().filter(|r| r.token == token).count() >= self.config.rooms_per_token {
             return Response::text(429, "this token holds as many rooms as it may\n");
         }
-        let waiting = Waiting { queue: VecDeque::new(), answers: HashMap::new(), next: 1, seen: Instant::now(), polling: 0, closed: false, bucket: Bucket::new(self.config.per_room.1) };
+        let waiting = Waiting {
+            queue: VecDeque::new(),
+            answers: HashMap::new(),
+            next: 1,
+            seen: Instant::now(),
+            polling: 0,
+            closed: false,
+            bucket: Bucket::new(self.config.per_room.1),
+        };
         rooms.insert(id.clone(), Arc::new(Room { secret: secret.clone(), token, waiting: Mutex::new(waiting), wake: Condvar::new() }));
         log::info!("relay: room {} opened", short(&id));
         self.opened(&id, &secret)
@@ -323,7 +332,11 @@ impl Relay {
                 return refusal(404, "the document isn't shared any more");
             }
             if !Room::online(&w, self.config.offline_after) {
-                return refusal(503, "the room's host is offline: the WordCraft app that shares this document isn't connected (the computer may be asleep)").with_header("Retry-After", "30");
+                return refusal(
+                    503,
+                    "the room's host is offline: the WordCraft app that shares this document isn't connected (the computer may be asleep)",
+                )
+                .with_header("Retry-After", "30");
             }
             if !w.bucket.take(self.config.per_room) {
                 return refusal(429, "too many requests to this room").with_header("Retry-After", "1");
@@ -363,5 +376,10 @@ fn short(id: &str) -> &str {
 pub fn serve(listener: std::net::TcpListener, relay: Arc<Relay>, max_connections: usize) -> std::io::Result<()> {
     let config = wordcraft_http::Config { max_connections, idle: Duration::from_secs(60), write: Duration::from_secs(60), ..Default::default() };
     let limit = relay.clone();
-    wordcraft_http::serve_with(listener, config, Arc::new(move |req: &Request| limit.body_limit(req)), Arc::new(move |req: &Request| relay.handle(req)))
+    wordcraft_http::serve_with(
+        listener,
+        config,
+        Arc::new(move |req: &Request| limit.body_limit(req)),
+        Arc::new(move |req: &Request| relay.handle(req)),
+    )
 }

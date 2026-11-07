@@ -42,7 +42,8 @@ pub fn is_hex(s: &str, len: usize) -> bool {
 /// trying a relay out, and for tests). Returns it without a trailing `/`.
 pub fn relay_url(url: &str) -> Result<String, String> {
     let url = url.trim().trim_end_matches('/');
-    let local = ["http://127.0.0.1:", "http://localhost:", "http://[::1]:"].iter().any(|p| url.starts_with(p)) || ["http://127.0.0.1", "http://localhost"].contains(&url);
+    let local = ["http://127.0.0.1:", "http://localhost:", "http://[::1]:"].iter().any(|p| url.starts_with(p))
+        || ["http://127.0.0.1", "http://localhost"].contains(&url);
     let https = url.strip_prefix("https://").is_some_and(|rest| !rest.is_empty() && !rest.contains(['?', '#', ' ', '@']));
     // No user part: `http://127.0.0.1:80@elsewhere` goes elsewhere.
     if (https || local) && !url.contains('@') {

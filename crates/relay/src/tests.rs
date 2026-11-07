@@ -74,7 +74,16 @@ fn relay_addresses_are_https_or_this_computer() {
     assert!(relay_url("https://relay.example.org/base").is_ok());
     assert!(relay_url("http://127.0.0.1:8790").is_ok());
     assert!(relay_url("http://localhost:8790").is_ok());
-    for bad in ["http://relay.example.org", "ftp://x", "https://", "relay.example.org", "http://127.0.0.1:80@evil.example", "https://u@relay.example.org", "http://127.0.0.1.evil.example", "https://relay.example.org/?x"] {
+    for bad in [
+        "http://relay.example.org",
+        "ftp://x",
+        "https://",
+        "relay.example.org",
+        "http://127.0.0.1:80@evil.example",
+        "https://u@relay.example.org",
+        "http://127.0.0.1.evil.example",
+        "https://relay.example.org/?x",
+    ] {
         assert!(relay_url(bad).is_err(), "{bad}");
     }
 }
@@ -90,7 +99,14 @@ fn an_agents_request_reaches_the_desktop_through_the_relay() {
     let (status, headers, body) = http(
         &format!("{url}?x=1"),
         "POST",
-        &[("Authorization", "Bearer invite-key"), ("Content-Type", "application/json"), ("Mcp-Method", "tools/list"), ("Mcp-Param-Region", "eu"), ("Cookie", "a=b"), ("X-Forwarded-For", "10.0.0.1")],
+        &[
+            ("Authorization", "Bearer invite-key"),
+            ("Content-Type", "application/json"),
+            ("Mcp-Method", "tools/list"),
+            ("Mcp-Param-Region", "eu"),
+            ("Cookie", "a=b"),
+            ("X-Forwarded-For", "10.0.0.1"),
+        ],
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
     );
     assert_eq!(status, 200, "{body}");
@@ -222,7 +238,13 @@ fn the_relay_holds_back_floods_and_large_bodies() {
     assert_eq!(status, 429);
     // Large bodies only where an answer goes, and only with the room's secret.
     let (room, secret) = hosting.claim();
-    let req = |path: &str, auth: Option<&str>| Request { method: "POST".into(), target: path.into(), headers: auth.map(|a| vec![("Authorization".to_string(), format!("Bearer {a}"))]).unwrap_or_default(), body: Vec::new(), peer: None };
+    let req = |path: &str, auth: Option<&str>| Request {
+        method: "POST".into(),
+        target: path.into(),
+        headers: auth.map(|a| vec![("Authorization".to_string(), format!("Bearer {a}"))]).unwrap_or_default(),
+        body: Vec::new(),
+        peer: None,
+    };
     assert_eq!(relay.body_limit(&req(&format!("/host/r/{room}/reply"), Some(&secret))), MAX_REPLY);
     assert_eq!(relay.body_limit(&req(&format!("/host/r/{room}/reply"), Some("nope"))), MAX_REQUEST);
     assert_eq!(relay.body_limit(&req(&format!("/host/r/{room}/reply"), None)), MAX_REQUEST);
@@ -246,7 +268,13 @@ fn hostile_frames_never_panic() {
             assert!(r.status >= 200, "{method} {target}");
         }
     }
-    for v in [json!(null), json!({"id": "x"}), json!({"id": 1, "status": 99}), json!({"id": u64::MAX, "status": 200, "headers": "x"}), json!({"id": 1, "status": 70000})] {
+    for v in [
+        json!(null),
+        json!({"id": "x"}),
+        json!({"id": 1, "status": 99}),
+        json!({"id": u64::MAX, "status": 200, "headers": "x"}),
+        json!({"id": 1, "status": 70000}),
+    ] {
         assert!(crate::wire::response_from(&v).is_none_or(|(_, r)| (200..600).contains(&r.status)), "{v}");
         let _ = crate::wire::request_from(&v);
     }

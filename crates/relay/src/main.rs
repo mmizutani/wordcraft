@@ -38,7 +38,8 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     let public_url = wordcraft_relay::relay_url(&value(args, "--public-url").ok_or(format!("--public-url is needed\n\n{USAGE}"))?)?;
     let listen = value(args, "--listen").unwrap_or_else(|| "127.0.0.1:8790".into());
-    let mut tokens: Vec<String> = std::env::var("WORDCRAFT_RELAY_TOKENS").unwrap_or_default().split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    let mut tokens: Vec<String> =
+        std::env::var("WORDCRAFT_RELAY_TOKENS").unwrap_or_default().split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
     if let Some(file) = value(args, "--tokens-file") {
         let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
         tokens.extend(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_string));
@@ -53,7 +54,8 @@ fn run(args: &[String]) -> Result<(), String> {
         Some(n) => n.parse::<usize>().ok().filter(|n| *n > 0).ok_or("--max-connections needs a number from 1")?,
         None => 512,
     };
-    let config = Config { public_url: public_url.clone(), tokens, trust_forwarded: args.iter().any(|a| a == "--trust-forwarded"), ..Config::default() };
+    let config =
+        Config { public_url: public_url.clone(), tokens, trust_forwarded: args.iter().any(|a| a == "--trust-forwarded"), ..Config::default() };
     let listener = std::net::TcpListener::bind(&listen).map_err(|e| format!("cannot listen on {listen}: {e}"))?;
     eprintln!("wordcraft-relay: listening on {listen}; rooms at {public_url}/r/<room>/mcp");
     serve(listener, Arc::new(Relay::new(config)), max_connections).map_err(|e| e.to_string())
