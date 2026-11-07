@@ -9,8 +9,11 @@
 //! which blocks it touched, and another copy applies it to the same blocks. So the ids are
 //! random, not counted from 1: copies that add blocks at the same time don't make the same ids.
 //!
-//! An id isn't part of what a block holds: `==` ignores it, files don't store it (a document read
-//! from one gets new ids), and the markup kept from a file doesn't depend on it.
+//! An id isn't part of what a block holds: `==` ignores it, the document's JSON doesn't hold it,
+//! and the markup kept from a file doesn't depend on it. Word files keep it: the docx writer saves
+//! it as the paragraph's id (`w14:paraId`, with the whole id beside it when that can't hold it),
+//! and the reader gives the paragraph that id back. A document read from a file without them gets
+//! new ids.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -66,6 +69,17 @@ impl BlockId {
     pub fn is_set(self) -> bool {
         self != BlockId::UNSET
     }
+
+    /// The id with these 64 bits: one a file saved ([`BlockId::bits`]). 0 is
+    /// [`BlockId::UNSET`].
+    pub const fn from_bits(bits: u64) -> BlockId {
+        BlockId(bits)
+    }
+
+    /// The id's 64 bits, as a file saves them.
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
 }
 
 /// Where this process's ids start: random, so that two processes (two people's copies of a
@@ -93,14 +107,16 @@ fn mix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Hashes an id as it is: ids are random already, and the set of them is built after every
-/// command.
+/// Hashes an id cheaply, scrambled with this process's random key: the set of ids is built after
+/// every command, and ids read from a file (`wc:blockId`) are whatever the file says, so they
+/// can't be trusted to be random (ids that differ only in their high bits would otherwise all
+/// fall in one bucket).
 #[derive(Default)]
 struct IdHasher(u64);
 
 impl Hasher for IdHasher {
     fn finish(&self) -> u64 {
-        self.0
+        mix(self.0 ^ seed())
     }
     fn write(&mut self, bytes: &[u8]) {
         for b in bytes {

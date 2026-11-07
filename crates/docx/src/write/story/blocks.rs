@@ -93,7 +93,10 @@ impl Writer<'_> {
         if rows.is_empty() {
             return;
         }
-        w.open("w:tbl", &[]);
+        match self.para_ids.take_table(t.id) {
+            Some(full) => w.open("w:tbl", &[("wc:blockId", &full)]),
+            None => w.open("w:tbl", &[]),
+        }
         let chg = t.props.fmt_change.as_ref().map(|c| self.change_attrs(c.rev));
         tblpr(w, &t.props, chg.as_ref());
         w.open("w:tblGrid", &[]);
