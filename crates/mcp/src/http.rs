@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -63,13 +63,20 @@ struct Answer {
     ended: bool,
 }
 
+/// Requests one key may have waiting for its connection; more are answered 503 at once, so a
+/// client sending faster than the app answers can't pile up request bodies.
+const QUEUE: usize = 8;
+
 struct Job {
     body: String,
     answer: Sender<Answer>,
+    /// When the request's caller stops waiting: a job not begun by then is dropped, never run
+    /// after its caller was told it timed out.
+    until: Instant,
 }
 
 struct Seat {
-    jobs: Sender<Job>,
+    jobs: SyncSender<Job>,
     last: Instant,
 }
 
@@ -207,10 +214,17 @@ impl Endpoint {
         for _ in 0..2 {
             let jobs = self.seat(key)?;
             let (tx, rx) = mpsc::channel();
-            if jobs.send(Job { body: body.clone(), answer: tx }).is_err() {
-                // The thread idled out: open it again.
-                self.forget(key);
-                continue;
+            let until = Instant::now().checked_add(self.options.timeout).unwrap_or_else(Instant::now);
+            match jobs.try_send(Job { body: body.clone(), answer: tx, until }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    return Err(refusal(503, -32603, "too many requests are waiting for this key: try again").with_header("Retry-After", "1"));
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    // The thread idled out: open it again.
+                    self.forget(key);
+                    continue;
+                }
             }
             return match rx.recv_timeout(self.options.timeout) {
                 Ok(a) if a.ended => {
@@ -236,7 +250,7 @@ impl Endpoint {
     }
 
     /// `key`'s thread, opened (and the key checked with the app) when it has none.
-    fn seat(&self, key: &str) -> Result<Sender<Job>, Response> {
+    fn seat(&self, key: &str) -> Result<SyncSender<Job>, Response> {
         {
             let Ok(mut seats) = self.seats.lock() else { return Err(refusal(500, -32603, "internal error")) };
             let idle = self.options.idle;
@@ -264,8 +278,8 @@ impl Endpoint {
 
     /// Start a thread holding a connection to the app with `key`, once the app says the key is
     /// an invite's.
-    fn open_seat(&self, key: &str) -> Result<Sender<Job>, Response> {
-        let (jobs, inbox) = mpsc::channel::<Job>();
+    fn open_seat(&self, key: &str) -> Result<SyncSender<Job>, Response> {
+        let (jobs, inbox) = mpsc::sync_channel::<Job>(QUEUE);
         let (ready_tx, ready) = mpsc::channel::<Result<(), Response>>();
         let (open, key, idle) = (self.open.clone(), key.to_string(), self.options.idle);
         let spawned = std::thread::Builder::new().name("mcp http key".into()).spawn(move || {
@@ -317,6 +331,9 @@ impl Endpoint {
 /// A key's thread: answer its requests in turn until it idles out or the app refuses the key.
 fn serve_key(mut server: Server, inbox: &Receiver<Job>, idle: Duration) {
     while let Ok(job) = inbox.recv_timeout(idle) {
+        if Instant::now() >= job.until {
+            continue;
+        }
         let reply = server.handle_line(&job.body);
         // A failed request may be the first sign that the key was taken back (the copy says so
         // and its connection closes): ask the app whether it still takes the key.

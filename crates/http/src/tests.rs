@@ -118,3 +118,35 @@ fn serves_keep_alive_requests_expect_continue_and_a_connection_cap() {
     assert!(out.starts_with("HTTP/1.1 503"), "{out}");
     drop(first);
 }
+
+/// A client that sends a byte now and then, each well within the idle time, is cut off once the
+/// request has taken its whole deadline: it can't hold a connection (and the cap) for long.
+#[test]
+fn a_slow_drip_of_bytes_is_cut_off_at_the_request_deadline() {
+    use std::time::{Duration, Instant};
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config = Config { idle: Duration::from_millis(400), request: Duration::from_millis(600), ..Config::default() };
+    std::thread::spawn(move || serve(listener, config, Arc::new(|_: &Request| Response::text(200, "ok"))));
+    for raw in [
+        &b"POST /a HTTP/1.1\r\nX-Slow: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"[..],
+        &b"POST /a HTTP/1.1\r\nContent-Length: 40\r\n\r\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"[..],
+    ] {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let started = Instant::now();
+        let head = raw.len() - 40;
+        s.write_all(&raw[..head]).unwrap();
+        // One byte every 100 ms: each read is quick, the whole would take 4 s.
+        for b in &raw[head..] {
+            std::thread::sleep(Duration::from_millis(100));
+            if s.write_all(std::slice::from_ref(b)).is_err() {
+                break;
+            }
+        }
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        assert!(out.starts_with("HTTP/1.1 408"), "{out:?}");
+        assert!(started.elapsed() < Duration::from_millis(3000), "{:?}", started.elapsed());
+    }
+}
