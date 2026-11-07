@@ -146,7 +146,7 @@ pub fn specs() -> Vec<CommandSpec> {
         .params(r#"{"force"?: bool (desktop app's control channel and MCP bridge only: without it a document with unsaved changes is an error and stays open; with it the changes are discarded. Headless sessions never ask; file.closeDocument closes a document there)}"#)
         .pure(),
         CommandSpec::new("file.closeDocument", "Close Document", "Agents", close_document)
-            .params(r#"{"id"?: n (an open document, see view.switchWindows; default the active one), "force"?: bool (discard unsaved changes; without it a document with unsaved changes is an error and stays open)} → {"closed": id, "active": id, "documents": [{"id", "title", "path", "dirty", "active"}]}; closing the last document leaves a new blank one"#)
+            .params(r#"{"id"?: n (an open document, see view.switchWindows; default the active one), "force"?: bool (discard unsaved changes; without it a document with unsaved changes is an error and stays open)} → {"closed": id, "active": id, "documents": [{"id", "title", "path", "dirty", "active"}]}; closing the last document leaves a new blank one; a shared document (room.share) is refused until sharing stops, which the app's own close does first"#)
             .pure(),
         CommandSpec::new("file.properties", "Properties", "File › Info", properties)
             .params(r#"{"title"?, "subject"?, "author"?, "keywords"?, "comments"?, "category"?, "custom"?: {name: string | {"value": string, "linkTarget"?: string | null} | null (removes)}}; text values and bookmark targets are at most 1 MiB; a string keeps an existing target, an object replaces it (omitted/null target unlinks)"#),
@@ -318,6 +318,11 @@ fn close_document(s: &mut Session, v: &Value) -> CmdResult {
     let dirty = s.documents().iter().any(|d| d.id == id && d.dirty);
     if dirty && p::bool(v, "force") != Some(true) {
         return Err(CmdError::Failed("the document has unsaved changes: save it first, or pass \"force\": true to discard them".into()));
+    }
+    // What the room takes after this would be lost with it: the window stops sharing first when
+    // it closes the document itself, so this is a step of a macro, say.
+    if s.shared_room().is_some_and(|(shared, _)| shared == id) {
+        return Err(CmdError::Failed("the document is shared: stop sharing it first (room.stop), or close it in the window".into()));
     }
     s.close_document(id)?;
     Ok(json!({"closed": id, "active": s.document_id(), "documents": s.documents()}))

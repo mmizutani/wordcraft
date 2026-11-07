@@ -164,7 +164,7 @@ pub enum RoomError {
 
 /// What a room calls when its hub accepted changes or it closed: the app's window asks to be
 /// drawn again, to show them.
-type OnChange = Box<dyn Fn() + Send + Sync>;
+type OnChange = Arc<dyn Fn() + Send + Sync>;
 
 /// One shared document: its hub, and what its participants' copies share.
 pub struct Room {
@@ -217,15 +217,17 @@ impl Room {
     }
 
     /// Call `f` whenever the hub accepted changes, and when the room closes, on the thread that
-    /// made that happen (in place of what was called before).
+    /// made that happen (in place of what was called before). The room holds no lock of its own
+    /// while `f` runs, so `f` may use the room, even close it.
     pub fn on_change(&self, f: impl Fn() + Send + Sync + 'static) {
-        *self.on_change.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(f));
+        *self.on_change.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(f));
     }
 
     /// Wake whoever waits for a change ([`Room::wait_past`], [`Room::on_change`]).
     fn changed(&self) {
         self.changed.notify_all();
-        if let Some(f) = self.on_change.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        let f = self.on_change.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(f) = f {
             f();
         }
     }

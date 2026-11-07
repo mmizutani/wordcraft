@@ -2,6 +2,7 @@
 //! to its owner's copy for each step, and participants with a key get copies of their own,
 //! which answer their requests ([`Lobby`], [`hosted::call`]).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
@@ -337,7 +338,7 @@ fn an_edit_whose_text_went_meanwhile_is_reported_lost() {
 
 #[test]
 fn a_request_that_only_reads_says_when_an_earlier_edit_was_lost() {
-    for method in ["document.inspect", "engine.commands", "ui.render", "room.participants"] {
+    for method in ["document.inspect", "engine.commands", "ui.render", "ui.parity", "room.participants"] {
         let (_win, _own, _room, mut agent) = typed_in_a_box_that_went(1);
         let params = if method == "ui.render" { json!({"scale": 0.25}) } else { json!({}) };
         // Bringing in what the person changed gives the agent's typing up: the request says so,
@@ -362,7 +363,7 @@ fn every_request_first_sends_what_an_earlier_command_left() {
     let key = room.invite("Agent", Role::Editor).unwrap();
     let mut agent = room.join_with(&key).unwrap();
     agent.run("caret.docEnd", &json!({})).unwrap();
-    for method in ["document.inspect", "engine.commands", "ui.render", "room.participants", "engine.execute"] {
+    for method in ["document.inspect", "engine.commands", "ui.render", "ui.parity", "room.participants", "engine.execute"] {
         // An edit the hub hasn't taken yet, as others' changes sending it back leave one.
         agent.run("text.insert", &json!({"text": "!"})).unwrap();
         assert!(agent.has_unconfirmed());
@@ -375,8 +376,76 @@ fn every_request_first_sends_what_an_earlier_command_left() {
         assert!(!agent.has_unconfirmed(), "{method} left an edit unsent");
     }
     let (version, hub) = room.document();
-    assert_eq!(hub.plain_text(StoryRef::Body), "one two three!!!!!");
+    assert_eq!(hub.plain_text(StoryRef::Body), "one two three!!!!!!");
     assert_eq!(agent.received(), version);
+}
+
+#[test]
+fn a_command_the_hub_took_answers_though_sharing_stops_right_after() {
+    let (mut win, _, _) = window();
+    let (room, _own) = Room::host(&mut win, "Minoru").unwrap();
+    let key = room.invite("Agent", Role::Editor).unwrap();
+    let mut agent = room.join_with(&key).unwrap();
+    // The window stops sharing as soon as the hub took the agent's edit, before the agent's
+    // copy hears back from it.
+    let stopped = Arc::new(AtomicBool::new(false));
+    let (once, shared) = (stopped.clone(), Arc::downgrade(&room));
+    room.on_change(move || {
+        if !once.swap(true, Ordering::SeqCst)
+            && let Some(room) = shared.upgrade()
+        {
+            room.close();
+        }
+    });
+    // All of it is in the room, so the command's result comes back.
+    execute(&mut agent, "text.insert", json!({"text": "zero "})).unwrap();
+    assert!(stopped.load(Ordering::SeqCst) && room.is_closed());
+    assert_eq!(room.document().1.plain_text(StoryRef::Body), "zero one two three");
+    // The next request says the document isn't shared any more.
+    assert_eq!(call(&mut agent, "document.inspect", json!({})).unwrap_err(), "the document isn't shared any more");
+}
+
+#[test]
+fn a_macro_cut_off_by_sharing_stopping_says_how_much_didn_t_reach_the_room() {
+    let (mut win, _, _) = window();
+    let (room, _own) = Room::host(&mut win, "Minoru").unwrap();
+    let key = room.invite("Agent", Role::Owner).unwrap();
+    let mut agent = room.join_with(&key).unwrap();
+    let n = 2 * crate::room::MAX_BATCH;
+    let steps: Vec<Value> = (0..n).map(|_| json!({"command": "text.insert", "params": {"text": "x"}})).collect();
+    execute(&mut agent, "tools.macros", json!({"define": {"name": "many", "steps": steps}})).unwrap();
+    // Sharing stops once the hub took the first batch of the macro's changes.
+    let stopped = Arc::new(AtomicBool::new(false));
+    let (once, shared) = (stopped.clone(), Arc::downgrade(&room));
+    room.on_change(move || {
+        if !once.swap(true, Ordering::SeqCst)
+            && let Some(room) = shared.upgrade()
+        {
+            room.close();
+        }
+    });
+    let why = execute(&mut agent, "tools.macros", json!({"run": "many"})).unwrap_err();
+    let left = n - crate::room::MAX_BATCH;
+    assert_eq!(why, format!("the document isn't shared any more, so {left} of your changes didn't reach it"));
+    assert_eq!(room.document().1.plain_text(StoryRef::Body).matches('x').count(), crate::room::MAX_BATCH);
+}
+
+#[test]
+fn a_command_doesn_t_close_the_shared_document_while_it_is_shared() {
+    let (mut win, shared, other) = window();
+    let (room, _own) = Room::host(&mut win, "Minoru").unwrap();
+    // A macro's step, run in the window's session while it shows the other document: what the
+    // room took after the close would be lost.
+    win.activate(other).unwrap();
+    let step = json!({"command": "file.closeDocument", "params": {"id": shared, "force": true}});
+    win.run("tools.macros", &json!({"define": {"name": "close", "steps": [step]}})).unwrap();
+    let why = win.run("tools.macros", &json!({"run": "close"})).unwrap_err().to_string();
+    assert!(why.contains("the document is shared: stop sharing it first"), "{why}");
+    assert!(win.is_open(shared));
+    // Once sharing stops, it closes.
+    room.close();
+    win.run("tools.macros", &json!({"run": "close"})).unwrap();
+    assert!(!win.is_open(shared));
 }
 
 #[test]

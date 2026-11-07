@@ -176,7 +176,10 @@ changes closes at once (#1268). Closing closes the document and its window, and 
 focused before it becomes the active one. The last window stays open with no page, and
 `file.new` or `file.open` goes on from there (#1712); closing it doesn't quit the app. With
 `doc` naming a document in the background, `file.close` closes that document and its window under
-the same rule (unsaved changes need `{"force": true}`), and the active window stays active.
+the same rule (unsaved changes need `{"force": true}`), and the active window stays active. A
+macro's `file.close` step closes the document the window shows once the macro has run, as File ›
+Close does: one with unsaved changes stays open, and the status line says why. It never quits
+the app.
 
 ### Native printing
 
@@ -252,13 +255,14 @@ without, or `file.closeDocument`), and so does quitting the app: once nothing is
 the room closes before the app does (`app.quit`, which quits without asking, closes it first
 too). A close or a quit sees every change the room took until then: an agent's edit since the
 window's last frame is unsaved work, so a close without `force` is refused for it, and the
-person's Close or quit asks to save it. A shared document is never replaced by a file opened in
-its place, even a blank one: `file.open` opens beside it. One document is shared at a time.
-Undo and Redo (`edit.undo`, `edit.redo`, `edit.undoTo`) take back the steps of whoever runs
-them, the window's or a participant's own, and leave others' changes in. When another
-participant changed what the step changed since (the same characters, blocks, part or document
-field), the step stays and the command fails naming them (`edit.undoTo` stops there and says
-why under `stopped`).
+person's Close or quit asks to save it. A macro can't close the shared document while it is
+shared: its `file.closeDocument` step fails, saying to stop sharing first. A shared document is
+never replaced by a file opened in its place, even a blank one: `file.open` opens beside it.
+One document is shared at a time. Undo and Redo (`edit.undo`, `edit.redo`, `edit.undoTo`) take
+back the steps of whoever runs them, the window's or a participant's own, and leave others'
+changes in. When another participant changed what the step changed since (the same characters,
+blocks, part or document field), the step stays and the command fails naming them
+(`edit.undoTo` stops there and says why under `stopped`).
 
 ### Joining with an invite's key
 
@@ -276,9 +280,9 @@ the same key or none. The copy answers:
 | `ui.parity` | — | as for the window |
 | `room.participants` | — | `{"you", "participants", "version"}`: the caller, everyone in the room, and the version of the document the copy has |
 
-Any other method name is a command id, as for the window. Each request first sends the
-participant's changes the room hasn't taken yet, if an earlier command left some, and brings in
-what others changed since. When one of those changes couldn't be made again, the request fails
+Any other method name is a command id, as for the window. Each request the copy doesn't refuse
+first sends the participant's changes the room hasn't taken yet, if an earlier command left
+some, and brings in what others changed since. When one of those changes couldn't be made again, the request fails
 with the error that says so (naming its command) and does nothing else, so it can be sent
 again; a command also doesn't run while the room still hasn't taken them. `doc` may name the
 shared document only. Commands that work on files,

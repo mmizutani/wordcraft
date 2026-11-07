@@ -116,7 +116,10 @@ fn answer(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, Str
             let scale = params.get("scale").and_then(Value::as_f64).map_or(2.0, |v| v as f32);
             copy.session().page_png(page, scale)
         }
-        "ui.parity" => Ok(crate::catalog::parity(&copy.session().registry)),
+        "ui.parity" => {
+            catch_up(copy, method, false)?;
+            Ok(crate::catalog::parity(&copy.session().registry))
+        }
         "room.participants" => {
             catch_up(copy, method, false)?;
             Ok(json!({"you": copy.participant(), "participants": copy.room().participants(), "version": copy.received()}))
@@ -185,7 +188,8 @@ fn catch_up(copy: &mut Replica, what: &str, command: bool) -> Result<(), String>
 /// all of them: up to [`super::MAX_BATCH`] changes at a time, so a long macro's go in several
 /// sends, and made again after the changes the hub sends them back for. It stops after
 /// [`MAX_SENDS`] sends in a row that the hub took none of, and with an error when the
-/// participant is out of the room ([`ended`]).
+/// participant is out of the room ([`ended`]) while some are left: once the hub took them all,
+/// the request answers, and the next one says the participant is out.
 fn send_all(copy: &mut Replica) -> Result<(), String> {
     copy.receive();
     // A send counts as taken when it leaves fewer changes than ever before, so this ends.
@@ -194,10 +198,12 @@ fn send_all(copy: &mut Replica) -> Result<(), String> {
     while copy.has_unconfirmed() && idle < MAX_SENDS {
         copy.send();
         copy.receive();
-        if let Some(why) = ended(copy) {
-            return Err(why);
-        }
         let left = copy.unconfirmed();
+        if left > 0
+            && let Some(why) = ended(copy)
+        {
+            return Err(format!("{why}, so {left} of your changes didn't reach it"));
+        }
         if left < fewest {
             fewest = left;
             idle = 0;

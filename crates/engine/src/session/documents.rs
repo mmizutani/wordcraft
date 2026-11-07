@@ -650,9 +650,16 @@ impl Session {
         self.room = Some((self.document_id, std::sync::Arc::downgrade(room)));
     }
 
+    /// The open document shared through a room that is still open, by id, and that room
+    /// ([`Session::shared_through`]), whichever document is active.
+    pub(crate) fn shared_room(&self) -> Option<(u64, std::sync::Arc<crate::room::Room>)> {
+        let (id, room) = self.room.as_ref()?;
+        room.upgrade().filter(|r| !r.is_closed()).map(|r| (*id, r))
+    }
+
     /// Whether the active document is shared through a room that is still open.
     pub(crate) fn is_shared(&self) -> bool {
-        self.room.as_ref().is_some_and(|(id, room)| *id == self.document_id && room.upgrade().is_some_and(|r| !r.is_closed()))
+        self.shared_room().is_some_and(|(id, _)| id == self.document_id)
     }
 
     /// The open document saved at `path`, if any: the same file reached by another spelling

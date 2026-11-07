@@ -680,12 +680,90 @@ mod tests {
         let mut agent = lobby.join_with(&key).unwrap();
         agent_runs(&mut agent, "caret.docEnd", json!({}));
         agent_runs(&mut agent, "text.insert", json!({"text": " four"}));
-        // `app.quit` quits unasked: sharing stops first, with every change the room took in the
-        // window, and the agent's copy stops answering.
+        // `app.quit` quits unasked, and sharing stops first: the agent's copy stops answering.
+        // (The agent's edit is in the window already: every control request first gets what the
+        // room took.)
         result(&mut a, "app.quit", json!({}));
         assert!(a.quit_requested);
         assert!(a.share.is_none());
         assert_eq!(text(&a), "one two three four");
+        assert!(hosted::call(&mut agent, "document.inspect", &json!({})).unwrap_err().contains("isn't shared"));
+    }
+
+    #[test]
+    fn a_macro_s_close_closes_the_shown_document_and_never_quits() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        a.execute("tools.macros", json!({"define": {"name": "close", "steps": [{"command": "file.close"}]}})).unwrap();
+        // The window shows another document, with unsaved work: the macro's Close keeps it open
+        // and says why.
+        a.execute("file.new", json!({})).unwrap();
+        a.execute("text.insert", json!({"text": "draft"})).unwrap();
+        let draft = a.session.document_id();
+        a.run("tools.macros", json!({"run": "close"})).unwrap();
+        assert!(!a.quit_requested && a.session.is_open(draft));
+        assert!(a.status_msg.as_ref().is_some_and(|(m, _)| m.contains("unsaved changes")), "{:?}", a.status_msg);
+        // Without it, the document closes; the app and the shared document stay.
+        a.session.dirty = false;
+        a.run("tools.macros", json!({"run": "close"})).unwrap();
+        assert!(!a.quit_requested && !a.session.is_open(draft));
+        assert!(a.share.is_some() && a.session.is_open(shared));
+        agent_runs(&mut agent, "text.insert", json!({"text": "zero "}));
+        // In the shared document, the macro runs in the window's copy, which closes nothing.
+        assert_eq!(a.session.document_id(), shared);
+        assert!(a.run("tools.macros", json!({"run": "close"})).is_err());
+        assert!(!a.quit_requested && a.share.is_some() && a.session.is_open(shared));
+        a.catch_up_share();
+        assert_eq!(text(&a), "zero one two three");
+    }
+
+    #[test]
+    fn a_macro_can_t_close_the_shared_document_while_it_is_shared() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        a.execute("file.new", json!({})).unwrap();
+        let step = json!({"command": "file.closeDocument", "params": {"id": shared, "force": true}});
+        a.execute("tools.macros", json!({"define": {"name": "close", "steps": [step]}})).unwrap();
+        // An agent's edit since the window's last frame: closing would drop it, and what the
+        // room took after.
+        agent_runs(&mut agent, "text.insert", json!({"text": "zero "}));
+        let why = a.run("tools.macros", json!({"run": "close"})).unwrap_err();
+        assert!(why.contains("stop sharing it first"), "{why}");
+        assert!(a.share.is_some() && a.session.is_open(shared));
+        a.catch_up_share();
+        assert_eq!(shared_text(&mut a, shared), "zero one two three");
+        agent_runs(&mut agent, "text.insert", json!({"text": "and "}));
+        // Once sharing stops, the macro closes it.
+        result(&mut a, "room.stop", json!({}));
+        a.run("tools.macros", json!({"run": "close"})).unwrap();
+        assert!(!a.session.is_open(shared));
+    }
+
+    #[test]
+    fn a_close_made_for_the_shared_document_in_the_background_stops_sharing_first() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let shared = result(&mut a, "room.share", json!({}))["document"].as_u64().unwrap();
+        let key = result(&mut a, "room.invite", json!({"name": "Writer", "role": "editor"}))["key"].as_str().unwrap().to_string();
+        let mut agent = lobby.join_with(&key).unwrap();
+        a.execute("file.new", json!({})).unwrap();
+        a.session.with_document(shared, |s| s.dirty = false).unwrap();
+        // Close, as a command run on the shared document while another is shown asks for it.
+        // An agent's edit since the last frame is unsaved work: the document stays, shared.
+        agent_runs(&mut agent, "text.insert", json!({"text": "zero "}));
+        a.handle_request(&json!({"close": true, "document": shared}));
+        assert!(a.share.is_some() && a.session.is_open(shared));
+        assert_eq!(shared_text(&mut a, shared), "zero one two three");
+        // With nothing unsaved, sharing stops before it closes.
+        a.session.with_document(shared, |s| s.dirty = false).unwrap();
+        a.handle_request(&json!({"close": true, "document": shared}));
+        assert!(a.share.is_none() && !a.session.is_open(shared));
         assert!(hosted::call(&mut agent, "document.inspect", &json!({})).unwrap_err().contains("isn't shared"));
     }
 
