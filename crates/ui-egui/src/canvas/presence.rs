@@ -288,6 +288,36 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_read_mode_s_side_margins_stops_following() {
+        // Read Mode's wheel turns pages over the whole canvas, its side margins too: that takes
+        // the view back from the participant followed, as over the column.
+        let text: Vec<String> = (0..300).map(|i| format!("Line {i} of a long document")).collect();
+        let (mut h, lobby) = harness(&text.join("\n"));
+        owner(h.state_mut(), "room.share", json!({}));
+        let mut ada = agent(h.state_mut(), &lobby, "Ada");
+        runs(&mut ada, "select.text", json!({"text": "Line 290 "}));
+        owner(h.state_mut(), "view.readMode", json!({}));
+        owner(h.state_mut(), "view.readColumnWidth", json!({"value": "narrow"}));
+        h.run_steps(3);
+        assert!(h.state().session.view.read_mode);
+        h.state_mut().run("ui.follow", json!({"participant": ada.id()})).unwrap();
+        h.run_steps(3);
+        let column = h.state().canvas.canvas_rect.unwrap();
+        assert!(column.min.x > 60.0, "the column is centred, with margins beside it: {column:?}");
+        let margin = egui::pos2(column.min.x - 30.0, column.center().y);
+        h.input_mut().events.push(egui::Event::PointerMoved(margin));
+        h.input_mut().events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -120.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+            source: egui::MouseWheelSource::Unknown,
+        });
+        h.run_steps(2);
+        assert_eq!(h.state().canvas.follow, None, "a wheel over the margin stops following");
+    }
+
+    #[test]
     fn follow_takes_only_someone_else_in_the_shared_document_shown() {
         let (mut h, lobby) = harness("one two three");
         let a = h.state_mut();
