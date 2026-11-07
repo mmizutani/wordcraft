@@ -352,8 +352,12 @@ pub struct Config {
     /// How long one request, its head and body, may take to arrive once it began: a client
     /// sending a byte now and then can't hold a connection longer.
     pub request: Duration,
-    /// How long writing one response may take.
+    /// How long writing one response may take, plus a second for each `write_rate` bytes of its
+    /// body: a client reading a byte now and then can't keep the connection, or the answer it
+    /// holds, for longer.
     pub write: Duration,
+    /// The slowest a client may read a long answer, in bytes a second.
+    pub write_rate: usize,
     /// Requests on one connection before it closes.
     pub max_requests: usize,
 }
@@ -366,6 +370,7 @@ impl Default for Config {
             idle: Duration::from_secs(30),
             request: Duration::from_secs(60),
             write: Duration::from_secs(30),
+            write_rate: 64 << 10,
             max_requests: 1000,
         }
     }
@@ -462,6 +467,32 @@ impl Read for Timed {
     }
 }
 
+/// The write side of a connection: each write waits only until `until`, so a client reading a
+/// little at a time can't make a response take longer than its deadline.
+struct TimedWrite<'a> {
+    stream: &'a TcpStream,
+    until: Instant,
+}
+
+impl Write for TimedWrite<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let left = self.until.checked_duration_since(Instant::now()).filter(|l| !l.is_zero()).ok_or(std::io::ErrorKind::TimedOut)?;
+        self.stream.set_write_timeout(Some(left))?;
+        // Small writes, so the deadline is looked at again often.
+        self.stream.write(buf.get(..buf.len().min(64 << 10)).unwrap_or(buf))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+/// How long writing `resp` may take under `config`.
+fn write_budget(config: &Config, resp: &Response) -> Duration {
+    let len = u64::try_from(resp.body.len()).unwrap_or(u64::MAX);
+    let rate = u64::try_from(config.write_rate.max(1)).unwrap_or(u64::MAX);
+    config.write.saturating_add(Duration::from_secs(len / rate))
+}
+
 /// `d` from now (far ahead when that doesn't fit an [`Instant`]).
 fn after(d: Duration) -> Instant {
     let now = Instant::now();
@@ -508,7 +539,11 @@ pub fn connection(stream: TcpStream, peer: SocketAddr, config: &Config, handler:
         let close = http10 || req.header("Connection").is_some_and(|c| c.eq_ignore_ascii_case("close"));
         let resp = handler(&req);
         let close = close || resp.close;
-        if write_response(&mut writer, &resp, close).is_err() || close {
+        let mut timed = TimedWrite { stream: &writer, until: after(write_budget(config, &resp)) };
+        let written = write_response(&mut timed, &resp, close);
+        // Restore the plain timeout for what else this connection writes.
+        let _ = writer.set_write_timeout(Some(config.write));
+        if written.is_err() || close {
             return;
         }
     }

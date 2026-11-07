@@ -400,6 +400,10 @@ fn serve_key(mut server: Server, inbox: &Receiver<Job>, idle: Duration, recheck:
                 let _ = job.answer.send(Answer { reply: None, ended: true });
                 return;
             }
+            // Asking took time: the caller may have stopped waiting meanwhile.
+            if Instant::now() >= job.until {
+                continue;
+            }
         }
         let reply = server.handle_line(&job.body);
         // A failed request may be the first sign that the key was taken back (the copy says so
