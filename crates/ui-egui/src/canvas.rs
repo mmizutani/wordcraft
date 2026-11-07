@@ -605,7 +605,7 @@ fn others_marks(app: &WordApp, ui: &Ui, layout: &DocLayout, rects: &[Rect], scal
     if others.is_empty() || preview_sel(app).is_some() {
         return Vec::new();
     }
-    let pages = presence::Pages { layout, doc: &app.session.doc, page_hint: app.session.page_hint, rects, scale };
+    let pages = presence::Pages { layout, doc: &app.session.doc, page_hint: app.session.page_hint, rects, scale, visible: ui.clip_rect() };
     presence::marks(&pages, &others, crate::now_ms(), ui.input(|i| i.pointer.hover_pos()), app.canvas.follow)
 }
 
