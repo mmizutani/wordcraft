@@ -120,6 +120,8 @@ impl WordApp {
         }
         self.lobby.open(room.clone());
         self.share = Some(Share { room, copy });
+        // Agents on other machines reach it through the relay, when one is set up (#76).
+        self.start_relay();
         Ok(self.share_state())
     }
 
@@ -128,6 +130,7 @@ impl WordApp {
     /// document or another one. Whether it shared one.
     pub(crate) fn stop_sharing(&mut self) -> bool {
         let Some(mut share) = self.share.take() else { return false };
+        self.stop_relay();
         // The room takes nothing more, and what it took last is the window's too.
         share.room.close();
         let _ = share.copy.lend_document(&mut self.session, Replica::receive);
@@ -241,6 +244,7 @@ impl WordApp {
                     "participants": participants,
                     "invited": invited,
                     "agentFiles": s.room.agent_files().0.name(),
+                    "relay": self.relay_state(),
                 })
             }
         }
@@ -264,8 +268,9 @@ const MAX_EXPIRY: u64 = 30 * 24 * 60 * 60;
 ///   File › Options › Agents allows, or fewer when `files` says so: `none`, `folders` (that pane's
 ///   folders) or `all`, never more than the setting. `remote` (an agent on another machine): never
 ///   the owner, no files unless `files` names some, and the key stops working after a day unless
-///   `expiresIn` says otherwise. The reply carries no connection lines: people don't run tunnels,
-///   the relay (#76) will give a remote invite its URL.
+///   `expiresIn` says otherwise. Its reply has the URL the agent uses (`url`, the relay's, #76)
+///   and an MCP client configuration with it and the key (`mcpConfig`), both `null` while the
+///   document's room isn't open on a relay; people don't run tunnels.
 ///   `expiresIn`: seconds until the key stops working (60 to 30 days). `uses`: how many times it
 ///   joins.
 /// - `room.revoke {key | name}`: take an invite back, by its key or by the name it was for (the key
@@ -273,6 +278,8 @@ const MAX_EXPIRY: u64 = 30 * 24 * 60 * 60;
 /// - `room.role {name, role}`: give an invited participant another role from now on.
 /// - `room.participants`: whether a document is shared, its version, who is in it, and the
 ///   invites not taken back (`invited`, without their keys).
+/// - `room.relay {relay?, token?, off?}`: the relay agents on other machines reach the shared
+///   document through ([`WordApp::relay_method`]).
 /// - `room.stop`: stop sharing.
 pub(crate) fn room_method(app: &mut WordApp, method: &str, p: &Value) -> Option<Result<Value, String>> {
     let s = |k: &str| p.get(k).and_then(Value::as_str);
@@ -312,7 +319,7 @@ pub(crate) fn room_method(app: &mut WordApp, method: &str, p: &Value) -> Option<
             let key = room.invite_on(name, role, terms).map_err(|e| e.to_string())?;
             // A remote invite's files are none unless it named some (`Hub::invite_on`).
             let files = if remote { Some(files.unwrap_or(AgentFiles::None)) } else { files };
-            Ok(json!({
+            let mut reply = json!({
                 "key": key,
                 "name": name.trim(),
                 "role": role,
@@ -320,7 +327,14 @@ pub(crate) fn room_method(app: &mut WordApp, method: &str, p: &Value) -> Option<
                 "remote": remote,
                 "expires": expires,
                 "uses": uses,
-            }))
+            });
+            // An agent elsewhere reaches the document at the relay's URL (#76), with the key.
+            if remote {
+                let url = app.relay_url();
+                reply["mcpConfig"] = url.as_deref().map_or(Value::Null, |u| crate::relay::mcp_config(u, &key));
+                reply["url"] = json!(url);
+            }
+            Ok(reply)
         })(),
         "room.revoke" => (|| {
             let room = room()?;
@@ -344,6 +358,7 @@ pub(crate) fn room_method(app: &mut WordApp, method: &str, p: &Value) -> Option<
             Ok(json!({"changed": changed, "name": name.trim(), "role": role}))
         })(),
         "room.participants" => Ok(app.share_state()),
+        "room.relay" => app.relay_method(p),
         "room.stop" => Ok(json!({"stopped": app.stop_sharing()})),
         _ => return None,
     })

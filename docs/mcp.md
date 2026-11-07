@@ -53,9 +53,12 @@ back, or past its time, is refused (401), and the request that finds it out says
   for a tunnel in front), and when it has an `Origin` (a web page), unless `--allow-origin`
   lists it. Bodies are capped at 1 MiB, connections at 64, keys at 64.
 
-Agents in sandboxes won't need a tunnel: the app will dial out to a relay that serves this
-endpoint at a public URL (#76). Until then, putting a tunnel in front of the port is a
-developer's test, not how people connect.
+Agents in sandboxes don't need a tunnel: the app dials out to a relay, which gives the shared
+document a public URL and passes each request to this endpoint in the app (#76,
+[relay.md](relay.md)). Set it up in File › Share › Agents on other computers, or with
+`room.relay`; a remote invite then answers with the URL and an MCP client configuration holding
+the key. Putting a tunnel in front of `--http` yourself is a developer's test, not how people
+connect.
 
 ## Scripts from the command line
 
@@ -356,8 +359,9 @@ An agent on another machine (a sandbox) is invited with
 `{"action": "invite", "name": "Sandbox", "remote": true}`: never the owner, no file unless
 `files` names some, and a key that stops working after a day unless `expiresIn` (seconds) says
 otherwise; `uses: 1` lets it join once. It reaches the room over HTTP with the key
-([MCP over HTTP](#mcp-over-http)), and will through a relay this computer dials out to, with no
-tunnel to run (#76); see
+([MCP over HTTP](#mcp-over-http)), through a relay this computer dials out to, with no tunnel to
+run ([relay.md](relay.md), #76): the invite's reply has the URL (`url`) and an MCP client
+configuration (`mcpConfig`); see
 [Agents on other machines](control-protocol.md#agents-on-other-machines). Only an invite's key
 goes to a sandbox, never the window's.
 
