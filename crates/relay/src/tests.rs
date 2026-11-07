@@ -584,8 +584,9 @@ fn heads_without_their_bodies_are_turned_away_unless_the_request_could_be_made()
     {
         assert_eq!(answered(&mut head(&path)), Some(status), "{path}");
     }
-    // An agent's room: 16 bodies may be arriving from one address, then 429 until one is done.
-    let mut waiting: Vec<TcpStream> = (0..16).map(|_| head(&format!("/r/{room}/mcp"))).collect();
+    // An agent's room: 32 requests may be arriving or waiting from one address, then 429 until
+    // one is done.
+    let mut waiting: Vec<TcpStream> = (0..32).map(|_| head(&format!("/r/{room}/mcp"))).collect();
     for s in &mut waiting {
         assert_eq!(answered(s), None);
     }

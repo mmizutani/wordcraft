@@ -29,11 +29,11 @@ const ID_MASK: u64 = (1 << 53) - 1;
 /// Polls one room's desktop may have waiting at once: the app has two. More would only hold
 /// connections that the relay's other rooms need.
 const MAX_POLLS: usize = 4;
-/// Agents' request bodies that may be arriving at once from one address: each holds a
-/// connection until it has arrived.
-const ARRIVING_PER_SOURCE: usize = 16;
-/// Bodies that may be arriving at once from one token's desktops (rooms opened, small answers):
-/// a desktop answers up to 16 requests at once.
+/// Agents' requests that may be arriving or waiting for their answers at once from one address:
+/// each holds a connection, and its body, until it has been answered.
+const ARRIVING_PER_SOURCE: usize = 32;
+/// Calls with a body that may be arriving or being handled at once from one token's desktops
+/// (rooms opened, small answers): a desktop answers up to 16 requests at once.
 const ARRIVING_PER_TOKEN: usize = 32;
 /// The most an agent's request may be once written into a poll's answer: a JSON body escapes
 /// to at most twice its size; more means bytes that JSON would never carry raw.

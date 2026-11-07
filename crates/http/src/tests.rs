@@ -276,3 +276,29 @@ fn a_connection_s_place_is_given_back_even_when_its_thread_never_starts() {
     .unwrap();
     assert_eq!(open.load(Ordering::SeqCst), 0);
 }
+
+/// What a request's body limit holds is kept until the request has been handled, not only until
+/// its body has arrived: the body, and what the handler makes of it, are in memory until then.
+#[test]
+fn a_body_limits_hold_lasts_until_the_request_is_handled() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Held(Arc<AtomicBool>);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let released = Arc::new(AtomicBool::new(false));
+    let (r, seen) = (released.clone(), released.clone());
+    let limit: super::BodyLimit = Arc::new(move |_: &Request| Ok((64, super::Hold::new(Held(r.clone())))));
+    let handler: super::Handler = Arc::new(move |_: &Request| Response::text(200, if seen.load(Ordering::SeqCst) { "released" } else { "held" }));
+    std::thread::spawn(move || super::serve_with(listener, Config::default(), limit, handler));
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.write_all(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello").unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    assert!(out.ends_with("held"), "{out:?}");
+    assert!(released.load(Ordering::SeqCst), "given back once handled");
+}

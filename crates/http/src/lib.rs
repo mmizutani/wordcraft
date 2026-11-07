@@ -393,8 +393,9 @@ pub type Handler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
 
 /// The most body a request may have, decided from its head (method, target and headers): a
 /// server can take large bodies only where they belong, and only from whoever may send them.
-/// With it, a [`Hold`] kept until the body has been read, or has failed to arrive: a place among
-/// the bodies arriving at once, say. `Err` answers the
+/// With it, a [`Hold`] kept until the request has been handled, or its body has failed to
+/// arrive: a place among the requests being read and handled at once, say, so the memory a body
+/// takes while the handler works on it counts too. `Err` answers the
 /// request with that response, unread, and closes the connection.
 pub type BodyLimit = Arc<dyn Fn(&Request) -> Result<(usize, Hold), Response> + Send + Sync>;
 
@@ -558,7 +559,8 @@ pub fn connection(stream: TcpStream, peer: SocketAddr, config: &Config, body_lim
             }
         };
         req.peer = Some(peer);
-        // Kept until the body has been read, or has failed to arrive.
+        // Kept until the request has been handled, or its body has failed to arrive: the body and
+        // whatever the handler makes of it stay in memory until then.
         let (limit, reserved) = match body_limit(&req) {
             Ok(l) => l,
             Err(resp) => {
@@ -582,9 +584,10 @@ pub fn connection(stream: TcpStream, peer: SocketAddr, config: &Config, body_lim
             refuse(&mut writer, &mut reader, &e);
             return;
         }
-        drop(reserved);
         let close = http10 || req.header("Connection").is_some_and(|c| c.eq_ignore_ascii_case("close"));
         let resp = handler(&req);
+        drop(req);
+        drop(reserved);
         let close = close || resp.close;
         let mut timed = TimedWrite { stream: &writer, until: after(write_budget(config, &resp)) };
         let written = write_response(&mut timed, &resp, close);
