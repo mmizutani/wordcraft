@@ -118,6 +118,19 @@ pub fn is_empty_file(_path: &std::path::Path) -> bool {
     false
 }
 
+/// Whether anything is at `path`: a file, a folder, or a link (even one that leads nowhere). The
+/// caller checks that `path` is in reach first.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn entry_exists(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// [`entry_exists`]: on the web files come through the browser, never by path.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn entry_exists(_path: &std::path::Path) -> bool {
+    false
+}
+
 /// The canonical form of `path` (symbolic links and `.`/`..` resolved), for telling whether two
 /// spellings name one file; `None` when it can't be resolved or is outside the readable roots.
 #[cfg(not(target_arch = "wasm32"))]
@@ -822,6 +835,38 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<(), String> {
 
 #[cfg(target_arch = "wasm32")]
 pub fn write_file(path: &str, _bytes: &[u8]) -> Result<(), String> {
+    Err(format!("{path}: files are saved through the browser on the web"))
+}
+
+/// Why an export from a shared document isn't written to `path`: something is there.
+pub(crate) fn not_new(path: &str) -> String {
+    format!("{path} is there already: an export from a shared document makes a new file, never replaces one")
+}
+
+/// Write `bytes` to `path` as a new file, never over anything: the file is created only if
+/// nothing is at `path` (not even a link), in one step, so two writers racing to one name, or a
+/// file another program puts there meanwhile, are never replaced. Whether `path` may be written
+/// is asked now, as the roots in force say now. For exports from a participant's copy of a
+/// shared document (#31). A write that fails takes the new file away again.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_new_file(path: &str, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    crate::file_access::check_write(path)?;
+    let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(not_new(path)),
+        Err(e) => return Err(format!("{path}: {e}")),
+    };
+    if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("{path}: {e}"));
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn write_new_file(path: &str, _bytes: &[u8]) -> Result<(), String> {
     Err(format!("{path}: files are saved through the browser on the web"))
 }
 

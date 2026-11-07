@@ -74,6 +74,13 @@ impl Scope {
     }
 }
 
+/// The [`Scope::File`] commands that only write a copy of the document to the file they name,
+/// changing neither it nor which document is open: every participant's copy runs them
+/// ([`crate::room::Role::refuses_command`]), held to the files the participant can use
+/// ([`crate::room::Room::reach`]). Saving isn't one: it stamps the document (author, times,
+/// revision) and gives it a path.
+pub const EXPORTS: &[&str] = &["file.exportPdf", "file.exportPng", "file.printPdf"];
+
 /// The commands whose scope isn't their prefix's.
 pub const OVERRIDES: &[(&str, Scope)] = &[
     // The participant's own caret, selection, Find, clipboard and pen, and what is read through

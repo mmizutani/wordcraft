@@ -65,6 +65,16 @@ pub struct Prefs {
     /// reads as the defaults.
     #[serde(deserialize_with = "lenient_assistant")]
     pub assistant: AssistantPrefs,
+    /// File › Options › Agents, "Files agents can use" (#31): which files the commands of agents
+    /// in a shared document can use, unless their invite chose for them. A damaged saved value
+    /// reads as none.
+    #[serde(deserialize_with = "lenient_agent_files")]
+    pub agent_files: crate::agent_files::AgentFiles,
+    /// The folders "Only these folders" gives agents, each read-only or read and write; kept
+    /// while another choice is made. Damaged entries are dropped
+    /// ([`crate::agent_files::cleaned`]).
+    #[serde(deserialize_with = "lenient_agent_folders")]
+    pub agent_folders: Vec<crate::agent_files::AgentFolder>,
 }
 
 /// The built-in assistant's settings.
@@ -156,6 +166,8 @@ impl Default for Prefs {
             default_language: None,
             autocorrect: Default::default(),
             assistant: Default::default(),
+            agent_files: Default::default(),
+            agent_folders: Vec::new(),
         }
     }
 }
@@ -177,6 +189,23 @@ fn lenient_default_language<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Op
     Ok(value.as_str().and_then(wordcraft_proof::lang::normalize_tag))
 }
 
+/// Read a damaged saved choice of the files agents can use as none, keeping the other
+/// preferences.
+fn lenient_agent_files<'de, D: serde::Deserializer<'de>>(d: D) -> Result<crate::agent_files::AgentFiles, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// Keep the saved folders agents can use that are still good ones, dropping the rest.
+fn lenient_agent_folders<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<crate::agent_files::AgentFolder>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let folders = match value {
+        serde_json::Value::Array(items) => items.into_iter().filter_map(|f| serde_json::from_value(f).ok()).collect(),
+        _ => Vec::new(),
+    };
+    Ok(crate::agent_files::cleaned(folders))
+}
+
 /// Ignore an invalid saved Page Color without discarding other preferences.
 fn lenient_read_page_color<'de, D: serde::Deserializer<'de>>(d: D) -> Result<crate::cmd::view::ReadPageColor, D::Error> {
     let value = serde_json::Value::deserialize(d)?;
@@ -186,8 +215,34 @@ fn lenient_read_page_color<'de, D: serde::Deserializer<'de>>(d: D) -> Result<cra
 #[cfg(test)]
 mod tests {
     use super::{AssistantPrefs, Prefs};
+    use crate::agent_files::{AgentFiles, AgentFolder};
     use crate::cmd::view::ReadPageColor;
     use crate::room::Role;
+
+    #[test]
+    fn the_files_agents_can_use_load_from_old_and_damaged_prefs() {
+        let old: Prefs = serde_json::from_str(r#"{"checkSpelling":false}"#).unwrap();
+        assert_eq!((old.agent_files, old.agent_folders.len()), (AgentFiles::None, 0), "none, as before the setting");
+        let root = if cfg!(windows) { r"C:\\work" } else { "/work" };
+        let saved: Prefs = serde_json::from_str(&format!(
+            r#"{{"agentFiles":"folders","agentFolders":[{{"path":"{root}","write":true}},{{"path":"relative"}},7,{{"write":true}}],"checkSpelling":false}}"#
+        ))
+        .unwrap();
+        assert_eq!(saved.agent_files, AgentFiles::Folders);
+        assert_eq!(saved.agent_folders, [AgentFolder { path: root.replace(r"\\", r"\"), write: true }], "damaged entries are dropped");
+        assert!(!saved.check_spelling);
+        for bad in [
+            r#"{"agentFiles":"ask","agentFolders":{"path":"/x"},"checkSpelling":false}"#,
+            r#"{"agentFiles":3,"agentFolders":"/x","checkSpelling":false}"#,
+        ] {
+            let prefs: Prefs = serde_json::from_str(bad).unwrap();
+            assert_eq!((prefs.agent_files, prefs.agent_folders.len()), (AgentFiles::None, 0), "{bad}");
+            assert!(!prefs.check_spelling, "the other preferences stay: {bad}");
+        }
+        let again: Prefs = serde_json::from_value(serde_json::to_value(&saved).unwrap()).unwrap();
+        assert_eq!(again, saved);
+        assert_eq!(serde_json::to_value(&saved).unwrap()["agentFiles"], "folders");
+    }
 
     #[test]
     fn read_page_color_loads_from_old_and_damaged_prefs() {

@@ -68,7 +68,7 @@ pub fn tool_definitions() -> Value {
         tool(
             "list_commands",
             "List commands",
-            "Every WordCraft command: id, label, ribbon location, shortcut, params, whether it changes the document (`mutates`), its `scope` (document, selection, view, file, app or ui: what it touches; an agent in a shared document gets document and selection commands) and `positions`, the params that are places in the document. Filter with `query` and `scope`.",
+            "Every WordCraft command: id, label, ribbon location, shortcut, params, whether it changes the document (`mutates`), its `scope` (document, selection, view, file, app or ui: what it touches; an agent in a shared document gets document, selection and view commands and the exports, as `enabled` says in its copy) and `positions`, the params that are places in the document. Filter with `query` and `scope`.",
             obj(
                 json!({"query": s("Case-insensitive filter on id/label/location"), "scope": s("Only commands of this scope: document, selection, view, file, app or ui")}),
                 &[]
@@ -109,7 +109,7 @@ pub fn tool_definitions() -> Value {
         tool(
             "save_document",
             "Save",
-            "Save (format from the extension: docx, pdf, odt, rtf, html, md, tex, txt, png).",
+            "Save (format from the extension: docx, pdf, odt, rtf, html, md, tex, txt, png). A .pdf or .png path exports a copy (file.exportPdf, file.exportPng), the one kind of save an agent invited to a shared document makes: to a new file in a folder the app's File › Options › Agents lets agents write in.",
             with_doc(obj(json!({"path": s("File path; omit to save in place")}), &[])),
             false
         ),
@@ -192,12 +192,13 @@ pub fn tool_definitions() -> Value {
         tool(
             "room",
             "Shared document",
-            "Share the document the app shows with other agents and people, each editing a copy of their own at once (desktop app only). With the app's own key, as its owner: `share` shares the active document; `invite` {name, role} gives a key for a participant (role: viewer, commenter, suggester (the default; their edits are tracked changes in their name), editor or owner), who joins by connecting with it (WORDCRAFT_CONTROL_KEY=<key> wordcraft-cli mcp --connect 127.0.0.1:<port>) and then works on the shared document only, with their role; `revoke` {key} takes a key back, ending the copies that joined with it; `stop` stops sharing. `participants`, for anyone: who is in the shared document, and who you are.",
+            "Share the document the app shows with other agents and people, each editing a copy of their own at once (desktop app only). With the app's own key, as its owner: `share` shares the active document; `invite` {name, role, files} gives a key for a participant (role: viewer, commenter, suggester (the default; their edits are tracked changes in their name), editor or owner), who joins by connecting with it (WORDCRAFT_CONTROL_KEY=<key> wordcraft-cli mcp --connect 127.0.0.1:<port>) and then works on the shared document only, with their role, and with the files the app's File › Options › Agents allows (none unless the person chose some), or fewer when `files` says so; `revoke` {key} takes a key back, ending the copies that joined with it; `stop` stops sharing. `participants`, for anyone: who is in the shared document, who you are, and which files your commands can use.",
             obj(
                 json!({
                     "action": {"type": "string", "enum": ["share", "invite", "revoke", "participants", "stop"]},
                     "name": s("invite: the participant's name, which their comments and tracked changes carry; share: yours (the author name when left out)"),
                     "role": s("invite: viewer, commenter, suggester (default), editor or owner"),
+                    "files": {"type": "string", "enum": ["none", "folders", "all"], "description": "invite: which files the participant's commands can use: none, folders (the folders of the app's File › Options › Agents) or all; never more than that setting allows, which they follow when this is left out"},
                     "key": s("revoke: the key invite gave")
                 }),
                 &["action"]
@@ -302,6 +303,8 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
             let ext = p.and_then(|x| x.rsplit('.').next()).unwrap_or("").to_ascii_lowercase();
             if ext == "png" {
                 wrap(exec(b, "file.exportPng", json!({"path": p}), doc))
+            } else if ext == "pdf" {
+                wrap(exec(b, "file.exportPdf", json!({"path": p}), doc))
             } else {
                 wrap(exec(
                     b,
@@ -360,8 +363,10 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
         "ui_inspect" => wrap(b.call("ui.inspect", json!({}))),
         "room" => match st("action") {
             Some(action @ ("share" | "invite" | "revoke" | "participants" | "stop")) => {
-                let params: serde_json::Map<String, Value> =
-                    ["name", "role", "key"].iter().filter_map(|k| a.get(*k).filter(|v| !v.is_null()).map(|v| (k.to_string(), v.clone()))).collect();
+                let params: serde_json::Map<String, Value> = ["name", "role", "key", "files"]
+                    .iter()
+                    .filter_map(|k| a.get(*k).filter(|v| !v.is_null()).map(|v| (k.to_string(), v.clone())))
+                    .collect();
                 wrap(b.call(&format!("room.{action}"), Value::Object(params)))
             }
             Some(other) => ToolResult::error(format!("unknown action {other:?}: share, invite, revoke, participants or stop")),
@@ -403,6 +408,22 @@ mod tests {
         assert_eq!(method, "engine.execute");
         assert_eq!(call["command"], json!("file.open"));
         call["params"].take()
+    }
+
+    /// A .pdf or .png path is an exported copy, which an agent invited to a shared document may
+    /// make; other formats save.
+    #[test]
+    fn save_document_exports_pdf_and_png_copies() {
+        for (path, command) in
+            [("/w/out.pdf", "file.exportPdf"), ("/w/Out.PDF", "file.exportPdf"), ("/w/page.png", "file.exportPng"), ("/w/report.docx", "file.save")]
+        {
+            let mut b = Recording { seen: None };
+            let r = call_tool(&mut b, "save_document", &json!({"path": path}));
+            assert!(!r.is_error, "{path}: {r:?}");
+            let (method, call) = b.seen.expect("the backend was called");
+            assert_eq!((method.as_str(), call["command"].as_str()), ("engine.execute", Some(command)), "{path}");
+            assert_eq!(call["params"]["path"], path);
+        }
     }
 
     #[test]

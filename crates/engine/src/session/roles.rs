@@ -7,6 +7,12 @@ use wordcraft_doc::Document;
 use super::{CmdError, Session};
 use crate::room::Role;
 
+/// The command no participant's copy runs, whatever their role ([`Session::confined_refuses`]).
+const OPTIONS: &str = "file.options";
+
+/// Why not.
+const OPTIONS_ARE_THE_WINDOW_S: &str = "the options, which files agents can use among them, are set at the window";
+
 /// What a suggester's command forced on: the document's Track Changes setting and the Track
 /// Formatting preference as they were.
 pub(super) type Forced = Option<(bool, bool)>;
@@ -19,16 +25,42 @@ impl Session {
     }
 
     /// Why a participant's copy (`confined`) doesn't run command `id`, inside other
-    /// commands too (a macro's steps, Repeat): its role's scopes don't allow it. No files, other
-    /// documents or windows, and the application's settings only for an owner.
-    pub(super) fn confined_refuses(&self, id: &str) -> Option<String> {
+    /// commands too (a macro's steps, Repeat): its role's scopes don't allow it
+    /// ([`Role::refuses_command`]). No files but exports, other documents or windows, and the
+    /// application's settings only for an owner, but never File › Options, which says which
+    /// files agents can use: that is the person's, at the window.
+    pub(crate) fn confined_refuses(&self, id: &str) -> Option<String> {
         if !self.confined {
             return None;
         }
-        match crate::scope::Scope::of(id) {
-            Some(scope) => self.role.unwrap_or(Role::Owner).refuses(scope),
-            None => Some("it has no scope".to_string()),
+        if id == OPTIONS {
+            return Some(OPTIONS_ARE_THE_WINDOW_S.to_string());
         }
+        self.role.unwrap_or(Role::Owner).refuses_command(id)
+    }
+
+    /// Where a participant's copy (`confined`) may export to: a new file in a folder it may write.
+    /// It never replaces a file there, as a viewer's role says they change nothing; outside
+    /// those folders the file system isn't asked whether there's one.
+    pub(crate) fn exports_to_new_file(&self, path: &str) -> Result<(), CmdError> {
+        if !self.confined {
+            return Ok(());
+        }
+        crate::file_access::check_write(path).map_err(CmdError::Failed)?;
+        if crate::io::entry_exists(std::path::Path::new(path)) {
+            return Err(CmdError::Failed(crate::io::not_new(path)));
+        }
+        Ok(())
+    }
+
+    /// Write an export's `bytes` to `path`, once it is made. From a participant's copy, as a new
+    /// file only, created so that nothing put there meanwhile (another participant's export of
+    /// the same name, say) is replaced, and only if the copy may still write there: the files it
+    /// can use may have narrowed while the export was made ([`crate::io::write_new_file`]).
+    /// Otherwise as any file is written.
+    pub(crate) fn write_export(&self, path: &str, bytes: &[u8]) -> Result<(), CmdError> {
+        let written = if self.confined { crate::io::write_new_file(path, bytes) } else { crate::io::write_file(path, bytes) };
+        written.map_err(CmdError::Failed)
     }
 
     /// Whether a command is held to the participant's role as a whole: an edit (`mutates`), and

@@ -211,7 +211,7 @@ should be is left out (the page instead says it can't be read, as above). `WORDC
 
 ## What an agent can reach
 
-Through WordCraft, **the shared document and nothing else**:
+Through WordCraft, **the shared document, and the files you let agents use**:
 
 - WordCraft gives the agent one MCP server, `wordcraft`: `wordcraft-cli mcp --connect
   127.0.0.1:<port>` with the conversation's invite key in `WORDCRAFT_CONTROL_KEY`. The port is the
@@ -219,8 +219,12 @@ Through WordCraft, **the shared document and nothing else**:
   invites, never for the window's key, which the agent never sees (not in `session/new`, its
   environment or WordCraft's log).
 - With that key it gets a copy of the shared document of its own: it reads it, follows what
-  others change, and runs commands within its role. Commands that open, save, print or export
-  files, that open another document, or that reach the window or the settings are refused.
+  others change, and runs commands within its role. Commands that open or save files, that open
+  another document, or that reach the window or the settings are refused. A command that reads
+  or writes a file it names (a picture, mail merge's recipients, an export to PDF or PNG)
+  reaches only the files File › Options › Agents lets agents use: none, unless you chose some
+  folders or any file there (see
+  [Files participants can use](control-protocol.md#files-participants-can-use)).
 - Every connection with the invite's key works on that one copy, and the agent stays one
   participant of the room however often it connects.
 - It starts in a new empty private folder (`wordcraft-agent-…` under your cache on Unix,

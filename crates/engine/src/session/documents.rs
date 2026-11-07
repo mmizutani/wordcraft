@@ -657,6 +657,14 @@ impl Session {
         room.upgrade().filter(|r| !r.is_closed()).map(|r| (*id, r))
     }
 
+    /// Tell the room that shares a document of this session, while it is open, which files agents
+    /// can use now ([`crate::Prefs::agent_files`]): their next requests reach that.
+    pub(crate) fn tell_room_agent_files(&self) {
+        if let Some((_, room)) = self.shared_room() {
+            room.set_agent_files(self.prefs.agent_files, self.prefs.agent_folders.clone());
+        }
+    }
+
     /// Whether the active document is shared through a room that is still open.
     pub(crate) fn is_shared(&self) -> bool {
         self.shared_room().is_some_and(|(id, _)| id == self.document_id)

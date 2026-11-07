@@ -2,13 +2,10 @@
 //! each answers its participant's requests, on their connection's thread, with the control
 //! channel's methods for one document (`docs/control-protocol.md`, Shared documents).
 
-use std::sync::{Arc, OnceLock};
-
 use serde_json::{Value, json};
 
 use super::{Replica, Role};
-use crate::file_access::AutomationRoots;
-use crate::scope::Scope;
+use crate::agent_files::AgentFiles;
 
 /// Most sends in a row of a command's edits that the hub takes none of before [`call`] answers
 /// that it hasn't taken them yet: the hub sends edits back when they clash with another
@@ -43,26 +40,34 @@ pub fn ended(copy: &Replica) -> Option<String> {
 /// - `document.inspect`: the document as the copy has it.
 /// - `engine.commands`: every command, as MCP lists them, `enabled` when the participant may run
 ///   it now.
-/// - `ui.render`: a page as base64 PNG ([`crate::Session::page_png`]); a copy writes no files, so
-///   `path` is refused.
+/// - `ui.render`: a page as base64 PNG ([`crate::Session::page_png`]); `path` is refused
+///   (`file.exportPng` writes a page to a file).
 /// - `ui.parity`: the feature catalog's parity, as the window gives it.
-/// - `room.participants`: who is in the room (`participants`), who the caller is (`you`), and
-///   the version of the document the copy has (`version`).
+/// - `room.participants`: who is in the room (`participants`), who the caller is (`you`), the
+///   version of the document the copy has (`version`), and which files the caller's commands
+///   can use (`files`: `none`, `folders` or `all`; with `folders`, `folders`, each `{path,
+///   write}`).
 /// - Any other method: a command id, run as `engine.execute` runs it, with `params` as its
 ///   params (as the window takes it).
 ///
 /// A `doc` other than the copy's own document is refused (it holds that one only), and so are
 /// the window's methods (`ui.*`, `app.quit`), and sharing and inviting, which are the owner's.
-/// Their commands reach none of the computer's files, whatever their role: one that reads or
-/// writes a file it names (mail merge's recipients, a picture) is refused
-/// ([`crate::file_access::AutomationRoots::none`]).
+/// Their commands reach the files the room gives them ([`super::Room::reach`], asked for each
+/// request): what File › Options › Agents in the window says, or less when their invite chose
+/// less: none (the default), only some folders, each read-only or read and write, or any file on
+/// this computer (not by a network path); always by a full path, and never WordCraft's settings folder
+/// ([`crate::file_access::protect`]). When that narrows while a request runs, the request
+/// reaches no file from then on. A command that reads or writes a file outside that (mail
+/// merge's recipients, a picture, an export) is refused, and so is every file to the
+/// application's settings an owner changes (fonts, language packs). Every role exports the
+/// document to a new file where it may write ([`crate::scope::EXPORTS`]); no copy runs
+/// `file.options`.
 pub fn call(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, String> {
-    static NO_FILES: OnceLock<Arc<AutomationRoots>> = OnceLock::new();
-    let none = NO_FILES.get_or_init(AutomationRoots::none);
-    crate::file_access::confine(Some(none), || answer(copy, method, params))
+    // Asked for each request, so a changed setting holds from the participant's next one on.
+    copy.room().reach(copy.id()).confine(|| answer(copy, method, params))
 }
 
-/// [`call`], with no file in reach.
+/// [`call`], within the files the participant can use.
 fn answer(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, String> {
     if let Some(why) = ended(copy) {
         return Err(why);
@@ -109,7 +114,7 @@ fn answer(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, Str
         "ui.render" => {
             own_document(copy, params)?;
             if params.get("path").is_some_and(|p| !p.is_null()) {
-                return Err("`path`: a participant's copy writes no files; without one, the page comes back as base64 `png`".into());
+                return Err("`path`: the page comes back as base64 `png`; file.exportPng writes it to a file you may write".into());
             }
             catch_up(copy, method, false)?;
             let page = params.get("page").and_then(Value::as_u64).unwrap_or(1);
@@ -122,7 +127,13 @@ fn answer(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, Str
         }
         "room.participants" => {
             catch_up(copy, method, false)?;
-            Ok(json!({"you": copy.participant(), "participants": copy.room().participants(), "version": copy.received()}))
+            let (files, folders) = copy.room().files_for(copy.id());
+            let mut reply =
+                json!({"you": copy.participant(), "participants": copy.room().participants(), "version": copy.received(), "files": files.name()});
+            if files == AgentFiles::Folders {
+                reply["folders"] = json!(folders);
+            }
+            Ok(reply)
         }
         "room.share" | "room.invite" | "room.revoke" | "room.stop" => {
             Err(format!("`{method}` is the owner's: {} joined the shared document as a {}", copy.participant().name, copy.participant().role))
@@ -140,6 +151,10 @@ fn answer(copy: &mut Replica, method: &str, params: &Value) -> Result<Value, Str
 /// when the hub sent the edit back and another participant's change took its text away, or when
 /// the hub hasn't taken all of it.
 fn execute(copy: &mut Replica, id: &str, params: &Value) -> Result<Value, String> {
+    // Without a path, an export asks the window where to save, and a copy has none.
+    if crate::scope::EXPORTS.contains(&id) && params.get("path").and_then(Value::as_str).is_none() {
+        return Err(format!("{id} needs a `path` here: there's no window to ask where to save"));
+    }
     catch_up(copy, id, true)?;
     let lost = copy.stats().lost;
     let result = copy.run(id, params).map_err(|e| e.to_string());
@@ -242,5 +257,8 @@ fn no_window(method: &str) -> String {
 /// commands change nothing, and the command is enabled.
 fn may_run(copy: &Replica, id: &str, mutates: bool) -> bool {
     let role = copy.participant().role;
-    Scope::of(id).is_some_and(|s| role.allows(s)) && !(mutates && role == Role::Viewer) && copy.session().why_disabled(id).is_none()
+    role.refuses_command(id).is_none()
+        && copy.session().confined_refuses(id).is_none()
+        && !(mutates && role == Role::Viewer)
+        && copy.session().why_disabled(id).is_none()
 }

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use wordcraft_engine::agent_files::AgentFiles;
 use wordcraft_engine::room::{Lobby, Replica, Role, Room};
 use wordcraft_engine::scope::Scope;
 use wordcraft_engine::{CmdError, Session};
@@ -184,17 +185,34 @@ impl WordApp {
     }
 
     /// Whether the window shares a document, which one, its version, who the window is in it and
-    /// who else is.
+    /// who else is: for each participant who joined with a key, which files their commands can use
+    /// now (`files`), as File › Options › Agents (`agentFiles`) and their invite say.
     fn share_state(&self) -> Value {
         match &self.share {
             None => json!({"shared": false}),
-            Some(s) => json!({
-                "shared": true,
-                "document": s.copy.document(),
-                "version": s.room.version(),
-                "you": s.copy.participant(),
-                "participants": s.room.participants(),
-            }),
+            Some(s) => {
+                let participants: Vec<Value> = s
+                    .room
+                    .participants()
+                    .into_iter()
+                    .map(|p| {
+                        let files = s.room.held_to(p.id);
+                        let mut v = json!(p);
+                        if let Some(files) = files {
+                            v["files"] = json!(files.name());
+                        }
+                        v
+                    })
+                    .collect();
+                json!({
+                    "shared": true,
+                    "document": s.copy.document(),
+                    "version": s.room.version(),
+                    "you": s.copy.participant(),
+                    "participants": participants,
+                    "agentFiles": s.room.agent_files().0.name(),
+                })
+            }
         }
     }
 }
@@ -204,9 +222,11 @@ impl WordApp {
 ///
 /// - `room.share {name?}`: share the active document; the window joins as its owner, under
 ///   `name` or the author name.
-/// - `room.invite {name, role?}`: a key for a participant called `name` with `role` (viewer,
-///   commenter, suggester (the default), editor or owner), who joins with it
-///   (`docs/control-protocol.md`, Shared documents).
+/// - `room.invite {name, role?, files?}`: a key for a participant called `name` with `role`
+///   (viewer, commenter, suggester (the default), editor or owner), who joins with it
+///   (`docs/control-protocol.md`, Shared documents). Their commands use the files File › Options ›
+///   Agents allows, or fewer when `files` says so: `none`, `folders` (that pane's folders) or
+///   `all`, never more than the setting.
 /// - `room.revoke {key}`: take an invite back; the copies that joined with it stop answering.
 /// - `room.participants`: whether a document is shared, its version, and who is in it.
 /// - `room.stop`: stop sharing.
@@ -222,8 +242,12 @@ pub(crate) fn room_method(app: &mut WordApp, method: &str, p: &Value) -> Option<
                 None => Role::Suggester,
                 Some(r) => Role::named(r).ok_or_else(|| format!("`role` {r:?}: viewer, commenter, suggester, editor or owner"))?,
             };
-            let key = room.invite(name, role).map_err(|e| e.to_string())?;
-            Ok(json!({"key": key, "name": name.trim(), "role": role}))
+            let files = match p.get("files").filter(|v| !v.is_null()) {
+                None => None,
+                Some(v) => Some(v.as_str().and_then(AgentFiles::named).ok_or("`files`: none, folders or all")?),
+            };
+            let key = room.invite_with(name, role, files).map_err(|e| e.to_string())?;
+            Ok(json!({"key": key, "name": name.trim(), "role": role, "files": files.map(AgentFiles::name)}))
         })(),
         "room.revoke" => (|| {
             let room = room()?;
@@ -301,6 +325,46 @@ mod tests {
             at = end;
         }
         out
+    }
+
+    /// Which files agents can use (#31): the window's File › Options › Agents reaches the agents
+    /// already in the room, an invite can give its agent fewer files, and the owner sees what
+    /// each agent can use.
+    #[test]
+    fn the_window_says_which_files_agents_can_use() {
+        let lobby = Lobby::default();
+        let mut a = window(&lobby);
+        let dir = std::env::temp_dir().join(format!("wordcraft-window-agent-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), "from the folder").unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        result(&mut a, "room.share", json!({}));
+        let follows = result(&mut a, "room.invite", json!({"name": "Researcher", "role": "editor"}));
+        assert_eq!(follows["files"], Value::Null, "it follows the setting");
+        let fewer = result(&mut a, "room.invite", json!({"name": "Proofreader", "role": "editor", "files": "none"}));
+        assert_eq!(fewer["files"], "none");
+        for junk in [json!("everything"), json!(3), json!(["all"])] {
+            let e = call(&mut a, "room.invite", json!({"name": "Eve", "files": junk}));
+            assert!(e["error"].as_str().unwrap().contains("none, folders or all"), "{e}");
+        }
+        let mut researcher = lobby.join_with(follows["key"].as_str().unwrap()).unwrap();
+        let mut proofreader = lobby.join_with(fewer["key"].as_str().unwrap()).unwrap();
+        let notes = dir.join("notes.txt").to_string_lossy().into_owned();
+        let reads =
+            |copy: &mut Replica| hosted::call(copy, "engine.execute", &json!({"command": "insert.textFromFile", "params": {"path": notes}})).is_ok();
+        assert!(!reads(&mut researcher), "no file until the person says");
+        // The window's own Options reach the agents already in the room.
+        let folder = dir.to_string_lossy().into_owned();
+        result(&mut a, "engine.execute", json!({"command": "file.options", "params": {"agentFiles": "folders", "agentFolders": [folder]}}));
+        assert!(reads(&mut researcher));
+        assert!(!reads(&mut proofreader), "its invite gave it none");
+        let state = result(&mut a, "room.participants", json!({}));
+        let files: Vec<(&str, &Value)> =
+            state["participants"].as_array().unwrap().iter().map(|p| (p["name"].as_str().unwrap(), &p["files"])).collect();
+        assert_eq!(files, [("Minoru", &Value::Null), ("Researcher", &json!("folders")), ("Proofreader", &json!("none"))]);
+        assert_eq!(state["agentFiles"], "folders");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

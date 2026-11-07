@@ -157,6 +157,8 @@ impl FileBrowser {
                 f.push(("All files".into(), vec!["*".into()]));
                 (name.clone(), f)
             }
+            // Folders only: no file matches no extension.
+            FileDialogRequest::Folder => (String::new(), vec![("Folders".into(), vec![])]),
         };
         let mut b = FileBrowser {
             req,
@@ -197,8 +199,26 @@ impl FileBrowser {
 
     /// OK: a highlighted folder, or a typed folder, is opened; otherwise the typed name is the
     /// pick. Save adds the chosen type's extension to a name without one and asks once more
-    /// before replacing a file; Open wants a file that exists.
+    /// before replacing a file; Open wants a file that exists. Choosing a folder picks the
+    /// highlighted folder, the typed one, or with neither the folder shown.
     pub(crate) fn accept(&mut self) -> Step {
+        if self.req == FileDialogRequest::Folder {
+            // The folder shown may be one typed in the location bar that isn't there, or a file.
+            let shown = self.name.trim().is_empty();
+            let picked = match self.selected.take().filter(|p| p.is_dir()) {
+                Some(dir) => Some(dir),
+                None if shown => Some(self.dir.clone()).filter(|d| d.is_dir()),
+                None => resolve(&self.dir, &self.name).filter(|p| p.is_dir()),
+            };
+            return match picked {
+                Some(dir) => Step::Pick(dir),
+                None => {
+                    let missing = if shown { self.dir.to_string_lossy().into_owned() } else { self.name.trim().to_string() };
+                    self.note = Note::NotFound(missing);
+                    Step::Stay
+                }
+            };
+        }
         if let Some(dir) = self.selected.take().filter(|p| p.is_dir()) {
             self.navigate(dir);
             return Step::Stay;
@@ -229,6 +249,8 @@ impl FileBrowser {
                 }
                 Step::Pick(path)
             }
+            // Answered above.
+            FileDialogRequest::Folder => Step::Stay,
         }
     }
 
@@ -245,6 +267,7 @@ impl FileBrowser {
         match self.req {
             FileDialogRequest::Open { .. } | FileDialogRequest::OpenMany { .. } => "Open",
             FileDialogRequest::Save { .. } => "Save As",
+            FileDialogRequest::Folder => "Choose a Folder",
         }
     }
 
@@ -252,6 +275,7 @@ impl FileBrowser {
         match self.req {
             FileDialogRequest::Open { .. } | FileDialogRequest::OpenMany { .. } => "Open",
             FileDialogRequest::Save { .. } => "Save",
+            FileDialogRequest::Folder => "Select Folder",
         }
     }
 }
@@ -444,7 +468,7 @@ fn body(ui: &mut Ui, b: &mut FileBrowser, t: &Tokens) -> Option<Option<PathBuf>>
     ui.add_space(6.0);
     let mut refilter = false;
     ui.horizontal(|ui| {
-        let label = ui.label(tl!("File name:"));
+        let label = ui.label(if b.req == FileDialogRequest::Folder { tl!("Folder:") } else { tl!("File name:") });
         // The name field takes what the label (longer in some languages) and the type list leave.
         let width = (ui.available_width() - 170.0).max(120.0);
         let r = ui.add(egui::TextEdit::singleline(&mut b.name).desired_width(width)).labelled_by(label.id);
@@ -562,6 +586,49 @@ mod tests {
         b.name = "old".into();
         assert_eq!(b.accept(), Step::Stay, "asks before replacing");
         assert_eq!(b.accept(), Step::Pick(dir.join("drafts").join("old.docx")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Choosing a folder (File › Options › Agents, #31): the built-in browser lists folders only
+    /// and picks the highlighted folder, a typed one, or the one shown. With no system dialog, its
+    /// pick is added to the folders agents can use, read-only.
+    #[test]
+    fn choosing_a_folder_picks_the_highlighted_typed_or_shown_one() {
+        let dir = std::fs::canonicalize(scratch("folder")).unwrap();
+        std::fs::create_dir(dir.join("drafts")).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        let mut b = FileBrowser::new(FileDialogRequest::Folder, AfterPick::AgentFolder, dir.clone(), false);
+        let names: Vec<String> = b.listing.as_ref().unwrap().entries.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, ["drafts"], "folders only");
+        assert_eq!(b.accept(), Step::Pick(dir.clone()), "the folder shown");
+        b.name = "drafts".into();
+        assert_eq!(b.accept(), Step::Pick(dir.join("drafts")), "a typed one");
+        b.name = "missing".into();
+        assert_eq!(b.accept(), Step::Stay);
+        b.name.clear();
+        b.selected = Some(dir.join("drafts"));
+        assert_eq!(b.accept(), Step::Pick(dir.join("drafts")), "the highlighted one");
+        // A file or a missing folder typed in the location bar is shown, and not picked.
+        for typed in [dir.join("notes.txt"), dir.join("gone")] {
+            b.navigate(typed.clone());
+            assert_eq!(b.accept(), Step::Stay, "{typed:?}");
+            assert!(matches!(&b.note, Note::NotFound(n) if *n == typed.to_string_lossy()), "{typed:?}");
+        }
+        let services = Services {
+            file_dialog: Some(Box::new(|_req| {
+                let (tx, rx) = channel();
+                tx.send(Err("no portal".to_string())).unwrap();
+                rx
+            })),
+            ..Default::default()
+        };
+        let mut a = WordApp::new(Session::new(wordcraft_doc::Document::new()), services);
+        let _ = a.ask_file(FileDialogRequest::Folder, AfterPick::AgentFolder);
+        assert!(a.file_browser_open());
+        a.close_file_browser(Some(dir.join("drafts")));
+        let folders = &a.session.prefs.agent_folders;
+        assert_eq!(folders.len(), 1);
+        assert!(folders[0].path.ends_with("drafts") && !folders[0].write, "{folders:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

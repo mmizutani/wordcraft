@@ -40,6 +40,7 @@
 
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -47,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use wordcraft_doc::change::{Anchor, Mapped};
 use wordcraft_doc::{ChangeSet, Document, StoryRef};
 
+use crate::agent_files::{AgentFiles, AgentFolder, Reach};
 use crate::scope::Scope;
 use crate::{Registry, Session};
 
@@ -98,6 +100,20 @@ impl Role {
             Scope::Document | Scope::Selection | Scope::View => true,
             Scope::App => self == Role::Owner,
             Scope::File | Scope::Ui => false,
+        }
+    }
+
+    /// Why this role's copy doesn't run command `id`, when it doesn't: its scope isn't one the
+    /// role has ([`Role::refuses`]). Exporting ([`crate::scope::EXPORTS`]) is every role's: it
+    /// reads the document and writes a copy of it, to a file the participant's reach allows
+    /// ([`Room::reach`]).
+    pub fn refuses_command(self, id: &str) -> Option<String> {
+        if crate::scope::EXPORTS.contains(&id) {
+            return None;
+        }
+        match Scope::of(id) {
+            Some(scope) => self.refuses(scope),
+            None => Some("it has no scope".to_string()),
         }
     }
 
@@ -169,6 +185,13 @@ type OnChange = Arc<dyn Fn() + Send + Sync>;
 /// One shared document: its hub, and what its participants' copies share.
 pub struct Room {
     hub: Mutex<Hub>,
+    /// Which files agents' commands can use, and the folders for that, as the window's setting
+    /// says ([`Room::set_agent_files`]): none until it does.
+    agent_files: Mutex<(AgentFiles, Vec<AgentFolder>)>,
+    /// Set, and replaced by a new one, when participants' reach narrows: the setting narrowed,
+    /// an invite was taken back, the room closed. The reach of a request running then gives no
+    /// file from then on ([`Room::reach`]).
+    withdrawn: Mutex<Arc<AtomicBool>>,
     /// Signalled when the hub accepts a change, and when the room closes.
     changed: Condvar,
     /// Called after that ([`Room::on_change`]).
@@ -189,7 +212,14 @@ impl Room {
     }
 
     fn with_registry(hub: Hub, registry: Arc<Registry>) -> Arc<Room> {
-        Arc::new(Room { hub: Mutex::new(hub), changed: Condvar::new(), on_change: Mutex::new(None), registry })
+        Arc::new(Room {
+            hub: Mutex::new(hub),
+            agent_files: Mutex::new((AgentFiles::None, Vec::new())),
+            withdrawn: Mutex::new(Arc::new(AtomicBool::new(false))),
+            changed: Condvar::new(),
+            on_change: Mutex::new(None),
+            registry,
+        })
     }
 
     /// Share the active document of `session`, a session the room's own process keeps for
@@ -210,6 +240,8 @@ impl Room {
         let room = Room::with_registry(hub, session.registry.clone());
         // A shared document is never replaced by one opened in its place.
         session.shared_through(&room);
+        // Agents reach the files the window's setting gives them, as it is now and as it changes.
+        session.tell_room_agent_files();
         // The copy's own session stands in while the window's isn't lent to it.
         let stand_in = Session::with_registry(Document::new(), room.registry.clone());
         let copy = Replica::lent_by(room.clone(), who, session, stand_in, doc);
@@ -237,7 +269,16 @@ impl Room {
     /// readable.
     pub fn close(&self) {
         self.hub().close();
+        self.withdraw();
         self.changed();
+    }
+
+    /// The reach of the requests running now gives no file from now on ([`Room::reach`]): it
+    /// narrowed.
+    fn withdraw(&self) {
+        let fresh = Arc::new(AtomicBool::new(false));
+        let before = std::mem::replace(&mut *self.withdrawn.lock().unwrap_or_else(PoisonError::into_inner), fresh);
+        before.store(true, Ordering::Release);
     }
 
     /// Whether the room was closed ([`Room::close`]).
@@ -361,11 +402,73 @@ impl Room {
         self.hub().invite_numbered(name, role)
     }
 
+    /// [`Room::invite`], choosing which files the participant's commands can use, never more
+    /// than the room's setting allows ([`Room::set_agent_files`]); `None`: what the setting says.
+    pub fn invite_with(&self, name: &str, role: Role, files: Option<AgentFiles>) -> Result<String, RoomError> {
+        self.hub().invite_with(name, role, files)
+    }
+
+    /// From now on, agents' commands can use `files` (with `folders` for
+    /// [`AgentFiles::Folders`]): the window's setting (File › Options › Agents), the most any
+    /// participant gets; an invite may choose less for its participant. Participants reach it from
+    /// their next request on; when it narrows, a request running now reaches no file from then on.
+    pub fn set_agent_files(&self, files: AgentFiles, folders: Vec<AgentFolder>) {
+        let narrower = {
+            let mut setting = self.agent_files.lock().unwrap_or_else(PoisonError::into_inner);
+            let (before, kept) = &*setting;
+            // A folder taken off the list, or no longer written, narrows it too.
+            let narrower =
+                before.at_most(files) != *before || kept.iter().any(|k| !folders.iter().any(|f| f.path == k.path && (f.write || !k.write)));
+            *setting = (files, folders);
+            narrower
+        };
+        if narrower {
+            self.withdraw();
+        }
+    }
+
+    /// The window's setting of which files agents can use ([`Room::set_agent_files`]).
+    pub fn agent_files(&self) -> (AgentFiles, Vec<AgentFolder>) {
+        self.agent_files.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Where participant `id`'s commands can reach now: what their invite chose, at most the
+    /// setting, else the setting; with folders, those that can still be opened ([`Reach::of`]).
+    /// No file once they're out of the room, and none from the moment it narrows
+    /// ([`Room::set_agent_files`], [`Room::revoke`], [`Room::close`]). The folders are looked at
+    /// with no lock held.
+    pub fn reach(&self, id: ParticipantId) -> Reach {
+        // Taken first: a change made while the reach is worked out withdraws it.
+        let withdrawn = self.withdrawn.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let (files, folders) = self.files_for(id);
+        Reach::of(files, &folders).until(withdrawn)
+    }
+
+    /// Which files participant `id`'s commands can use now ([`Hub::files_for`]), and the
+    /// setting's folders.
+    pub fn files_for(&self, id: ParticipantId) -> (AgentFiles, Vec<AgentFolder>) {
+        let (setting, folders) = self.agent_files();
+        (self.hub().files_for(id, setting), folders)
+    }
+
+    /// Which files participant `id`'s commands can use now ([`Room::files_for`]), for those who
+    /// joined with a key; `None` for those who didn't: the window, whose commands are the
+    /// person's, and the room's own process.
+    pub fn held_to(&self, id: ParticipantId) -> Option<AgentFiles> {
+        let setting = self.agent_files().0;
+        let hub = self.hub();
+        hub.joined_with_key(id).then(|| hub.files_for(id, setting))
+    }
+
     /// Take back the invite with `key`: no one joins with it any more, and the copies that
     /// joined with it are out of the room (the hub accepts no change of theirs, and a hosted
     /// copy stops answering). Whether there was one.
     pub fn revoke(&self, key: &str) -> bool {
-        self.hub().revoke(key)
+        let revoked = self.hub().revoke(key);
+        if revoked {
+            self.withdraw();
+        }
+        revoked
     }
 
     /// Join the room with a key [`Room::invite`] handed out, under its name and role.

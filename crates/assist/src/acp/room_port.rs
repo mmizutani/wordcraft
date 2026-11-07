@@ -481,7 +481,7 @@ mod tests {
         let reply = c.call(&json!({"id": 4, "key": "0".repeat(32), "method": "document.inspect"}).to_string());
         assert_eq!((reply["id"].clone(), reply["error"].clone()), (json!(4), json!("unauthorized")));
         assert!(c.closed());
-        // A copy reaches no file.
+        // A copy saves no file (and reaches none, as File › Options › Agents is at None).
         let mut c = Conn::open(&port);
         let reply = c.call(&line(5, "file.saveAs", json!({"path": std::env::temp_dir().join("wordcraft-room-port.docx")})));
         assert_eq!(reply["ok"], json!(false), "{reply}");

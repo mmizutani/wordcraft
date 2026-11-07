@@ -578,6 +578,33 @@ mod tests {
         assert_eq!(w.recv()["ok"], true);
     }
 
+    /// An agent invited as an owner changes no option, which files agents can use among them, and
+    /// never reads the window's key, whatever files agents may use: the settings folder is out of
+    /// every agent's reach (#31).
+    #[test]
+    fn an_owner_s_invite_changes_no_option_and_reads_no_key() {
+        let (port, rx, room, key) = boot_shared(Role::Owner);
+        room.set_agent_files(wordcraft_engine::agent_files::AgentFiles::All, vec![]);
+        let settings = std::env::temp_dir().join(format!("wordcraft-control-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&settings).unwrap();
+        let key_file = settings.join("control-key.local-7981");
+        std::fs::write(&key_file, KEY).unwrap();
+        wordcraft_engine::file_access::protect(&settings);
+        let mut c = Conn::open(port);
+        let r = c.call(&format!(
+            r#"{{"id":1,"key":"{key}","method":"engine.execute","params":{{"command":"file.options","params":{{"agentFiles":"all"}}}}}}"#
+        ));
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("set at the window"), "{r}");
+        let path = serde_json::to_string(&*key_file.to_string_lossy()).unwrap();
+        let r = c.call(&format!(r#"{{"id":2,"method":"engine.execute","params":{{"command":"insert.textFromFile","params":{{"path":{path}}}}}}}"#));
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("settings folder is out of reach"), "{r}");
+        assert!(!room.document().1.plain_text(StoryRef::Body).contains(KEY));
+        assert!(rx.try_recv().is_err(), "nothing reached the window");
+        let _ = std::fs::remove_dir_all(&settings);
+    }
+
     #[test]
     fn revoking_the_key_or_sharing_no_more_ends_the_connection() {
         let (port, rx, room, key) = boot_shared(Role::Suggester);

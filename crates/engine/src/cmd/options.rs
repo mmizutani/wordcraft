@@ -4,6 +4,7 @@
 
 use serde_json::{Value, json};
 
+use crate::agent_files::{AgentFiles, AgentFolder, MAX_AGENT_FOLDERS};
 use crate::{CmdError, CmdResult, CommandSpec, Prefs, Session, p};
 
 /// Options panes, in the order the page lists them (the `pane` param of `file.options`).
@@ -11,8 +12,8 @@ pub const PANES: [&str; 10] = ["general", "display", "proofing", "save", "langua
 
 /// Longest initials kept, in characters.
 pub const MAX_INITIALS_CHARS: usize = 9;
-/// Longest folder path (dictionaries, user templates) taken, in characters.
-const MAX_FOLDER_CHARS: usize = 4096;
+/// Longest folder path (dictionaries, user templates, agents' folders) taken, in characters.
+const MAX_FOLDER_CHARS: usize = crate::agent_files::MAX_FOLDER_CHARS;
 /// Longest word the custom dictionary takes, in characters.
 pub const MAX_WORD_CHARS: usize = 64;
 /// Most words one call may add or remove.
@@ -22,7 +23,7 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec::new("file.options", "Options", "File", options)
             .params(
-                r#"{"pane"?: "general|display|proofing|save|language|accessibility|advanced|agents|account|assistant", "author"?: string, "initials"?: string, "units"?: "inches|centimeters|millimeters|points|picas|auto" (auto: the region's), "region"?: string (a locale tag like pl-PL, saved: the paper File › New starts on, the default units and the decimal separator; auto: the system's), "typingReplacesSelection"?: bool, "insertKeyOvertype"?: bool, "overtype"?: bool, "marks"?: {"tabs"?: bool, "spaces"?: bool, "paragraphs"?: bool, "hidden"?: bool}, "checkSpelling"?: bool, "markGrammar"?: bool, "ignoreUppercase"?: bool, "ignoreNumbers"?: bool, "ignoreInternet"?: bool, "dictionariesFolder"?: string (a folder of Hunspell .aff/.dic files searched first, saved; auto: the system locations only), "userTemplatesFolder"?: string (the folder File › New lists personal templates from, saved; auto: the app's own Templates folder; not a network folder), "addWords"?: [string], "removeWords"?: [string]} — with any setting it changes them and opens nothing; without, it opens File › Options (at `pane`). Returns the settings."#,
+                r#"{"pane"?: "general|display|proofing|save|language|accessibility|advanced|agents|account|assistant", "author"?: string, "initials"?: string, "units"?: "inches|centimeters|millimeters|points|picas|auto" (auto: the region's), "region"?: string (a locale tag like pl-PL, saved: the paper File › New starts on, the default units and the decimal separator; auto: the system's), "typingReplacesSelection"?: bool, "insertKeyOvertype"?: bool, "overtype"?: bool, "marks"?: {"tabs"?: bool, "spaces"?: bool, "paragraphs"?: bool, "hidden"?: bool}, "checkSpelling"?: bool, "markGrammar"?: bool, "ignoreUppercase"?: bool, "ignoreNumbers"?: bool, "ignoreInternet"?: bool, "dictionariesFolder"?: string (a folder of Hunspell .aff/.dic files searched first, saved; auto: the system locations only), "userTemplatesFolder"?: string (the folder File › New lists personal templates from, saved; auto: the app's own Templates folder; not a network folder), "addWords"?: [string], "removeWords"?: [string], "agentFiles"?: "none|folders|all" (which files the commands of agents invited to a shared document can use: none, only agentFolders, or any file; the most any of them gets, as an invite may give its agent fewer), "agentFolders"?: [{"path": string (a full folder path, not a network folder), "write"?: bool (they can write in it too)}] (at most 32; replaces the list)} — with any setting it changes them and opens nothing; without, it opens File › Options (at `pane`). Returns the settings. A participant's copy of a shared document doesn't run it."#,
             )
             .pure(),
         CommandSpec::new("text.overtype", "Overtype", "File › Options › Advanced", |s, v| {
@@ -147,6 +148,18 @@ fn options(s: &mut Session, v: &Value) -> CmdResult {
     let check_spelling = bool_param(v, "checkSpelling")?;
     let add = words_param(v, "addWords")?;
     let remove = words_param(v, "removeWords")?;
+    let agent_files = match v.get("agentFiles") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(f)) => {
+            Some(AgentFiles::named(f).ok_or_else(|| CmdError::Params(format!("`agentFiles` is none, folders or all, not {:?}", echo(f))))?)
+        }
+        Some(_) => return Err(CmdError::Params("`agentFiles` is none, folders or all".into())),
+    };
+    let agent_folders = match v.get("agentFolders") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(items)) => Some(agent_folders(items, &s.prefs.agent_folders)?),
+        Some(_) => return Err(CmdError::Params("`agentFolders` must be a list of {\"path\", \"write\"?}".into())),
+    };
 
     let setting = author.is_some()
         || initials.is_some()
@@ -158,7 +171,9 @@ fn options(s: &mut Session, v: &Value) -> CmdResult {
         || !mark_values.is_empty()
         || check_spelling.is_some()
         || !add.is_empty()
-        || !remove.is_empty();
+        || !remove.is_empty()
+        || agent_files.is_some()
+        || agent_folders.is_some();
     if let Some(name) = author {
         super::file::set_author(s, &json!({"name": name}))?;
     }
@@ -197,6 +212,17 @@ fn options(s: &mut Session, v: &Value) -> CmdResult {
     if !add.is_empty() || !remove.is_empty() {
         s.persist_user_dictionary(&remove);
     }
+    let agents = agent_files.is_some() || agent_folders.is_some();
+    if let Some(f) = agent_files {
+        s.prefs.agent_files = f;
+    }
+    if let Some(f) = agent_folders {
+        s.prefs.agent_folders = f;
+    }
+    if agents {
+        // Agents already in a shared document reach what it says from their next request on.
+        s.tell_room_agent_files();
+    }
     if setting {
         // Marks, hidden text and proofing change what is laid out.
         s.relayout();
@@ -233,6 +259,8 @@ pub fn current(s: &Session) -> Value {
         "dictionary": wordcraft_proof::user_dictionary(),
         "dictionariesFolder": pr.dictionaries_folder,
         "userTemplatesFolder": pr.user_templates_folder,
+        "agentFiles": pr.agent_files,
+        "agentFolders": pr.agent_folders,
         "dictionaries": wordcraft_proof::installed_dictionaries()
             .into_iter()
             .map(|(lang, dic)| json!({"language": lang.tag(), "file": dic.map(|d| d.to_string_lossy().into_owned())}))
@@ -269,6 +297,78 @@ fn folder_setting(key: &str, f: &str, local_only: bool) -> Result<Option<String>
         return Err(CmdError::Failed(format!("no folder at {}", path.display())));
     }
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// `agentFolders`: each a full path to an existing folder on this computer (or `{path, write}`),
+/// stored with its links followed; at most [`MAX_AGENT_FOLDERS`], each once. A folder the list
+/// has already (`stored`) is kept as it is, without looking at it, so taking out a folder that
+/// went, or changing another's `write`, never fails on it.
+fn agent_folders(items: &[Value], stored: &[AgentFolder]) -> Result<Vec<AgentFolder>, CmdError> {
+    if items.len() > MAX_AGENT_FOLDERS {
+        return Err(CmdError::Params(format!("`agentFolders`: at most {MAX_AGENT_FOLDERS} folders")));
+    }
+    let mut folders: Vec<AgentFolder> = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let key = format!("agentFolders[{i}]");
+        let (path, write) = match item {
+            Value::String(path) => (path.as_str(), false),
+            Value::Object(o) => {
+                let path = o.get("path").and_then(Value::as_str).ok_or_else(|| CmdError::Params(format!("`{key}` needs a `path`")))?;
+                let write = match o.get("write") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(_) => return Err(CmdError::Params(format!("`{key}.write` must be true or false"))),
+                };
+                (path, write)
+            }
+            _ => return Err(CmdError::Params(format!("`{key}` must be {{\"path\", \"write\"?}}"))),
+        };
+        let path = match stored.iter().find(|f| f.path == path.trim()) {
+            Some(kept) => kept.path.clone(),
+            None => agent_folder(&key, path, std::env::var_os("HOME").map(std::path::PathBuf::from))?,
+        };
+        if folders.iter().any(|f| f.path == path) {
+            return Err(CmdError::Params(format!("`{key}`: {} is in the list already", echo(&path))));
+        }
+        folders.push(AgentFolder { path, write });
+    }
+    Ok(folders)
+}
+
+/// One of `agentFolders`: a full path (or one starting with `~/`, in the `home` folder) to an
+/// existing folder on this computer, returned with its links followed, so `..` or a link can't
+/// stand for another folder. A network folder is refused before anything looks at it (#2852).
+pub(crate) fn agent_folder(key: &str, f: &str, home: Option<std::path::PathBuf>) -> Result<String, CmdError> {
+    let f = f.trim();
+    let home = home.filter(|h| !h.as_os_str().is_empty());
+    let path = match (f.strip_prefix("~/"), home) {
+        (Some(rest), Some(h)) => h.join(rest),
+        _ => std::path::PathBuf::from(f),
+    };
+    // Judged as it will be used: `~/` is the home folder's full path by now (or still refused
+    // as not a full one, with no home folder).
+    let given = path.to_string_lossy().into_owned();
+    if let Some(why) = crate::agent_files::unusable(&given) {
+        return Err(CmdError::Params(format!("`{key}`: {:?} can't be a folder agents use: {why}", echo(f))));
+    }
+    let no_folder = || CmdError::Failed(format!("`{key}`: no folder at {}", echo(&given)));
+    let found = crate::io::canonical(&path).filter(|p| p.is_dir()).ok_or_else(no_folder)?;
+    let found = crate::file_access::plain(found).to_string_lossy().into_owned();
+    // A drive mapped to another machine is only seen to be one once its links are followed.
+    if let Some(why) = crate::agent_files::unusable(&found) {
+        return Err(CmdError::Params(format!("`{key}`: {:?} can't be a folder agents use: {why}", echo(f))));
+    }
+    Ok(found)
+}
+
+/// At most the first 200 characters of `text`, for an error message: what was given can be
+/// anything.
+fn echo(text: &str) -> String {
+    let mut shown: String = text.chars().take(200).collect();
+    if shown.len() < text.len() {
+        shown.push('…');
+    }
+    shown
 }
 
 /// Search `folder` for Hunspell dictionaries before the system locations, from now on (the saved

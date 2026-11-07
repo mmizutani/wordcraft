@@ -53,6 +53,7 @@ impl eframe::App for App {
         #[cfg(target_os = "macos")]
         apple_events::poll(&self.5, &mut self.0, ctx);
         self.0.logic(ctx);
+        save_agent_files_now(&self.0, ctx);
         self.3.show(frame);
         let mut window = self.4;
         // Only until the off-screen check below has run: it is the one reader.
@@ -238,6 +239,82 @@ fn load_prefs(app: &mut WordApp) {
     {
         app.apply_prefs(ui);
     }
+    agent_files_on_disk().saved = Some(agent_files(app));
+}
+
+/// Which files agents can use ([`wordcraft_engine::Prefs::agent_files`] and its folders), as
+/// `ui.json` has them from this window: saved as soon as they change (#31), so a crash can't bring
+/// back a wider setting, and kept as the file has them when the app saves on exit, so a window
+/// that started before another one narrowed them doesn't widen them again.
+fn agent_files_on_disk() -> std::sync::MutexGuard<'static, AgentFilesOnDisk> {
+    static ON_DISK: std::sync::Mutex<AgentFilesOnDisk> = std::sync::Mutex::new(AgentFilesOnDisk { saved: None, failed: None });
+    ON_DISK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// How long after a failed save of which files agents can use the next one is tried.
+const AGENT_FILES_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What `ui.json` has of which files agents can use, as this window last loaded or saved it
+/// (`None` until the preferences load), and when a save of a change to it last failed.
+#[derive(Default)]
+struct AgentFilesOnDisk {
+    saved: Option<AgentFilesSetting>,
+    failed: Option<std::time::Instant>,
+}
+
+impl AgentFilesOnDisk {
+    /// Whether to save `now` at `at`: it isn't what the file has, and no save failed in the
+    /// last [`AGENT_FILES_RETRY`]. Never before the preferences loaded.
+    fn wants(&self, now: &AgentFilesSetting, at: std::time::Instant) -> bool {
+        self.due_in(now, at) == Some(std::time::Duration::ZERO)
+    }
+
+    /// While `now` is [`pending`](Self::pending), how long after `at` its next save is due
+    /// (zero: due now); `None` when the file has it.
+    fn due_in(&self, now: &AgentFilesSetting, at: std::time::Instant) -> Option<std::time::Duration> {
+        self.pending(now)
+            .then(|| self.failed.map_or(std::time::Duration::ZERO, |failed| AGENT_FILES_RETRY.saturating_sub(at.saturating_duration_since(failed))))
+    }
+
+    /// Whether the window has a change the file doesn't (a save failed, or none was tried yet).
+    fn pending(&self, now: &AgentFilesSetting) -> bool {
+        self.saved.as_ref().is_some_and(|saved| saved != now)
+    }
+
+    /// A save of `now` at `at` was tried: `written` or not.
+    fn tried(&mut self, now: AgentFilesSetting, written: bool, at: std::time::Instant) {
+        if written {
+            self.saved = Some(now);
+            self.failed = None;
+        } else {
+            self.failed = Some(at);
+        }
+    }
+}
+
+type AgentFilesSetting = (wordcraft_engine::agent_files::AgentFiles, Vec<wordcraft_engine::agent_files::AgentFolder>);
+
+fn agent_files(app: &WordApp) -> AgentFilesSetting {
+    (app.session.prefs.agent_files, app.session.prefs.agent_folders.clone())
+}
+
+/// Save the preferences now if which files agents can use changed since they were saved; after a
+/// failed save, again every [`AGENT_FILES_RETRY`] until one is written.
+fn save_agent_files_now(app: &WordApp, ctx: &egui::Context) {
+    save_agent_files(&mut agent_files_on_disk(), agent_files(app), ctx, || write_app_prefs(app, false));
+}
+
+/// [`save_agent_files_now`]: `write` saves the preferences and says whether they were written.
+/// While a failed save waits to be tried again, the window is woken for it, since an idle window
+/// runs no frame on its own and the wider setting would stay on disk until something else woke it.
+fn save_agent_files(on_disk: &mut AgentFilesOnDisk, now: AgentFilesSetting, ctx: &egui::Context, write: impl FnOnce() -> bool) {
+    if on_disk.wants(&now, std::time::Instant::now()) {
+        let written = write();
+        on_disk.tried(now.clone(), written, std::time::Instant::now());
+    }
+    if let Some(after) = on_disk.due_in(&now, std::time::Instant::now()) {
+        ctx.request_repaint_after(after);
+    }
 }
 
 /// Fonts the user added (#582) live in `fonts` in the settings folder: load them, and store fonts
@@ -262,26 +339,44 @@ fn saved_window() -> Option<WindowGeometry> {
     UiState::from_json(&bytes)?.window?.sanitized()
 }
 
+/// Save the preferences on exit: which files agents can use stay as `ui.json` has them
+/// ([`agent_files_on_disk`]), unless this window changed them and couldn't save that yet.
 fn save_prefs(app: &WordApp) {
+    let pending = agent_files_on_disk().pending(&agent_files(app));
+    write_app_prefs(app, !pending);
+}
+
+/// Write `app`'s preferences to `ui.json`; with `disk_agent_files`, which files agents can use as
+/// the file has them, if it has them. Whether they were written (or are never saved).
+fn write_app_prefs(app: &WordApp, disk_agent_files: bool) -> bool {
     if !prefs_enabled() {
-        return;
+        return true;
     }
-    if let Some(p) = prefs_path() {
-        if let Some(dir) = p.parent()
-            && let Err(e) = std::fs::create_dir_all(dir)
-        {
-            log::warn!("preferences: cannot create {}: {e}", dir.display());
-            return;
-        }
-        match serde_json::to_vec_pretty(&app.prefs()) {
-            Ok(bytes) => {
-                if let Err(e) = write_prefs(&p, &bytes) {
-                    log::warn!("preferences: cannot save {}: {e}", p.display());
-                }
-            }
-            Err(e) => log::warn!("preferences: cannot serialize: {e}"),
+    let Some(p) = prefs_path() else { return true };
+    match write_app_prefs_to(app, &p, disk_agent_files) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("preferences: cannot save {}: {e}", p.display());
+            false
         }
     }
+}
+
+/// [`write_app_prefs`] to the file at `path`.
+fn write_app_prefs_to(app: &WordApp, path: &std::path::Path, disk_agent_files: bool) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    let mut prefs = app.prefs();
+    if disk_agent_files
+        && let Ok(bytes) = std::fs::read(path)
+        && let Some(disk) = UiState::from_json(&bytes)
+    {
+        prefs.editing.agent_files = disk.editing.agent_files;
+        prefs.editing.agent_folders = disk.editing.agent_folders;
+    }
+    let bytes = serde_json::to_vec_pretty(&prefs).map_err(|e| format!("cannot serialize: {e}"))?;
+    write_prefs(path, &bytes).map_err(|e| e.to_string())
 }
 
 /// Writes `bytes` to a sibling temporary file and renames it over `path`, so a failed or
@@ -417,6 +512,12 @@ fn main() -> eframe::Result {
     // First, so the panic hook and every start-up warning are recorded (`logging`).
     let logger = logging::install();
     logging::install_panic_hook();
+    // The settings folder holds the control channel's keys (with one, an agent would be the
+    // window), recovery copies and preferences: no agent invited to a shared document reaches it,
+    // whatever files File › Options › Agents lets agents use (#31).
+    if let Some(dir) = wordcraft_control_key::settings_dir() {
+        wordcraft_engine::file_access::protect(&dir);
+    }
     let mut control_port: Option<u16> = std::env::var("WORDCRAFT_CONTROL_PORT").ok().and_then(|p| p.parse().ok());
     let mut files = Vec::new();
     let mut sample = false;
@@ -694,7 +795,126 @@ mod launch_arg_tests {
 
 #[cfg(test)]
 mod prefs_tests {
-    use super::write_prefs;
+    use super::{AGENT_FILES_RETRY, AgentFilesOnDisk, WordApp, agent_files, save_agent_files, write_app_prefs_to, write_prefs};
+    use wordcraft_engine::Session;
+    use wordcraft_engine::agent_files::{AgentFiles, AgentFolder};
+    use wordcraft_ui_egui::Services;
+
+    /// Which files agents can use is saved the moment it changes (#31), and a save on exit keeps
+    /// it as the file has it, so a window that started before another one narrowed it doesn't
+    /// widen it again.
+    #[test]
+    fn which_files_agents_can_use_is_saved_at_once_and_kept_on_exit() {
+        let dir = std::env::temp_dir().join(format!("wordcraft-prefs-agent-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("ui.json");
+        let mut app = WordApp::new(Session::new(wordcraft_doc::Document::new()), Services::default());
+        let t0 = std::time::Instant::now();
+        let mut on_disk = AgentFilesOnDisk::default();
+        assert!(!on_disk.wants(&agent_files(&app), t0), "nothing to save before the preferences load");
+        on_disk.saved = Some(agent_files(&app));
+        assert!(!on_disk.wants(&agent_files(&app), t0));
+        // This window gives agents every file: saved at once.
+        app.session.prefs.agent_files = AgentFiles::All;
+        assert!(on_disk.wants(&agent_files(&app), t0));
+        on_disk.tried(agent_files(&app), true, t0);
+        assert!(!on_disk.wants(&agent_files(&app), t0), "once");
+        write_app_prefs_to(&app, &path, false).unwrap();
+        let on_disk = || serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk()["editing"]["agentFiles"], "all");
+        // Another window narrows it to none; this one quits later, with its other settings.
+        let mut other = on_disk();
+        other["editing"]["agentFiles"] = "none".into();
+        std::fs::write(&path, serde_json::to_vec(&other).unwrap()).unwrap();
+        app.session.prefs.overtype = true;
+        app.session.prefs.agent_folders = vec![AgentFolder { path: "/anywhere".into(), write: true }];
+        write_app_prefs_to(&app, &path, true).unwrap();
+        assert_eq!(on_disk()["editing"]["agentFiles"], "none", "kept as the file has it");
+        assert_eq!(on_disk()["editing"]["agentFolders"], serde_json::json!([]));
+        assert_eq!(on_disk()["editing"]["overtype"], true, "the rest is this window's");
+        // Without a file, the window's own are written.
+        std::fs::remove_file(&path).unwrap();
+        write_app_prefs_to(&app, &path, true).unwrap();
+        assert_eq!(on_disk()["editing"]["agentFiles"], "all");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A save of a narrower setting that fails is tried again, a few seconds later, and until
+    /// it is written the window's own setting is what the save on exit keeps.
+    #[test]
+    fn a_failed_save_of_which_files_agents_can_use_is_tried_again() {
+        let t0 = std::time::Instant::now();
+        let all = (AgentFiles::All, vec![]);
+        let none = (AgentFiles::None, vec![]);
+        let mut on_disk = AgentFilesOnDisk { saved: Some(all.clone()), failed: None };
+        assert!(on_disk.wants(&none, t0));
+        on_disk.tried(none.clone(), false, t0);
+        assert!(on_disk.pending(&none), "the save on exit writes the window's own");
+        assert!(!on_disk.wants(&none, t0 + AGENT_FILES_RETRY / 2), "not every frame");
+        assert!(on_disk.wants(&none, t0 + AGENT_FILES_RETRY));
+        on_disk.tried(none.clone(), true, t0 + AGENT_FILES_RETRY);
+        assert!(!on_disk.pending(&none) && !on_disk.wants(&none, t0 + AGENT_FILES_RETRY * 2));
+        assert_eq!(on_disk.saved, Some(none));
+        // Changed back before a retry: nothing left to save.
+        let mut on_disk = AgentFilesOnDisk { saved: Some(all.clone()), failed: Some(t0) };
+        assert!(!on_disk.wants(&all, t0 + AGENT_FILES_RETRY) && !on_disk.pending(&all));
+        on_disk.tried(all.clone(), true, t0);
+        assert_eq!(on_disk.saved, Some(all));
+    }
+
+    /// An idle window runs no frame on its own, so after a failed save it asks to be woken when
+    /// the next try is due, and stops asking once the save is written (Codex on #64).
+    #[test]
+    fn a_failed_save_of_which_files_agents_can_use_wakes_the_window_to_try_again() {
+        // A context that records the wake-ups asked of it.
+        fn watched() -> (egui::Context, std::sync::Arc<std::sync::Mutex<Vec<std::time::Duration>>>) {
+            let woken = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let ctx = egui::Context::default();
+            ctx.set_request_repaint_callback({
+                let woken = woken.clone();
+                move |info| woken.lock().unwrap().push(info.delay)
+            });
+            (ctx, woken)
+        }
+        let all = (AgentFiles::All, vec![]);
+        let none = (AgentFiles::None, vec![]);
+        let (ctx, woken) = watched();
+        let mut on_disk = AgentFilesOnDisk { saved: Some(all.clone()), failed: None };
+        let mut tries = 0;
+        save_agent_files(&mut on_disk, none.clone(), &ctx, || {
+            tries += 1;
+            false
+        });
+        assert_eq!(tries, 1);
+        let delays = woken.lock().unwrap().clone();
+        assert!(matches!(delays.as_slice(), [d] if *d > AGENT_FILES_RETRY / 2 && *d <= AGENT_FILES_RETRY), "woken for the next try: {delays:?}");
+        // Not due yet: no second try, and still waiting to be woken for it.
+        let (ctx, woken) = watched();
+        save_agent_files(&mut on_disk, none.clone(), &ctx, || {
+            tries += 1;
+            true
+        });
+        assert_eq!(tries, 1);
+        assert_eq!(woken.lock().unwrap().len(), 1);
+        // Due: written, and nothing more to wake the window for.
+        let (ctx, woken) = watched();
+        on_disk.failed = on_disk.failed.and_then(|t| t.checked_sub(AGENT_FILES_RETRY));
+        save_agent_files(&mut on_disk, none.clone(), &ctx, || {
+            tries += 1;
+            true
+        });
+        assert_eq!(tries, 2);
+        assert_eq!(on_disk.saved, Some(none.clone()));
+        assert_eq!(*woken.lock().unwrap(), vec![]);
+        // Nothing changed: nothing written, nothing to wake for.
+        save_agent_files(&mut on_disk, none, &ctx, || {
+            tries += 1;
+            true
+        });
+        assert_eq!(tries, 2);
+        assert_eq!(*woken.lock().unwrap(), vec![]);
+        assert_eq!(on_disk.due_in(&all, std::time::Instant::now()), Some(std::time::Duration::ZERO), "a new change is due at once");
+    }
 
     #[test]
     fn failed_preferences_write_keeps_the_old_file_and_reports_the_error() {

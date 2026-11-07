@@ -238,8 +238,8 @@ With the window's key:
 
 | Method | Params | Result |
 |---|---|---|
-| `room.share` | `name?` | shares the active document; the window joins its room as its owner, under `name`, else the author name (File › Options › User name), else `Owner`. `{"shared": true, "document", "version", "you", "participants"}`: the document's id, the number of changes the room took, the window's participant and everyone in the room, each `{"id", "name", "role"}`. Sharing the same document again answers the same; another one is an error while one is shared |
-| `room.invite` | `name`, `role?` | a key (32 hex digits, random) for a participant called `name`, with `role` ([roles](#roles), `suggester` unless given): `{"key", "name", "role"}`. A name is someone's in the room for good, even after they left, since their comments and tracked changes keep it: up to 128 characters, no control characters, compared without case |
+| `room.share` | `name?` | shares the active document; the window joins its room as its owner, under `name`, else the author name (File › Options › User name), else `Owner`. `{"shared": true, "document", "version", "you", "participants", "agentFiles"}`: the document's id, the number of changes the room took, the window's participant and everyone in the room, each `{"id", "name", "role"}` and, for those who joined with a key, `"files"`: which files their commands can use now (`none`, `folders` or `all`, see [Files participants can use](#files-participants-can-use)); `agentFiles` is what File › Options › Agents gives agents. Sharing the same document again answers the same; another one is an error while one is shared |
+| `room.invite` | `name`, `role?`, `files?` | a key (32 hex digits, random) for a participant called `name`, with `role` ([roles](#roles), `suggester` unless given): `{"key", "name", "role", "files"}`. A name is someone's in the room for good, even after they left, since their comments and tracked changes keep it: up to 128 characters, no control characters, compared without case. `files` (`none`, `folders` or `all`) gives the participant fewer files than File › Options › Agents gives agents, never more; left out (`null`), they get what the setting gives, whenever it changes |
 | `room.revoke` | `key` | takes the invite back: nobody joins with the key any more, and the copies that joined with it are out of the room (the room refuses their changes, and their connections end). `{"revoked": bool}` |
 | `room.participants` | — | `{"shared": false}`, or what `room.share` answers |
 | `room.stop` | — | stops sharing: the room closes and every participant's connection ends; the window keeps the document as it is, with every change the room took, whether it shows that document or another. `{"stopped": bool}` |
@@ -276,9 +276,9 @@ the same key or none. The copy answers:
 | `engine.execute` | `command`, `params` | runs the command in the copy, held to the participant's role, and sends what it changed to the room until the room took all of it (up to 1,024 changes at a time, so a long macro's go in several). The command's result; an error when the room sent the edit back and it couldn't be made again because another participant's change took its text away (the error names the command), or when others' changes sent its changes back four times in a row and the room hasn't taken them yet (they stay in the copy and go first with the next request; closing the connection drops them) |
 | `document.inspect` | `text?` | the document as the copy has it, with what others changed |
 | `engine.commands` | `search?` | every command, as for the window; `enabled` says whether this participant may run it now |
-| `ui.render` | `page?`, `scale?` | a page of the document as base64 `png`, as for the window; a copy writes no files, so `path` is refused |
+| `ui.render` | `page?`, `scale?` | a page of the document as base64 `png`, as for the window; `path` is refused (`file.exportPng` writes a page to a file the participant may write) |
 | `ui.parity` | — | as for the window |
-| `room.participants` | — | `{"you", "participants", "version"}`: the caller, everyone in the room, and the version of the document the copy has |
+| `room.participants` | — | `{"you", "participants", "version", "files"}`: the caller, everyone in the room, the version of the document the copy has, and which files the caller's commands can use now (`none`, `folders` or `all`; with `folders`, also `"folders"`, each `{"path", "write"}`) |
 
 Any other method name is a command id, as for the window. Each request the copy doesn't refuse
 first sends the participant's changes the room hasn't taken yet, if an earlier command left
@@ -286,11 +286,10 @@ some, and brings in what others changed since. When one of those changes couldn'
 with the error that says so (naming its command) and does nothing else, so it can be sent
 again; a command also doesn't run while the room still hasn't taken them. `doc` may name the
 shared document only. Commands that work on files,
-other documents or windows (`file.*`, `view.switchWindows`, `ui.*`), the window's methods
-(`ui.click`, `ui.screenshot`…, `app.quit`) and the room's other methods (which are the owner's)
-are refused. Their commands reach none of the computer's files, whatever their role: a document
-command that reads or writes a file it names (mail merge's recipients `path`, a picture's) is
-refused. `document.changes` follows what changed, by the window and others alike, in the
+other documents or windows (`file.*` but the exports, `view.switchWindows`, `ui.*`), the window's
+methods (`ui.click`, `ui.screenshot`…, `app.quit`) and the room's other methods (which are the
+owner's) are refused. Their commands reach only the files the person lets agents use, or fewer
+(see [Files participants can use](#files-participants-can-use)). `document.changes` follows what changed, by the window and others alike, in the
 copy's own versions.
 
 When the invite is taken back or sharing stops, the connection's next request gets an error
@@ -299,6 +298,44 @@ document is shared.
 
 `wordcraft-cli mcp --connect 127.0.0.1:7981` with `WORDCRAFT_CONTROL_KEY` set to the invite's
 key gives an agent its copy through MCP's tools (see [MCP](mcp.md#shared-documents)).
+
+### Files participants can use
+
+Which files the commands of participants who joined with a key can read and write is the
+person's choice, in File › Options › Agents (`file.options` `agentFiles` and `agentFolders`),
+saved with the app's settings:
+
+| `agentFiles` | Their commands can use |
+|---|---|
+| `none` (the default) | no file: a command that reads or writes a file it names (mail merge's recipients `path`, a picture's, an export's) is refused |
+| `folders` | the files in `agentFolders` (at most 32, each a full path to an existing folder on this computer, not a network folder): they read in each, and write only in those with `"write": true` |
+| `all` | any file on this computer |
+
+- That is the most any participant gets. An invite's `files` gives its participant fewer (`none`,
+  or `folders` while the setting is `all`), never more: while the setting is `none`, no
+  participant's command reaches a file, whatever its invite says, so choosing None stops every
+  agent at once.
+- It is asked at each request, so a change holds from each participant's next request on. When it
+  narrows (a narrower choice, a folder taken out or made read-only), when the invite is taken back
+  or when sharing stops, a request running then (a long macro, say) reaches no file from then on.
+- A path must be a full one on this computer: a relative path or a network path
+  (`\\server\share`, `//server/share`) is refused, and so is a path outside every folder, by its
+  spelling, before the file system is asked anything about it. Links are followed: one that leads
+  out of a folder is outside it, and on Windows one that leads to another computer, or a drive
+  mapped to one, is refused too. On macOS, Linux and BSD a network folder mounted as an ordinary
+  folder is reached like any other, so with `all` agents reach it.
+- WordCraft's own settings folder, which holds its preferences, its recovery copies and the
+  window's key, is never in reach, even with `all`.
+- Every role exports the document where it may write: `file.exportPdf`, `file.exportPng` and
+  `file.printPdf` run in every copy, each with a `path` (there is no window to ask), and make a new
+  file, never replacing one: it is created in one step once the export is made, so two exports
+  racing to one name never replace each other, and only if the participant may still write there. Saving (`file.save`, `file.saveAs`) stays the window's: it stamps the
+  document and gives it a path. An owner's commands on the application's settings (fonts,
+  language packs) reach no file.
+- No participant's copy runs `file.options`, whatever its role: which files agents can use is set
+  at the window. Commands sent with the window's key are the person's: they use every file the
+  person can, and may change the setting.
+- The web app reaches no files, so it has no such setting.
 
 ### The room's own port
 

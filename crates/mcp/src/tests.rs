@@ -441,6 +441,11 @@ fn the_room_tool_calls_the_app_s_room_methods() {
             "room.invite",
             json!({"name": "Copy editor", "role": "suggester"}),
         ),
+        (
+            json!({"action": "invite", "name": "Researcher", "role": "viewer", "files": "folders"}),
+            "room.invite",
+            json!({"name": "Researcher", "role": "viewer", "files": "folders"}),
+        ),
         (json!({"action": "revoke", "key": "abc", "name": null}), "room.revoke", json!({"key": "abc"})),
         (json!({"action": "participants"}), "room.participants", json!({})),
         (json!({"action": "stop"}), "room.stop", json!({})),

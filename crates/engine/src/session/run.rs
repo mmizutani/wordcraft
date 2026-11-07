@@ -207,7 +207,14 @@ impl Session {
         // While it runs, a command on this document records no change of its own: this one
         // records the whole edit when it ends.
         self.command_docs.push(home);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::cmd::column::dispatch(self, id, mutates, run, params)));
+        // The application's settings an owner's copy changes reach no file, whatever files the
+        // participant can use: fonts and language packs are installed for the person, at the
+        // window.
+        let no_files =
+            (self.confined && crate::scope::Scope::of(id) == Some(crate::scope::Scope::App)).then(crate::file_access::AutomationRoots::none);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::file_access::confine(no_files.as_ref(), || crate::cmd::column::dispatch(self, id, mutates, run, params))
+        }));
         self.command_docs.pop();
         let mut result = match result {
             Ok(r) => r,

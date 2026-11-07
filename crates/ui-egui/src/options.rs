@@ -183,7 +183,7 @@ pub fn page(app: &mut WordApp, ui: &mut Ui) {
                 "language" => language(app, ui),
                 "accessibility" => accessibility(app, ui),
                 "advanced" => advanced(app, ui),
-                "agents" => agents(ui),
+                "agents" => agents(app, ui),
                 "account" => account(app, ui),
                 "assistant" => assistant(app, ui),
                 _ => general(app, ui),
@@ -701,9 +701,101 @@ fn templates_folder(app: &mut WordApp, ui: &mut Ui) {
     note(ui, "File › New lists the .dotx and .dotm templates here under Personal; Save as Word Template starts here.");
 }
 
-fn agents(ui: &mut Ui) {
+/// Agents: how scripts and agents reach the app, and which files the agents invited to a shared
+/// document can use (#31): none (the default), only the folders listed, each read-only or read
+/// and write, or any file. That is the most any of them gets: an invite may give its agent fewer.
+/// The folder list stays whatever is chosen (an invite may choose it). Every change goes through
+/// `file.options`, which checks the folders. The web app reaches no files, so it has none of this.
+fn agents(app: &mut WordApp, ui: &mut Ui) {
+    use wordcraft_engine::agent_files::AgentFiles;
     section(ui, "Agents");
     ui.label(tl!("Every command is available to scripts and AI agents: run `wordcraft-cli mcp` for an MCP server, or start the app with `--control <port>` for the JSON control channel."));
+    if cfg!(target_arch = "wasm32") {
+        return;
+    }
+    ui.add_space(8.0);
+    section(ui, "Files agents can use");
+    note(
+        ui,
+        "For agents you invite to a shared document, the assistant among them. A script or agent that uses the app's own control key acts as you: it can use every file, and change this setting.",
+    );
+    let files = app.session.prefs.agent_files;
+    for (choice, label) in [(AgentFiles::None, "None"), (AgentFiles::Folders, "Only these folders"), (AgentFiles::All, "Any file")] {
+        if ui.radio(files == choice, tl!(label)).clicked() && files != choice {
+            set(app, json!({"agentFiles": choice.name()}));
+        }
+    }
+    if app.session.prefs.agent_files == AgentFiles::All {
+        let t = Tokens::get(ui.ctx());
+        ui.label(RichText::new(tl!("Agents can read and change any file you can, except WordCraft's own settings.")).color(t.red));
+    }
+    ui.add_space(6.0);
+    agent_folders(app, ui);
+}
+
+/// The folders "Only these folders" gives agents: each with Read and write and Remove, and a
+/// path to add, typed or picked with Browse… (where the app has a folder picker).
+fn agent_folders(app: &mut WordApp, ui: &mut Ui) {
+    let folders_label = ui.label(tl!("Folders:")).id;
+    let folders = app.session.prefs.agent_folders.clone();
+    let listed = |write_of: &dyn Fn(usize, bool) -> Option<bool>| -> Vec<Value> {
+        folders.iter().enumerate().filter_map(|(i, f)| write_of(i, f.write).map(|write| json!({"path": f.path, "write": write}))).collect()
+    };
+    let mut change: Option<Vec<Value>> = None;
+    if folders.is_empty() {
+        note(ui, "No folders yet.");
+    }
+    for (i, f) in folders.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let mut write = f.write;
+            if ui.checkbox(&mut write, tl!("Read and write")).changed() {
+                change = Some(listed(&|j, w| Some(if j == i { write } else { w })));
+            }
+            if ui.button(tl!("Remove")).clicked() {
+                change = Some(listed(&|j, w| (j != i).then_some(w)));
+            }
+            // The folder's name, then where it is, which ends in an ellipsis when it is too long
+            // for the pane; the whole path is the tooltip.
+            let path = std::path::Path::new(&f.path);
+            let name = path.file_name().map_or_else(|| f.path.clone(), |n| n.to_string_lossy().into_owned());
+            let parent = path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            ui.label(crate::i18n::isolate(&name)).on_hover_text(&f.path);
+            ui.add(egui::Label::new(RichText::new(crate::i18n::isolate_path(&parent)).weak()).truncate()).on_hover_text(&f.path);
+        });
+    }
+    if let Some(list) = change {
+        set(app, json!({"agentFolders": list}));
+    }
+    let id = egui::Id::unique("options_agent_folder");
+    let mut typed = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_default();
+    ui.horizontal(|ui| {
+        let r = ui.add(egui::TextEdit::singleline(&mut typed).desired_width(320.0).hint_text(tl!("A folder's full path"))).labelled_by(folders_label);
+        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let given = !typed.trim().is_empty();
+        if (ui.add_enabled(given, egui::Button::new(tl!("Add"))).clicked() || (enter && given)) && add_agent_folder(app, typed.trim()).is_ok() {
+            typed.clear();
+        }
+        if app.services.file_dialog.is_some() && ui.button(tl!("Browse…")).clicked() {
+            let _ = app.ask_file(crate::file_dialogs::FileDialogRequest::Folder, crate::file_dialogs::AfterPick::AgentFolder);
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(id, typed));
+    note(
+        ui,
+        "Agents read the files in these folders and write only in those marked Read and write, where their exported PDFs and pictures go. WordCraft's own settings folder is never theirs.",
+    );
+}
+
+/// Add `path` to the folders agents can use, read-only (Add, Browse…): an error is shown on the
+/// status line too.
+pub(crate) fn add_agent_folder(app: &mut WordApp, path: &str) -> Result<Value, String> {
+    let mut list: Vec<Value> = app.session.prefs.agent_folders.iter().map(|f| json!({"path": f.path, "write": f.write})).collect();
+    list.push(json!({"path": path}));
+    let r = app.run("file.options", json!({"agentFolders": list}));
+    if let Err(e) = &r {
+        app.status(e.clone());
+    }
+    r
 }
 
 /// The accounts the assistant signs in with (#19): ChatGPT's, with who is signed in, whether

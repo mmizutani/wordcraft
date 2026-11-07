@@ -545,3 +545,55 @@ fn only_the_person_allows_unattended_requests() {
     faked_click(&mut h);
     assert!(!h.state().session.prefs.assistant.allow_unattended, "and a faked one may turn it off");
 }
+
+/// File › Options › Agents › Files agents can use (#31): the choice, a folder added by its path,
+/// Read and write and Remove all go through `file.options`, Any file warns, and the setting
+/// survives a restart.
+#[test]
+fn agents_pane_chooses_the_files_agents_can_use() {
+    use egui::accesskit::Role;
+    use wordcraft_engine::agent_files::AgentFiles;
+    let dir = std::env::temp_dir().join(format!("wordcraft-options-agent-folders-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    let mut a = app();
+    a.run("file.options", json!({"pane": "agents"})).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    assert_eq!(h.state().session.prefs.agent_files, AgentFiles::None, "none until the person chooses");
+    h.get_by_role_and_label(Role::RadioButton, "Only these folders").click();
+    h.run_steps(4);
+    assert_eq!(h.state().session.prefs.agent_files, AgentFiles::Folders);
+    h.get_by_role_and_label(Role::TextInput, "Folders:").focus();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::TextInput, "Folders:").type_text(&dir.to_string_lossy());
+    h.run_steps(2);
+    h.get_by_label("Add").click();
+    h.run_steps(4);
+    let folders = h.state().session.prefs.agent_folders.clone();
+    assert_eq!(folders.len(), 1, "{folders:?}");
+    assert!(std::fs::canonicalize(&folders[0].path).unwrap() == dir && !folders[0].write, "read-only at first");
+    h.get_by_label("Read and write").click();
+    h.run_steps(4);
+    assert!(h.state().session.prefs.agent_folders[0].write);
+    h.get_by_role_and_label(Role::RadioButton, "Any file").click();
+    h.run_steps(4);
+    assert_eq!(h.state().session.prefs.agent_files, AgentFiles::All);
+    assert!(h.query_by_label_contains("Agents can read and change any file you can").is_some(), "Any file warns");
+    // The setting and its folders survive a restart.
+    let saved = serde_json::to_vec(&h.state().prefs()).unwrap();
+    let mut b = app();
+    b.apply_prefs(UiState::from_json(&saved).unwrap());
+    assert_eq!((b.session.prefs.agent_files, &b.session.prefs.agent_folders), (AgentFiles::All, &h.state().session.prefs.agent_folders));
+    h.get_by_label("Remove").click();
+    h.run_steps(4);
+    assert!(h.state().session.prefs.agent_folders.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

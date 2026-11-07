@@ -7,6 +7,7 @@ use wordcraft_doc::change::Side;
 use wordcraft_doc::{ChangeSet, Document};
 
 use super::{Participant, ParticipantId, Role, RoomError, rules};
+use crate::agent_files::AgentFiles;
 
 /// Most changes a hub keeps for copies that are behind; a copy further behind reads the document
 /// again.
@@ -81,12 +82,15 @@ struct Invite {
     role: Role,
     /// Which invite this is: the participants who join with it keep its number.
     number: u64,
+    /// Which files its participant's commands can use, when the invite chose for them (never
+    /// more than the room's setting); `None`: what the setting says ([`crate::room::Room::reach`]).
+    files: Option<AgentFiles>,
 }
 
 impl std::fmt::Debug for Invite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The key stays out of logs.
-        f.debug_struct("Invite").field("name", &self.name).field("role", &self.role).finish_non_exhaustive()
+        f.debug_struct("Invite").field("name", &self.name).field("role", &self.role).field("files", &self.files).finish_non_exhaustive()
     }
 }
 
@@ -165,6 +169,12 @@ impl Hub {
     /// or a participant has the name (one who left too: their comments and tracked changes
     /// keep it).
     pub fn invite(&mut self, name: &str, role: Role) -> Result<String, RoomError> {
+        self.invite_with(name, role, None)
+    }
+
+    /// [`Hub::invite`], choosing which files its participant's commands can use, at most what the
+    /// room's setting allows ([`Hub::files_for`]); `None`: what the setting says.
+    pub fn invite_with(&mut self, name: &str, role: Role, files: Option<AgentFiles>) -> Result<String, RoomError> {
         self.open()?;
         let name = valid_name(name)?;
         if self.invites.iter().any(|i| same_name(&i.name, name)) || self.participants.iter().any(|m| same_name(&m.who.name, name)) {
@@ -178,7 +188,7 @@ impl Hub {
         let key: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let number = self.invited;
         self.invited = self.invited.saturating_add(1);
-        self.invites.push(Invite { key: key.clone(), name: name.to_string(), role, number });
+        self.invites.push(Invite { key: key.clone(), name: name.to_string(), role, number, files });
         Ok(key)
     }
 
@@ -211,6 +221,26 @@ impl Hub {
             .ok_or_else(|| RoomError::Name(format!("no name like {name} is free in this room")))?;
         let key = self.invite(&free, role)?;
         Ok((free, key))
+    }
+
+    /// Whether participant `id` joined with a key an invite handed out ([`Hub::admit_with`]), so
+    /// their commands are held to the files the room gives them, rather than joining in the
+    /// room's own process (the window, whose commands are the person's).
+    pub fn joined_with_key(&self, id: ParticipantId) -> bool {
+        self.member(id).is_some_and(|m| m.via.is_some())
+    }
+
+    /// The files participant `id`'s commands can use while the room's setting is `setting`: what
+    /// their invite chose, but never more than the setting ([`AgentFiles::at_most`]), else the
+    /// setting. None at all when they aren't in the room (they left, or the invite they joined
+    /// with was taken back) or the room doesn't know them.
+    pub fn files_for(&self, id: ParticipantId, setting: AgentFiles) -> AgentFiles {
+        let Some(member) = self.member(id).filter(|m| m.here) else { return AgentFiles::None };
+        let Some(number) = member.via else { return setting };
+        match self.invites.iter().find(|i| i.number == number) {
+            Some(invite) => invite.files.map_or(setting, |f| f.at_most(setting)),
+            None => AgentFiles::None,
+        }
     }
 
     /// Take back the invite with `key`: no one joins with it any more, and those who joined
