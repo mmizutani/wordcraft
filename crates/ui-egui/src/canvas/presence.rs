@@ -3,7 +3,9 @@
 //! every frame ([`crate::WordApp::others_here`]) as places in the window's document, so they are
 //! drawn where the text they are at is now.
 
+use std::cell::Cell;
 use std::ops::RangeInclusive;
+use std::sync::{Arc, Weak};
 
 use egui::{Color32, Painter, Pos2, Rect, Stroke, pos2, vec2};
 use wordcraft_doc::{Pos, StoryRef};
@@ -41,7 +43,7 @@ pub(crate) struct Mark {
 /// `page_hint`), the pages' screen rectangles, the zoom, and the part of the screen the pages
 /// are seen in.
 pub(crate) struct Pages<'a> {
-    pub(crate) layout: &'a DocLayout,
+    pub(crate) layout: &'a Arc<DocLayout>,
     pub(crate) doc: &'a wordcraft_doc::Document,
     pub(crate) page_hint: usize,
     pub(crate) rects: &'a [Rect],
@@ -50,12 +52,52 @@ pub(crate) struct Pages<'a> {
     pub(crate) bands: &'a [(f32, f32)],
     pub(crate) scale: f32,
     pub(crate) visible: Rect,
+    /// What of each story was near the screen last frame ([`Spans`]).
+    pub(crate) spans: &'a Spans,
+}
+
+/// What of each story is near the screen ([`screen_span`]), kept from frame to frame while the
+/// layout and the view stay the same. Finding it walks the lines on the pages on screen, which
+/// in Web Layout are the whole document's, so others moving or selecting don't walk them again.
+#[derive(Default)]
+pub(crate) struct Spans(Cell<Option<SpansFor>>);
+
+/// [`Spans`] for one layout and view.
+struct SpansFor {
+    /// The layout, held weakly so its address can't be another layout's while this is kept.
+    layout: Weak<DocLayout>,
+    rects: Vec<Rect>,
+    bands: Vec<(f32, f32)>,
+    scale: f32,
+    visible: Rect,
+    spans: Vec<(StoryRef, Option<(Pos, Pos)>)>,
+}
+
+impl SpansFor {
+    fn new(pages: &Pages<'_>) -> Self {
+        SpansFor {
+            layout: Arc::downgrade(pages.layout),
+            rects: pages.rects.to_vec(),
+            bands: pages.bands.to_vec(),
+            scale: pages.scale,
+            visible: pages.visible,
+            spans: Vec::new(),
+        }
+    }
+
+    fn is_for(&self, pages: &Pages<'_>) -> bool {
+        std::ptr::eq(self.layout.as_ptr(), Arc::as_ptr(pages.layout))
+            && self.rects == pages.rects
+            && self.bands == pages.bands
+            && self.scale == pages.scale
+            && self.visible == pages.visible
+    }
 }
 
 /// Where everyone else in `others` (with when their place last changed) is on `pages`; `now` and
 /// the `pointer` say whose names show, and `follow` whom the person follows.
 pub(crate) fn marks(pages: &Pages<'_>, others: &[(&Other, f64)], now: f64, pointer: Option<Pos2>, follow: Option<ParticipantId>) -> Vec<Mark> {
-    let Pages { layout, doc, page_hint, rects, bands, scale, visible } = *pages;
+    let Pages { layout, doc, page_hint, rects, bands, scale, visible, spans: kept } = *pages;
     // The screen band page `pi` shows: all of it across, its band down.
     let band = |pi: usize, pr: &Rect| -> Rect {
         let (top, bot) = bands.get(pi).copied().unwrap_or((0.0, pr.height()));
@@ -77,19 +119,20 @@ pub(crate) fn marks(pages: &Pages<'_>, others: &[(&Other, f64)], now: f64, point
             egui::Rangef::new(pr.min.y + top * s, pr.min.y + bottom * s).intersects(reach.y_range())
         })
     };
-    // What of each story is near the screen, found once a frame for everyone in that story.
-    let mut spans: Vec<(StoryRef, Option<(Pos, Pos)>)> = Vec::new();
+    // What of each story is near the screen, found once for everyone in that story, and kept
+    // while the layout and the view stay the same.
+    let mut known = kept.0.take().filter(|k| k.is_for(pages)).unwrap_or_else(|| SpansFor::new(pages));
     let mut budget = MAX_RECTS;
     let mut out = Vec::new();
     for (o, moved) in others.iter().filter(|(o, _)| o.at.is_some()).take(MAX_DRAWN) {
         let Some(sel) = o.at.as_ref() else { continue };
         let mut sel_rects = Vec::new();
         let story = sel.anchor.story;
-        let span = match spans.iter().find(|(st, _)| *st == story) {
+        let span = match known.spans.iter().find(|(st, _)| *st == story) {
             Some((_, span)) => span.clone(),
             None => {
                 let span = shown_pages.clone().and_then(|pages| screen_span(layout, story, pages, &near));
-                spans.push((story, span.clone()));
+                known.spans.push((story, span.clone()));
                 span
             }
         };
@@ -117,6 +160,7 @@ pub(crate) fn marks(pages: &Pages<'_>, others: &[(&Other, f64)], now: f64, point
         let flag = caret.is_some() && (now - moved < FLAG_MS || hovered || follow == Some(o.who.id));
         out.push(Mark { who: o.who.id, name: o.who.name.clone(), color: o.color, rects: sel_rects, caret, flag });
     }
+    kept.0.set(Some(known));
     out
 }
 
@@ -299,6 +343,7 @@ mod tests {
             bands: &a.canvas.page_bands,
             scale: a.canvas.scale,
             visible,
+            spans: &a.canvas.presence_spans,
         };
         marks(&pages, &others, now, pointer, a.canvas.follow)
     }
@@ -683,6 +728,45 @@ mod tests {
         let rects = layout.selection_rects(&s.doc, &from, &to, 0);
         assert!(!rects.is_empty() && rects.len() < 20, "only the cells there: {}", rects.len());
         assert!(from > start && to < end);
+    }
+
+    #[test]
+    fn what_is_near_the_screen_is_found_again_only_when_the_layout_or_the_view_changes() {
+        // Codex's security review: finding it walks the lines on the pages on screen, in Web
+        // Layout the whole document's, so others moving or selecting don't walk them again.
+        let text: Vec<String> = (0..300).map(|i| format!("Line {i} of a long document")).collect();
+        let (mut h, lobby) = harness(&text.join("\n"));
+        owner(h.state_mut(), "room.share", json!({}));
+        let mut ada = agent(h.state_mut(), &lobby, "Ada");
+        runs(&mut ada, "select.text", json!({"text": "Line 3 of"}));
+        h.run_steps(3);
+        let a = h.state_mut();
+        let now = crate::now_ms();
+        assert_eq!(drawn(a, now, None)[0].rects.len(), 1, "Ada's selection");
+        // What is kept is used: planted, it says none of the body is near the screen.
+        let plant = |a: &mut WordApp| {
+            let mut k = a.canvas.presence_spans.0.take().unwrap();
+            k.spans = vec![(wordcraft_doc::StoryRef::Body, None)];
+            a.canvas.presence_spans.0.set(Some(k));
+        };
+        plant(a);
+        assert!(drawn(a, now, None)[0].rects.is_empty(), "the kept span is used while nothing changed");
+        // The window's frames keep it too, while the layout and the view stay the same.
+        h.run_steps(1);
+        plant(h.state_mut());
+        h.run_steps(2);
+        let a = h.state_mut();
+        let k = a.canvas.presence_spans.0.take().unwrap();
+        assert_eq!(k.spans, vec![(wordcraft_doc::StoryRef::Body, None)], "a frame that changes nothing walks no lines");
+        a.canvas.presence_spans.0.set(Some(k));
+        // Another view finds it again.
+        let view = Rect::from_min_size(egui::pos2(-1e6, -1e6), egui::vec2(2e6, 2e6));
+        assert_eq!(drawn_in(a, view, now, None)[0].rects.len(), 1, "another view");
+        // So does another layout.
+        plant(a);
+        a.session.run("caret.docEnd", &json!({})).unwrap();
+        a.session.run("text.insert", &json!({"text": "!"})).unwrap();
+        assert_eq!(drawn_in(a, view, now, None)[0].rects.len(), 1, "another layout");
     }
 
     fn control_inspect(a: &mut WordApp) -> serde_json::Value {

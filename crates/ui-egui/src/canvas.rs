@@ -123,6 +123,8 @@ pub struct CanvasState {
     /// Follow someone (#32): the view keeps the caret of this participant of the shared document
     /// in sight, until the person scrolls, clicks the page or types (`ui.follow`).
     pub(crate) follow: Option<wordcraft_engine::room::ParticipantId>,
+    /// What of each story others' selections are cut to, kept while the layout and view stay.
+    pub(crate) presence_spans: presence::Spans,
     /// The caret's colour and the fingerprint of where it was worked out ([`caret_color_at`]).
     caret_bg: Option<(u64, Color32)>,
     dragging: bool,
@@ -360,6 +362,7 @@ impl Default for CanvasState {
             tiles: HashMap::new(),
             page_keys: PageKeys::default(),
             markup_facts: std::cell::Cell::new(None),
+            presence_spans: presence::Spans::default(),
             scroll_to_caret: true,
             keep_view: false,
             nav_to_caret: false,
@@ -603,7 +606,7 @@ fn prepare_view(app: &mut WordApp, ui: &Ui, full: Rect, layout: &DocLayout) -> C
 }
 
 /// Where the others in the shared document are on the pages at `rects` ([`presence::marks`]).
-fn others_marks(app: &WordApp, ui: &Ui, layout: &DocLayout, rects: &[Rect], geo: &Geometry) -> Vec<presence::Mark> {
+fn others_marks(app: &WordApp, ui: &Ui, layout: &std::sync::Arc<DocLayout>, rects: &[Rect], geo: &Geometry) -> Vec<presence::Mark> {
     let others = app.others_here();
     // A preview lays out another document than the one their places are in.
     if others.is_empty() || preview_sel(app).is_some() {
@@ -617,6 +620,7 @@ fn others_marks(app: &WordApp, ui: &Ui, layout: &DocLayout, rects: &[Rect], geo:
         bands: &geo.bands,
         scale: geo.scale,
         visible: ui.clip_rect(),
+        spans: &app.canvas.presence_spans,
     };
     presence::marks(&pages, &others, crate::now_ms(), ui.input(|i| i.pointer.hover_pos()), app.canvas.follow)
 }
