@@ -2,7 +2,7 @@
 //! tool calls, plans and permission requests, and how each turn ended. Held to a size: the
 //! oldest entries go first.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use serde::Serialize;
 
@@ -150,19 +150,21 @@ pub struct Details {
 
 /// The turn [`Transcript::details`] is reading.
 #[derive(Default)]
-struct TurnBuilder {
+struct TurnBuilder<'a> {
     asked: Option<String>,
     plan: Option<Vec<Step>>,
     calls: Vec<Step>,
     context: Option<Sent>,
     sources: Vec<Source>,
     more_sources: u32,
+    /// The sources seen, listed or not, so each counts once.
+    seen: HashSet<(SourceKind, &'a str, Option<&'a str>)>,
 }
 
-impl TurnBuilder {
+impl<'a> TurnBuilder<'a> {
     /// Add the turn to `turns`, if it has anything to show, and start another.
     fn finish(&mut self, turns: &mut Vec<TurnDetails>) {
-        let TurnBuilder { asked, plan, calls, context, sources, more_sources } = std::mem::take(self);
+        let TurnBuilder { asked, plan, calls, context, sources, more_sources, .. } = std::mem::take(self);
         let steps = plan.unwrap_or(calls);
         if asked.is_some() || !steps.is_empty() || context.is_some() || !sources.is_empty() {
             turns.push(TurnDetails { asked, steps, context, sources, more_sources });
@@ -170,21 +172,24 @@ impl TurnBuilder {
     }
 
     /// What tool call `call` read. An agent's read that doesn't say where is listed by its title.
-    fn read(&mut self, call: &ToolCall) {
-        let unsaid = (call.sources.is_empty() && matches!(call.kind.as_str(), "read" | "search" | "fetch")).then(|| Source {
-            kind: SourceKind::Other,
-            title: call.title.clone(),
-            target: None,
-        });
-        for source in call.sources.iter().cloned().chain(unsaid) {
-            if self.sources.contains(&source) {
-                continue;
-            }
-            if self.sources.len() < MAX_TURN_SOURCES {
-                self.sources.push(source);
-            } else {
-                self.more_sources = self.more_sources.saturating_add(1);
-            }
+    /// Details is worked out each frame it shows: what isn't listed isn't copied.
+    fn read(&mut self, call: &'a ToolCall) {
+        for source in &call.sources {
+            self.source(source.kind, &source.title, source.target.as_deref());
+        }
+        if call.sources.is_empty() && matches!(call.kind.as_str(), "read" | "search" | "fetch") {
+            self.source(SourceKind::Other, &call.title, None);
+        }
+    }
+
+    fn source(&mut self, kind: SourceKind, title: &'a str, target: Option<&'a str>) {
+        if !self.seen.insert((kind, title, target)) {
+            return;
+        }
+        if self.sources.len() < MAX_TURN_SOURCES {
+            self.sources.push(Source { kind, title: title.to_string(), target: target.map(str::to_string) });
+        } else {
+            self.more_sources = self.more_sources.saturating_add(1);
         }
     }
 }

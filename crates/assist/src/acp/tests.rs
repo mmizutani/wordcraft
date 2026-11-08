@@ -858,6 +858,10 @@ fn an_agent_s_locations_and_fetches_reach_sources_and_junk_is_ignored() {
             json!({"sessionUpdate": "tool_call", "toolCallId": "s", "title": "Search", "kind": "search", "status": "in_progress", "locations": "junk"}),
         ),
         send(json!({"sessionUpdate": "tool_call_update", "toolCallId": "r", "status": "completed"})),
+        send(
+            json!({"sessionUpdate": "tool_call", "toolCallId": "m", "title": "Fetch and keep", "kind": "fetch", "status": "in_progress", "rawInput": {"url": "https://example.com/kept"}}),
+        ),
+        send(json!({"sessionUpdate": "tool_call_update", "toolCallId": "m", "status": "completed", "locations": [{"path": "/tmp/cache"}]})),
     ]]);
     let mut c = Chat::with(&script);
     c.ask("Read");
@@ -872,6 +876,8 @@ fn an_agent_s_locations_and_fetches_reach_sources_and_junk_is_ignored() {
             (SourceKind::Web, "https://example.com/linked", Some("https://example.com/linked")),
             (SourceKind::Other, "Fetch junk", None),
             (SourceKind::Other, "Search", None),
+            (SourceKind::Web, "https://example.com/kept", Some("https://example.com/kept")),
+            (SourceKind::File, "/tmp/cache", Some("/tmp/cache")),
         ],
         "an update that says nothing of them keeps what the call said"
     );

@@ -1276,17 +1276,12 @@ mod sources {
 
     #[test]
     fn wordcraft_s_tools_say_what_they_read() {
-        let document =
-            |title: &str, target: Option<&str>| Source { kind: SourceKind::Document, title: title.into(), target: target.map(str::to_string) };
-        assert_eq!(tools::sources("get_text", &json!({})), [document("get_text", None)]);
-        assert_eq!(tools::sources("list_commands", &json!({"query": "table"})), [document("list_commands", None)]);
+        let document = |title: &str| Source { kind: SourceKind::Document, title: title.into(), target: None };
+        assert_eq!(tools::sources("get_text", &json!({})), [document("get_text")]);
+        assert_eq!(tools::sources("list_commands", &json!({"query": "table"})), [document("list_commands")]);
         assert_eq!(
             tools::sources("execute", &json!({"command": "document.paragraph", "params": {"path": [2]}})),
-            [document("execute document.paragraph", Some("[2]"))]
-        );
-        assert_eq!(
-            tools::sources("execute", &json!({"command": "document.paragraph", "params": {"path": ["junk"]}})),
-            [document("execute document.paragraph", None)]
+            [document("execute document.paragraph")]
         );
         assert_eq!(tools::sources("type_text", &json!({"text": "x"})), []);
         assert_eq!(tools::sources("execute", &json!({"command": "format.bold"})), []);
@@ -1323,6 +1318,27 @@ mod sources {
         }
         let turn = t.details().turns.remove(1);
         assert_eq!((turn.sources.len(), turn.more_sources), (MAX_TURN_SOURCES, 5));
+
+        // What isn't listed counts once too.
+        t.record(&call(9000, vec![file(MAX_TURN_SOURCES)], "read"));
+        assert_eq!(t.details().turns[1].more_sources, 5);
+    }
+
+    #[test]
+    fn a_target_too_long_to_show_whole_is_left_out() {
+        let long = format!("https://example.com/{}", "a".repeat(600));
+        let source = Source { kind: SourceKind::Web, title: long.clone(), target: Some(long) };
+        let call = ToolCall {
+            id: "a".into(),
+            title: "t".into(),
+            kind: "fetch".into(),
+            status: ToolStatus::Completed,
+            detail: String::new(),
+            changes: None,
+            sources: vec![source],
+        };
+        let Event::Tool(call) = Event::Tool(call).bounded() else { panic!() };
+        assert_eq!(call.sources[0].target, None, "cut, it could lead somewhere else");
     }
 
     #[test]

@@ -1593,7 +1593,16 @@ fn sources_say_what_a_turn_was_given_and_what_it_read() {
     let paragraph = h.get_by_role_and_label(egui::accesskit::Role::Link, "execute document.paragraph");
     paragraph.click();
     h.run_steps(2);
-    assert_eq!(h.state().session.sel.focus.path.last(), 1, "a paragraph's row goes to it");
+    let selected = h.state().session.doc.copy_range(&h.state().session.sel.anchor, &h.state().session.sel.focus).plain_text();
+    assert_eq!(selected.trim_end(), "second paragraph", "a paragraph's row selects it, by its id");
+
+    // A row for a paragraph that went says so: an old path could go somewhere else.
+    h.state_mut().execute("select.all", json!({})).unwrap();
+    h.state_mut().execute("text.insert", json!({"text": "Other"})).unwrap();
+    h.run_steps(2);
+    h.get_by_role_and_label(egui::accesskit::Role::Link, "execute document.paragraph").click();
+    h.run_steps(2);
+    assert!(h.state().assist.notice.as_deref().is_some_and(|n| n.contains("isn't in the document")), "{:?}", h.state().assist.notice);
     h.state_mut().run("assist.cancel", json!({})).unwrap();
 }
 

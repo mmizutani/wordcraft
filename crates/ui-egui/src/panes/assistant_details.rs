@@ -6,8 +6,6 @@ use egui::{RichText, Ui};
 use serde_json::json;
 use wordcraft_assist::answer::opens;
 use wordcraft_assist::{DetailStep, Details, Sent, Source, SourceKind, StepState, Usage};
-use wordcraft_doc::{Path, Pos, StoryRef};
-use wordcraft_engine::cmd::pos_json;
 use wordcraft_engine::room::Role;
 
 use super::assistant::{Mark, wrapped};
@@ -78,7 +76,8 @@ fn sources(app: &mut WordApp, ui: &mut Ui, t: &Tokens, details: &Details) {
 /// What a turn gave the model, in one row, and a note when the selection was cut.
 fn context_row(ui: &mut Ui, t: &Tokens, sent: &Sent) {
     let kib = |bytes: u32| format!("{:.1}", f64::from(bytes) / 1024.0);
-    let mut parts = vec![if sent.selection_bytes > 0 { tl!("the selection").to_string() } else { tl!("where the caret is").to_string() }];
+    let selection = sent.selection_bytes > 0 || sent.selection_cut;
+    let mut parts = vec![if selection { tl!("the selection").to_string() } else { tl!("where the caret is").to_string() }];
     let around = sent.before.saturating_add(sent.after);
     if around > 0 {
         parts.push(fmt(tl!("{count} paragraphs around it"), &[("count", &around.to_string())]));
@@ -100,14 +99,16 @@ fn context_row(ui: &mut Ui, t: &Tokens, sent: &Sent) {
 /// and an address opens only on the person's click.
 fn source_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, source: &Source) {
     let words = RichText::new(&source.title).small();
-    let path = source.target.as_deref().filter(|_| source.kind == SourceKind::Document).and_then(|p| serde_json::from_str::<Path>(p).ok());
-    match (source.kind, source.target.as_deref(), path) {
-        (SourceKind::Document, _, Some(path)) => {
-            if ui.link(words).on_hover_text(tl!("Go to the paragraph it read")).clicked() {
-                let _ = app.run("caret.set", json!({"pos": pos_json(&Pos::new(StoryRef::Body, path, 0))}));
+    match (source.kind, source.target.as_deref()) {
+        (SourceKind::Document, Some(block)) => {
+            if ui.link(words).on_hover_text(tl!("Select the paragraph it read")).clicked() {
+                let range = json!({"anchor": {"block": block, "off": 0}, "focus": {"block": block, "off": u32::MAX}});
+                if app.run("select.range", range).is_err() {
+                    app.assist.notice = Some(tl!("That paragraph isn't in the document any more.").to_string());
+                }
             }
         }
-        (SourceKind::Web, Some(address), _) if opens(address) => super::answer::web_link(app, ui, words.color(ui.visuals().hyperlink_color), address),
+        (SourceKind::Web, Some(address)) if opens(address) => super::answer::web_link(app, ui, words.color(ui.visuals().hyperlink_color), address),
         _ => wrapped(ui, words.color(t.text)),
     }
 }

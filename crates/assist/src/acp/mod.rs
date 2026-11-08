@@ -468,9 +468,11 @@ impl Acp {
         if call.title.is_empty() {
             call.title = "Tool call".into();
         }
-        let sources = call_sources(update, &call.kind);
-        if !sources.is_empty() {
-            call.sources = sources;
+        // An update says only what changed: what it leaves out still stands.
+        for source in call_sources(update, &call.kind) {
+            if !call.sources.contains(&source) && call.sources.len() < MAX_SOURCES {
+                call.sources.push(source);
+            }
         }
         // What the assistant changed in the document while the call ran (through WordCraft's MCP
         // server or `wordcraft-cli call`) is the call's: its row links to it. Kinds that change

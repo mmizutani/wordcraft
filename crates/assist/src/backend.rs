@@ -181,7 +181,7 @@ pub struct Source {
     pub kind: SourceKind,
     /// What it is, as the pane lists it.
     pub title: String,
-    /// Where it is: a paragraph's path in the document, as JSON, a file's path or an address.
+    /// Where it is: a paragraph's id, which edits don't change, a file's path or an address.
     pub target: Option<String>,
 }
 
@@ -361,8 +361,9 @@ impl Event {
             Event::Text { text: t } => Event::Text { text: text(t) },
             Event::Thought { text: t } => Event::Thought { text: text(t) },
             Event::Tool(t) => {
-                let sources =
-                    t.sources.into_iter().take(MAX_SOURCES).map(|s| Source { title: label(&s.title), target: s.target.map(|t| label(&t)), ..s });
+                // A target too long to show whole goes: cut, it could lead somewhere else.
+                let target = |t: Option<String>| t.filter(|t| t.chars().count() <= MAX_LABEL).map(|t| label(&t));
+                let sources = t.sources.into_iter().take(MAX_SOURCES).map(|s| Source { title: label(&s.title), target: target(s.target), ..s });
                 Event::Tool(ToolCall {
                     id: label(&t.id),
                     title: label(&t.title),
@@ -467,6 +468,11 @@ pub trait ToolHost {
     /// Call tool `name` with `args`. Junk arguments and unknown tools are error outputs, never
     /// panics.
     fn call(&mut self, name: &str, args: &Value) -> ToolOutput;
+    /// The id of the paragraph the arguments of a read name, if they name one that is there.
+    fn read_at(&self, args: &Value) -> Option<String> {
+        let _ = args;
+        None
+    }
     /// Select from `anchor` to `focus` in the host's copy of the document before a turn: the
     /// person's selection in the window, as places in paragraphs named by id, which edits that
     /// moved the paragraphs don't move. Whether it could; a host without a copy of its own
@@ -728,7 +734,10 @@ impl TurnCtx<'_> {
         let id = if id.is_empty() { format!("call-{}", self.calls) } else { id.to_string() };
         let title = crate::tools::title(name, args);
         let kind = crate::tools::kind(name).to_string();
-        let sources = crate::tools::sources(name, args);
+        let mut sources = crate::tools::sources(name, args);
+        if let Some(source) = sources.first_mut() {
+            source.target = self.tools.read_at(args);
+        }
         if self.is_cancelled() {
             return ToolOutput::error("stopped: the person stopped this turn");
         }

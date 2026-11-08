@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use serde_json::{Value, json};
 use wordcraft_doc::change::Anchor;
+use wordcraft_doc::{Path, Pos, StoryRef};
 use wordcraft_engine::room::{Replica, Room, RoomError, hosted};
 use wordcraft_mcp::tools::{ToolResult, call_tool, tool_definitions};
 
@@ -153,6 +154,14 @@ impl ToolHost for CopyTools {
         ToolOutput { changes, ..out }
     }
 
+    fn read_at(&self, args: &Value) -> Option<String> {
+        let path = serde_json::from_value::<Path>(args.pointer("/params/path")?.clone()).ok()?;
+        let story = args.pointer("/params/story").map_or(Some(StoryRef::Body), |s| serde_json::from_value(s.clone()).ok())?;
+        let doc = &self.copy.session().doc;
+        doc.para(story, &path)?;
+        Some(doc.anchor_at(&Pos::new(story, path, 0))?.block.to_string())
+    }
+
     fn select(&mut self, anchor: Anchor, focus: Anchor) -> bool {
         // What the hub took since, the person's edits among it, first: within the files the
         // assistant can use now, as its tool calls are, since an edit of its own made again
@@ -287,15 +296,14 @@ pub fn kind(name: &str) -> &'static str {
     }
 }
 
-/// What a call of WordCraft's own tools reads, for the pane's Sources: the shared document, and
-/// the paragraph when it names one. A call that changes the document reads nothing here.
+/// What a call of WordCraft's own tools reads, for the pane's Sources: the shared document. A call
+/// that changes the document reads nothing here. [`ToolHost::read_at`] adds the paragraph.
 pub fn sources(name: &str, args: &Value) -> Vec<Source> {
     let command = args.get("command").and_then(Value::as_str).unwrap_or_default();
     if !matches!(kind(name), "read" | "search") && !command.starts_with("document.") {
         return Vec::new();
     }
-    let path = args.pointer("/params/path").and_then(Value::as_array).filter(|p| !p.is_empty() && p.iter().all(Value::is_u64));
-    vec![Source { kind: SourceKind::Document, title: title(name, args), target: path.map(|p| Value::from(p.clone()).to_string()) }]
+    vec![Source { kind: SourceKind::Document, title: title(name, args), target: None }]
 }
 
 /// A call's result in a line or two, for its row in the pane.
