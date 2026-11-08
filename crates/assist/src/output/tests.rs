@@ -145,9 +145,13 @@ fn past_the_limit_the_rest_are_counted_and_none_is_taken_for_ended() {
     let details = t.details();
     assert_eq!(details.turns[0].output.len(), super::MAX_ROWS);
     assert_eq!(details.more_output, 10);
-    // An edit before the limit moves rows past it and back: nothing is said to have ended.
-    let states: Vec<_> = listed(&t).into_iter().map(|r| r.2).collect();
-    assert!(states.iter().all(|s| *s == OutputState::Open));
+    // With rows past the limit, a row missing from the list may only have moved past it: nothing
+    // is said to have ended.
+    s.run("select.text", &json!({"text": "word0"})).unwrap();
+    s.run("review.reject", &json!({})).unwrap();
+    note(&mut t, &s);
+    assert_eq!(t.details().more_output, 9);
+    assert!(listed(&t).iter().all(|r| r.2 == OutputState::Open), "{:?}", listed(&t).first());
 }
 
 #[test]
