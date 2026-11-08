@@ -223,6 +223,9 @@ fn a_table_past_a_document_s_limits_keeps_all_its_words() {
     let wide = format!("| {} |\n", (0..100).map(|n| format!("c{n}")).collect::<Vec<_>>().join(" | "));
     let f = format(&format!("{wide}|{}\n", "-|".repeat(100)), false);
     assert!(words(&f).contains("c99"), "{:?}", f.blocks);
+    // Nor do words past the columns its header has go.
+    let f = format("| a | b |\n|---|---|\n| c | d | hidden |\n", false);
+    assert!(words(&f).contains("hidden"), "{f:?}");
     // One that fits still reads as a table.
     let f = format("| a | b |\n|---|---|\n| c | d |\n", false);
     assert!(!f.blocks.is_empty() && f.rest.is_empty(), "{f:?}");

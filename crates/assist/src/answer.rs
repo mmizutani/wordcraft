@@ -7,7 +7,6 @@
 
 use std::borrow::Cow;
 
-use wordcraft_doc::table::{MAX_COLS, MAX_ROWS};
 use wordcraft_formats::markdown;
 use wordcraft_formats::model::{FBlock, Fmt, Inline, Kind, Para};
 
@@ -74,10 +73,11 @@ pub fn opens(address: &str) -> bool {
 pub fn format(text: &str, streaming: bool) -> Formatted {
     let (read, past) = split_at_line(text, MAX_PARSED);
     let read = if streaming { settled(read) } else { Cow::Borrowed(read) };
-    if table_past_limits(&read) {
+    let (flow, cut) = markdown::parse_reporting_cuts(&read);
+    // The parser reads documents, which hold tables to limits. An answer's words all stay.
+    if cut {
         return Formatted { blocks: Vec::new(), rest: text.to_string() };
     }
-    let flow = markdown::parse(&read);
     let mut out = Builder::default();
     for block in &flow.blocks {
         out.block(block);
@@ -85,23 +85,6 @@ pub fn format(text: &str, streaming: bool) -> Formatted {
     let mut formatted = out.done();
     formatted.rest.push_str(past);
     formatted
-}
-
-/// Whether `text` may hold a table past what a document holds: the parser, reading documents,
-/// leaves the rest out, and an answer's words all stay. Counted by lines with a `|` in them, so
-/// text that only looks like one reads as plain text too.
-fn table_past_limits(text: &str) -> bool {
-    let mut rows = 0usize;
-    for line in text.lines() {
-        let cells = line.bytes().filter(|b| *b == b'|').count();
-        if cells > 0 {
-            rows = rows.saturating_add(1);
-        }
-        if cells > MAX_COLS || rows > MAX_ROWS {
-            return true;
-        }
-    }
-    false
 }
 
 /// `text` up to about `max` bytes, ending with a line where it can, and what follows.
