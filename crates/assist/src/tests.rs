@@ -1174,6 +1174,14 @@ mod details {
     }
 
     #[test]
+    fn a_backend_s_cost_is_held_to_the_pane_s_limits() {
+        let long = Event::Usage(Usage { cost: Some(format!("\u{202E}{}", "9".repeat(500))), ..Usage::default() }).bounded();
+        let Event::Usage(usage) = long else { panic!("{long:?}") };
+        let cost = usage.cost.unwrap_or_default();
+        assert!(!cost.contains('\u{202E}') && cost.len() <= 64, "{cost}");
+    }
+
+    #[test]
     fn trimming_the_oldest_entries_keeps_details_true_to_what_is_left() {
         let mut t = Transcript::default();
         t.asked("Gone soon");
