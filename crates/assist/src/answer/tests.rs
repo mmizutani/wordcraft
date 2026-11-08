@@ -217,3 +217,26 @@ fn a_list_may_start_at_zero() {
     let markers: Vec<&str> = f.blocks.iter().filter_map(|b| if let Block::Item { marker, .. } = b { Some(marker.as_str()) } else { None }).collect();
     assert_eq!(markers, ["0.", "1.", "2."]);
 }
+
+#[test]
+fn a_table_past_a_document_s_limits_keeps_all_its_words() {
+    let wide = format!("| {} |\n", (0..100).map(|n| format!("c{n}")).collect::<Vec<_>>().join(" | "));
+    let f = format(&format!("{wide}|{}\n", "-|".repeat(100)), false);
+    assert!(words(&f).contains("c99"), "{:?}", f.blocks);
+    // One that fits still reads as a table.
+    let f = format("| a | b |\n|---|---|\n| c | d |\n", false);
+    assert!(!f.blocks.is_empty() && f.rest.is_empty(), "{f:?}");
+}
+
+#[test]
+fn prose_after_a_closed_code_block_is_read_on_its_own_as_it_arrives() {
+    let f = format("```\na\n\nb\n```\nNext", true);
+    assert_eq!(f.blocks, [Block::Code("a\n\nb".into()), Block::Para(vec![Span { text: "Next".into(), ..Span::default() }])]);
+}
+
+#[test]
+fn a_bullet_list_ends_the_ordered_list_before_it() {
+    let f = format("1. first\n\n- bullet\n\n1. again", false);
+    let markers: Vec<&str> = f.blocks.iter().filter_map(|b| if let Block::Item { marker, .. } = b { Some(marker.as_str()) } else { None }).collect();
+    assert_eq!(markers, ["1.", "•", "1."]);
+}

@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 
+use wordcraft_doc::table::{MAX_COLS, MAX_ROWS};
 use wordcraft_formats::markdown;
 use wordcraft_formats::model::{FBlock, Fmt, Inline, Kind, Para};
 
@@ -73,6 +74,9 @@ pub fn opens(address: &str) -> bool {
 pub fn format(text: &str, streaming: bool) -> Formatted {
     let (read, past) = split_at_line(text, MAX_PARSED);
     let read = if streaming { settled(read) } else { Cow::Borrowed(read) };
+    if table_past_limits(&read) {
+        return Formatted { blocks: Vec::new(), rest: text.to_string() };
+    }
     let flow = markdown::parse(&read);
     let mut out = Builder::default();
     for block in &flow.blocks {
@@ -81,6 +85,23 @@ pub fn format(text: &str, streaming: bool) -> Formatted {
     let mut formatted = out.done();
     formatted.rest.push_str(past);
     formatted
+}
+
+/// Whether `text` may hold a table past what a document holds: the parser, reading documents,
+/// leaves the rest out, and an answer's words all stay. Counted by lines with a `|` in them, so
+/// text that only looks like one reads as plain text too.
+fn table_past_limits(text: &str) -> bool {
+    let mut rows = 0usize;
+    for line in text.lines() {
+        let cells = line.bytes().filter(|b| *b == b'|').count();
+        if cells > 0 {
+            rows = rows.saturating_add(1);
+        }
+        if cells > MAX_COLS || rows > MAX_ROWS {
+            return true;
+        }
+    }
+    false
 }
 
 /// `text` up to about `max` bytes, ending with a line where it can, and what follows.
@@ -161,6 +182,10 @@ impl Builder {
                     }
                     format!("{next}.")
                 } else {
+                    // A bullet ends an ordered list at this depth: the next one starts again.
+                    if let Some(n) = self.numbers.get_mut(level) {
+                        *n = None;
+                    }
                     "•".to_string()
                 };
                 self.push(Block::Item { marker, level: list.level, spans: spans(p, false) });
@@ -249,10 +274,10 @@ fn inline_text(inline: &Inline) -> String {
 /// not finished yet is held back until it is. The same words read the same way before and after
 /// the marker that closes them comes, so the person sees no `**` come and go.
 fn settled(text: &str) -> Cow<'_, str> {
-    if in_fence(text) {
+    let Some(after_fence) = after_fences(text) else {
         return Cow::Borrowed(text);
-    }
-    let start = text.rfind("\n\n").map_or(0, |i| i.saturating_add(2));
+    };
+    let start = text.rfind("\n\n").map_or(0, |i| i.saturating_add(2)).max(after_fence);
     let last = text.get(start..).unwrap_or_default();
     let mut read = scan(last);
     let mut kept = last;
@@ -274,21 +299,28 @@ fn settled(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Whether `text` ends inside a code fence, as the parser reads them: one closes on a line of
-/// nothing but at least as many of the same character.
-fn in_fence(text: &str) -> bool {
+/// Where `text`'s last closed code fence ends, 0 without one; `None` when it ends inside a fence.
+/// Fences as the parser reads them: one closes on a line of nothing but at least as many of the
+/// same character.
+fn after_fences(text: &str) -> Option<usize> {
     let mut open: Option<(char, usize)> = None;
-    for line in text.lines() {
+    let mut after = 0usize;
+    let mut at = 0usize;
+    for line in text.split_inclusive('\n') {
+        at = at.saturating_add(line.len());
         let t = line.trim();
         let Some(c) = t.chars().next().filter(|c| matches!(c, '`' | '~')) else { continue };
         let n = t.chars().take_while(|x| *x == c).count();
         match open {
             None if n >= 3 && (c != '`' || !t.get(n..).is_some_and(|info| info.contains('`'))) => open = Some((c, n)),
-            Some((f, at_least)) if f == c && n >= at_least && t.len() == n => open = None,
+            Some((f, at_least)) if f == c && n >= at_least && t.len() == n => {
+                open = None;
+                after = at;
+            }
             _ => {}
         }
     }
-    open.is_some()
+    open.is_none().then_some(after)
 }
 
 /// What a paragraph still arriving left unfinished.
