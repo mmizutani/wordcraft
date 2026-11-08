@@ -322,9 +322,27 @@ fn edit_keeps_the_person_s_text() {
     h.run_steps(3);
     let m = Memory::load(&folder.0);
     assert_eq!(m.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["Use short paragraphs."]);
-    let answered =
-        h.state().conversation().unwrap().transcript().entries().any(|e| matches!(e, Entry::Proposal { answer: Some(ProposalAnswer::Kept), .. }));
-    assert!(answered);
+    let entries: Vec<Entry> = h.state().conversation().unwrap().transcript().entries().cloned().collect();
+    let kept = entries.iter().find_map(|e| match e {
+        Entry::Proposal { text, answer: Some(ProposalAnswer::Kept), .. } => Some(text.as_str()),
+        _ => None,
+    });
+    assert_eq!(kept, Some("Use short paragraphs."), "the pane says what was stored, not what was proposed");
+}
+
+/// A new conversation numbers its proposals from 1 again: its first isn't opened with a draft left
+/// from the last one's first.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_new_conversation_doesn_t_take_a_draft_from_the_last() {
+    let folder = Folder::new();
+    let mut h = poisoned(&folder);
+    h.state_mut().assist.memory.editing_proposal = Some((1, "An old draft.".into()));
+    h.run_steps(3);
+    h.state_mut().assist_with(Box::new(Fake::new().then(vec![Step::say("[[remember: New.]]")])));
+    h.state_mut().run("assist.ask", json!({"prompt": "Start again"})).unwrap();
+    settle(h.state_mut());
+    assert_eq!(h.state().assist.memory.editing_proposal, None);
 }
 
 /// While memory is off no card shows, though the marker is still taken out of the answer.
