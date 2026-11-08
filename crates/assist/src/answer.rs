@@ -73,6 +73,7 @@ pub fn opens(address: &str) -> bool {
 pub fn format(text: &str, streaming: bool) -> Formatted {
     let (read, past) = split_at_line(text, MAX_PARSED);
     let read = if streaming { settled(read) } else { Cow::Borrowed(read) };
+    let read = separate_fences(read);
     let (flow, cut) = markdown::parse_reporting_cuts(&read);
     // The parser reads documents, which hold tables to limits. An answer's words all stay.
     if cut {
@@ -85,6 +86,45 @@ pub fn format(text: &str, streaming: bool) -> Formatted {
     let mut formatted = out.done();
     formatted.rest.push_str(past);
     formatted
+}
+
+/// A paragraph of this alone says two code blocks are two: the parser gives each line of code as a
+/// paragraph of its own, and nothing between one fence's lines and the next one's.
+const BETWEEN_FENCES: &str = "\u{F8FF}";
+
+/// `text` with [`BETWEEN_FENCES`] between a closing fence and the next opening one.
+fn separate_fences(text: Cow<'_, str>) -> Cow<'_, str> {
+    let mut fences = Fences::default();
+    let mut closed = false;
+    let mut at = 0usize;
+    let mut places = Vec::new();
+    for line in text.split_inclusive('\n') {
+        let was_open = fences.open.is_some();
+        fences.line(line);
+        match (was_open, fences.open.is_some()) {
+            (true, false) => closed = true,
+            (false, true) if closed => {
+                places.push(at);
+                closed = false;
+            }
+            (false, false) if !line.trim().is_empty() => closed = false,
+            _ => {}
+        }
+        at = at.saturating_add(line.len());
+    }
+    if places.is_empty() {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len().saturating_add(places.len().saturating_mul(BETWEEN_FENCES.len() + 2)));
+    let mut from = 0usize;
+    for place in places {
+        out.push_str(text.get(from..place).unwrap_or_default());
+        out.push_str(BETWEEN_FENCES);
+        out.push_str("\n\n");
+        from = place;
+    }
+    out.push_str(text.get(from..).unwrap_or_default());
+    Cow::Owned(out)
 }
 
 /// `text` up to about `max` bytes, ending with a line where it can, and what follows.
@@ -106,6 +146,8 @@ struct Builder {
     spans: usize,
     /// The last number of the ordered list open at each depth.
     numbers: Vec<Option<u32>>,
+    /// The code block drawn last ended: the next line of code starts another.
+    code_ended: bool,
 }
 
 impl Builder {
@@ -138,17 +180,23 @@ impl Builder {
     }
 
     fn para(&mut self, p: &Para) {
+        if matches!(p.inlines.as_slice(), [Inline::Text(text, _)] if text == BETWEEN_FENCES) {
+            self.code_ended = true;
+            return;
+        }
         let block = match (&p.kind, &p.list) {
             (Kind::Code, _) => {
                 let line = p.inlines.iter().map(inline_text).collect::<String>();
                 // Once something has gone to the plain text, what follows goes after it.
                 if self.formatted.rest.is_empty()
+                    && !self.code_ended
                     && let Some(Block::Code(code)) = self.formatted.blocks.last_mut()
                 {
                     code.push('\n');
                     code.push_str(&line);
                     return;
                 }
+                self.code_ended = false;
                 Block::Code(line)
             }
             (Kind::Rule, _) => Block::Rule,
@@ -282,28 +330,40 @@ fn settled(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Where `text`'s last closed code fence ends, 0 without one; `None` when it ends inside a fence.
-/// Fences as the parser reads them: one closes on a line of nothing but at least as many of the
-/// same character.
-fn after_fences(text: &str) -> Option<usize> {
-    let mut open: Option<(char, usize)> = None;
-    let mut after = 0usize;
-    let mut at = 0usize;
-    for line in text.split_inclusive('\n') {
-        at = at.saturating_add(line.len());
+/// Which code fence the lines so far left open, as the parser reads them: one closes on a line of
+/// nothing but at least as many of the same character.
+#[derive(Default)]
+struct Fences {
+    open: Option<(char, usize)>,
+}
+
+impl Fences {
+    fn line(&mut self, line: &str) {
         let t = line.trim();
-        let Some(c) = t.chars().next().filter(|c| matches!(c, '`' | '~')) else { continue };
+        let Some(c) = t.chars().next().filter(|c| matches!(c, '`' | '~')) else { return };
         let n = t.chars().take_while(|x| *x == c).count();
-        match open {
-            None if n >= 3 && (c != '`' || !t.get(n..).is_some_and(|info| info.contains('`'))) => open = Some((c, n)),
-            Some((f, at_least)) if f == c && n >= at_least && t.len() == n => {
-                open = None;
-                after = at;
-            }
+        match self.open {
+            None if n >= 3 && (c != '`' || !t.get(n..).is_some_and(|info| info.contains('`'))) => self.open = Some((c, n)),
+            Some((f, at_least)) if f == c && n >= at_least && t.len() == n => self.open = None,
             _ => {}
         }
     }
-    open.is_none().then_some(after)
+}
+
+/// Where `text`'s last closed code fence ends, 0 without one; `None` when it ends inside a fence.
+fn after_fences(text: &str) -> Option<usize> {
+    let mut fences = Fences::default();
+    let mut after = 0usize;
+    let mut at = 0usize;
+    for line in text.split_inclusive('\n') {
+        let was_open = fences.open.is_some();
+        fences.line(line);
+        at = at.saturating_add(line.len());
+        if was_open && fences.open.is_none() {
+            after = at;
+        }
+    }
+    fences.open.is_none().then_some(after)
 }
 
 /// What a paragraph still arriving left unfinished.
