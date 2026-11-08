@@ -351,3 +351,30 @@ fn with_memory_off_no_card_shows() {
     h.run_steps(4);
     assert!(h.query_by_label("Keep").is_none());
 }
+
+/// With two cards waiting, editing either stays open however the frames draw them.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn editing_one_of_two_cards_stays_open() {
+    use egui_kittest::kittest::Queryable;
+    for editing in [1, 2] {
+        let folder = Folder::new();
+        let mut a = window(&folder);
+        a.assist_with(Box::new(Fake::new().then(vec![Step::say("[[remember: One.]] [[remember: Two.]]")])));
+        a.session.view.assistant_pane = true;
+        a.run("assist.ask", json!({"prompt": "Go"})).unwrap();
+        settle(&mut a);
+        a.assist.memory.editing_proposal = Some((editing, "Mine.".into()));
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 1200.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        h.run_steps(4);
+        assert_eq!(h.state().assist.memory.editing_proposal, Some((editing, "Mine.".to_string())), "editing {editing}");
+        assert!(h.query_by_label("Cancel").is_some(), "editing {editing}");
+    }
+}

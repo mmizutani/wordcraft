@@ -157,7 +157,8 @@ pub(crate) fn proposal_card(app: &mut WordApp, ui: &mut Ui, t: &Tokens, id: u64,
 
 /// A waiting proposal's text, or the box it is being edited in, and its buttons.
 fn waiting_card(app: &mut WordApp, ui: &mut Ui, t: &Tokens, id: u64, text: &str) {
-    let editing = app.assist.memory.editing_proposal.take().filter(|(i, _)| *i == id);
+    let mine = app.assist.memory.editing_proposal.as_ref().is_some_and(|(i, _)| *i == id);
+    let editing = if mine { app.assist.memory.editing_proposal.take() } else { None };
     let Some((_, mut edited)) = editing else {
         ui.add(egui::Label::new(RichText::new(text).font(crate::theme::semibold(12.0)).color(t.text)).wrap());
         ui.horizontal_wrapped(|ui| {
@@ -173,7 +174,7 @@ fn waiting_card(app: &mut WordApp, ui: &mut Ui, t: &Tokens, id: u64, text: &str)
         });
         return;
     };
-    ui.add(egui::TextEdit::multiline(&mut edited).char_limit(MAX_TEXT).desired_rows(2).desired_width(f32::INFINITY));
+    ui.add(egui::TextEdit::multiline(&mut edited).char_limit(MAX_TEXT).desired_rows(2).desired_width(f32::INFINITY).hint_text(tl!("What to keep")));
     let mut open = true;
     ui.horizontal_wrapped(|ui| {
         if ui.add_enabled(!edited.trim().is_empty(), egui::Button::new(tl!("Keep"))).clicked()
@@ -259,7 +260,7 @@ fn list(app: &mut WordApp, ui: &mut Ui) {
 /// The row of the item being edited: its text in a box, with Save and Cancel.
 fn edit_row(app: &mut WordApp, ui: &mut Ui) {
     let Some((id, mut text)) = app.assist.memory.editing.take() else { return };
-    ui.add(egui::TextEdit::multiline(&mut text).char_limit(MAX_TEXT).desired_rows(2).desired_width(f32::INFINITY));
+    ui.add(egui::TextEdit::multiline(&mut text).char_limit(MAX_TEXT).desired_rows(2).desired_width(f32::INFINITY).hint_text(tl!("What to keep")));
     let mut open = true;
     ui.horizontal(|ui| {
         if ui.small_button(tl!("Save")).clicked() && app.run("assist.memory.edit", json!({"id": id, "text": text})).is_ok() {
