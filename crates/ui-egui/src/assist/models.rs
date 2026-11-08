@@ -184,7 +184,7 @@ fn chatgpt_menus(list: &ModelList, saved: &ModelChoice) -> Menus {
         running_model: saved.model.clone(),
         efforts: usual_levels(effort, Some(DEFAULT_EFFORT)),
         effort: Some(effort.unwrap_or(DEFAULT_EFFORT).to_string()),
-        unknown_because: Some("WordCraft is reading the models this account may use.".into()).filter(|_| !matches!(list, ModelList::Failed(_))),
+        unknown_because: (!matches!(list, ModelList::Failed(_))).then(|| "WordCraft is reading the models this account may use.".into()),
         failed: if let ModelList::Failed(why) = list { Some(why.clone()) } else { None },
         ..Menus::default()
     }
