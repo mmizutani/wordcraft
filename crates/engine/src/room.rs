@@ -502,17 +502,6 @@ impl Room {
         Some(text)
     }
 
-    /// Whether the places two ranges of changes touched meet in the latest document: the changes of
-    /// participant `by` in `versions` and those of `other` in `others`. Each range's place runs from
-    /// the first thing it touched to the last, so one that touched both sides of the other counts.
-    pub fn changes_meet(&self, versions: RangeInclusive<u64>, by: &str, others: RangeInclusive<u64>, other: &str) -> bool {
-        let (Some(one), Some(two)) = (self.where_changed(versions, Some(by)), self.where_changed(others, Some(other))) else { return false };
-        let (_, doc) = self.document();
-        let place = |(a, b): (Anchor, Anchor)| Some((doc.pos_of(a, None)?, doc.pos_of(b, None)?));
-        let (Some((a, b)), Some((c, d))) = (place(one), place(two)) else { return false };
-        a.story == c.story && a <= d && c <= b
-    }
-
     /// The names of everyone who changed the document after `version`. `None` when the hub no
     /// longer keeps those changes.
     pub fn changed_since(&self, version: u64) -> Option<Vec<String>> {

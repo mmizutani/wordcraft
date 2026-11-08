@@ -236,6 +236,8 @@ pub(crate) fn tick(app: &mut WordApp) {
 pub(crate) fn after_command(app: &mut WordApp, id: &str, r: Result<Value, String>) -> Result<Value, String> {
     if decision(id).is_some() {
         edits::review_ended(app);
+    } else {
+        edits::command_ended(app);
     }
     if !id.starts_with("assist.") {
         return r;
@@ -518,6 +520,7 @@ pub(crate) fn before_command(app: &mut WordApp, id: &str) {
     if decision(id).is_some() {
         edits::record(app);
     }
+    edits::command_starts(app);
 }
 
 /// The person ran a command that changed the document, other than Accept or Reject.

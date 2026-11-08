@@ -1655,6 +1655,52 @@ fn someone_else_s_words_aren_t_quoted_as_the_person_s_edit() {
     assert!(!context.contains("changed your text"), "{context}");
 }
 
+/// A text someone else changed isn't watched again: the next edit of it would quote their words
+/// as what the assistant wrote.
+#[test]
+fn a_text_someone_else_changed_isn_t_quoted_later() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Editor).unwrap();
+    helper.run("select.text", &json!({"text": "there"})).unwrap();
+    helper.run("text.insert", &json!({"text": "folks"})).unwrap();
+    helper.send();
+    settle(&mut a);
+    ask(&mut a, "Theirs", None);
+    assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
+    a.run("select.text", json!({"text": "Hello"})).unwrap();
+    a.run("text.insert", json!({"text": "Howdy"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Mine", None);
+    assert!(!context_of(&seen, 2).contains("changed your text"), "{}", context_of(&seen, 2));
+}
+
+/// A later turn's changes elsewhere don't stop the person's edit of an earlier text being said.
+#[test]
+fn an_edit_of_an_earlier_turn_s_text_is_said() {
+    let (mut a, seen) = wrote_hello(vec![Step::tool("type_text", json!({"text": "Also "}))]);
+    ask(&mut a, "More", None);
+    a.run("select.text", json!({"text": "there"})).unwrap();
+    a.run("text.insert", json!({"text": "world"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 2);
+    assert!(context.contains("to \"Hello world\""), "{context}");
+}
+
+/// A script's edit alongside the person's own means nothing is said.
+#[test]
+fn a_script_s_edit_beside_the_person_s_says_nothing() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    a.execute("select.text", json!({"text": "there"})).unwrap();
+    a.execute("text.insert", json!({"text": "planted"})).unwrap();
+    a.run("select.text", json!({"text": "Hello"})).unwrap();
+    a.run("text.insert", json!({"text": "Howdy"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
+}
+
 /// A script's edit in the window goes through the person's copy, and isn't theirs.
 #[test]
 fn a_script_s_edit_isn_t_the_person_s() {

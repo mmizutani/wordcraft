@@ -3,13 +3,16 @@
 //! tracked insertion.
 //!
 //! The hub keeps its latest document alone, so what a tool call's text said has to be read when its
-//! turn ends. At the next prompt, a text that reads differently now and that the person's own
-//! changes touched, and no one else's, is an edit: someone else's edit of it doesn't count, nor
-//! does the person typing elsewhere.
+//! turn ends. The digest then quotes both what it said and what it says now as the assistant's and
+//! the person's, so a text is quoted only if no one else could have put words in it: when it reads
+//! differently and anyone but the person changed the document since it was last read, it says
+//! nothing and stops being watched. Feedback to a model had better miss an edit than invent one,
+//! and a participant's text must not reach it as the person's correction. This errs quiet in a
+//! room with others typing, which only costs a hint.
 
 use std::collections::VecDeque;
 
-use wordcraft_engine::room::{Role, Room};
+use wordcraft_engine::room::Role;
 
 use crate::WordApp;
 
@@ -33,9 +36,13 @@ pub(super) struct Edits {
     watched: VecDeque<Written>,
     /// A turn has started whose tool calls haven't been read yet.
     running: bool,
-    /// The person's own command changed the document since the last look: the room can't tell it
-    /// from a script's, which goes through the same copy.
+    /// Since the last look, the person's own command changed the document, and a command of a
+    /// script's or an agent's did. The room can't tell them apart: both go through the person's
+    /// copy, so one of a script's means nothing is said.
     person_changed: bool,
+    script_changed: bool,
+    /// The document's revision as the command running now started.
+    rev_before: u64,
 }
 
 impl Edits {
@@ -43,7 +50,6 @@ impl Edits {
         self.running = true;
     }
 
-    /// The person's own command changed the document, not a script's or an agent's in the window.
     pub(super) fn person_changed_it(&mut self) {
         self.person_changed = true;
     }
@@ -55,6 +61,7 @@ pub(super) fn tick(app: &mut WordApp) {
         return;
     }
     app.assist.edits.running = false;
+    read_again(app, false);
     let Some(a) = app.conversation() else { return };
     let (room, name) = (a.room().clone(), a.name().to_string());
     let calls: Vec<_> = a
@@ -76,45 +83,56 @@ pub(super) fn tick(app: &mut WordApp) {
     }
 }
 
-/// Whether the person's changes since `w` was read touched it and no one else's did, the
-/// assistant's included. The digest quotes what the text now says as the person's, so with anyone
-/// else's words possibly in it, it says nothing: a participant's text must not reach the model as
-/// the person's correction. Better to miss an edit than to invent one.
-fn only_the_person_touched(room: &Room, w: &Written, person: &str, name: &str) -> bool {
-    let meets = |by: &str| room.changes_by(w.seen, by).is_some_and(|(f, l)| room.changes_meet(f..=l, by, w.first..=w.last, name));
-    room.changed_since(w.seen).is_some_and(|names| meets(person) && names.iter().all(|other| other == person || !meets(other)))
+/// Before a prompt, or an Accept or Reject: what the person changed of each text goes in the digest.
+pub(super) fn record(app: &mut WordApp) {
+    read_again(app, true);
+    let edits = &mut app.assist.edits;
+    edits.person_changed = false;
+    edits.script_changed = false;
 }
 
-/// Before a prompt, or an Accept or Reject: what the person changed of each text goes in the digest.
-/// A text the document no longer has stops being watched.
-pub(super) fn record(app: &mut WordApp) {
+/// Accept or Reject ran: what it did to the text isn't an edit.
+pub(super) fn review_ended(app: &mut WordApp) {
+    read_again(app, false);
+}
+
+/// A command of the window's starts or ended: one that isn't the person's and changed the document
+/// is a script's or an agent's.
+pub(super) fn command_starts(app: &mut WordApp) {
+    app.assist.edits.rev_before = app.session.rev();
+}
+
+pub(super) fn command_ended(app: &mut WordApp) {
+    if !app.assist.by_person && app.session.rev() != app.assist.edits.rev_before {
+        app.assist.edits.script_changed = true;
+    }
+}
+
+/// Read each watched text as it is now, and with `say`, put what the person changed in the digest.
+/// A text the document no longer has, or that someone else may have changed, stops being watched:
+/// the assistant's own later changes too, whose new call is watched instead.
+fn read_again(app: &mut WordApp, say: bool) {
     if app.assist.edits.watched.is_empty() {
         return;
     }
     app.catch_up_share();
-    read_again(app, true);
-    app.assist.edits.person_changed = false;
-}
-
-/// Accept or Reject ran: what it did to the text isn't an edit, so the text is read again as it is.
-pub(super) fn review_ended(app: &mut WordApp) {
-    if !app.assist.edits.watched.is_empty() {
-        app.catch_up_share();
-        read_again(app, false);
-    }
-}
-
-fn read_again(app: &mut WordApp, say: bool) {
     let Some(a) = app.conversation() else { return };
     let (room, name) = (a.room().clone(), a.name().to_string());
     let Some(person) = room.participants().into_iter().find(|p| p.role == Role::Owner).map(|p| p.name) else { return };
-    let say = say && app.assist.edits.person_changed;
+    let edits = &app.assist.edits;
+    let say = say && edits.person_changed && !edits.script_changed;
     let now = room.version();
     let watched = std::mem::take(&mut app.assist.edits.watched);
     for mut w in watched {
         let Some(text) = room.text_where_changed(w.first..=w.last, Some(&name), MAX_TEXT) else { continue };
-        if say && text != w.text && only_the_person_touched(&room, &w, &person, &name) {
-            app.assist.feedback.record_edit(&w.text, &text);
+        if text != w.text {
+            // The hub no longer keeping those changes means it can't be said whose they were.
+            if !room.changed_since(w.seen).is_some_and(|names| names.iter().all(|who| *who == person)) {
+                continue;
+            }
+            if say {
+                app.assist.feedback.record_edit(&w.text, &text);
+            }
         }
         w.text = text;
         w.seen = now;

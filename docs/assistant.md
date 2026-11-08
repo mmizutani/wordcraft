@@ -63,8 +63,10 @@ channel made.
 
 The list also says when you changed what the assistant wrote, after accepting it or inside its
 tracked insertion: what the text said and what it says now, each cut to 120 characters from just
-before they differ. Someone else's edit of the text doesn't count, and neither does typing
-elsewhere or rejecting the change.
+before they differ. Typing elsewhere and rejecting the change don't count. Neither does a text
+when anyone else changed the document since it was last read, or when a script changed it through
+the window: the list quotes it as your words, so it says nothing when it can't tell whose they
+are.
 
 ## Memory
 
