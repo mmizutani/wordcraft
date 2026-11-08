@@ -15,8 +15,8 @@ mod proofing;
 
 pub(crate) use changes::reject_all;
 pub use changes::{
-    DELETION_TEXT_CHARS, DeletionBalloon, changes_by, deletion_balloons, format_changes, has_deletions, has_format_changes, move_changes,
-    tracking_json,
+    AuthoredChange, DELETION_TEXT_CHARS, DeletionBalloon, changes_by, changes_of, deletion_balloons, format_changes, has_deletions,
+    has_format_changes, move_changes, tracking_json,
 };
 use changes::{list_changes, nav_change, resolve_all_then, resolve_sel_then, tracking_options};
 pub(crate) use comments::comment_at_caret;

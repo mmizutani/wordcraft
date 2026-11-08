@@ -1154,6 +1154,26 @@ fn two_reviewers() -> Session {
     s
 }
 
+/// What the window compares when the person resolves an assistant's changes (#86): one author's,
+/// with an insertion split into runs by formatting as one change.
+#[test]
+fn changes_of_one_author_are_whole_and_leave_the_others_out() {
+    let mut s = Session::new(Document::from_text("one two"));
+    s.author = "Bot".into();
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    s.run("select.text", &json!({"text": "two"})).unwrap();
+    s.run("text.insert", &json!({"text": "plain "})).unwrap();
+    s.run("format.bold", &json!({"value": true})).unwrap();
+    s.run("text.insert", &json!({"text": "bold"})).unwrap();
+    s.author = "Ana".into();
+    s.run("caret.docStart", &json!({})).unwrap();
+    s.run("text.insert", &json!({"text": "Ana "})).unwrap();
+    let bot = super::changes_of(&s, "Bot");
+    let kinds: Vec<(&str, &str)> = bot.iter().map(|c| (c.kind, c.text.as_str())).collect();
+    assert_eq!(kinds, [("insert", "plain bold"), ("delete", "two")]);
+    assert_eq!(super::changes_of(&s, "Nobody"), []);
+}
+
 /// The assistant pane's Accept all / Reject all from this assistant: one reviewer's changes are
 /// resolved, everyone else's stay as they were.
 #[test]

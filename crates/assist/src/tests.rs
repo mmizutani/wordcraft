@@ -12,8 +12,8 @@ use wordcraft_engine::room::{Replica, Role, Room};
 use crate::backend::{MAX_EVENT_TEXT, MAX_LABEL, MAX_OPTIONS, PERMISSION_TIMEOUT};
 use crate::tools::{CopyTools, MAX_OUTPUT, TOOLS, specs};
 use crate::{
-    Answer, AssistError, Assistant, Caps, Context, Entry, Event, Fake, Options, PermissionKind, PermissionOption, PermissionPolicy,
-    PermissionRequest, Step, StopReason, ToolHost, ToolStatus, Transcript, role_for,
+    Answer, AssistError, Assistant, Caps, Context, Decision, Entry, Event, Fake, Feedback, Options, PermissionKind, PermissionOption,
+    PermissionPolicy, PermissionRequest, Step, StopReason, ToolHost, ToolStatus, Transcript, role_for,
 };
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -1107,4 +1107,26 @@ fn a_turn_starts_with_the_person_s_selection() {
     a.ask_at("Again", None, Some((nowhere, nowhere))).unwrap();
     assert!(a.wait_idle(WAIT));
     assert_eq!(a.transcript().last_answer().as_deref(), Some("Still here."));
+}
+
+#[test]
+fn the_digest_is_newest_first_cut_and_within_its_budget() {
+    let mut f = Feedback::default();
+    assert_eq!(f.digest(), None);
+    f.record(Decision::Accepted, "insert", "first");
+    f.record(Decision::Rejected, "delete", "line one\nline two \"quoted\"\u{202E}");
+    let digest = f.digest().unwrap();
+    let lines: Vec<&str> = digest.lines().collect();
+    assert_eq!(lines[1..], ["- rejected your deletion: \"line one line two \\\"quoted\\\"\"", "- accepted your insertion: \"first\""]);
+
+    // Text is cut at characters, not bytes; the whole stays within the budget, the newest kept.
+    let mut f = Feedback::default();
+    for n in 0..500 {
+        f.record(Decision::Rejected, "insert", &format!("{n} {}", "é".repeat(300)));
+    }
+    let digest = f.digest().unwrap();
+    assert!(digest.len() <= crate::feedback::MAX_DIGEST, "{}", digest.len());
+    let newest = digest.lines().nth(1).unwrap();
+    assert!(newest.contains("\"499 "), "{newest}");
+    assert_eq!(newest.chars().filter(|c| *c == 'é').count(), crate::feedback::MAX_TEXT - 4);
 }

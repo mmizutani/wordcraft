@@ -587,6 +587,35 @@ pub fn changes_by(s: &Session, author: &str) -> usize {
         .sum()
 }
 
+/// One of an author's tracked changes in the document: what the window compares before and after
+/// the person resolves some (#86). Neighbouring runs of one change are one here.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AuthoredChange {
+    /// `insert`, `delete`, `format`…, as the Reviewing Pane names it.
+    pub kind: &'static str,
+    pub text: String,
+}
+
+/// The tracked changes `author` made across the document, in every story, as [`changes_by`] counts
+/// them but for a deletion hidden under someone else's insertion, which the reviewing list doesn't
+/// show either.
+pub fn changes_of(s: &Session, author: &str) -> Vec<AuthoredChange> {
+    let theirs = |rev: Option<u32>| rev.and_then(|r| s.doc.revisions.get(r as usize)).is_some_and(|r| r.author == author);
+    let stories = std::iter::once(StoryRef::Body).chain(s.doc.parts.keys().map(|id| StoryRef::Part(*id)));
+    let mut out = Vec::new();
+    for story in stories {
+        let mut spans: Vec<Change> = Vec::new();
+        for c in changes_in(s, story).into_iter().filter(|c| theirs(c.rev)) {
+            match spans.last_mut().filter(|l| l.kind == c.kind && l.rev == c.rev && l.b == c.a) {
+                Some(last) => last.b = c.b,
+                None => spans.push(c),
+            }
+        }
+        out.extend(spans.iter().map(|c| AuthoredChange { kind: c.kind, text: s.doc.copy_range(&c.a, &c.b).plain_text() }));
+    }
+    out
+}
+
 pub(super) fn list_changes(s: &mut Session, _: &Value) -> CmdResult {
     let list = changes(s);
     Ok(Value::Array(

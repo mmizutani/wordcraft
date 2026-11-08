@@ -18,6 +18,9 @@
 //! (`assist.allowUnattended`), refusing unless they allowed it, and the answer is logged. A tool
 //! call's row links to the change it made in the shared document (`assist.showChange`).
 //!
+//! What the person accepts and rejects of the conversation's changes starts the next turn's
+//! context (#86, [`review_ended`]); nothing of it is stored.
+//!
 //! The web app (#26) has the pane and the commands but no assistant: its backends would sign in
 //! through a loopback port or start agents, which take the desktop app ([`desktop`]). The pane
 //! says so, and the buttons' tooltips too.
@@ -25,11 +28,13 @@
 //! Signing in to ChatGPT (#19) is [`chatgpt`]'s: File › Options › Account and the pane start it,
 //! and [`tick`] takes how it ended, so ChatGPT is offered ready at once.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use wordcraft_assist::{Answer, Assistant, Backend, Caps, Context, Host, Offer, Options, PermissionPolicy, Readiness};
+use wordcraft_assist::{Answer, Assistant, Backend, Caps, Context, Decision, Feedback, Host, Offer, Options, PermissionPolicy, Readiness};
 use wordcraft_engine::cmd::assist::AssistantStatus;
+use wordcraft_engine::cmd::review::{AuthoredChange, changes_of};
 use wordcraft_engine::room::Role;
 
 use crate::WordApp;
@@ -66,6 +71,9 @@ pub(crate) struct AssistState {
     /// The command running now is the person's ([`WordApp::run`]: the pane, a menu, a
     /// shortcut), not a program's: a turn it asks for asks them its agent's permission requests.
     pub(crate) by_person: bool,
+    /// What the person accepted and rejected of the conversation's changes since its last turn
+    /// (#86), which the next turn's context starts with.
+    feedback: Feedback,
     /// The permission request of the conversation the pane last opened for: it opens once for
     /// each, so the person sees what the turn waits for; closed while it waits, the request is
     /// answered cancelled. A new conversation numbers its requests from 1 again.
@@ -394,7 +402,10 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
         start(app, role)?;
     }
     let caps = Caps::default();
-    let context = Context::of(&app.session, &caps).to_text(&caps);
+    let mut context = Context::of(&app.session, &caps).to_text(&caps);
+    if let Some(digest) = app.assist.feedback.digest() {
+        context = format!("{digest}\n\n{context}");
+    }
     // The person's selection, by paragraph id: the assistant's copy finds it there, though the
     // paragraphs moved with edits it has and the window hasn't yet.
     let doc = &app.session.doc;
@@ -424,6 +435,7 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
     a.ask_with_policy(prompt, Some(context), selection, policy).map_err(|e| e.to_string())?;
     let (name, role, tracked) = (a.name().to_string(), a.role(), a.tracked());
+    app.assist.feedback.clear();
     Ok(json!({"asked": true, "assistant": name, "role": role.name(), "tracked": tracked}))
 }
 
@@ -467,8 +479,44 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
     app.assist.conversation = Some(Conversation { assistant, document: app.session.document_id() });
     // Its requests are numbered from 1: the pane opens for each of them.
     app.assist.opened_for = None;
+    // It may be about another document, whose turn shouldn't quote this one's text.
+    app.assist.feedback.clear();
     sync_unattended(app);
     Ok(())
+}
+
+/// The conversation's changes as the person's Accept or Reject `id` starts: what
+/// [`review_ended`] compares.
+pub(crate) fn review_started(app: &WordApp, id: &str) -> Option<Vec<AuthoredChange>> {
+    decision(id)?;
+    Some(changes_of(&app.session, app.conversation()?.name()))
+}
+
+/// The person's Accept or Reject `id` ran: the conversation's changes `before` it that are gone
+/// now are what the next turn hears about (#86). Only [`WordApp::execute_user`] calls this, for
+/// the person's own commands: another participant's decisions arrive through the room, a script's
+/// through [`WordApp::execute`], and a macro's step has an id of its own.
+pub(crate) fn review_ended(app: &mut WordApp, id: &str, before: Vec<AuthoredChange>) {
+    let (Some(decision), Some(name)) = (decision(id), app.conversation().map(|a| a.name().to_string())) else { return };
+    let mut left: HashMap<AuthoredChange, usize> = HashMap::new();
+    for change in changes_of(&app.session, &name) {
+        *left.entry(change).or_default() += 1;
+    }
+    for change in before {
+        match left.get_mut(&change) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => app.assist.feedback.record(decision, change.kind, &change.text),
+        }
+    }
+}
+
+/// What command `id` decides about a change, when it is the person's Accept or Reject.
+fn decision(id: &str) -> Option<Decision> {
+    match id {
+        "review.accept" | "review.acceptAll" => Some(Decision::Accepted),
+        "review.reject" | "review.rejectAll" => Some(Decision::Rejected),
+        _ => None,
+    }
 }
 
 /// The tones Rewrite offers in menus: the label shown, and the tone asked for.
