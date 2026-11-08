@@ -2,7 +2,8 @@
 //!
 //! At the top, the assistant new conversations use (whether it is ready, and if not what to do:
 //! for ChatGPT, Continue with ChatGPT, #19) and who it is in the document: its name and role, which the person can change for the
-//! conversation. Then the conversation: the prompts, the answers, thoughts folded away, a row per
+//! conversation. Then the conversation: the prompts, the answers as formatted text
+//! ([`super::answer`]), thoughts folded away, a row per
 //! tool call folded to how it went (open: what it said, and the way to the change it made, #23),
 //! the plan as a checklist, permission requests with their options while they wait, errors, and
 //! why a turn stopped, said plainly. At the bottom, Accept all and Reject all of this assistant's
@@ -182,7 +183,8 @@ fn transcript(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
             ui.label(RichText::new(tl!("Ask the assistant to draft, rewrite or check your writing. It works in the document like a collaborator: with the Suggester role, every edit is a tracked change for you to accept or reject.")).color(t.text_dim));
         }
         for (i, e) in entries.iter().enumerate() {
-            entry(app, ui, t, i, e, waiting);
+            let streaming = busy && i.saturating_add(1) == entries.len();
+            entry(app, ui, t, i, e, waiting, streaming);
             ui.add_space(6.0);
         }
         if busy {
@@ -200,7 +202,7 @@ fn wrapped(ui: &mut Ui, text: RichText) {
     ui.add(egui::Label::new(text).wrap());
 }
 
-fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waiting: Option<u64>) {
+fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waiting: Option<u64>, streaming: bool) {
     match e {
         Entry::Asked { text } => {
             egui::Frame::NONE.fill(t.checked).corner_radius(6).inner_margin(6).show(ui, |ui| {
@@ -209,7 +211,7 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
                 wrapped(ui, RichText::new(text).color(t.text));
             });
         }
-        Entry::Answer { text } => wrapped(ui, RichText::new(text).color(t.text)),
+        Entry::Answer { text } => super::answer::answer(app, ui, t, text, streaming),
         Entry::Thought { text } => {
             egui::CollapsingHeader::new(RichText::new(tl!("Thinking")).small().color(t.text_dim))
                 .id_salt(("assistant_thought", i))

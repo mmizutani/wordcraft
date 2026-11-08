@@ -554,7 +554,8 @@ pub(crate) fn role_note(role: Role) -> &'static str {
 pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
     use wordcraft_assist::Entry;
     match e {
-        Entry::Asked { text } | Entry::Answer { text } | Entry::Thought { text } => vec![text.clone()],
+        Entry::Asked { text } | Entry::Thought { text } => vec![text.clone()],
+        Entry::Answer { text } => crate::panes::answer::shown_texts(text),
         Entry::Tool(call) => vec![call.title.clone(), call.detail.clone()],
         Entry::Plan { entries } => entries.iter().map(|p| p.content.clone()).collect(),
         Entry::Permission { request, .. } => std::iter::once(request.title.clone()).chain(request.options.iter().map(|o| o.name.clone())).collect(),

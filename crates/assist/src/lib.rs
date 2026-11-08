@@ -30,6 +30,7 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod acp;
+pub mod answer;
 mod assistant;
 pub mod backend;
 /// Sign in with ChatGPT and the ChatGPT backend: desktop only (HTTPS and a loopback port).

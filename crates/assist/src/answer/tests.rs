@@ -1,0 +1,159 @@
+//! Answers read as Markdown: what each block and span says, hostile text, and text that is still
+//! arriving.
+
+use std::time::{Duration, Instant};
+
+use super::{Block, Formatted, MAX_BLOCKS, Span, format, opens};
+
+fn words(f: &Formatted) -> String {
+    let span = |s: &[Span]| s.iter().map(|s| s.text.as_str()).collect::<String>();
+    let mut out: Vec<String> = f
+        .blocks
+        .iter()
+        .map(|b| match b {
+            Block::Para(s) | Block::Quote(s) | Block::Heading { spans: s, .. } | Block::Item { spans: s, .. } => span(s),
+            Block::Code(t) => t.clone(),
+            Block::Rule => String::new(),
+        })
+        .collect();
+    out.push(f.rest.clone());
+    out.join("\n")
+}
+
+#[test]
+fn headings_lists_emphasis_code_and_quotes_read_as_themselves() {
+    let f = format(
+        "# Title\n\nSome **bold**, *italic*, `code` and ~~gone~~.\n\n- one\n  - deep\n- two\n\n3. three\n4. four\n\n> said\n\n```\nlet a;\nlet b;\n```\n\n---\n",
+        false,
+    );
+    let [title, para, one, deep, two, three, four, quote, code, rule] = f.blocks.as_slice() else { panic!("{:#?}", f.blocks) };
+    assert!(matches!(title, Block::Heading { level: 1, spans } if spans[0].text == "Title"), "{title:?}");
+    let Block::Para(spans) = para else { panic!("{para:?}") };
+    assert!(spans.iter().any(|s| s.bold && s.text == "bold"), "{spans:?}");
+    assert!(spans.iter().any(|s| s.italic && s.text == "italic"), "{spans:?}");
+    assert!(spans.iter().any(|s| s.code && s.text == "code"), "{spans:?}");
+    assert!(spans.iter().any(|s| s.strike && s.text == "gone"), "{spans:?}");
+    assert!(matches!(one, Block::Item { marker, level: 0, .. } if marker == "•"), "{one:?}");
+    assert!(matches!(deep, Block::Item { level: 1, .. }), "{deep:?}");
+    assert!(matches!(two, Block::Item { level: 0, .. }), "{two:?}");
+    assert!(matches!(three, Block::Item { marker, .. } if marker == "3."), "{three:?}");
+    assert!(matches!(four, Block::Item { marker, .. } if marker == "4."), "{four:?}");
+    assert!(matches!(quote, Block::Quote(s) if s[0].text == "said"), "{quote:?}");
+    assert_eq!(code, &Block::Code("let a;\nlet b;".into()));
+    assert_eq!(rule, &Block::Rule);
+}
+
+#[test]
+fn a_link_keeps_its_address_and_only_web_addresses_open() {
+    let f = format("[here](https://example.com/a) and [run](file:///bin/sh)", false);
+    let Block::Para(spans) = &f.blocks[0] else { panic!("{f:?}") };
+    let linked: Vec<_> = spans.iter().filter_map(|s| s.link.as_deref().map(|l| (s.text.as_str(), l))).collect();
+    assert_eq!(linked, [("here", "https://example.com/a"), ("run", "file:///bin/sh")]);
+    assert!(opens("https://example.com/a") && opens("HTTP://example.com"));
+    for address in ["file:///bin/sh", "javascript:alert(1)", "mailto:a@b.c", "wordcraft://x", "", "http:"] {
+        assert!(!opens(address), "{address}");
+    }
+}
+
+#[test]
+fn a_picture_shows_its_description_and_nothing_is_loaded() {
+    // A 1×1 PNG in the text: the parser makes it a picture, which an answer doesn't draw.
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    let f = format(&format!("![a chart](data:image/png;base64,{png}) ![far](https://example.com/x.png)"), false);
+    let shown = words(&f);
+    assert!(shown.contains("a chart"), "{shown}");
+    assert!(!shown.contains("iVBOR"), "{shown}");
+}
+
+#[test]
+fn entities_cant_bring_back_what_hides_or_reorders_text() {
+    let f = format("wollA&#x202E; &#xE0041;x", false);
+    let shown = words(&f);
+    assert!(!shown.contains('\u{202E}') && !shown.contains('\u{E0041}'), "{shown:?}");
+    let f = format("[a](https://x.example/&#x202E;moc)", false);
+    let Block::Para(spans) = &f.blocks[0] else { panic!("{f:?}") };
+    assert!(!spans[0].link.as_deref().unwrap_or_default().contains('\u{202E}'), "{spans:?}");
+}
+
+/// Every piece of Markdown that has to be read at once to be hard. The budget is a debug build's
+/// on a busy machine: a release build reads each in a small part of it (a frame is about 16 ms).
+#[test]
+fn junk_reads_within_a_frame_budget_and_holds_to_the_limits() {
+    const SIZE: usize = 256 << 10;
+    let repeat = |s: &str| s.repeat(SIZE / s.len());
+    let cases = [
+        repeat("*"),
+        repeat("* "),
+        repeat("**a"),
+        repeat("_a "),
+        repeat("`"),
+        repeat("`a"),
+        repeat("["),
+        repeat("[a]("),
+        repeat("!["),
+        repeat(">"),
+        repeat("> "),
+        repeat("- "),
+        repeat("  - a\n"),
+        repeat("- a\n"),
+        repeat("1. a\n"),
+        repeat("# a\n"),
+        repeat("|a"),
+        repeat("|a|\n|-|\n"),
+        repeat("```\n"),
+        format!("```\n{}", repeat("a\n")),
+        repeat("&#x202E;"),
+        repeat("\\"),
+        repeat("é"),
+    ];
+    for case in &cases {
+        for streaming in [false, true] {
+            let at = Instant::now();
+            let f = format(case, streaming);
+            let took = at.elapsed();
+            let name: String = case.chars().take(12).collect();
+            assert!(took < Duration::from_millis(1500), "{name:?} (streaming: {streaming}) took {took:?}");
+            assert!(f.blocks.len() <= MAX_BLOCKS, "{name:?}: {} blocks", f.blocks.len());
+        }
+    }
+}
+
+#[test]
+fn an_answer_past_the_limits_is_all_still_there_as_text() {
+    let many: String = (0..2000).map(|n| format!("- item {n}\n")).collect();
+    let f = format(&many, false);
+    assert_eq!(f.blocks.len(), MAX_BLOCKS);
+    assert!(f.rest.contains("item 1999"), "{}", f.rest.len());
+    let long = format!("{}end of it", "word ".repeat(30_000));
+    let f = format(&long, false);
+    assert!(f.rest.ends_with("end of it"), "{}", f.rest.len());
+}
+
+#[test]
+fn text_still_arriving_shows_no_marker_and_only_ever_grows() {
+    let answer = "Some **bold words**, *italic ones*, `some code`, ~~gone~~ and [a link](https://example.com/page) end.";
+    let mut before = String::new();
+    for n in 0..=answer.len() {
+        let shown = words(&format(&answer[..n], true));
+        let shown = shown.trim_end();
+        for marker in ['*', '`', '~', '[', ']'] {
+            assert!(!shown.contains(marker), "{marker} in {shown:?} at {:?}", &answer[..n]);
+        }
+        assert!(shown.starts_with(before.trim_end()), "{shown:?} after {before:?}");
+        before = shown.to_string();
+    }
+    assert_eq!(before, "Some bold words, italic ones, some code, gone and a link end.");
+}
+
+#[test]
+fn a_finished_answer_is_read_as_it_is() {
+    // Nothing is closed or held back once the turn has moved on.
+    let f = format("a **b [c", false);
+    assert_eq!(words(&f).trim_end(), "a **b [c");
+}
+
+#[test]
+fn an_open_code_fence_stays_code_as_it_arrives() {
+    let f = format("```\nlet **a", true);
+    assert_eq!(f.blocks, [Block::Code("let **a".into())]);
+}

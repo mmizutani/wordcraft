@@ -15,7 +15,8 @@
 //! `CRAFT_LANGUAGE_PACK_INDEX` for a local pack index). `{"assistScript": [[step, …], …]}` has the
 //! next assistant conversation use the scripted assistant, one list of steps per turn: `{"say":
 //! text}`, `{"think": text}`, `{"tool": name, "args": {…}}`, `{"plan": [text, …]}` (an entry
-//! may be `{"content": text, "status": "completed|in_progress|pending"}`) or `{"ask": title}` (a
+//! may be `{"content": text, "status": "completed|in_progress|pending"}`), `{"hold": true}` (the
+//! turn goes on running, to show it under way) or `{"ask": title}` (a
 //! permission request: the pane asks it in a turn the person asked for, such as one started with
 //! `{"run": "assist.ask", "params": {"prompt": …}}`, and answers it per `assist.allowUnattended`
 //! in a program's: one from `engine.execute`, or typed with `ui.text` and sent with `ui.key`,
@@ -248,8 +249,10 @@ fn scripted_assistant(turns: &[serde_json::Value]) -> Result<wordcraft_assist::F
             )
         } else if let Some(t) = s.get("ask") {
             Step::Ask(text(t))
+        } else if s.get("hold").is_some() {
+            Step::Hold
         } else {
-            return Err(format!("an assistScript step is say, think, tool, plan or ask: {s}"));
+            return Err(format!("an assistScript step is say, think, tool, plan, ask or hold: {s}"));
         })
     };
     turns.iter().try_fold(wordcraft_assist::Fake::new(), |fake, turn| {

@@ -54,6 +54,15 @@ stopped other than by finishing says why, plainly: the answer was cut off at the
 writes at once, the assistant stopped after the most steps one request may take, or it declined
 to go on.
 
+An answer shows as formatted text: headings, lists, emphasis, code and quotes, read with the same
+Markdown parser the file formats use. While an answer arrives, what its last paragraph hasn't
+finished is closed or held back, so no `**` comes and goes, and a link waits until its address is
+whole. A picture shows only its description; nothing is fetched. A link is a widget of its own in
+the text, reachable by keyboard, with its address beside its words when they differ. Only a
+`http` or `https` address opens, and only on your own click: a click the control channel made
+leaves it closed and the pane says so. At most 64 KiB of an answer, 512 blocks and 4096 runs of
+text are formatted, and the rest shows as plain text.
+
 ## Backends
 
 | Id | Backend | What runs it |

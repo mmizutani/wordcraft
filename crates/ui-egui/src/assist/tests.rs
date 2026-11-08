@@ -1345,3 +1345,85 @@ fn the_share_page_leaves_the_assistant_s_role_to_the_assistant_pane() {
     a.execute("room.invite", json!({"name": "Ana", "role": "viewer"})).unwrap();
     assert_eq!(a.execute("room.role", json!({"name": "Ana", "role": "editor"})).unwrap()["changed"], true);
 }
+
+/// A window with the pane open and a turn of the scripted assistant that says `answer`, finished.
+#[cfg(not(target_arch = "wasm32"))]
+fn answered(answer: &str) -> egui_kittest::Harness<'static, WordApp> {
+    let mut app = window("one two three");
+    app.assist_with(Box::new(Fake::new().then(vec![Step::say(answer)])));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Answer"})).unwrap();
+    for _ in 0..4000 {
+        if !h.state().conversation().is_some_and(|c| c.is_busy()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+    h
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn an_answer_shows_formatted_and_not_its_markers() {
+    use egui_kittest::kittest::Queryable;
+    let h = answered("## Findings\n\n- **first** point\n\n> a quote\n\n```\nsome code\n```");
+    for shown in ["Findings", "first", " point", "a quote", "some code"] {
+        assert!(h.query_by_label(shown).is_some(), "{shown}");
+    }
+    for marker in ["## Findings", "**first**", "> a quote", "```"] {
+        assert!(h.query_by_label_contains(marker).is_none(), "{marker}");
+    }
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_link_in_an_answer_says_where_it_goes_and_opens_only_on_the_person_s_click() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = answered("See [the bank](https://example.com/not-the-bank) or [run this](file:///bin/sh).");
+    assert!(h.query_by_label(" (https://example.com/not-the-bank)").is_some(), "the address shows beside the words");
+    assert!(h.query_by_label(" (file:///bin/sh)").is_some());
+    // What isn't a web address isn't a link.
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Link, "run this").is_none());
+
+    // What the window asked to open, as its frames go.
+    let frame = |h: &mut egui_kittest::Harness<'_, WordApp>| {
+        let ctx = h.ctx.clone();
+        let mut raw = std::mem::take(h.input_mut());
+        h.state_mut().raw_input_hook(&ctx, &mut raw);
+        *h.input_mut() = raw;
+        h.step();
+        h.output()
+            .platform_output
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::OutputCommand::OpenUrl(u) if u.url == "https://example.com/not-the-bank"))
+    };
+    let pos = h.get_by_role_and_label(egui::accesskit::Role::Link, "the bank").rect().center();
+    let (req, _rx) = crate::control::ControlRequest::new("ui.click", json!({"x": pos.x, "y": pos.y}));
+    let ctx = h.ctx.clone();
+    assert!(matches!(crate::control::handle(h.state_mut(), &ctx, &req), crate::control::Outcome::Done(_)));
+    assert!(!(0..20).any(|_| frame(&mut h)), "a click the control channel made opens nothing");
+    assert!(h.state().assist.notice.as_deref().is_some_and(|n| n.contains("Only you")), "{:?}", h.state().assist.notice);
+
+    h.input_mut().events.push(egui::Event::PointerMoved(pos));
+    let mut opened = frame(&mut h);
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        opened |= frame(&mut h);
+    }
+    opened |= (0..3).any(|_| frame(&mut h));
+    assert!(opened, "the person's click opens it");
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_huge_answer_draws_within_a_frame_budget() {
+    // A debug build's budget on a busy machine, as `the_window_never_waits_for_its_assistants`.
+    const BUDGET: Duration = Duration::from_secs(1);
+    let mut h = answered(&"- a\n".repeat(64 << 10));
+    let at = std::time::Instant::now();
+    h.run_steps(1);
+    assert!(at.elapsed() < BUDGET, "a frame took {:?}", at.elapsed());
+}
