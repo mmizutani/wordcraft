@@ -108,10 +108,12 @@ fn usage(ui: &mut Ui, t: &Tokens, usage: &Usage) {
 
 /// A row of Properties, its value named by its label for a screen reader.
 fn property(ui: &mut Ui, t: &Tokens, name: &str, value: &str) {
-    ui.horizontal_wrapped(|ui| {
-        // Rows of text, not of controls.
+    ui.scope(|ui| {
+        // Rows of text, not of controls: a wrapped row takes its height from this as it starts.
         ui.spacing_mut().interact_size.y = 0.0;
-        let label = ui.label(RichText::new(name).small().color(t.text_dim));
-        ui.add(egui::Label::new(RichText::new(value).small().color(t.text)).wrap()).labelled_by(label.id);
+        ui.horizontal_wrapped(|ui| {
+            let label = ui.label(RichText::new(name).small().color(t.text_dim));
+            ui.add(egui::Label::new(RichText::new(value).small().color(t.text)).wrap()).labelled_by(label.id);
+        });
     });
 }
