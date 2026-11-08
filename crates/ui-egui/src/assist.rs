@@ -35,6 +35,7 @@ use wordcraft_engine::room::Role;
 use crate::WordApp;
 
 pub(crate) mod chatgpt;
+pub(crate) mod models;
 
 /// Seconds between two askings of what is offered while the pane is open (a sign-in or an
 /// install done meanwhile shows up).
@@ -202,6 +203,8 @@ pub(crate) fn tick(app: &mut WordApp) {
     }
     // A sign-in or a sign-out that ended changes what ChatGPT's offer says: ask again now.
     let account_changed = chatgpt::tick(app);
+    #[cfg(not(target_arch = "wasm32"))]
+    models::tick(app, account_changed);
     let stale = account_changed
         || match app.assist.offers_at {
             None => true,
@@ -247,6 +250,8 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
             if req.get("open").and_then(Value::as_bool) == Some(true) {
                 app.assist.focus_prompt = FOCUS_FRAMES;
                 refresh_offers(app);
+                #[cfg(not(target_arch = "wasm32"))]
+                models::retry_failed(app);
             }
             Ok(json!({"value": app.session.view.assistant_pane}))
         }
@@ -323,18 +328,28 @@ fn choice(app: &mut WordApp, req: &Value) -> Result<Value, String> {
     let backend = backend_in_use(app).ok_or(wordcraft_engine::cmd::assist::NOT_SET_UP)?;
     if req.get("set").and_then(Value::as_bool) == Some(true) {
         let value = req.get("value").and_then(Value::as_str).map(str::to_string);
+        let is_model = req.get("which").and_then(Value::as_str) == Some("model");
+        if let (Some(value), Some(offer)) = (&value, models::menus(app)) {
+            let offered = if is_model { offer.offers_model(value) } else { offer.offers_effort(value) };
+            if !offered {
+                let rows = if is_model { &offer.models } else { &offer.efforts };
+                let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+                return Err(format!("`{value}`: {backend} doesn't offer it (it offers {})", ids.join(", ")));
+            }
+        }
         let models = &mut app.session.prefs.assistant.models;
         let entry = models.entry(backend.clone()).or_default();
-        match req.get("which").and_then(Value::as_str) {
-            Some("model") => entry.model = value,
-            _ => entry.effort = value,
+        if is_model {
+            entry.model = value;
+        } else {
+            entry.effort = value;
         }
         if entry.model.is_none() && entry.effort.is_none() {
             models.remove(&backend);
         }
     }
     let chosen = app.session.prefs.assistant.models.get(&backend).cloned().unwrap_or_default();
-    Ok(json!({"backend": backend, "chosen": chosen, "running": running(app)}))
+    Ok(json!({"backend": backend, "chosen": chosen, "running": running(app), "offered": models::menus(app)}))
 }
 
 /// What the conversation's last turn says ran.

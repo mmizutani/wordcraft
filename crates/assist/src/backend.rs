@@ -62,6 +62,55 @@ pub struct ModelOption {
     pub default_effort: Option<String>,
 }
 
+/// A reasoning level a backend offers whatever the model, under a name of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Level {
+    pub id: String,
+    pub name: String,
+}
+
+/// What a backend offers to choose from, and what it is set to now.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Offered {
+    pub models: Vec<ModelOption>,
+    /// The levels for any model. A model that names its own levels takes those.
+    pub efforts: Vec<Level>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// Most models a backend's offer keeps.
+pub const MAX_OFFERED_MODELS: usize = 64;
+
+/// Most reasoning levels a backend's offer keeps, for a model or for any.
+pub const MAX_OFFERED_LEVELS: usize = 16;
+
+/// Whether `id` can name a model or a level: what a request sends back, so it isn't cut.
+fn offered_id(id: &str) -> bool {
+    !id.trim().is_empty() && id.len() <= MAX_LABEL && !id.chars().any(char::is_control)
+}
+
+impl Offered {
+    /// The offer held to the pane's limits: at most [`MAX_OFFERED_MODELS`] models and
+    /// [`MAX_OFFERED_LEVELS`] levels, names as labels, entries without a usable id dropped.
+    fn bounded(self) -> Offered {
+        let models = self.models.into_iter().filter(|m| offered_id(&m.id)).take(MAX_OFFERED_MODELS).map(|m| ModelOption {
+            name: label(&m.name),
+            description: m.description.map(|d| label(&d)),
+            efforts: m.efforts.into_iter().filter(|e| offered_id(e)).take(MAX_OFFERED_LEVELS).collect(),
+            default_effort: m.default_effort.filter(|e| offered_id(e)),
+            id: m.id,
+        });
+        let efforts = self.efforts.into_iter().filter(|l| offered_id(&l.id)).take(MAX_OFFERED_LEVELS);
+        Offered {
+            models: models.collect(),
+            efforts: efforts.map(|l| Level { name: label(&l.name), id: l.id }).collect(),
+            model: self.model.filter(|m| offered_id(m)),
+            effort: self.effort.filter(|e| offered_id(e)),
+        }
+    }
+}
+
 /// The assistant's place in the shared document, which the backend gets when the conversation
 /// starts ([`Backend::begin`]): who it is, and the key of the invite it joined with, which an
 /// agent outside the process connects with (WordCraft's MCP server, `WORDCRAFT_CONTROL_KEY`).
@@ -309,6 +358,8 @@ pub enum Event {
     /// Something the person should know about the turn, which goes on: what ran instead of what
     /// they chose, or a level that wasn't applied.
     Note { text: String },
+    /// What the backend offers to choose from, whole: it replaces what it said before.
+    Options(Offered),
     /// The turn ended.
     Done { stop: StopReason },
     /// The turn failed: why, said plainly. The turn ended.
@@ -339,6 +390,7 @@ impl Event {
             Event::Permission(r) => Event::Permission(PermissionRequest { id: r.id, ..PermissionRequest::bounded(&r.title, r.options) }),
             Event::Model { name, effort, asked } => Event::Model { name: label(&name), effort: effort.map(|e| label(&e)), asked },
             Event::Note { text: t } => Event::Note { text: text(t) },
+            Event::Options(offered) => Event::Options(offered.bounded()),
             Event::Error { message } => Event::Error { message: text(message) },
             e @ (Event::Answered { .. } | Event::Done { .. }) => e,
         }

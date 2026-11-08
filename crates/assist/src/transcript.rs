@@ -147,6 +147,8 @@ impl Transcript {
                 }
             }
             Event::Note { text } => self.push(Entry::Note { text: text.clone() }),
+            // What is offered isn't part of the conversation: [`crate::Assistant::offered`].
+            Event::Options(_) => {}
             Event::Done { stop } => {
                 if *stop != StopReason::EndTurn {
                     self.push(Entry::Stopped { stop: *stop });

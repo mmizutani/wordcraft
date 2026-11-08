@@ -127,12 +127,26 @@ wasn't applied. It stays left out until the model or the effort changes. A list 
 stops a turn only when nothing was chosen. A choice that no longer resolves stays saved, and the
 pane says what ran instead.
 
-`assist.model {"id"?: string | null}` and `assist.effort {"level"?: string | null}` choose for the
-assistant in use: leave the param out to read, and `null` goes back to the default. Each answers
-with the backend, what is chosen and what the last turn says ran. A change applies from the next
-turn and keeps the conversation, since each request sends the earlier turns as words and answers.
-The choice is kept per backend in the preferences (`assistant.models`). A person invited to the
-document can't run either command, at any role.
+**The menus.** Beside Send and Stop are a Model menu and an Effort menu, wrapping under them when
+the pane is narrow. The Model menu starts with a Default row that names what it resolves to, and
+that row clears the choice. The Effort menu lists this model's levels, ticks the current one and
+tags what runs with nothing chosen. With no levels listed it offers Low, Medium and High. Choosing
+takes one click. During a turn both are greyed out and say why. The web app has no backend, so it
+shows neither.
+
+WordCraft reads the list on a thread of its own when the pane opens with someone signed in and no
+list held, and again after a sign-in, so no frame waits for it. While it reads, the Model menu has
+the Default row and says so on hover. A read that fails shows the reason under the menus, doesn't
+stop a turn that has a saved choice, and is tried again the next time the pane opens.
+
+**The commands.** `assist.model {"id"?: string | null}` and `assist.effort {"level"?: string | null}`
+choose for the assistant in use: leave the param out to read, and `null` goes back to the default.
+Each answers with the backend, what is chosen, what the last turn says ran and what the menus
+offer. Once the offer is known, a value outside it is refused and names what is offered. A change
+applies from the next turn and keeps the conversation, since each request sends the earlier turns
+as words and answers. The choice is kept per backend in the preferences (`assistant.models`). A
+person invited to the document can't run either command, at any role, and neither can be addressed
+to a document with `doc`.
 
 ### Setting up an agent
 
@@ -411,6 +425,11 @@ own account the way it documents.
    tone: the answer streams in, the rewrite is a tracked change by "ChatGPT", and its tool rows
    open to the change. The turn's line reads `GPT-6-Luna · Medium`. If it says `(requested)`, the
    stream doesn't report the effort: note that in #84.
+   Open the Model menu: it lists your account's models with Default (GPT-6-Luna) on top, and if it
+   has only that row, or the Effort menu offers only Low, Medium and High for every model, note
+   which in #84, since the list then lacks those fields. Note too whether `gpt-6-luna` is listed
+   and on which plan. Choose another model and effort, and send another prompt: the line shows
+   them, and the conversation goes on.
 3. Ask for something long, and press Stop while it answers: it stops at once and says so. Ask
    again: it answers.
 4. Sign Out on the same page: `chatgpt-credentials.json` is gone, and the pane says to sign in,

@@ -55,6 +55,10 @@ struct Script {
     asked: Mutex<Vec<String>>,
     /// The token endpoint waits while this is set (a code exchange that takes a while).
     hold_token: AtomicBool,
+    /// What the models list answers: its status and body.
+    models: Mutex<Option<(u16, String)>>,
+    /// The models list waits while this is set.
+    hold_models: AtomicBool,
 }
 
 /// The fake sign-in server: the token, discovery and revocation endpoints.
@@ -182,6 +186,13 @@ fn serve() -> Server {
                     &json!({"issuer": "https://auth.openai.com", "revocation_endpoint": format!("{base2}/oauth/revoke")}).to_string(),
                 ),
                 ("POST", "/oauth/revoke") => answer(&mut stream, 200, ""),
+                ("GET", "/v1/models") => {
+                    while script2.hold_models.load(Ordering::Relaxed) && !stop2.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let (status, body) = script2.models.lock().unwrap().clone().unwrap_or((404, "{}".into()));
+                    answer(&mut stream, status, &body);
+                }
                 _ => answer(&mut stream, 404, "{}"),
             }
         }
@@ -697,4 +708,162 @@ fn the_pane_says_how_to_sign_in_once() {
     assert!(h.query_by_label("Sign in with a ChatGPT Plus or Pro account in Options › Account.").is_some());
     assert!(h.query_by_label_contains("Sign in: ").is_none());
     assert!(h.query_by_label("Continue with ChatGPT").is_some());
+}
+
+/// The two models the issue's list has, in its order: `gpt-6.1-sol` first.
+fn the_list() -> (u16, String) {
+    let list = json!({"models": [
+        {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol", "default_reasoning_level": "low",
+         "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "ultra"}]},
+        {"slug": "gpt-6-luna", "display_name": "GPT-6-Luna", "description": "Quick", "default_reasoning_level": "medium",
+         "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "max"}]},
+    ]});
+    (200, list.to_string())
+}
+
+/// A window signed in at `server`, with the pane open on ChatGPT.
+fn on_chatgpt(folder: &Folder, server: &Server) -> WordApp {
+    let mut a = window(folder, server);
+    sign_in(&mut a, server);
+    a.ui.assistant = ID.into();
+    a.run("assist.pane", json!({"value": true})).unwrap();
+    a
+}
+
+fn read_list(a: &mut WordApp) {
+    until(a, "the list was read", |a| {
+        !matches!(a.assist.chatgpt.list, super::super::models::ModelList::Reading(_) | super::super::models::ModelList::Unread)
+    });
+}
+
+fn ids(rows: &[crate::assist::models::Row]) -> Vec<&str> {
+    rows.iter().map(|r| r.id.as_str()).collect()
+}
+
+#[test]
+fn the_menus_list_the_accounts_models_with_gpt_6_luna_at_medium_as_the_default() {
+    use crate::assist::models::menus;
+    let (folder, server) = (Folder::new(), serve());
+    *server.script.models.lock().unwrap() = Some(the_list());
+    let mut a = on_chatgpt(&folder, &server);
+    read_list(&mut a);
+    let m = menus(&a).unwrap();
+    assert_eq!(ids(&m.models), ["gpt-6.1-sol", "gpt-6-luna"]);
+    assert_eq!((m.default_model.as_deref(), m.running_model.as_deref(), m.chosen_model.clone()), (Some("GPT-6-Luna"), Some("GPT-6-Luna"), None));
+    assert_eq!(ids(&m.efforts), ["low", "medium", "max"]);
+    assert_eq!(m.effort.as_deref(), Some("medium"));
+    // The other model: its own levels, and the level that runs with nothing chosen tagged, which
+    // isn't the one its list entry calls its default.
+    a.execute("assist.model", json!({"id": "gpt-6.1-sol"})).unwrap();
+    let m = menus(&a).unwrap();
+    assert_eq!(ids(&m.efforts), ["low", "medium", "ultra"]);
+    assert_eq!(m.efforts.iter().filter(|e| e.is_default).map(|e| e.id.as_str()).collect::<Vec<_>>(), ["medium"]);
+    // A level of the other model is refused by this one, and a saved one that isn't offered falls
+    // back here as it does in the turn.
+    assert!(a.execute("assist.effort", json!({"level": "max"})).is_err());
+    a.execute("assist.effort", json!({"level": "ultra"})).unwrap();
+    a.execute("assist.model", json!({"id": null})).unwrap();
+    let m = menus(&a).unwrap();
+    assert_eq!((m.chosen_model.clone(), m.effort.as_deref()), (None, Some("medium")));
+    assert_eq!(a.session.prefs.assistant.models[ID].effort.as_deref(), Some("ultra"), "it stays saved");
+    assert!(a.execute("assist.model", json!({"id": "gone"})).unwrap_err().contains("gpt-6-luna"));
+    // A saved model that left the list ticks the Default row, and what runs is named.
+    a.session.prefs.assistant.models.get_mut(ID).unwrap().model = Some("gone".into());
+    let m = menus(&a).unwrap();
+    assert_eq!((m.chosen_model.clone(), m.running_model.as_deref()), (None, Some("GPT-6-Luna")));
+    // The list was read once, for the pane.
+    assert_eq!(server.script.asked.lock().unwrap().iter().filter(|p| *p == "/v1/models").count(), 1);
+}
+
+#[test]
+fn a_list_with_no_levels_offers_low_medium_and_high() {
+    let (folder, server) = (Folder::new(), serve());
+    *server.script.models.lock().unwrap() = Some((200, json!({"data": [{"id": "gpt-x", "object": "model"}]}).to_string()));
+    let mut a = on_chatgpt(&folder, &server);
+    read_list(&mut a);
+    let m = crate::assist::models::menus(&a).unwrap();
+    assert_eq!(ids(&m.efforts), ["low", "medium", "high"]);
+    assert_eq!(m.effort.as_deref(), Some("medium"));
+    assert_eq!(m.efforts.iter().filter(|e| e.is_default).map(|e| e.id.as_str()).collect::<Vec<_>>(), ["medium"]);
+}
+
+#[test]
+fn no_frame_waits_for_the_list_and_the_menus_say_so_meanwhile() {
+    use crate::assist::models::{ModelList, menus};
+    let (folder, server) = (Folder::new(), serve());
+    *server.script.models.lock().unwrap() = Some(the_list());
+    server.script.hold_models.store(true, Ordering::Relaxed);
+    let mut a = on_chatgpt(&folder, &server);
+    let started = Instant::now();
+    for _ in 0..20 {
+        crate::assist::tick(&mut a);
+    }
+    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    assert!(matches!(a.assist.chatgpt.list, ModelList::Reading(_)));
+    let m = menus(&a).unwrap();
+    assert!(m.models.is_empty() && m.unknown_because.is_some() && m.failed.is_none());
+    assert_eq!(ids(&m.efforts), ["low", "medium", "high"], "the usual levels can be chosen meanwhile");
+    server.script.hold_models.store(false, Ordering::Relaxed);
+    read_list(&mut a);
+    assert_eq!(ids(&menus(&a).unwrap().models), ["gpt-6.1-sol", "gpt-6-luna"]);
+}
+
+#[test]
+fn a_list_that_cant_be_read_says_why_and_is_tried_again_when_the_pane_opens() {
+    use crate::assist::models::menus;
+    let (folder, server) = (Folder::new(), serve());
+    *server.script.models.lock().unwrap() = Some((500, "{}".into()));
+    let mut a = on_chatgpt(&folder, &server);
+    read_list(&mut a);
+    let m = menus(&a).unwrap();
+    assert!(m.failed.as_deref().is_some_and(|why| why.contains("couldn't be listed")), "{:?}", m.failed);
+    assert!(!m.known && m.models.is_empty());
+    // A choice can still be made: the turn runs it, as a saved choice gets past a failed read.
+    a.execute("assist.model", json!({"id": "gpt-saved"})).unwrap();
+    assert_eq!(menus(&a).unwrap().running_model.as_deref(), Some("gpt-saved"));
+    for _ in 0..10 {
+        crate::assist::tick(&mut a);
+    }
+    assert_eq!(server.script.asked.lock().unwrap().iter().filter(|p| *p == "/v1/models").count(), 1, "not again every frame");
+    *server.script.models.lock().unwrap() = Some(the_list());
+    a.run("assist.pane", json!({"value": false})).unwrap();
+    a.run("assist.pane", json!({"value": true})).unwrap();
+    read_list(&mut a);
+    assert_eq!(ids(&menus(&a).unwrap().models), ["gpt-6.1-sol", "gpt-6-luna"]);
+}
+
+#[test]
+fn the_menus_need_someone_signed_in_and_a_new_sign_in_reads_the_list_again() {
+    use crate::assist::models::menus;
+    let (folder, server) = (Folder::new(), serve());
+    let mut a = window(&folder, &server);
+    a.ui.assistant = ID.into();
+    a.run("assist.pane", json!({"value": true})).unwrap();
+    crate::assist::tick(&mut a);
+    assert_eq!(menus(&a), None);
+    assert!(matches!(a.assist.chatgpt.list, crate::assist::models::ModelList::Unread), "nobody to read it for");
+    *server.script.models.lock().unwrap() = Some(the_list());
+    sign_in(&mut a, &server);
+    read_list(&mut a);
+    assert!(menus(&a).is_some());
+    a.run("assist.chatgpt.signOut", json!({})).unwrap();
+    until(&mut a, "signed out", |a| status(a) == ChatGptStatus::SignedOut);
+    assert_eq!(menus(&a), None);
+    sign_in(&mut a, &server);
+    read_list(&mut a);
+    assert_eq!(server.script.asked.lock().unwrap().iter().filter(|p| *p == "/v1/models").count(), 2);
+}
+
+#[test]
+fn a_program_can_read_the_menus_but_not_while_nothing_is_offered() {
+    let (folder, server) = (Folder::new(), serve());
+    *server.script.models.lock().unwrap() = Some(the_list());
+    let mut a = on_chatgpt(&folder, &server);
+    read_list(&mut a);
+    let answer = a.execute("assist.model", json!({})).unwrap();
+    assert_eq!(answer["backend"], ID);
+    assert_eq!(answer["offered"]["runningModel"], "GPT-6-Luna");
+    assert_eq!(answer["offered"]["models"][0]["id"], "gpt-6.1-sol");
+    assert_eq!(answer["offered"]["efforts"][1], json!({"id": "medium", "name": null, "description": null, "isDefault": true}));
+    assert_eq!(answer["running"], json!(null));
 }
