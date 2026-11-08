@@ -863,7 +863,8 @@ fn the_choice_reaches_the_agent_before_its_first_prompt() {
     assert_eq!(offered.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["fast", "deep"], "groups flattened");
     assert_eq!(offered.models[0].description.as_deref(), Some("Quick"));
     assert_eq!(offered.efforts.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["Skim", "Think hard"]);
-    assert_eq!((offered.model.as_deref(), offered.effort.as_deref()), (Some("deep"), Some("think")));
+    // What runs with nothing chosen: what Default goes back to, not what is chosen now.
+    assert_eq!((offered.model.as_deref(), offered.effort.as_deref()), (Some("fast"), Some("skim")));
 }
 
 #[test]
@@ -979,4 +980,61 @@ fn junk_options_are_skipped_and_never_panic() {
     assert_eq!(offered.models[0].name, "name");
     assert_eq!(offered.efforts.iter().map(|l| (l.id.as_str(), l.name.as_str())).collect::<Vec<_>>(), [("a", "a")], "once, named by its value");
     assert_eq!(parsed.line().map(|l| l.1), Some(None), "a current level it doesn't list has no name");
+}
+
+#[test]
+fn an_update_between_turns_is_read_before_the_next_prompt_is_set_up() {
+    let mut c = Chat::with(&configured(vec![vec![Step::ConfigUpdateAfter { options: options("deep", "skim") }], vec![Step::Report]]));
+    c.a.choose(Some("fast".into()), None);
+    c.ask("Hello");
+    assert_eq!(line(&c).map(|l| l.0), Some("Fast".to_string()));
+    c.ask("Again");
+    assert_eq!(set_config(&c), [pair("the-model", "fast")], "it moved to deep on its own, and fast is what is chosen");
+    assert_eq!(line(&c).map(|l| l.0), Some("Fast".to_string()));
+}
+
+#[test]
+fn an_update_while_a_change_is_answered_is_kept() {
+    let script = Script { refuse_set: Some("not now".into()), update_on_set: Some(options("deep", "skim")), ..configured(vec![vec![]]) };
+    let mut c = Chat::with(&script);
+    c.a.choose(None, Some("think".into()));
+    c.ask("Hello");
+    assert_eq!(line(&c), Some(("Deep".to_string(), Some("Skim".to_string()))), "what the agent said, though the change itself was refused");
+}
+
+#[test]
+fn a_stop_while_a_change_is_answered_leaves_what_runs_unknown_so_the_next_turn_sets_it() {
+    let script = Script { set_ms: 300, ..configured(vec![vec![Step::Report]]) };
+    let mut c = Chat::with(&script);
+    c.a.choose(Some("deep".into()), None);
+    c.a.ask("Hello", None).unwrap();
+    c.until("the agent started", |c| c.tool(START_ROW).is_some_and(|t| t.status == ToolStatus::Completed));
+    std::thread::sleep(Duration::from_millis(50));
+    c.a.cancel();
+    assert!(c.a.wait_idle(WAIT));
+    assert_eq!(c.stopped(), Some(StopReason::Cancelled));
+    // The agent took deep after all. Going back to Default sets what it had before.
+    c.a.choose(None, None);
+    c.ask("Again");
+    assert_eq!(set_config(&c), [pair("the-model", "deep"), pair("the-model", "fast")]);
+    assert_eq!(line(&c).map(|l| l.0), Some("Fast".to_string()));
+}
+
+#[test]
+fn a_refused_way_back_to_the_default_is_tried_again() {
+    let script = Script {
+        refuse_set: Some("not now".into()),
+        refuse_value: Some("skim".into()),
+        ..configured(vec![vec![Step::Report], vec![Step::Report], vec![Step::Report]])
+    };
+    let mut c = Chat::with(&script);
+    c.a.choose(None, Some("think".into()));
+    c.ask("Hello");
+    assert_eq!(c.a.offered().unwrap().effort.as_deref(), Some("skim"), "what Default goes back to");
+    assert_eq!(line(&c).and_then(|l| l.1).as_deref(), Some("Think hard"), "what runs");
+    c.a.choose(None, None);
+    c.ask("Back");
+    assert!(notes(&c).iter().any(|n| n.contains("skim") && n.contains("not now")), "{:?}", notes(&c));
+    c.ask("Back again");
+    assert_eq!(set_config(&c), [pair("the-level", "think"), pair("the-level", "skim"), pair("the-level", "skim")]);
 }

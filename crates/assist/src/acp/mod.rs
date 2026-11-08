@@ -37,8 +37,8 @@ use serde_json::{Value, json};
 use wordcraft_mcp::Backend as _;
 
 use crate::backend::{
-    Answer, Backend, BackendInfo, Event, MAX_OPTIONS, MAX_PLAN, PermissionKind, PermissionOption, PermissionPolicy, PermissionRequest, PlanEntry,
-    PlanStatus, Priority, Seat, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, label,
+    Answer, Backend, BackendInfo, Event, MAX_OPTIONS, MAX_PLAN, Offered, PermissionKind, PermissionOption, PermissionPolicy, PermissionRequest,
+    PlanEntry, PlanStatus, Priority, Seat, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, label,
 };
 use config::{Config, Select};
 pub use room_port::RoomPort;
@@ -266,6 +266,13 @@ pub struct Acp {
     started: HashMap<String, u64>,
 }
 
+impl Running {
+    /// The config option for the model or the level, and what it was before WordCraft changed it.
+    fn slot(&mut self, is_model: bool) -> (Option<&mut Select>, &mut Option<String>) {
+        if is_model { (self.config.model.as_mut(), &mut self.before.0) } else { (self.config.thought.as_mut(), &mut self.before.1) }
+    }
+}
+
 impl Acp {
     /// A backend that runs the agent `spec` sets up.
     pub fn new(spec: AgentSpec) -> Acp {
@@ -446,63 +453,123 @@ impl Acp {
 
     /// Set what the person chose for this turn, model first: its answer may change the levels.
     /// A value it no longer offers is skipped, with a note, and so is one it refuses: neither stops
-    /// the turn. Nothing chosen goes back to what WordCraft changed, if it changed anything.
+    /// the turn. Nothing chosen goes back to what WordCraft changed, once the agent takes it.
     /// Whether anything changed.
-    fn apply_choice(&mut self, turn: &Turn, ctx: &TurnCtx<'_>) -> Result<bool, String> {
+    fn apply_choice(&mut self, turn: &Turn, ctx: &mut TurnCtx<'_>) -> Result<bool, String> {
         let mut changed = false;
         for (is_model, wanted) in [(true, turn.model.as_ref()), (false, turn.effort.as_ref())] {
             let name = self.name().to_string();
-            let timeout = self.spec.start_timeout;
+            let until = Instant::now() + self.spec.start_timeout;
             let Some(running) = self.running.as_mut() else { break };
-            let (option, before) =
-                if is_model { (&running.config.model, &mut running.before.0) } else { (&running.config.thought, &mut running.before.1) };
-            let Some(Select { id, current, .. }) = option.as_ref() else { continue };
+            let session = running.session.clone();
+            let (Some(option), before) = running.slot(is_model) else { continue };
             let Some(target) = wanted.or(before.as_ref()).cloned() else { continue };
-            if option.as_ref().is_some_and(|o| !o.offers(&target)) {
+            if !option.offers(&target) {
                 if wanted.is_some() {
-                    ctx.emit(Event::Note { text: format!("{name} doesn't offer {target} now: it goes on with {current}.") });
+                    ctx.emit(Event::Note { text: format!("{name} doesn't offer {target} now: it goes on with {}.", option.current) });
                 }
                 continue;
             }
-            if target != *current {
+            let mut taken = target == option.current;
+            if !taken {
                 if wanted.is_some() && before.is_none() {
-                    *before = Some(current.clone());
+                    *before = Some(option.current.clone());
                 }
-                let params = json!({"sessionId": running.session, "configId": id, "value": target});
+                let params = json!({"sessionId": session, "configId": option.id, "value": target});
                 let asked = running.process.request("session/set_config_option", params)?;
-                match wait_for(&mut running.process, asked, Instant::now() + timeout, ctx, &name)? {
-                    None => return Ok(changed),
-                    Some(Ok(answer)) if answer.get("configOptions").is_some() => {
-                        running.config = Config::parse(&answer);
-                        changed = true;
-                    }
-                    Some(Ok(_)) => {
-                        // The protocol says it answers with all of them; this one didn't.
-                        let option = if is_model { &mut running.config.model } else { &mut running.config.thought };
-                        if let Some(option) = option {
+                let answered = self.answer_to(asked, until, ctx);
+                let Some(running) = self.running.as_mut() else { break };
+                match answered {
+                    Ok(Some(Ok(answer))) => {
+                        if answer.get("configOptions").is_some() {
+                            running.config = Config::parse(&answer);
+                        } else if let (Some(option), _) = running.slot(is_model) {
+                            // The protocol says it answers with all of them; this one didn't.
                             option.current = target;
                         }
+                        taken = true;
                         changed = true;
                     }
-                    Some(Err(e)) => ctx.emit(Event::Note { text: format!("{name} didn't change to {target}: {}", e.message) }),
+                    Ok(Some(Err(e))) => ctx.emit(Event::Note { text: format!("{name} didn't change to {target}: {}", e.message) }),
+                    stopped_or_stuck => {
+                        // It may still take the value: what it runs isn't known, so the next turn
+                        // says what it wants whatever was held.
+                        if let (Some(option), _) = running.slot(is_model) {
+                            option.current.clear();
+                        }
+                        return stopped_or_stuck.map(|_| changed);
+                    }
                 }
             }
-            if wanted.is_none() {
-                let before = if is_model { &mut running.before.0 } else { &mut running.before.1 };
-                *before = None;
+            if taken
+                && wanted.is_none()
+                && let Some(running) = self.running.as_mut()
+            {
+                *running.slot(is_model).1 = None;
             }
         }
         Ok(changed)
     }
 
-    /// Tell the pane what the session's config options offer and which model runs.
+    /// Tell the pane what the session's config options offer and which model runs. What is offered
+    /// says what runs with nothing chosen: what Default goes back to, or what the agent has.
     fn show_config(&self, ctx: &TurnCtx<'_>, offer: bool) {
         let Some(running) = &self.running else { return };
         if offer {
-            ctx.emit(Event::Options(running.config.offered()));
+            let offered = running.config.offered();
+            let (model, effort) = running.before.clone();
+            ctx.emit(Event::Options(Offered { model: model.or(offered.model.clone()), effort: effort.or(offered.effort.clone()), ..offered }));
         }
         if let Some((name, effort)) = running.config.line() {
             ctx.emit(Event::Model { name, effort, asked: false });
+        }
+    }
+
+    /// Wait for the answer to request `id`, before `until`, doing what a turn does with what the
+    /// agent sends meanwhile. `None` when the turn was stopped first.
+    fn answer_to(&mut self, id: i64, until: Instant, ctx: &mut TurnCtx<'_>) -> Result<Option<Result<Value, RpcError>>, String> {
+        let name = self.name().to_string();
+        loop {
+            if ctx.is_cancelled() {
+                return Ok(None);
+            }
+            if Instant::now() >= until {
+                return Err(format!("{name} didn't answer in time"));
+            }
+            let Some(running) = self.running.as_mut() else { return Err(format!("{name} isn't running")) };
+            let message = match running.process.next(TICK) {
+                None => continue,
+                Some(Incoming::Closed) => return Err(running.process.why_gone(&name)),
+                Some(Incoming::Junk(why)) => {
+                    log::debug!("assistant: {name} wrote {why}");
+                    continue;
+                }
+                Some(Incoming::Message(m)) => m,
+            };
+            match classify(&message) {
+                Message::Response { id: answered, result } if answered.as_i64() == Some(id) => return Ok(Some(result.cloned())),
+                Message::Notification { method: "session/update", params } => self.update(params, ctx),
+                Message::Request { id: asked, method, params } => self.answer_request(asked, method, params, false, ctx)?,
+                Message::Response { .. } | Message::Notification { .. } | Message::Invalid => {}
+            }
+        }
+    }
+
+    /// Take what the agent sent since the last turn, doing what a turn does with it: its config
+    /// options may have changed, which decides what the next prompt needs set first.
+    fn catch_up(&mut self, ctx: &mut TurnCtx<'_>) -> Result<(), String> {
+        loop {
+            let Some(running) = self.running.as_mut() else { return Ok(()) };
+            let message = match running.process.next(Duration::ZERO) {
+                None | Some(Incoming::Closed) => return Ok(()),
+                Some(Incoming::Junk(_)) => continue,
+                Some(Incoming::Message(m)) => m,
+            };
+            match classify(&message) {
+                Message::Notification { method: "session/update", params } => self.update(params, ctx),
+                Message::Request { id, method, params } => self.answer_request(id, method, params, false, ctx)?,
+                Message::Response { .. } | Message::Notification { .. } | Message::Invalid => {}
+            }
         }
     }
 
@@ -709,6 +776,9 @@ impl Backend for Acp {
         let fresh = self.running.is_none();
         if fresh && !self.start_shown(ctx)? {
             return Ok(StopReason::Cancelled);
+        }
+        if !fresh {
+            self.catch_up(ctx)?;
         }
         let changed = self.apply_choice(turn, ctx)?;
         if ctx.is_cancelled() {

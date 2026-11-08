@@ -50,8 +50,13 @@ pub struct Script {
     /// What `session/set_config_option` answers with for a value: all the options, which a model
     /// may change (else the ones it has, with that value current).
     pub after_set: BTreeMap<String, Value>,
-    /// `session/set_config_option` is refused with this message.
+    /// `session/set_config_option` is refused with this message, only for `refuse_value` if set.
     pub refuse_set: Option<String>,
+    pub refuse_value: Option<String>,
+    /// A `config_option_update` it sends while it answers `session/set_config_option`.
+    pub update_on_set: Option<Value>,
+    /// How long `session/set_config_option` takes to answer, in milliseconds.
+    pub set_ms: u64,
 }
 
 /// One thing a fake agent does in a turn.
@@ -80,6 +85,8 @@ pub enum Step {
     Plan { entries: Vec<String> },
     /// Say its config options have changed to `options` (a `config_option_update`).
     ConfigUpdate { options: Value },
+    /// The same, right after it answers this prompt: between turns.
+    ConfigUpdateAfter { options: Value },
     /// Ask permission for tool call `id` (options "allow" and "reject"), then say what came
     /// back: "permission: allow", "permission: reject" or "permission: cancelled".
     Ask { id: String, title: String },
@@ -255,11 +262,16 @@ impl Agent<'_> {
             }
             "session/set_config_option" => {
                 self.set.push(params.clone());
-                if let Some(why) = &self.script.refuse_set {
+                std::thread::sleep(Duration::from_millis(self.script.set_ms.min(60_000)));
+                if let Some(options) = &self.script.update_on_set {
+                    self.config = Some(options.clone());
+                    update(json!({"sessionUpdate": "config_option_update", "configOptions": options}));
+                }
+                let value = params.get("value").and_then(Value::as_str).unwrap_or_default();
+                if let Some(why) = self.script.refuse_set.as_ref().filter(|_| self.script.refuse_value.as_deref().is_none_or(|v| v == value)) {
                     fail(id, -32602, why);
                     return None;
                 }
-                let value = params.get("value").and_then(Value::as_str).unwrap_or_default();
                 let config_id = params.get("configId").and_then(Value::as_str).unwrap_or_default();
                 let mut config = self.script.after_set.get(value).cloned().or_else(|| self.config.clone()).unwrap_or(Value::Null);
                 if !self.script.after_set.contains_key(value)
@@ -319,6 +331,7 @@ impl Agent<'_> {
         let last = self.prompt.last().map(|t| t.trim().to_string()).unwrap_or_default();
         let steps = self.script.replies.get(&last).or_else(|| self.script.turns.get(self.turn)).cloned().unwrap_or_default();
         self.turn = self.turn.saturating_add(1);
+        let mut later = None;
         for step in steps {
             self.drain();
             if self.cancelled {
@@ -339,6 +352,7 @@ impl Agent<'_> {
                     self.config = Some(options.clone());
                     update(json!({"sessionUpdate": "config_option_update", "configOptions": options}));
                 }
+                Step::ConfigUpdateAfter { options } => later = Some(options),
                 Step::Plan { entries } => {
                     let entries: Vec<Value> = entries
                         .iter()
@@ -411,6 +425,10 @@ impl Agent<'_> {
         self.drain();
         let reason = if self.cancelled { "cancelled" } else { "end_turn" };
         reply(id, json!({"stopReason": reason}));
+        if let Some(options) = later {
+            self.config = Some(options.clone());
+            update(json!({"sessionUpdate": "config_option_update", "configOptions": options}));
+        }
         None
     }
 
