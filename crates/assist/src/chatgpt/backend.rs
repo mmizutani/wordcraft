@@ -881,11 +881,12 @@ enum Step {
 /// Take in one event of the answer: text and thoughts go to the pane at once, items are kept.
 fn on_event(event: &Value, answer: &mut Answer, progress: &mut Progress, ctx: &TurnCtx<'_>) -> Step {
     let text = |name: &str| event.get(name).and_then(Value::as_str).unwrap_or_default();
+    // Any of these may be the first to say what ran, the last ones included.
+    if matches!(text("type"), "response.created" | "response.in_progress" | "response.completed" | "response.incomplete") {
+        let (model, effort) = (event.pointer("/response/model"), event.pointer("/response/reasoning/effort"));
+        show_model(model.and_then(Value::as_str), effort.and_then(Value::as_str), progress, ctx);
+    }
     match text("type") {
-        "response.created" | "response.in_progress" => {
-            let (model, effort) = (event.pointer("/response/model"), event.pointer("/response/reasoning/effort"));
-            show_model(model.and_then(Value::as_str), effort.and_then(Value::as_str), progress, ctx);
-        }
         "response.output_text.delta" => {
             answer.streamed = true;
             say(text("delta"), answer, progress, ctx);
@@ -924,7 +925,12 @@ fn on_event(event: &Value, answer: &mut Answer, progress: &mut Progress, ctx: &T
 /// answer says, and what the turn asked for stands in for what it doesn't.
 fn show_model(model: Option<&str>, effort: Option<&str>, progress: &mut Progress, ctx: &TurnCtx<'_>) {
     let model = model.map(str::trim).filter(|m| !m.is_empty());
-    let name = model.filter(|m| !same_model(m, &progress.running.id)).unwrap_or(&progress.running.name).to_string();
+    // An event that doesn't name the model leaves what an earlier one said.
+    let name = match model {
+        Some(m) if !same_model(m, &progress.running.id) => m.to_string(),
+        Some(_) => progress.running.name.clone(),
+        None => progress.shown.as_ref().map_or_else(|| progress.running.name.clone(), |s| s.name.clone()),
+    };
     let said = effort.map(str::trim).filter(|e| !e.is_empty());
     let line = Shown {
         name,
