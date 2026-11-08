@@ -47,8 +47,6 @@ pub(crate) struct Client {
     pub(crate) host_id: String,
     /// The `oaiapp_…` client id the first sign-in was issued, once it was.
     pub(crate) client_id: Option<String>,
-    /// The model the person chose, if they chose one.
-    pub(crate) model: Option<String>,
 }
 
 /// The signed-in account and its tokens.
@@ -161,7 +159,7 @@ pub(crate) fn client(settings: &Path) -> Result<Client, String> {
     if let Some(c) = read_json::<Client>(&settings.join(CLIENT_FILE)).filter(|c| valid_host_id(&c.host_id)) {
         return Ok(c);
     }
-    let c = Client { host_id: new_host_id()?, client_id: None, model: None };
+    let c = Client { host_id: new_host_id()?, client_id: None };
     save_client(settings, &c)?;
     Ok(c)
 }

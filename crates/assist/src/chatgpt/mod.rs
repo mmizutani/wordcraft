@@ -9,7 +9,6 @@
 //! - [`account`]: who is signed in, read from the file (no network).
 //! - [`SignOut`]: deletes the credentials and revokes their refresh token.
 //! - [`models`], [`resolve`]: the models the account may use, and which one a turn runs.
-//! - [`choose_model`]: the one the person chose.
 //! - [`ChatGpt`]: the backend. It calls the Responses API, streamed, with WordCraft's tools as
 //!   function tools that run in this process.
 //!
@@ -27,8 +26,7 @@ mod sse;
 mod store;
 
 pub use auth::{
-    AuthError, CALLBACK_PATH, DEFAULT_PORT, PLAN_SCOPE, SCOPES, SIGN_IN_WAIT, SignIn, SignInOptions, SignOut, SignedOut, choose_model, chosen_model,
-    sign_out, sign_out_with,
+    AuthError, CALLBACK_PATH, DEFAULT_PORT, PLAN_SCOPE, SCOPES, SIGN_IN_WAIT, SignIn, SignInOptions, SignOut, SignedOut, sign_out, sign_out_with,
 };
 pub use backend::{ChatGpt, MAX_ROUNDS};
 pub use models::{Resolved, models, models_with, resolve};

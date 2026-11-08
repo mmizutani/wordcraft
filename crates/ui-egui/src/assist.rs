@@ -277,6 +277,7 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
             Ok(json!({"switched": switched}))
         }
         "backend" => backend(app, req.get("id").and_then(Value::as_str)),
+        "choice" => choice(app, req),
         "show" => {
             let last = req.get("version").and_then(Value::as_u64).unwrap_or(0);
             show_change(app, req.get("from").and_then(Value::as_u64).unwrap_or(last), last)
@@ -305,6 +306,45 @@ fn backend(app: &mut WordApp, id: Option<&str>) -> Result<Value, String> {
         app.ui.assistant = id.to_string();
     }
     Ok(json!({"chosen": chosen(app).map(|o| o.id.clone()), "offers": app.assist.offers}))
+}
+
+/// The backend the next turn runs on, whose choice of model and effort applies: a scripted one
+/// about to start, else the one chosen.
+pub(crate) fn backend_in_use(app: &WordApp) -> Option<String> {
+    app.assist.next.as_ref().map(|b| b.info().id).or_else(|| chosen(app).map(|o| o.id.clone()))
+}
+
+/// `assist.model` and `assist.effort`, which checked their params: with `set`, keep the choice
+/// for the backend in use (null: its default), and either way say what is chosen and what ran.
+fn choice(app: &mut WordApp, req: &Value) -> Result<Value, String> {
+    if app.assist.offers_at.is_none() {
+        refresh_offers(app);
+    }
+    let backend = backend_in_use(app).ok_or(wordcraft_engine::cmd::assist::NOT_SET_UP)?;
+    if req.get("set").and_then(Value::as_bool) == Some(true) {
+        let value = req.get("value").and_then(Value::as_str).map(str::to_string);
+        let models = &mut app.session.prefs.assistant.models;
+        let entry = models.entry(backend.clone()).or_default();
+        match req.get("which").and_then(Value::as_str) {
+            Some("model") => entry.model = value,
+            _ => entry.effort = value,
+        }
+        if entry.model.is_none() && entry.effort.is_none() {
+            models.remove(&backend);
+        }
+    }
+    let chosen = app.session.prefs.assistant.models.get(&backend).cloned().unwrap_or_default();
+    Ok(json!({"backend": backend, "chosen": chosen, "running": running(app)}))
+}
+
+/// What the conversation's last turn says ran.
+fn running(app: &WordApp) -> Value {
+    let entries = app.conversation().map(|a| a.transcript().entries().rev().collect::<Vec<_>>()).unwrap_or_default();
+    let line = entries.into_iter().find_map(|e| match e {
+        wordcraft_assist::Entry::Model { name, effort, asked } => Some(json!({"model": name, "effort": effort, "asked": asked})),
+        _ => None,
+    });
+    line.unwrap_or(Value::Null)
 }
 
 /// Select what the conversation's assistant put in or changed in versions `first` to `last` of
@@ -421,7 +461,9 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     // come before this command returns, and must not find a setting from before.
     sync_unattended(app);
     let policy = if app.assist.by_person { PermissionPolicy::Ask } else { unattended(app) };
+    let saved = app.conversation().and_then(|a| app.session.prefs.assistant.models.get(&a.info().id)).cloned().unwrap_or_default();
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
+    a.choose(saved.model, saved.effort);
     a.ask_with_policy(prompt, Some(context), selection, policy).map_err(|e| e.to_string())?;
     let (name, role, tracked) = (a.name().to_string(), a.role(), a.tracked());
     Ok(json!({"asked": true, "assistant": name, "role": role.name(), "tracked": tracked}))

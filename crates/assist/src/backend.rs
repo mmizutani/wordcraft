@@ -104,6 +104,10 @@ pub struct Turn {
     /// The person's selection, by stable paragraph id: the backend selects it in its document
     /// copy before the turn. `None` leaves that copy's selection where it is.
     pub selection: Option<(Anchor, Anchor)>,
+    /// The model the person chose for this backend; `None`: its default.
+    pub model: Option<String>,
+    /// The reasoning effort the person chose for this backend; `None`: its default.
+    pub effort: Option<String>,
 }
 
 /// Why a turn stopped (ACP's stop reasons, which the ChatGPT backend maps its own to).

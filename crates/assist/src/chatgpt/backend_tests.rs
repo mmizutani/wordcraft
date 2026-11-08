@@ -14,7 +14,7 @@ use wordcraft_engine::room::{Replica, Room};
 use super::backend::Tuning;
 use super::fake_server::{Part, Reply, Request, Server};
 use super::tests::{Folder, Script, WAIT, eventually, expire, no_api, signed_in};
-use super::{AUTHOR, ChatGpt, Endpoints, ID, USAGE_PAGE, choose_model};
+use super::{AUTHOR, ChatGpt, Endpoints, ID, USAGE_PAGE};
 use crate::{Assistant, Backend, Entry, Options, StopReason, ToolStatus};
 
 /// The window: its session, showing `text`, shared under the name Minoru.
@@ -294,8 +294,8 @@ fn a_request_is_what_the_responses_api_takes_from_a_chatgpt_plan() {
     let names: Vec<&str> = functions.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names, crate::tools::TOOLS);
     assert!(functions.iter().all(|t| t["type"] == "function" && t["strict"] == false && t["parameters"].is_object()));
-    // The person's choice of model, from Options.
-    super::choose_model(c.folder.path(), Some("gpt-test-mini")).unwrap();
+    // The person's choice of model.
+    c.assistant.choose(Some("gpt-test-mini".into()), None);
     c.ask("Again");
     assert_eq!(c.bodies()[1]["model"], "gpt-test-mini");
 }
@@ -896,7 +896,7 @@ fn a_refused_effort_stays_left_out_until_the_model_changes() {
     assert_eq!(c.bodies()[2]["reasoning"], json!({"summary": "auto"}), "the next turn doesn't ask again");
     assert_eq!(notes(&c), Vec::<String>::new());
     assert_eq!(model_line(&c).map(|l| l.1), Some(None), "and doesn't show what it didn't ask for");
-    choose_model(c.folder.path(), Some("gpt-6.1-sol")).unwrap();
+    c.assistant.choose(Some("gpt-6.1-sol".into()), None);
     c.ask("Other");
     assert_eq!(c.bodies()[3]["reasoning"]["effort"], "medium", "another model may take it");
 }
@@ -904,11 +904,38 @@ fn a_refused_effort_stays_left_out_until_the_model_changes() {
 #[test]
 fn a_chosen_model_that_left_the_list_falls_back_and_the_pane_says_so() {
     let mut c = listing(real_list(), vec![says("Hi.")]);
-    choose_model(c.folder.path(), Some("gpt-gone")).unwrap();
+    c.assistant.choose(Some("gpt-gone".into()), None);
     c.ask("Hello");
     assert_eq!(c.bodies()[0]["model"], "gpt-6-luna");
     assert!(notes(&c).iter().any(|n| n.contains("gpt-gone") && n.contains("GPT-6-Luna")), "{:?}", notes(&c));
-    assert_eq!(super::chosen_model(c.folder.path()).as_deref(), Some("gpt-gone"), "the choice stays saved");
+}
+
+#[test]
+fn a_chosen_effort_the_model_lacks_falls_back_and_the_pane_says_so() {
+    let mut c = listing(real_list(), vec![says("Hi.")]);
+    c.assistant.choose(None, Some("ultra".into()));
+    c.ask("Hello");
+    assert_eq!(c.bodies()[0]["reasoning"]["effort"], "medium");
+    assert!(notes(&c).iter().any(|n| n.contains("ultra") && n.contains("medium")), "{:?}", notes(&c));
+}
+
+#[test]
+fn a_chosen_model_and_effort_reach_the_next_request_with_the_history_intact() {
+    let mut c = listing(real_list(), vec![says("First."), says("Second."), says("Third.")]);
+    c.ask("One");
+    assert_eq!((&c.bodies()[0]["model"], &c.bodies()[0]["reasoning"]["effort"]), (&json!("gpt-6-luna"), &json!("medium")));
+    c.assistant.choose(Some("gpt-6.1-sol".into()), Some("ultra".into()));
+    c.ask("Two");
+    let second = &c.bodies()[1];
+    assert_eq!((&second["model"], &second["reasoning"]["effort"]), (&json!("gpt-6.1-sol"), &json!("ultra")));
+    assert_eq!(second["input"], json!([user("One"), assistant("First."), user("Two")]));
+    // Back to the default: the same conversation goes on.
+    c.assistant.choose(None, None);
+    c.ask("Three");
+    let third = &c.bodies()[2];
+    assert_eq!((&third["model"], &third["reasoning"]["effort"]), (&json!("gpt-6-luna"), &json!("medium")));
+    assert_eq!(third["input"], json!([user("One"), assistant("First."), user("Two"), assistant("Second."), user("Three")]));
+    assert_eq!(c.server.to("/v1/models").len(), 1, "the list is read once a conversation");
 }
 
 #[test]
@@ -916,9 +943,10 @@ fn a_list_that_cant_be_read_doesnt_stop_a_turn_with_a_choice() {
     let mut c = listing(Reply::json(500, &json!({"error": "down"})), vec![says_it_ran("gpt-saved", None)]);
     c.ask("Nothing chosen");
     assert!(c.error().unwrap().contains("couldn't be listed"), "{:?}", c.error());
-    choose_model(c.folder.path(), Some("gpt-saved")).unwrap();
+    c.assistant.choose(Some("gpt-saved".into()), Some("high".into()));
     c.ask("Hello");
     assert_eq!(c.error(), None);
     assert_eq!(c.bodies()[0]["model"], "gpt-saved");
+    assert_eq!(c.bodies()[0]["reasoning"]["effort"], "high");
     assert_eq!(model_line(&c).map(|l| l.0), Some("gpt-saved".to_string()));
 }

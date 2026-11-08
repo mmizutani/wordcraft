@@ -11,10 +11,11 @@
 //! pane toggle and the setting do anything.
 //!
 //! The settings are the person's (`Prefs::assistant`): `assist.defaultRole`, the role
-//! assistants join a shared document with, never owner; and `assist.allowUnattended`, whether an
+//! assistants join a shared document with, never owner; `assist.allowUnattended`, whether an
 //! assistant goes ahead when its agent asks permission in a turn a program asked for, which no
-//! one is there to answer (refused unless the person allows it). In the person's own turns the
-//! Assistant pane asks them.
+//! one is there to answer (refused unless the person allows it), while in the person's own turns
+//! the Assistant pane asks them; and `assist.model` and `assist.effort`, what the assistant in use
+//! runs from the next turn, per backend.
 //!
 //! `assist.showChange` selects what one of the assistant's tool calls changed, by the version of
 //! the shared document it made.
@@ -33,6 +34,7 @@
 
 use serde_json::{Value, json};
 
+use crate::prefs::{MAX_CHOICE_CHARS, ModelChoice};
 use crate::{AssistantPrefs, CmdError, CmdResult, CommandSpec, Session};
 
 /// Most bytes of a prompt; the assistant refuses more.
@@ -122,6 +124,14 @@ pub fn specs() -> Vec<CommandSpec> {
         .pure(),
         CommandSpec::new("assist.backend", "Assistant", "Home › Assistant", backend)
             .params(r#"{"id"?: string (one the window offers; omit to list them)} → the assistants offered, whether each is ready, and the one chosen"#)
+            .when(in_window)
+            .pure(),
+        CommandSpec::new("assist.model", "Model", "Home › Assistant", |s, v| choice(s, v, "model", "id"))
+            .params(r#"{"id"?: string | null (a model the assistant in use offers; null goes back to its default; omit to read)} → what is chosen, what runs and what is offered. It applies from the next turn and keeps the conversation"#)
+            .when(in_window)
+            .pure(),
+        CommandSpec::new("assist.effort", "Effort", "Home › Assistant", |s, v| choice(s, v, "effort", "level"))
+            .params(r#"{"level"?: string | null (a reasoning level; null goes back to the default; omit to read)} → what is chosen, what runs and what is offered. It applies from the next turn and keeps the conversation"#)
             .when(in_window)
             .pure(),
         CommandSpec::new("assist.defaultRole", "Assistants Join As", "File › Options › Assistant", default_role)
@@ -359,6 +369,23 @@ fn backend(s: &mut Session, v: &Value) -> CmdResult {
     };
     s.push_ui_request(json!({"assist": "backend", "id": id}));
     Ok(json!({"id": id}))
+}
+
+/// Read what is chosen for the assistant in use, or choose: the window knows which assistant
+/// that is, and keeps the choice for it (`Prefs::assistant`). `which` is `model` or `effort`, and
+/// `key` the param that holds it.
+fn choice(s: &mut Session, v: &Value, which: &str, key: &str) -> CmdResult {
+    let value = match v.get(key) {
+        None => None,
+        Some(Value::Null) => Some(Value::Null),
+        Some(Value::String(text)) if ModelChoice::valid(text) => Some(json!(text.trim())),
+        Some(_) => return Err(CmdError::Params(format!("`{key}`: text of at most {MAX_CHOICE_CHARS} characters, or null for the default"))),
+    };
+    s.push_ui_request(match &value {
+        Some(value) => json!({"assist": "choice", "which": which, "set": true, "value": value}),
+        None => json!({"assist": "choice", "which": which, "set": false}),
+    });
+    Ok(json!({which: value}))
 }
 
 /// The role assistants join a shared document with (File › Options › Assistant).

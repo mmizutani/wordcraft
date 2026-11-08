@@ -124,7 +124,15 @@ and the choice, in this order:
 A model whose list entry names no levels takes any level. If ChatGPT refuses an effort, the
 request goes again once without it, keeping the reasoning summary, and the pane says the effort
 wasn't applied. It stays left out until the model or the effort changes. A list that can't be read
-stops a turn only when nothing was chosen.
+stops a turn only when nothing was chosen. A choice that no longer resolves stays saved, and the
+pane says what ran instead.
+
+`assist.model {"id"?: string | null}` and `assist.effort {"level"?: string | null}` choose for the
+assistant in use: leave the param out to read, and `null` goes back to the default. Each answers
+with the backend, what is chosen and what the last turn says ran. A change applies from the next
+turn and keeps the conversation, since each request sends the earlier turns as words and answers.
+The choice is kept per backend in the preferences (`assistant.models`). A person invited to the
+document can't run either command, at any role.
 
 ### Setting up an agent
 

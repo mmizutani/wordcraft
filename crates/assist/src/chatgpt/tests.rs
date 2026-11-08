@@ -361,24 +361,6 @@ fn sign_in_without_returned_scopes_keeps_the_requested_scopes() {
 }
 
 #[test]
-fn finishing_registration_preserves_the_model_chosen_while_waiting_for_the_browser() {
-    let folder = Folder::new();
-    let script = Arc::new(Script::default());
-    let server = server(script.clone(), no_api);
-    let endpoints = Endpoints::local(server.base());
-    let mut sign_in = SignIn::start(folder.path(), options(&endpoints)).unwrap();
-    let url = sign_in.url().to_string();
-    *script.nonce.lock().unwrap() = param(&url, "nonce").unwrap();
-    choose_model(folder.path(), Some("gpt-test-mini")).unwrap();
-    let (status, page) = callback(sign_in.redirect_uri(), &format!("code=c&state={}&client_id=oaiapp_issued-1", param(&url, "state").unwrap()));
-    assert_eq!(status, 200, "{page}");
-    sign_in.wait(WAIT).cloned().unwrap().unwrap();
-    let client = store::client(folder.path()).unwrap();
-    assert_eq!(client.model.as_deref(), Some("gpt-test-mini"));
-    assert_eq!(client.client_id.as_deref(), Some("oaiapp_issued-1"));
-}
-
-#[test]
 fn an_unsaved_sign_in_preserves_credentials_when_the_lock_times_out_and_revokes_new_tokens() {
     let (folder, _script, server, endpoints) = signed_in(no_api);
     let old = store::read_credentials(folder.path()).unwrap();
@@ -688,13 +670,12 @@ fn a_spent_or_turned_away_refresh_token_ends_the_sign_in_whatever_shape_the_refu
 fn a_registration_chatgpt_no_longer_knows_is_forgotten_and_signing_in_again_registers_anew() {
     let (folder, script, server, endpoints) = signed_in(no_api);
     let host_id = store::client(folder.path()).unwrap().host_id;
-    choose_model(folder.path(), Some("gpt-test")).unwrap();
     expire(folder.path());
     *script.refuse.lock().unwrap() = Some((401, json!({"error": "invalid_client"})));
     assert_eq!(access_token(folder.path(), &endpoints, None).unwrap_err(), AuthError::SignInAgain);
-    // The refused client id is forgotten, with the sign-in; the host id and the model stay.
+    // The refused client id is forgotten, with the sign-in; the host id stays.
     let client = store::client(folder.path()).unwrap();
-    assert_eq!((client.host_id.as_str(), client.client_id.as_deref(), client.model.as_deref()), (host_id.as_str(), None, Some("gpt-test")));
+    assert_eq!((client.host_id.as_str(), client.client_id.as_deref()), (host_id.as_str(), None));
     assert_eq!(super::account(folder.path()), None);
     // Signing in again, as the error says, registers WordCraft anew (without the last sign-in's
     // hints) and works.
@@ -983,7 +964,7 @@ fn id_tokens_are_checked_for_issuer_audience_expiry_and_nonce() {
 }
 
 #[test]
-fn the_models_list_keeps_listed_models_in_order_and_the_choice_is_kept() {
+fn the_models_list_keeps_listed_models_in_order() {
     let listed = json!({"models": [
         {"slug": "gpt-a", "display_name": "GPT A", "visibility": "list"},
         {"slug": "hidden", "display_name": "Hidden", "visibility": "hide"},
@@ -1006,20 +987,6 @@ fn the_models_list_keeps_listed_models_in_order_and_the_choice_is_kept() {
     assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["gpt-test", "gpt-test-mini"]);
     assert_eq!(server.to("/v1/models")[0].header("authorization"), Some("Bearer access-0"));
     assert!(matches!(models_with(Folder::new().path(), &endpoints), Err(AuthError::NotSignedIn)));
-    // The choice.
-    assert_eq!(chosen_model(folder.path()), None);
-    choose_model(folder.path(), Some(" gpt-test-mini ")).unwrap();
-    assert_eq!(chosen_model(folder.path()).as_deref(), Some("gpt-test-mini"));
-    assert!(choose_model(folder.path(), Some("not a model\n")).is_err());
-    assert!(choose_model(folder.path(), Some(&"m".repeat(200))).is_err());
-    assert_eq!(chosen_model(folder.path()).as_deref(), Some("gpt-test-mini"));
-    choose_model(folder.path(), None).unwrap();
-    assert_eq!(chosen_model(folder.path()), None);
-    // A hand-edited file with junk for a model: none chosen.
-    let client = store::client(folder.path()).unwrap();
-    store::save_client(folder.path(), &store::Client { model: Some("two words\n".into()), ..client }).unwrap();
-    assert_eq!(chosen_model(folder.path()), None);
-    assert_eq!(store::client(folder.path()).unwrap().client_id.as_deref(), Some("oaiapp_issued-1"), "the client id stays");
 }
 
 #[test]

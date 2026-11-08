@@ -640,6 +640,38 @@ fn the_transcript_line_shows_the_model_and_effort_and_a_note_says_what_changed()
     assert!(h.query_by_label("GPT-6-Luna · Extra High (requested)").is_some(), "a level no one confirmed says so");
 }
 
+/// A choice is kept per backend and reaches each turn of the conversation, which goes on; null
+/// goes back to the default. It is a preference: saved with the others, not a document change.
+#[test]
+fn a_chosen_model_and_effort_reach_the_next_turn_and_are_saved() {
+    let fake = Fake::new();
+    let seen = fake.seen();
+    let mut a = window("one two three");
+    a.assist_with(Box::new(fake));
+    let answer = a.execute("assist.model", json!({})).unwrap();
+    assert_eq!(answer, json!({"backend": "fake", "chosen": {"model": null, "effort": null}, "running": null}));
+    ask(&mut a, "First", None);
+    let answer = a.execute("assist.effort", json!({"level": "high"})).unwrap();
+    assert_eq!(answer["chosen"], json!({"model": null, "effort": "high"}));
+    assert_eq!(answer["running"], json!({"model": "scripted", "effort": null, "asked": false}));
+    a.execute("assist.model", json!({"id": "gpt-x"})).unwrap();
+    ask(&mut a, "Second", None);
+    let saved = a.prefs();
+    assert_eq!(saved.editing.assistant.models["fake"].model.as_deref(), Some("gpt-x"));
+    a.execute("assist.model", json!({"id": null})).unwrap();
+    a.execute("assist.effort", json!({"level": null})).unwrap();
+    assert!(a.session.prefs.assistant.models.is_empty(), "nothing chosen, nothing kept");
+    ask(&mut a, "Third", None);
+    let turns = seen.lock().unwrap().turns.clone();
+    let choices: Vec<_> = turns.iter().map(|t| (t.model.as_deref(), t.effort.as_deref())).collect();
+    assert_eq!(choices, [(None, None), (Some("gpt-x"), Some("high")), (None, None)]);
+    assert_eq!(a.conversation().unwrap().transcript().entries().filter(|e| matches!(e, Entry::Asked { .. })).count(), 3, "one conversation");
+    assert!(!a.session.can_undo());
+    // Restored in a new window, with what else was saved.
+    let again: crate::UiState = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert_eq!(again.editing.assistant.models["fake"].effort.as_deref(), Some("high"));
+}
+
 fn waiting(a: &WordApp) -> bool {
     a.conversation().is_some_and(|c| c.pending_permission().is_some())
 }

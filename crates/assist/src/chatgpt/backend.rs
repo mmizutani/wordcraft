@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::auth::{self, AuthError, access_token};
+use super::auth::{AuthError, access_token};
 use super::http::{self, Reply, redact};
 use super::models::{self, Resolved, valid_model};
 use super::sse;
@@ -146,9 +146,8 @@ impl ChatGpt {
     /// What this turn runs ([`models::resolve`]), reading the account's list the first time.
     /// None when the turn was stopped meanwhile. A list that can't be read doesn't stop a turn
     /// with a choice: the choice runs as it is, and the next turn reads the list again.
-    fn resolved(&mut self, ctx: &TurnCtx<'_>) -> Result<Option<Resolved>, String> {
-        let model = auth::chosen_model(&self.settings);
-        let effort: Option<String> = None;
+    fn resolved(&mut self, turn: &Turn, ctx: &TurnCtx<'_>) -> Result<Option<Resolved>, String> {
+        let (model, effort) = (turn.model.as_ref(), turn.effort.as_ref());
         if self.listed.is_none() {
             let (settings, endpoints) = (self.settings.clone(), self.endpoints.clone());
             let Some(read) = off_thread(ctx.cancel(), move || models::models_with(&settings, &endpoints))? else {
@@ -164,11 +163,11 @@ impl ChatGpt {
             }
         }
         let listed = self.listed.as_deref().unwrap_or_default();
-        if let Some(resolved) = models::resolve(listed, model.as_deref(), effort.as_deref()) {
+        if let Some(resolved) = models::resolve(listed, model.map(String::as_str), effort.map(String::as_str)) {
             return Ok(Some(resolved));
         }
-        let id = model.filter(|m| valid_model(m)).ok_or("ChatGPT offers no model to this account.")?;
-        Ok(Some(Resolved { name: id.clone(), id, effort, model_gone: false, effort_gone: false }))
+        let id = model.filter(|m| valid_model(m)).ok_or("ChatGPT offers no model to this account.")?.clone();
+        Ok(Some(Resolved { name: id.clone(), id, effort: effort.cloned(), model_gone: false, effort_gone: false }))
     }
 
     /// A request's body: the model and reasoning level, the instructions, the history and this
@@ -204,8 +203,8 @@ impl ChatGpt {
 
     /// The turn's rounds: a request, the tool calls its answer makes, and the next request
     /// with their outputs, until an answer makes none.
-    fn rounds(&mut self, ctx: &mut TurnCtx<'_>, progress: &mut Progress) -> Result<StopReason, String> {
-        let Some(resolved) = self.resolved(ctx)? else {
+    fn rounds(&mut self, turn: &Turn, ctx: &mut TurnCtx<'_>, progress: &mut Progress) -> Result<StopReason, String> {
+        let Some(resolved) = self.resolved(turn, ctx)? else {
             return Ok(StopReason::Cancelled);
         };
         let ran = (resolved.id.clone(), resolved.effort.clone());
@@ -213,7 +212,7 @@ impl ChatGpt {
             self.unsupported.clear();
             self.ran = Some(ran);
         }
-        fallback_notes(&resolved, auth::chosen_model(&self.settings).as_deref(), None, ctx);
+        fallback_notes(&resolved, turn, ctx);
         let Resolved { id: model, name, effort, .. } = resolved;
         progress.running = Running { id: model.clone(), name, effort: effort.filter(|_| !self.effort_refused()) };
         for round in 1..=self.tuning.max_rounds.max(1) {
@@ -374,7 +373,7 @@ impl Backend for ChatGpt {
             self.instructions = instructions(note);
         }
         let mut progress = Progress { items: vec![user_message(turn)], ..Progress::default() };
-        let result = self.rounds(ctx, &mut progress);
+        let result = self.rounds(turn, ctx, &mut progress);
         self.remember(&turn.prompt, &progress);
         result
     }
@@ -947,11 +946,11 @@ fn same_model(answered: &str, asked: &str) -> bool {
 }
 
 /// Say what runs instead of what the person chose.
-fn fallback_notes(resolved: &Resolved, model: Option<&str>, effort: Option<&str>, ctx: &TurnCtx<'_>) {
-    if let Some(chosen) = model.filter(|_| resolved.model_gone) {
+fn fallback_notes(resolved: &Resolved, turn: &Turn, ctx: &TurnCtx<'_>) {
+    if let Some(chosen) = turn.model.as_ref().filter(|_| resolved.model_gone) {
         ctx.emit(Event::Note { text: format!("{chosen} isn't offered to this account now: {} runs instead.", resolved.name) });
     }
-    if let Some(chosen) = effort.filter(|_| resolved.effort_gone) {
+    if let Some(chosen) = turn.effort.as_ref().filter(|_| resolved.effort_gone) {
         let instead = resolved.effort.as_deref().map_or("no level asked for".to_string(), |e| format!("{e} instead"));
         ctx.emit(Event::Note { text: format!("{} doesn't offer {chosen} effort: it runs at {instead}.", resolved.name) });
     }

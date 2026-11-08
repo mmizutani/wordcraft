@@ -36,7 +36,6 @@ use sha2::{Digest, Sha256};
 
 use super::Endpoints;
 use super::http::{self, Reply, b64url, from_b64url, now, random, redact, same_secret};
-use super::models::valid_model;
 use super::store::{self, Account, Client, Credentials, Lock};
 
 /// The loopback port a sign-in listens on when it's free (else any free port).
@@ -516,7 +515,7 @@ fn client_id(p: &Pending, issued: Option<&str>) -> Result<String, AuthError> {
 }
 
 /// Forget the issued client id `dead`, which ChatGPT no longer knows (`invalid_client`): the
-/// host id and the chosen model stay, and the next sign-in registers WordCraft again. The caller holds the lock.
+/// host id stays, and the next sign-in registers WordCraft again. The caller holds the lock.
 fn forget_client(settings: &Path, dead: &str) -> Result<(), String> {
     let client = store::client(settings)?;
     if client.client_id.as_deref() != Some(dead) {
@@ -948,20 +947,4 @@ impl SignOut {
         }
         self.result.as_ref()
     }
-}
-
-/// The model the person chose, if they chose one (else the list's first is used).
-pub fn chosen_model(settings: &Path) -> Option<String> {
-    store::client(settings).ok().and_then(|c| c.model).filter(|m| valid_model(m))
-}
-
-/// Choose the model (None: the list's first).
-pub fn choose_model(settings: &Path, slug: Option<&str>) -> Result<(), AuthError> {
-    let slug = slug.map(str::trim).filter(|s| !s.is_empty());
-    if slug.is_some_and(|s| !valid_model(s)) {
-        return Err(AuthError::Failed("that isn't a model's name".into()));
-    }
-    let _lock = Lock::take(settings).map_err(AuthError::Storage)?;
-    let client = store::client(settings).map_err(AuthError::Storage)?;
-    store::save_client(settings, &Client { model: slug.map(str::to_string), ..client }).map_err(AuthError::Storage)
 }
