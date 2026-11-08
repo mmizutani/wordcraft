@@ -119,7 +119,7 @@ fn read_again(app: &mut WordApp, say: bool) {
         let Some(text) = room.text_where_changed(w.first..=w.last, Some(&name), MAX_TEXT) else { continue };
         if text != w.text {
             // The hub no longer keeping those changes means it can't be said whose they were.
-            if !room.changed_since(w.seen).is_some_and(|names| names.iter().all(|who| *who == person)) {
+            if app.assist.edits.script_changed || !room.changed_since(w.seen).is_some_and(|names| names.iter().all(|who| *who == person)) {
                 continue;
             }
             if say {

@@ -491,15 +491,7 @@ impl Room {
         let (anchor, focus) = self.where_changed(versions, by)?;
         let (_, doc) = self.document();
         let (a, b) = (doc.pos_of(anchor, None)?, doc.pos_of(focus, None)?);
-        let mut text = doc.copy_range(&a, &b).to_document().final_text(StoryRef::Body);
-        if text.len() > max {
-            let mut end = max;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
-        }
-        Some(text)
+        Some(doc.final_text_in(&a, &b, max))
     }
 
     /// The names of everyone who changed the document after `version`. `None` when the hub no

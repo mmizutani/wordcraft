@@ -1701,6 +1701,22 @@ fn a_script_s_edit_beside_the_person_s_says_nothing() {
     assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
 }
 
+/// A text a script changed isn't watched again: the person's later edit of it would quote the
+/// script's words as what the assistant wrote.
+#[test]
+fn a_text_a_script_changed_isn_t_quoted_later() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    a.execute("select.text", json!({"text": "there"})).unwrap();
+    a.execute("text.insert", json!({"text": "planted"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Theirs", None);
+    a.run("select.text", json!({"text": "Hello"})).unwrap();
+    a.run("text.insert", json!({"text": "Howdy"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Mine", None);
+    assert!(!context_of(&seen, 2).contains("changed your text"), "{}", context_of(&seen, 2));
+}
+
 /// A script's edit in the window goes through the person's copy, and isn't theirs.
 #[test]
 fn a_script_s_edit_isn_t_the_person_s() {
