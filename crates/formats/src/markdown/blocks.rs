@@ -138,18 +138,40 @@ fn take_definitions(lines: &mut Vec<String>) -> Refs {
     refs
 }
 
+/// The table cells a text may still make, and whether a table lost any to the limits.
+struct TableBudget {
+    cells: std::cell::Cell<usize>,
+    cut: std::cell::Cell<bool>,
+}
+
+impl TableBudget {
+    fn get(&self) -> usize {
+        self.cells.get()
+    }
+    fn set(&self, cells: usize) {
+        self.cells.set(cells);
+    }
+}
+
 /// Parse Markdown text into the flow model.
 pub fn parse(text: &str) -> model::Flow {
+    parse_reporting_cuts(text).0
+}
+
+/// [`parse`], and whether a table lost words to its limits: rows and columns past them, or cells
+/// past the columns its header has. Who shows the text must keep every word can read it another
+/// way then.
+pub fn parse_reporting_cuts(text: &str) -> (model::Flow, bool) {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut lines: Vec<String> = text.split('\n').map(|l| expand_tabs(l.trim_end_matches('\r'))).collect();
     let refs = take_definitions(&mut lines);
-    let budget = std::cell::Cell::new(super::MAX_TABLE_CELLS);
+    let budget = TableBudget { cells: std::cell::Cell::new(super::MAX_TABLE_CELLS), cut: std::cell::Cell::new(false) };
     let mut blocks = parse_blocks(&lines, 0, 0, &refs, &budget);
     // A leading "Title" from front matter isn't supported; a first-level heading stays a heading.
     if blocks.is_empty() {
         blocks.push(FBlock::Para(Para::default()));
     }
-    model::Flow { blocks, meta: Default::default() }
+    (model::Flow { blocks, meta: Default::default() }, budget.cut.get())
 }
 
 /// Leading tabs → spaces (tab stops of 4); the rest of the line is kept.
@@ -413,7 +435,7 @@ fn code_para(line: &str) -> FBlock {
 
 /// Parse block structure. `level` is the list nesting level for lists found here.
 /// `budget`: the table cells the document may still make ([`super::MAX_TABLE_CELLS`]).
-fn parse_blocks(lines: &[String], depth: usize, level: u8, refs: &Refs, budget: &std::cell::Cell<usize>) -> Vec<FBlock> {
+fn parse_blocks(lines: &[String], depth: usize, level: u8, refs: &Refs, budget: &TableBudget) -> Vec<FBlock> {
     let mut out = Vec::new();
     let mut para: Vec<String> = Vec::new();
     let mut i = 0;
@@ -519,7 +541,10 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8, refs: &Refs, budget: 
                     }
                     if !table.rows.is_empty() && fits(table.rows.len()) {
                         budget.set(budget.get() - cols);
-                        let (mut cells, _) = split_row(l, cols);
+                        let (mut cells, width) = split_row(l, cols);
+                        if width > cols {
+                            budget.cut.set(true);
+                        }
                         cells.resize(cols, String::new());
                         table.rows.push(cells.iter().zip(&aligns).map(|(s, a)| cell(s, false, *a)).collect());
                     } else {
@@ -529,6 +554,7 @@ fn parse_blocks(lines: &[String], depth: usize, level: u8, refs: &Refs, budget: 
                 }
                 if cut {
                     model::dropped(model::Dropped::TableCells);
+                    budget.cut.set(true);
                 }
                 if !table.rows.is_empty() {
                     out.push(FBlock::Table(table));
@@ -568,7 +594,7 @@ fn parse_indented_code(lines: &[String], i: &mut usize, out: &mut Vec<FBlock>) {
     out.extend(code.into_iter().map(code_para));
 }
 
-fn parse_quote(lines: &[String], i: &mut usize, depth: usize, level: u8, refs: &Refs, budget: &std::cell::Cell<usize>, out: &mut Vec<FBlock>) {
+fn parse_quote(lines: &[String], i: &mut usize, depth: usize, level: u8, refs: &Refs, budget: &TableBudget, out: &mut Vec<FBlock>) {
     let mut inner = Vec::new();
     while let Some(line) = lines.get(*i) {
         let trimmed = line.trim_start_matches([' ', '\t']);
@@ -626,7 +652,7 @@ fn marker_space(ind: usize, marker_len: usize, after: &str) -> (usize, usize) {
 }
 
 /// Parse a list starting at `lines[i]`; returns the index after it.
-fn parse_list(lines: &[String], mut i: usize, depth: usize, level: u8, out: &mut Vec<FBlock>, refs: &Refs, budget: &std::cell::Cell<usize>) -> usize {
+fn parse_list(lines: &[String], mut i: usize, depth: usize, level: u8, out: &mut Vec<FBlock>, refs: &Refs, budget: &TableBudget) -> usize {
     let Some(first) = lines.get(i).and_then(|l| list_marker(l.trim_start_matches([' ', '\t']))) else { return i + 1 };
     while let Some(line) = lines.get(i) {
         let ind = indent(line);
