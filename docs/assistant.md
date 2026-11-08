@@ -61,6 +61,11 @@ conversation. Nothing of it is stored, and a new conversation starts without it.
 Accept and Reject count: not another participant's, a script's, a macro's, or a click the control
 channel made.
 
+The list also says when you changed what the assistant wrote, after accepting it or inside its
+tracked insertion: what the text said and what it says now, each cut to 120 characters from just
+before they differ. Someone else's edit of the text doesn't count, and neither does typing
+elsewhere or rejecting the change.
+
 ## Memory
 
 What you keep reaches every later conversation with every backend. File › Options › Assistant

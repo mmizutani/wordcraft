@@ -1216,3 +1216,15 @@ fn a_proposal_s_text_is_cleaned_and_answered_once() {
     t.answer_proposal(1, crate::ProposalAnswer::Dismissed, None);
     assert_eq!(t.pending_proposal(1), None);
 }
+
+#[test]
+fn an_edit_shows_where_it_differs_within_the_cut() {
+    let mut f = Feedback::default();
+    let start = "word ".repeat(100);
+    f.record_edit(&format!("{start}old\nend"), &format!("{start}new\nend"));
+    let digest = f.digest().unwrap();
+    let line = digest.lines().nth(1).unwrap();
+    assert!(line.starts_with("- changed your text from \""), "{line}");
+    assert!(line.contains("old end\" to ") && line.contains("new end\""), "{line}");
+    assert!(line.chars().count() < 300, "{line}");
+}

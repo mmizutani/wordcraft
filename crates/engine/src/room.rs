@@ -483,6 +483,46 @@ impl Room {
         Some((doc.anchor_at(start)?, doc.anchor_at(end)?))
     }
 
+    /// The text at [`Room::where_changed`]'s place as it reads now with every change accepted, at
+    /// most `max` bytes: what a tool call's text has become, whoever changed it since. `None`
+    /// when that place isn't known any more. The hub keeps its latest document alone, so this is
+    /// the only way to read it: what it was has to be read when it was.
+    pub fn text_where_changed(&self, versions: RangeInclusive<u64>, by: Option<&str>, max: usize) -> Option<String> {
+        let (anchor, focus) = self.where_changed(versions, by)?;
+        let (_, doc) = self.document();
+        let (a, b) = (doc.pos_of(anchor, None)?, doc.pos_of(focus, None)?);
+        let mut text = doc.copy_range(&a, &b).to_document().final_text(StoryRef::Body);
+        if text.len() > max {
+            let mut end = max;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        }
+        Some(text)
+    }
+
+    /// Whether the places two ranges of changes touched meet in the latest document: the changes of
+    /// participant `by` in `versions` and those of `other` in `others`. Each range's place runs from
+    /// the first thing it touched to the last, so one that touched both sides of the other counts.
+    pub fn changes_meet(&self, versions: RangeInclusive<u64>, by: &str, others: RangeInclusive<u64>, other: &str) -> bool {
+        let (Some(one), Some(two)) = (self.where_changed(versions, Some(by)), self.where_changed(others, Some(other))) else { return false };
+        let (_, doc) = self.document();
+        let place = |(a, b): (Anchor, Anchor)| Some((doc.pos_of(a, None)?, doc.pos_of(b, None)?));
+        let (Some((a, b)), Some((c, d))) = (place(one), place(two)) else { return false };
+        a.story == c.story && a <= d && c <= b
+    }
+
+    /// The names of everyone who changed the document after `version`. `None` when the hub no
+    /// longer keeps those changes.
+    pub fn changed_since(&self, version: u64) -> Option<Vec<String>> {
+        let hub = self.hub();
+        let mut names: Vec<String> = hub.since(version).ok()?.iter().filter_map(|a| hub.name_of(a.by).map(str::to_string)).collect();
+        names.sort_unstable();
+        names.dedup();
+        Some(names)
+    }
+
     /// The first and the last version after `version` that participant `name` made (any copy
     /// that joined with their invite), if they made any: what a tool call that started then
     /// changed. `None` too when the hub no longer keeps the changes after `version`.

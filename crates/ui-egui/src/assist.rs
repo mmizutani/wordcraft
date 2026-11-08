@@ -42,6 +42,7 @@ use wordcraft_engine::room::Role;
 use crate::WordApp;
 
 pub(crate) mod chatgpt;
+mod edits;
 pub(crate) mod memory;
 
 /// Seconds between two askings of what is offered while the pane is open (a sign-in or an
@@ -94,6 +95,8 @@ pub(crate) struct AssistState {
     /// the agents' settings file, never logged.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) setup: Option<crate::options::agent_setup::AgentSetup>,
+    /// What the conversation wrote, to tell when the person changes it (#86).
+    edits: edits::Edits,
     /// The ChatGPT sign-in (#19): who is signed in, and a sign-in or sign-out under way.
     pub(crate) chatgpt: chatgpt::ChatGptState,
     /// What the assistant remembers across conversations (#86), as last read.
@@ -200,6 +203,7 @@ pub(crate) fn tick(app: &mut WordApp) {
             c.assistant.end();
         }
     }
+    edits::tick(app);
     // A permission request waits for the person: the pane opens to ask them. Closed while it
     // waits (Home › Assistant, the pane's close), the request is answered cancelled, so the
     // turn doesn't wait, hidden, for an answer no one can give.
@@ -230,6 +234,9 @@ pub(crate) fn tick(app: &mut WordApp) {
 /// requests it made (the last one's answer is the result), and tell the conversation the
 /// setting for requests no one can answer, which holds from a running turn's next request.
 pub(crate) fn after_command(app: &mut WordApp, id: &str, r: Result<Value, String>) -> Result<Value, String> {
+    if decision(id).is_some() {
+        edits::review_ended(app);
+    }
     if !id.starts_with("assist.") {
         return r;
     }
@@ -409,6 +416,7 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
         start(app, role)?;
     }
     let caps = Caps::default();
+    edits::record(app);
     let mut context = Context::of(&app.session, &caps).to_text(&caps);
     if let Some(digest) = app.assist.feedback.digest() {
         context = format!("{digest}\n\n{context}");
@@ -445,6 +453,7 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     a.ask_with_policy(prompt, Some(context), selection, policy).map_err(|e| e.to_string())?;
     let (name, role, tracked) = (a.name().to_string(), a.role(), a.tracked());
     app.assist.feedback.clear();
+    app.assist.edits.turn_started();
     Ok(json!({"asked": true, "assistant": name, "role": role.name(), "tracked": tracked}))
 }
 
@@ -491,6 +500,7 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
     // It may be about another document, whose turn shouldn't quote this one's text.
     app.assist.feedback.clear();
     memory::conversation_started(app);
+    app.assist.edits = edits::Edits::default();
     sync_unattended(app);
     Ok(())
 }
@@ -500,6 +510,21 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
 pub(crate) fn review_started(app: &WordApp, id: &str) -> Option<Vec<AuthoredChange>> {
     decision(id)?;
     changes_of(&app.session, app.conversation()?.name())
+}
+
+/// Accept or Reject `id` is about to run, whoever asked. What it does to the text isn't an edit of
+/// it, and what was edited before it still is ([`edits`]).
+pub(crate) fn before_command(app: &mut WordApp, id: &str) {
+    if decision(id).is_some() {
+        edits::record(app);
+    }
+}
+
+/// The person ran a command that changed the document, other than Accept or Reject.
+pub(crate) fn person_changed_it(app: &mut WordApp, id: &str) {
+    if decision(id).is_none() {
+        app.assist.edits.person_changed_it();
+    }
 }
 
 /// The person's Accept or Reject `id` ran: the conversation's changes `before` it that are gone
