@@ -143,31 +143,37 @@ impl ChatGpt {
         ChatGpt { tuning, ..self }
     }
 
-    /// What this turn runs ([`models::resolve`]), reading the account's list the first time.
-    /// None when the turn was stopped meanwhile. A list that can't be read doesn't stop a turn
-    /// with a choice: the choice runs as it is, and the next turn reads the list again.
+    /// What this turn runs ([`models::resolve`]), reading the account's list the first time, and
+    /// again for a chosen model it doesn't have: it may be older than the pane's. None when the
+    /// turn was stopped meanwhile. A list that can't be read doesn't stop a turn with a choice:
+    /// the choice runs as a model that names no levels would, and the next turn reads the list
+    /// again.
     fn resolved(&mut self, turn: &Turn, ctx: &TurnCtx<'_>) -> Result<Option<Resolved>, String> {
         let (model, effort) = (turn.model.as_ref(), turn.effort.as_ref());
-        if self.listed.is_none() {
+        let stale = |list: &[ModelOption]| model.is_some_and(|m| !list.iter().any(|l| l.id == *m));
+        if self.listed.as_deref().is_none_or(stale) {
             let (settings, endpoints) = (self.settings.clone(), self.endpoints.clone());
             let Some(read) = off_thread(ctx.cancel(), move || models::models_with(&settings, &endpoints))? else {
                 return Ok(None);
             };
             match (read, &model) {
                 // A list with nothing usable in it isn't kept: the next turn reads it again.
-                (Ok(list), _) => self.listed = Some(list).filter(|l| !l.is_empty()),
+                (Ok(list), _) if list.is_empty() => {}
+                (Ok(list), _) => self.listed = Some(list),
                 (Err(e), Some(_)) if !matches!(e, AuthError::NotSignedIn | AuthError::SignInAgain | AuthError::Denied) => {
                     log::info!("ChatGPT: the models can't be listed ({e}); the turn runs what was chosen");
                 }
                 (Err(e), _) => return Err(auth_says(&e)),
             }
         }
-        let listed = self.listed.as_deref().unwrap_or_default();
-        if let Some(resolved) = models::resolve(listed, model.map(String::as_str), effort.map(String::as_str)) {
-            return Ok(Some(resolved));
-        }
-        let id = model.filter(|m| valid_model(m)).ok_or("ChatGPT offers no model to this account.")?.clone();
-        Ok(Some(Resolved { name: id.clone(), id, effort: effort.cloned(), model_gone: false, effort_gone: false }))
+        let unlisted: Vec<ModelOption> = model
+            .filter(|m| valid_model(m))
+            .map(|id| ModelOption { id: id.clone(), name: id.clone(), ..ModelOption::default() })
+            .into_iter()
+            .collect();
+        let list = self.listed.as_deref().unwrap_or(&unlisted);
+        let resolved = models::resolve(list, model.map(String::as_str), effort.map(String::as_str));
+        resolved.map(Some).ok_or_else(|| "ChatGPT offers no model to this account.".to_string())
     }
 
     /// A request's body: the model and reasoning level, the instructions, the history and this

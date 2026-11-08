@@ -584,11 +584,16 @@ fn model_menus(app: &mut WordApp, ui: &mut Ui, t: &Tokens, menus: &Menus, busy: 
         let shown = menus.efforts.iter().find(|e| menus.effort.as_deref() == Some(e.id.as_str()));
         let shown = shown.map_or_else(|| tl!("Default").to_string(), |row| effort_name(row).to_string());
         let combo = craft_ui::ComboBox::from_id_salt("assistant_effort").selected_text(shown).width(MENU_WIDTH).truncate().show_ui(ui, |ui| {
+            // With no level to tag as the default, a row of its own goes back to it.
+            if !menus.efforts.iter().any(|e| e.is_default) && ui.selectable_label(menus.effort.is_none(), tl!("Default")).clicked() {
+                let _ = app.run("assist.effort", json!({"level": null}));
+            }
             for row in &menus.efforts {
                 let text =
                     if row.is_default { fmt(tl!("{effort} (default)"), &[("effort", effort_name(row))]) } else { effort_name(row).to_string() };
                 if ui.selectable_label(menus.effort.as_deref() == Some(row.id.as_str()), text).clicked() {
-                    let _ = app.run("assist.effort", json!({"level": row.id}));
+                    let level = if row.is_default { json!(null) } else { json!(row.id) };
+                    let _ = app.run("assist.effort", json!({"level": level}));
                 }
             }
         });

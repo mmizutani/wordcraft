@@ -911,6 +911,21 @@ fn a_chosen_model_that_left_the_list_falls_back_and_the_pane_says_so() {
 }
 
 #[test]
+fn a_chosen_model_the_conversations_list_lacks_reads_the_list_again() {
+    let mut c = listing(real_list(), vec![says("Hi."), says("Again."), says("Third.")]);
+    c.ask("Hello");
+    // Another account signed in, or the plan changed: the pane's list has what this one doesn't.
+    *c.script.models.lock().unwrap() = Some(Reply::json(200, &json!({"models": [{"slug": "gpt-new", "supported_reasoning_levels": ["max"]}]})));
+    c.assistant.choose(Some("gpt-new".into()), Some("max".into()));
+    c.ask("Again");
+    assert_eq!((&c.bodies()[1]["model"], &c.bodies()[1]["reasoning"]["effort"]), (&json!("gpt-new"), &json!("max")));
+    assert_eq!(notes(&c), Vec::<String>::new());
+    assert_eq!(c.server.to("/v1/models").len(), 2);
+    c.ask("Third");
+    assert_eq!(c.server.to("/v1/models").len(), 2, "not while it has the model");
+}
+
+#[test]
 fn a_chosen_effort_the_model_lacks_falls_back_and_the_pane_says_so() {
     let mut c = listing(real_list(), vec![says("Hi.")]);
     c.assistant.choose(None, Some("ultra".into()));
@@ -948,5 +963,9 @@ fn a_list_that_cant_be_read_doesnt_stop_a_turn_with_a_choice() {
     assert_eq!(c.error(), None);
     assert_eq!(c.bodies()[0]["model"], "gpt-saved");
     assert_eq!(c.bodies()[0]["reasoning"]["effort"], "high");
+    // With no choice of level, the level the pane says will run.
+    c.assistant.choose(Some("gpt-saved".into()), None);
+    c.ask("Again");
+    assert_eq!(c.bodies()[1]["reasoning"]["effort"], "medium");
     assert_eq!(model_line(&c).map(|l| l.0), Some("gpt-saved".to_string()));
 }

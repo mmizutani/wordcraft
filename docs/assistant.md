@@ -130,14 +130,16 @@ pane says what ran instead.
 **The menus.** Beside Send and Stop are a Model menu and an Effort menu, wrapping under them when
 the pane is narrow. The Model menu starts with a Default row that names what it resolves to, and
 that row clears the choice. The Effort menu lists this model's levels, ticks the current one and
-tags what runs with nothing chosen. With no levels listed it offers Low, Medium and High. Choosing
-takes one click. During a turn both are greyed out and say why. The web app has no backend, so it
+tags what runs with nothing chosen, and choosing the tagged row clears the choice. With no level to
+tag it has a Default row that does. With no levels listed it offers Low, Medium and High, and a
+script may choose any other, which the turn sends. Choosing takes one click. During a turn both are greyed out and say why. The web app has no backend, so it
 shows neither.
 
 WordCraft reads the list on a thread of its own when the pane opens with someone signed in and no
 list held, and again after a sign-in, so no frame waits for it. While it reads, the Model menu has
 the Default row and says so on hover. A read that fails shows the reason under the menus, doesn't
-stop a turn that has a saved choice, and is tried again the next time the pane opens.
+stop a turn that has a saved choice, and is tried again the next time the pane opens. A conversation
+reads the list once, and again if the person chooses a model its copy doesn't have.
 
 **The commands.** `assist.model {"id"?: string | null}` and `assist.effort {"level"?: string | null}`
 choose for the assistant in use: leave the param out to read, and `null` goes back to the default.

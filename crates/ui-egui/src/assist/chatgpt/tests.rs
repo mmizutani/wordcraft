@@ -785,6 +785,11 @@ fn a_list_with_no_levels_offers_low_medium_and_high() {
     assert_eq!(ids(&m.efforts), ["low", "medium", "high"]);
     assert_eq!(m.effort.as_deref(), Some("medium"));
     assert_eq!(m.efforts.iter().filter(|e| e.is_default).map(|e| e.id.as_str()).collect::<Vec<_>>(), ["medium"]);
+    // The list says nothing against another level, and the turn would send it.
+    a.execute("assist.effort", json!({"level": "ultra"})).unwrap();
+    let m = crate::assist::models::menus(&a).unwrap();
+    assert_eq!(ids(&m.efforts), ["low", "medium", "high", "ultra"]);
+    assert_eq!(m.effort.as_deref(), Some("ultra"));
 }
 
 #[test]

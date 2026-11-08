@@ -808,6 +808,26 @@ fn the_menus_show_in_the_prompt_row_and_are_disabled_during_a_turn() {
     h.run_steps(2);
     assert_eq!(h.state().session.prefs.assistant.models["fake"].model.as_deref(), Some("deep"));
     assert_eq!(shows(&h, "Model:").as_deref(), Some("Deep"), "the button says it now");
+    // A level's row chooses it; the row tagged as the default goes back to no choice.
+    h.get_by_role_and_label(Role::ComboBox, "Effort:").click();
+    h.run_steps(2);
+    h.get_by_label("Max").click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.prefs.assistant.models["fake"].effort.as_deref(), Some("max"));
+    h.get_by_role_and_label(Role::ComboBox, "Effort:").click();
+    h.run_steps(2);
+    h.get_by_label("Low (default)").click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.prefs.assistant.models["fake"].effort, None);
+    // With no level tagged, a Default row of its own does the same.
+    h.state_mut().execute("assist.model", json!({"id": "fast"})).unwrap();
+    h.state_mut().execute("assist.effort", json!({"level": "think"})).unwrap();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::ComboBox, "Effort:").click();
+    h.run_steps(2);
+    h.get_by_label("Default").click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.prefs.assistant.models["fake"].effort, None);
 }
 
 #[cfg(not(target_arch = "wasm32"))]

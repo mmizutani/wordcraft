@@ -25,7 +25,7 @@ pub(crate) struct Row {
     pub(crate) id: String,
     pub(crate) name: Option<String>,
     pub(crate) description: Option<String>,
-    /// What runs when nothing is chosen.
+    /// What runs when nothing is chosen: choosing it clears the choice.
     pub(crate) is_default: bool,
 }
 
@@ -45,9 +45,11 @@ pub(crate) struct Menus {
     pub(crate) efforts: Vec<Row>,
     /// The level the next turn runs at, when that is known: the row ticked.
     pub(crate) effort: Option<String>,
-    /// The offer is what the backend said: a choice outside it is refused. While it isn't known,
-    /// any choice is kept, and the turn says if it doesn't resolve.
+    /// The models are what the backend said: a choice outside them is refused. While they aren't
+    /// known, any choice is kept, and the turn says if it doesn't resolve.
     pub(crate) known: bool,
+    /// The same for the levels. A model whose list entry names none takes any.
+    pub(crate) efforts_known: bool,
     /// Why the model menu has only the Default row, or that reading the list failed.
     pub(crate) unknown_because: Option<String>,
     /// That the list couldn't be read, for beside the menu.
@@ -67,7 +69,7 @@ impl Menus {
 
     /// `level` is offered for the model, or nothing is known yet to refuse it by.
     pub(crate) fn offers_effort(&self, level: &str) -> bool {
-        !self.known || self.efforts.iter().any(|e| e.id == level)
+        !self.efforts_known || self.efforts.iter().any(|e| e.id == level)
     }
 }
 
@@ -130,6 +132,7 @@ fn offered_menus(o: &Offered, saved: &ModelChoice) -> Menus {
         efforts,
         effort,
         known: true,
+        efforts_known: true,
         ..Menus::default()
     }
 }
@@ -158,10 +161,11 @@ fn chatgpt_menus(list: &ModelList, saved: &ModelChoice) -> Menus {
         let levels = list.iter().find(|m| m.id == runs.id).map(|m| m.efforts.clone()).unwrap_or_default();
         let tagged = resolve(list, Some(&runs.id), None).and_then(|r| r.effort);
         let efforts = if levels.is_empty() {
-            level_rows(LEVELS_UNKNOWN, tagged.as_deref())
+            usual_levels(effort, tagged.as_deref())
         } else {
             level_rows(levels.iter().map(String::as_str), tagged.as_deref())
         };
+        let efforts_known = !levels.is_empty();
         return Menus {
             models: list.iter().map(model_row).collect(),
             default_model: Some(default.name),
@@ -170,6 +174,7 @@ fn chatgpt_menus(list: &ModelList, saved: &ModelChoice) -> Menus {
             efforts,
             effort: runs.effort,
             known: true,
+            efforts_known,
             ..Menus::default()
         };
     }
@@ -177,12 +182,18 @@ fn chatgpt_menus(list: &ModelList, saved: &ModelChoice) -> Menus {
         models: saved.model.iter().map(|id| plain_row(id)).collect(),
         chosen_model: saved.model.clone(),
         running_model: saved.model.clone(),
-        efforts: level_rows(LEVELS_UNKNOWN.into_iter().chain(effort.filter(|e| !LEVELS_UNKNOWN.contains(e))), Some(DEFAULT_EFFORT)),
+        efforts: usual_levels(effort, Some(DEFAULT_EFFORT)),
         effort: Some(effort.unwrap_or(DEFAULT_EFFORT).to_string()),
         unknown_because: Some("WordCraft is reading the models this account may use.".into()).filter(|_| !matches!(list, ModelList::Failed(_))),
         failed: if let ModelList::Failed(why) = list { Some(why.clone()) } else { None },
         ..Menus::default()
     }
+}
+
+/// The usual levels for a model that names none, and the one chosen if it is another.
+#[cfg(not(target_arch = "wasm32"))]
+fn usual_levels(chosen: Option<&str>, default: Option<&str>) -> Vec<Row> {
+    level_rows(LEVELS_UNKNOWN.into_iter().chain(chosen.filter(|e| !LEVELS_UNKNOWN.contains(e))), default)
 }
 
 /// Every frame: take the list when its read ended; start a read when the pane is open on ChatGPT
