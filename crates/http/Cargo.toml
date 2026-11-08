@@ -1,0 +1,12 @@
+[package]
+name = "wordcraft-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A small HTTP/1.1 server on std with bounded reads, for the MCP endpoint and the relay"
+
+[lints]
+workspace = true
+
+[dependencies]
+log = { workspace = true }

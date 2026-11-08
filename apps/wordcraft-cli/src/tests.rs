@@ -559,3 +559,16 @@ fn script_parse_resolves_paths_against_the_base() {
     assert_eq!(s.save, vec!["o.docx".to_string()]);
     assert_eq!(s.commands.len(), 1);
 }
+
+/// `mcp --http` (#75): loopback only, and it needs the room's port to join.
+#[test]
+fn mcp_over_http_serves_only_this_computer() {
+    let err = |a: &[&str]| run(&args(a)).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err(&["mcp", "--http", "0.0.0.0:8765", "--connect", "127.0.0.1:9"]).contains("not a loopback address"));
+    assert!(err(&["mcp", "--http", "192.0.2.1:8765", "--connect", "127.0.0.1:9"]).contains("not a loopback address"));
+    assert!(err(&["mcp", "--http", "localhost:8765", "--connect", "127.0.0.1:9"]).contains("IP:PORT"));
+    assert!(err(&["mcp", "--http", "127.0.0.1:8765"]).contains("--connect"));
+    assert!(err(&["mcp", "--http", "127.0.0.1:8765", "--connect", "notaport"]).contains("--connect"));
+    assert!(err(&["mcp", "--http", "127.0.0.1:8765", "--connect", "127.0.0.1:9", "--author", "Claude"]).contains("--author"));
+    assert!(err(&["mcp", "--allow-host", "x.ts.net"]).contains("--http"));
+}

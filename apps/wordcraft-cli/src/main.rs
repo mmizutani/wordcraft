@@ -44,7 +44,7 @@ USAGE:
                                               documents and with {\"id\": N} makes one active
   wordcraft-cli commands [--json]             list every command
   wordcraft-cli parity [--markdown]           feature-catalog parity
-  wordcraft-cli mcp [--connect HOST:PORT | --author NAME] [--automation-read-root DIR] [--automation-write-root DIR]
+  wordcraft-cli mcp [--connect HOST:PORT | --author NAME] [--automation-read-root DIR] [--automation-write-root DIR] [--http IP:PORT]
                                               MCP server on stdio (headless, or bridged to the app).
                                               --automation-read-root / --automation-write-root confine
                                               the files the agent's commands read (open, insert text
@@ -52,6 +52,13 @@ USAGE:
                                               export, merge output…) to DIR, links followed; a root left
                                               out grants none of its access. They apply to the headless
                                               server and are an error with --connect.
+                                              --http 127.0.0.1:PORT --connect <room port> serves MCP
+                                              over Streamable HTTP at http://127.0.0.1:PORT/mcp for
+                                              agents on other machines (the room port is File ›
+                                              Share's). Each request carries an invite's key in
+                                              Authorization: Bearer; the window's key is refused.
+                                              Loopback only; --allow-host NAMES and --allow-origin
+                                              ORIGINS (comma-separated) add Host and Origin values
   wordcraft-cli call <method> [<params> | -] [--connect HOST:PORT]
                                               send one request to the running app, or to a shared
                                               document's room, and print its result as JSON
@@ -332,7 +339,13 @@ const RUN_OPTIONS: &[OptionSpec] = &[
 ];
 const COMMANDS_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--json", takes_value: false }];
 const PARITY_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--markdown", takes_value: false }];
-const MCP_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--connect", takes_value: true }, OptionSpec { name: "--author", takes_value: true }];
+const MCP_OPTIONS: &[OptionSpec] = &[
+    OptionSpec { name: "--connect", takes_value: true },
+    OptionSpec { name: "--author", takes_value: true },
+    OptionSpec { name: "--http", takes_value: true },
+    OptionSpec { name: "--allow-host", takes_value: true },
+    OptionSpec { name: "--allow-origin", takes_value: true },
+];
 const ZOTERO_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--cmd", takes_value: true },
     OptionSpec { name: "--save", takes_value: true },
@@ -390,6 +403,25 @@ fn write_stdout(write: impl FnOnce(&mut std::io::StdoutLock<'static>) -> std::io
 fn script_operand<S: AsRef<OsStr>>(raw: &[S]) -> Option<PathBuf> {
     let at = raw.iter().position(|a| a.as_ref() == OsStr::new("--script"))?;
     raw.get(at + 1).map(|a| PathBuf::from(a.as_ref()))
+}
+
+/// `wordcraft-cli mcp --http`: MCP over Streamable HTTP on a loopback address, each request's
+/// invite key opening its own connection to the room at `connect`.
+fn serve_http(http: &str, connect: &str, hosts: &[String], origins: Vec<String>) -> Result<(), Failure> {
+    let addr: std::net::SocketAddr =
+        http.parse().map_err(|_| format!("mcp: --http needs IP:PORT on this computer, like 127.0.0.1:8765, got `{http}`"))?;
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "mcp: --http {addr} is not a loopback address: the endpoint serves only this computer; put a tunnel or the relay in front of it"
+        )
+        .into());
+    }
+    let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("mcp: cannot listen on {addr}: {e}"))?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let options = wordcraft_mcp::http::Options { hosts: Some(wordcraft_mcp::http::loopback_hosts(port, hosts)), origins, ..Default::default() };
+    let endpoint = std::sync::Arc::new(wordcraft_mcp::http::Endpoint::connecting(options, connect));
+    eprintln!("wordcraft-cli mcp: MCP over HTTP at http://{}:{port}/mcp, for the shared document at {connect}", addr.ip());
+    Ok(wordcraft_mcp::http::serve(listener, endpoint)?)
 }
 
 /// Whether `addr` (`HOST:PORT`, as `--connect` gives it) is at least shaped like an address: a
@@ -614,6 +646,26 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
             validate_options("mcp", &rest, MCP_OPTIONS)?;
             let author = arg_value(&rest, "--author");
             let connect = arg_value(&rest, "--connect");
+            if let Some(http) = arg_value(&rest, "--http") {
+                if roots.is_some() || author.is_some() {
+                    return Err(
+                        "mcp: --http serves a shared document's participants, who use their own copy: --author and the automation roots don't apply"
+                            .into(),
+                    );
+                }
+                let Some(connect) = connect.filter(|a| valid_connect_addr(a)) else {
+                    return Err("mcp: --http needs --connect HOST:PORT, the shared document's room port (File › Share)".into());
+                };
+                let list = |name: &str| {
+                    arg_value(&rest, name)
+                        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                };
+                return serve_http(&http, &connect, &list("--allow-host"), list("--allow-origin"));
+            }
+            if arg_value(&rest, "--allow-host").is_some() || arg_value(&rest, "--allow-origin").is_some() {
+                return Err("mcp: --allow-host and --allow-origin go with --http".into());
+            }
             if roots.is_some() && connect.is_some() {
                 return Err(
                     "mcp: --automation-read-root and --automation-write-root confine the headless server; a running app is not confined by them"

@@ -1,0 +1,31 @@
+[package]
+name = "wordcraft-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WordCraft's relay: agents on other machines reach a document shared from a desktop that dials out to it, with no tunnel"
+
+[[bin]]
+name = "wordcraft-relay"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+wordcraft-http = { workspace = true }
+serde_json = { workspace = true }
+# A desktop's answer is read as its fields only (a typed envelope), never as a whole JSON tree.
+serde = { workspace = true }
+log = { workspace = true }
+getrandom = { workspace = true }
+# A room's id is a hash of its secret, so only its secret opens it again, even after a restart.
+sha2 = { workspace = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+# Random room ids and secrets; the relay itself never runs in a browser, but its crate is checked there.
+getrandom = { workspace = true, features = ["wasm_js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The desktop's side (`host`): HTTPS to the relay, with ureq 3 and rustls as the app already uses them.
+ureq = { workspace = true }

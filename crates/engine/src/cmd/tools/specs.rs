@@ -181,6 +181,9 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("room.participants", "Participants", "File › Share", |_, _| Err(window_only("room.participants")))
             .params(r#"{} → {"shared": false} or what room.share answers"#)
             .pure(),
+        CommandSpec::new("room.relay", "Relay", "File › Share", |_, _| Err(window_only("room.relay")))
+            .params(r#"{"relay"?: a relay's address (https://…), "token"?: the token its operator gave (kept for the same relay), "off"?: true (stop using a relay)} → {"relay", "status": "off"|"waiting"|"connecting"|"connected"|"retrying"|"refused"|"failed", "why"?, "url": what agents on other machines use, once connected}"#)
+            .pure(),
         CommandSpec::new("room.stop", "Stop Sharing", "File › Share", |_, _| Err(window_only("room.stop"))).params(r#"{} → {"stopped"}"#).pure(),
         CommandSpec::new("insert.quickParts", "Quick Parts", "Insert › Text", |s, v| quick_parts(s, v, wordcraft_doc::QUICK_PARTS_GALLERY)).params(
             r#"{"save"?: name (from the selection), "in"?: "document" (save into the document's own building blocks, kept in its file; else this session's), "insert"?: name, "delete"?: name} → {"parts": names (this session's, then the document's Quick Parts), "document": the document's Quick Parts}"#,

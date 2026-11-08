@@ -1,8 +1,9 @@
 //! File › Share (#33): share the document shown with people and agents, invite them with a role
 //! (and, for an agent, which files it may use), see who is in it, change a role and take an
 //! invite back. Every control runs a command (`room.share`, `room.invite`, `room.role`,
-//! `room.revoke`, `room.stop`, [`crate::share::room_method`]), the ones the control channel and
-//! MCP run, so a program can do whatever the page does; the page only reads the room's state.
+//! `room.revoke`, `room.relay`, `room.stop`, [`crate::share::room_method`]), the ones the control
+//! channel and MCP run, so a program can do whatever the page does; the page only reads the
+//! room's state.
 
 use egui::{RichText, Ui, vec2};
 use serde_json::{Value, json};
@@ -26,11 +27,33 @@ pub(crate) struct Form {
     pub(crate) shown: Option<(String, String)>,
     /// Why the last command the page ran failed, as it said.
     pub(crate) error: String,
+    /// Whether the next invite is for an agent on another computer (`remote`).
+    pub(crate) remote: bool,
+    /// The URL the invite just made reaches the document at, for an agent on another computer
+    /// (the relay's, #76), shown with its key.
+    pub(crate) shown_url: Option<String>,
+    /// Whether the invite just made is for an agent on another computer: it joins through the
+    /// relay, never through this computer's room port.
+    pub(crate) shown_remote: bool,
+    /// The relay's address and token being typed (`room.relay`).
+    pub(crate) relay: String,
+    pub(crate) token: String,
 }
 
 impl Default for Form {
     fn default() -> Self {
-        Form { name: String::new(), role: Role::Suggester, files: None, shown: None, error: String::new() }
+        Form {
+            name: String::new(),
+            role: Role::Suggester,
+            files: None,
+            shown: None,
+            error: String::new(),
+            remote: false,
+            shown_url: None,
+            shown_remote: false,
+            relay: String::new(),
+            token: String::new(),
+        }
     }
 }
 
@@ -182,6 +205,7 @@ pub(crate) fn page(app: &mut WordApp, ui: &mut Ui) {
         stop_button(app, ui);
     }
     error_line(app, ui);
+    relay_section(app, ui);
     section(ui, "Send a copy");
     note(ui, tl!("A PDF or Word document to send by email or keep, without sharing the document itself."));
     ui.add_space(4.0);
@@ -301,6 +325,14 @@ fn invite_form(app: &mut WordApp, ui: &mut Ui) {
                     .on_hover_text(tl!("For an agent: which files its commands may read and write. Never more than File › Options › Agents allows."));
             });
         });
+        t.row(|r| {
+            r.cell(|_| {});
+            r.cell(|ui| {
+                ui.checkbox(&mut app.share_form.remote, tl!("On another computer")).on_hover_text(tl!(
+                    "For an agent elsewhere, such as one in a cloud sandbox: it reaches the document through the relay, uses no files unless you choose some, and its key stops working after a day."
+                ));
+            });
+        });
     });
     ui.add_space(6.0);
     let named = !app.share_form.name.trim().is_empty();
@@ -309,7 +341,7 @@ fn invite_form(app: &mut WordApp, ui: &mut Ui) {
     }
     if invite && named {
         let f = &app.share_form;
-        let params = json!({"name": f.name.trim(), "role": f.role, "files": f.files.map(AgentFiles::name)});
+        let params = json!({"name": f.name.trim(), "role": f.role, "files": f.files.map(AgentFiles::name), "remote": f.remote});
         app.invite_on_share_page(params);
     }
 }
@@ -324,16 +356,43 @@ impl WordApp {
         let key = v.get("key").and_then(Value::as_str).unwrap_or_default().to_string();
         let name = v.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
         self.share_form.shown = Some((name, key));
+        self.share_form.shown_url = v.get("url").and_then(Value::as_str).map(str::to_string);
+        self.share_form.shown_remote = v.get("remote").and_then(Value::as_bool) == Some(true);
         self.share_form.name.clear();
         Some(v)
     }
+
+    /// How the agent whose key is showing joins, as the page says under the key. An agent on
+    /// another computer gets the relay's URL as it is now, so an invite made while the relay was
+    /// still connecting shows it once it is up; until then the page says so, and never gives a
+    /// command for this computer's room port, which the agent can't reach.
+    pub(crate) fn shown_join(&self) -> Join {
+        if self.share_form.shown_remote {
+            return Join::Relay(self.relay_url().or_else(|| self.share_form.shown_url.clone()));
+        }
+        match self.lobby.addr() {
+            Some(addr) => Join::Here(addr),
+            None => Join::Closed,
+        }
+    }
+}
+
+/// How the agent an invite was just made for joins (`WordApp::shown_join`).
+#[derive(Debug, PartialEq)]
+pub(crate) enum Join {
+    /// From another computer, at the relay's URL: `None` until the relay is connected.
+    Relay(Option<String>),
+    /// On this computer, through the room port at this address.
+    Here(std::net::SocketAddr),
+    /// On this computer, but the room port isn't open.
+    Closed,
 }
 
 /// The key the last invite gave, to copy now: it isn't shown again.
 fn shown_key(app: &mut WordApp, ui: &mut Ui) {
     let Some((name, key)) = app.share_form.shown.clone() else { return };
     let t = Tokens::get(ui.ctx());
-    let addr = app.lobby.addr();
+    let join = app.shown_join();
     ui.add_space(10.0);
     egui::Frame::NONE.fill(t.panel).stroke(egui::Stroke::new(1.0, t.border)).corner_radius(6.0).inner_margin(12).show(ui, |ui| {
         ui.label(RichText::new(tl!("Key for {name}").replace("{name}", &name)).font(semibold(14.0)));
@@ -346,8 +405,23 @@ fn shown_key(app: &mut WordApp, ui: &mut Ui) {
             }
         });
         ui.add_space(6.0);
-        match addr {
-            Some(addr) => {
+        match join {
+            Join::Relay(Some(url)) => {
+                let config = serde_json::to_string_pretty(&crate::relay::mcp_config(&url, &key)).unwrap_or_default();
+                note(ui, tl!("For an MCP client on another computer, such as an AI agent's:"));
+                ui.add(egui::Label::new(RichText::new(&config).monospace()).selectable(true));
+                if ui.button(tl!("Copy configuration")).clicked() {
+                    ui.ctx().copy_text(config.clone());
+                }
+            }
+            Join::Relay(None) => {
+                note(
+                    ui,
+                    tl!("The relay isn't connected yet, so there's no address for the agent to reach the document at. Its configuration shows here once it is."),
+                );
+                note(ui, &relay_status(&app.relay_state()));
+            }
+            Join::Here(addr) => {
                 let line = mcp_line(&key, addr);
                 note(ui, tl!("For an MCP client, such as an AI agent's:"));
                 ui.horizontal(|ui| {
@@ -357,13 +431,102 @@ fn shown_key(app: &mut WordApp, ui: &mut Ui) {
                     }
                 });
             }
-            None => note(ui, tl!("Agents join through the app's room port, which isn't open: they can't join right now.")),
+            Join::Closed => note(ui, tl!("Agents join through the app's room port, which isn't open: they can't join right now.")),
         }
         ui.add_space(6.0);
         if ui.button(tl!("Done")).clicked() {
             app.share_form.shown = None;
         }
     });
+}
+
+/// How the relay's connection is, in words.
+fn relay_status(state: &Value) -> String {
+    let status = state.get("status").and_then(Value::as_str).unwrap_or("off");
+    let words = match status {
+        "waiting" => tl!("Connects when you share a document."),
+        "connecting" => tl!("Connecting…"),
+        "connected" => tl!("Connected: agents on other computers reach the shared document."),
+        "retrying" => tl!("Can't reach the relay; trying again. Agents are told the document is offline."),
+        "refused" => tl!("The relay refused this computer."),
+        "failed" => tl!("Not connected."),
+        _ => tl!("Not connected."),
+    };
+    match state.get("why").and_then(Value::as_str) {
+        Some(why) => format!("{words} {why}"),
+        None => words.to_string(),
+    }
+}
+
+/// Agents on other computers: the relay they reach the shared document through (`room.relay`).
+fn relay_section(app: &mut WordApp, ui: &mut Ui) {
+    section(ui, "Agents on other computers");
+    let state = app.relay_method(&json!({})).unwrap_or(Value::Null);
+    let relay = state.get("relay").and_then(Value::as_str).map(str::to_string);
+    let Some(relay) = relay else {
+        note(
+            ui,
+            tl!(
+                "An AI agent on another computer, such as one in a cloud sandbox, reaches a shared document through a relay this app connects to. Nothing on this computer is opened to the internet. Enter the relay's address and the token from whoever runs it."
+            ),
+        );
+        ui.add_space(6.0);
+        let mut connect = false;
+        crate::rtl::Table::new("share_relay").columns(2).spacing(vec2(12.0, 8.0)).show(ui, |t| {
+            t.row(|r| {
+                let label = r.cell(|ui| ui.label(tl!("Relay")));
+                r.cell(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut app.share_form.relay).desired_width(320.0).hint_text(tl!("https://relay.example.org")))
+                        .labelled_by(label.id);
+                });
+            });
+            t.row(|r| {
+                let label = r.cell(|ui| ui.label(tl!("Token")));
+                r.cell(|ui| {
+                    let field =
+                        ui.add(egui::TextEdit::singleline(&mut app.share_form.token).password(true).desired_width(320.0)).labelled_by(label.id);
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        connect = true;
+                    }
+                });
+            });
+        });
+        ui.add_space(6.0);
+        let ready = !app.share_form.relay.trim().is_empty() && !app.share_form.token.trim().is_empty();
+        if ui.add_enabled(ready, egui::Button::new(RichText::new(tl!("Use this relay")).font(medium(13.5)))).clicked() {
+            connect = true;
+        }
+        if connect && ready {
+            let params = json!({"relay": app.share_form.relay.trim(), "token": app.share_form.token.trim()});
+            if run(app, "room.relay", params).is_some() {
+                app.share_form.relay.clear();
+                app.share_form.token.clear();
+            }
+        }
+        return;
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(&relay).monospace());
+        ui.label(relay_status(&state));
+    });
+    if let Some(url) = state.get("url").and_then(Value::as_str) {
+        ui.add_space(4.0);
+        note(ui, tl!("Agents invited on another computer use this address with their key:"));
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(RichText::new(url).monospace()).selectable(true));
+            if ui.button(tl!("Copy address")).clicked() {
+                ui.ctx().copy_text(url.to_string());
+            }
+        });
+    }
+    ui.add_space(6.0);
+    if ui
+        .button(RichText::new(tl!("Stop using this relay")).font(medium(13.5)))
+        .on_hover_text(tl!("Agents on other computers can't reach the document any more. The relay's address and token are forgotten."))
+        .clicked()
+    {
+        run(app, "room.relay", json!({"off": true}));
+    }
 }
 
 /// Who is in the document: their role (an invited participant's can change), which files their

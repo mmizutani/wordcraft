@@ -35,7 +35,9 @@ impl Class {
 pub const TABLE: &[(&str, Class)] = &[
     ("geom", Class::Layer(0)),
     ("control-key", Class::Standalone),
+    ("http", Class::Standalone),
     ("doc", Class::Layer(1)),
+    ("relay", Class::Layer(1)),
     ("fonts", Class::Layer(1)),
     ("metafile", Class::Layer(1)),
     ("layout", Class::Layer(2)),

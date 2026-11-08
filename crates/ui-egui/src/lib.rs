@@ -65,6 +65,7 @@ pub mod print_page;
 pub mod printing;
 pub mod proofing_pane;
 pub mod read_aloud;
+mod relay;
 pub mod ribbon;
 pub mod ribbon_fit;
 pub mod rtl;
@@ -662,6 +663,8 @@ pub struct WordApp {
     lobby: wordcraft_engine::room::Lobby,
     /// The document this window shares, if it shares one ([`share`]).
     share: Option<share::Share>,
+    /// The relay agents on other machines reach the shared document through ([`relay`], #76).
+    relay: relay::RelayState,
     /// File › Share's invite form and the key it just gave ([`share_page`]).
     share_form: share_page::Form,
     /// The built-in assistant: its conversation, the assistants offered, the prompt being

@@ -31,7 +31,7 @@ cat ~/.config/wordcraft/control-key.local-7981   # Linux, outside Flatpak, port 
 
 - Send the key as top-level `"key"` with every request, or once per connection with
   `{"method": "auth", "key": "…"}` (reply `{"ok": true, "result": {"as": "window"}}`, or for an
-  invite's key `{"as": "participant", "name", "role"}`); later requests on that
+  invite's key `{"as": "participant", "name", "role", "remote"}`, `remote` saying whether the invite was for an agent on another machine); later requests on that
   connection may leave `key` out. Only `auth` reads `params.key`; for other methods `params.key`
   is an ordinary parameter (`ui.key {"key": "Enter"}` presses Enter).
 - The key is checked on every request. A missing or wrong key gets
@@ -91,7 +91,7 @@ echo '{"text": "Hello"}' | wordcraft-cli call text.insert - --connect 127.0.0.1:
 | `ui.parity` | — | feature-catalog parity |
 | `ui.resize` | `width`, `height` | asks for that window content size in points; sizes that aren't positive and finite are refused, the rest are clamped to the app's minimum (760 × 480) and to the largest surface the GPU can draw (at most 16384; that limit wins over the minimum), and the reply's `width` and `height` are the size asked for |
 | `ui.focus` / `app.quit` | | window control |
-| `room.share`, `room.invite`, `room.revoke`, `room.role`, `room.participants`, `room.stop` | see [Shared documents](#shared-documents) | sharing the document the window shows with agents and people who join with a key |
+| `room.share`, `room.invite`, `room.revoke`, `room.role`, `room.participants`, `room.relay`, `room.stop` | see [Shared documents](#shared-documents) | sharing the document the window shows with agents and people who join with a key |
 
 Any other method name is treated as a command id: `{"method": "format.bold"}` works.
 
@@ -265,10 +265,11 @@ them):
 | Method | Params | Result |
 |---|---|---|
 | `room.share` | `name?` | shares the active document; the window joins its room as its owner, under `name`, else the author name (File › Options › User name), else `Owner`. `{"shared": true, "document", "version", "you", "participants", "agentFiles"}`: the document's id, the number of changes the room took, the window's participant and everyone in the room, each `{"id", "name", "role", "color", "selection"}` (see [Where everyone is](#where-everyone-is)) and, for those who joined with a key, `"files"`: which files their commands can use now (`none`, `folders` or `all`, see [Files participants can use](#files-participants-can-use)); `agentFiles` is what File › Options › Agents gives agents. Sharing the same document again answers the same; another one is an error while one is shared |
-| `room.invite` | `name`, `role?`, `files?`, `remote?`, `expiresIn?`, `uses?` | a key (32 hex digits, random) for a participant called `name`, with `role` ([roles](#roles), `suggester` unless given): `{"key", "name", "role", "files", "remote", "expires", "uses"}`. `expiresIn` (seconds, 60 to 2,592,000, that is 30 days): the key stops working then (`expires`, in seconds since 1970), as if taken back, and the copies that joined with it are out of the room. `uses` (from 1): how many times the key joins, each copy a join; the copies that joined stay. `remote: true` is for a participant on another machine ([Agents on other machines](#agents-on-other-machines)): never `owner`, no file unless `files` names some, and a day (`expiresIn` 86,400) unless `expiresIn` says otherwise. A name is someone's in the room for good, even after they left, since their comments and tracked changes keep it: up to 128 characters, no control characters, compared without case. `files` (`none`, `folders` or `all`) gives the participant fewer files than File › Options › Agents gives agents, never more; left out (`null`), they get what the setting gives, whenever it changes |
+| `room.invite` | `name`, `role?`, `files?`, `remote?`, `expiresIn?`, `uses?` | a key (32 hex digits, random) for a participant called `name`, with `role` ([roles](#roles), `suggester` unless given): `{"key", "name", "role", "files", "remote", "expires", "uses"}`. `expiresIn` (seconds, 60 to 2,592,000, that is 30 days): the key stops working then (`expires`, in seconds since 1970), as if taken back, and the copies that joined with it are out of the room. `uses` (from 1): how many times the key joins, each copy a join; the copies that joined stay. `remote: true` is for a participant on another machine ([Agents on other machines](#agents-on-other-machines)): never `owner`, no file unless `files` names some, and a day (`expiresIn` 86,400) unless `expiresIn` says otherwise; its reply also has `url`, where the agent reaches the document (the relay's, see `room.relay`), and `mcpConfig`, an MCP client configuration with that URL and the key, both `null` while the document isn't open on a relay. A name is someone's in the room for good, even after they left, since their comments and tracked changes keep it: up to 128 characters, no control characters, compared without case. `files` (`none`, `folders` or `all`) gives the participant fewer files than File › Options › Agents gives agents, never more; left out (`null`), they get what the setting gives, whenever it changes |
 | `room.revoke` | `key` or `name` | takes the invite back, by its key or by the name it was for (compared without case; the key shows once in File › Share): nobody joins with the key any more, and the copies that joined with it are out of the room (the room refuses their changes, and their connections end). `{"revoked": bool}` |
 | `room.role` | `name`, `role` | gives the participant invited as `name` (compared without case) `role` from now on: the room holds their next change to it, their copies' next requests follow it, and a copy that joins with the key later has it. `{"changed": bool, "name", "role"}`. Only invited participants change role: the window keeps its own, and the built-in assistant's is chosen in its Assistant pane |
-| `room.participants` | — | `{"shared": false}`, or what `room.share` answers, with `"invited"`: the invites not taken back, each `{"name", "role", "files", "joined", "remote", "expires", "usesLeft"}` (`joined`: how many copies are in the room with its key now; `expires` and `usesLeft` are `null` when the invite didn't set them), never their keys |
+| `room.participants` | — | `{"shared": false}`, or what `room.share` answers, with `"invited"`: the invites not taken back, each `{"name", "role", "files", "joined", "remote", "expires", "usesLeft"}` (`joined`: how many copies are in the room with its key now; `expires` and `usesLeft` are `null` when the invite didn't set them), never their keys, and `"relay"`: what `room.relay` answers |
+| `room.relay` | `relay?`, `token?`, `off?` | the relay agents on other machines reach the shared document through ([relay.md](relay.md), #76). `relay` (`https://…`; `http://` only to this computer, for trying one out) and `token` (from whoever runs it; left out, the one kept for the same relay) set it up and keep it in the settings folder (`relay.json`, readable only by the person), with the room it opened there last so agents' URLs stay the same; `off: true` stops using it and forgets it; nothing reads it. `{"relay", "status", "url", "why"?}`: `status` is `off`, `waiting` (no document shared), `connecting`, `connected`, `retrying` (the relay can't be reached; agents are told the document is offline), `refused` (the relay doesn't take the token) or `failed`, `why` says why it isn't connected, and `url` is where agents reach the document once it is. The room opens on the relay when a document is shared and closes when sharing stops |
 | `room.stop` | — | stops sharing: the room closes and every participant's connection ends; the window keeps the document as it is, with every change the room took, whether it shows that document or another. `{"stopped": bool}` |
 
 The window keeps the shared document up to date while it shows another one: every frame brings
@@ -429,10 +430,12 @@ bound resource use; a continuous local connection flood can still deny availabil
 ### Agents on other machines
 
 An agent in a sandbox (E2B, a Kubernetes agent sandbox, any cloud runner) is invited with
-`remote: true`. Nobody runs a tunnel to let it in: this computer will dial out to a relay
-(self-hosted, or the project's), and the agent will reach the room at a URL with its invite's key,
-from any MCP client (MCP over Streamable HTTP, #75, through the relay, #76). Until then a remote
-invite sets the rules below, which every way in keeps.
+`remote: true`. Nobody runs a tunnel to let it in: this computer dials out to a relay
+(`room.relay`, File › Share › Agents on other computers; [relay.md](relay.md), #76), and the
+agent reaches the room at the relay's URL with its invite's key, from any MCP client over
+Streamable HTTP ([MCP over HTTP](mcp.md#mcp-over-http), #75). The invite's reply has the URL and
+an MCP client configuration to hand the agent. The relay checks no key: the app does, and
+refuses the window's. A remote invite sets the rules below, which every way in keeps.
 
 - Never put the window's key in a sandbox: whoever holds it acts as the person, in the window,
   with every file the person can use. Only an invite's key leaves this computer. `auth` says which
@@ -446,7 +449,7 @@ invite sets the rules below, which every way in keeps.
   not another join; on the window's port each connection is. Taking the key back
   (`room.revoke`) ends its copies at once, as for any invite.
 
-For developers only, before the relay: `wordcraft-cli mcp --connect` sends a key only to
+For developers only, without a relay: `wordcraft-cli mcp --connect` sends a key only to
 `127.0.0.1`, and only when that is where the connection really leads, so a reverse SSH tunnel
 from this computer to a sandbox you can reach lets a remote invite join the room's port
 (File › Share's MCP line shows the port). This is a way to test, not how

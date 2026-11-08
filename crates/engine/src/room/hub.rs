@@ -341,6 +341,13 @@ impl Hub {
         self.member(id).is_some_and(|m| m.via.is_some())
     }
 
+    /// Whether participant `id` joined with a remote invite's key ([`Terms::remote`]), for an
+    /// agent on another machine.
+    pub fn is_remote(&self, id: ParticipantId) -> bool {
+        let Some(number) = self.member(id).and_then(|m| m.via) else { return false };
+        self.invites.iter().any(|i| i.number == number && i.remote)
+    }
+
     /// The files participant `id`'s commands can use while the room's setting is `setting`: what
     /// their invite chose, but never more than the setting ([`AgentFiles::at_most`]), else the
     /// setting. None at all when they aren't in the room (they left, or the invite they joined

@@ -1,7 +1,8 @@
 # MCP server
 
-WordCraft speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio, so
-Claude and other agents can write and edit documents.
+WordCraft speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio, and
+over Streamable HTTP for agents on other machines ([MCP over HTTP](#mcp-over-http)), so Claude
+and other agents can write and edit documents.
 
 ```sh
 wordcraft-cli mcp                          # headless session (no window)
@@ -17,6 +18,49 @@ loopback addresses; see [Keys](control-protocol.md#keys). The bridge serves even
 isn't open yet: tool calls return "not reachable … will retry on each call" and succeed once the
 app's port opens (#4078), so a client that starts before WordCraft doesn't lose the server for
 its whole session.
+
+## MCP over HTTP
+
+An agent on another machine joins a shared document with nothing but a URL and an invite's key,
+from any MCP client that speaks Streamable HTTP (#75):
+
+```sh
+wordcraft-cli mcp --http 127.0.0.1:8765 --connect 127.0.0.1:<room port>
+# the agent's MCP config: url http://127.0.0.1:8765/mcp, header Authorization: Bearer <invite key>
+```
+
+`--connect` is the shared document's room port, as File › Share's line shows it. Every request
+carries a remote invite's key (`room.invite` with `remote: true`) in `Authorization: Bearer`; a
+key from an invite for this computer is refused (403), since it may be the owner and use the
+files File › Options › Agents allows; the key opens one connection to the app, and so one copy of the
+document, held to the invite's role and files, for as long as requests keep coming (30 minutes
+without one closes it). The window's key is refused (403): it acts as the person. A key taken
+back, or past its time, is refused (401), and the request that finds it out says so.
+
+- **Both revisions on one endpoint.** A 2026-07-28 client sends no `initialize`: each request
+  names its version in `_meta` (`io.modelcontextprotocol/protocolVersion`) and in the
+  `MCP-Protocol-Version` header, with `Mcp-Method` (and `Mcp-Name` for `tools/call` and
+  `resources/read`) saying what the body does. A header that doesn't match is 400 with
+  `-32020`; a version the server doesn't speak is 400 with `-32022` and the versions it does;
+  an unknown method is 404. `server/discover` says what the server is, results carry
+  `resultType`, and lists carry `ttlMs` and `cacheScope` (the document itself, `ttlMs: 0`). A
+  2025-06-18 (or 2025-03-26) client starts with `initialize` as before. The stdio server takes
+  both kinds of request too.
+- **No sessions.** The key is the only identity: WordCraft mints no `Mcp-Session-Id` and
+  ignores one a client sends. Replies are `application/json`; nothing streams, so `GET` and
+  `DELETE` are 405.
+- **This computer only.** It listens on loopback and refuses another address. A request is
+  refused (403) unless its `Host` is that address (`--allow-host` adds names, comma-separated,
+  for a tunnel in front), and when it has an `Origin` (a web page), unless `--allow-origin`
+  lists it. Bodies are capped at 1 MiB, connections at 64, keys at 64, and answers waiting for slow clients to read them at 256 MiB in all, and one answer at 64 MiB (a larger one is an error saying so, and is never built whole: the app's reply is read no further than 64 MiB, and the tool's text and the reply stop growing there). A running request holds 64 MiB of that budget until its answer's size is known, so requests let in together can't pass it; past it, a new request gets 503 before it runs, or waits for room and gets 503 unrun if its caller's time runs out first. Writing one answer may take 30 s plus a second for each 64 KiB; a client reading slower is cut off. Any answer but a success closes the connection, so a client whose requests are refused can't keep one open. A POST carries one
+  JSON-RPC message: a batch (an array) gets 400, as MCP over HTTP has had none since 2025-06-18.
+
+Agents in sandboxes don't need a tunnel: the app dials out to a relay, which gives the shared
+document a public URL and passes each request to this endpoint in the app (#76,
+[relay.md](relay.md)). Set it up in File › Share › Agents on other computers, or with
+`room.relay`; a remote invite then answers with the URL and an MCP client configuration holding
+the key. Putting a tunnel in front of `--http` yourself is a developer's test, not how people
+connect.
 
 ## Scripts from the command line
 
@@ -156,7 +200,7 @@ test source in File › Options › Language and on the bar's Install.
 |---|---|
 | `list_commands` | every command, with its scope and the params that are places (filter with `query` and `scope`; see [Command scopes](#command-scopes)) — over 650 of them |
 | `execute` | run one command: `{command: "insert.table", params: {rows: 3, cols: 4}}` |
-| `batch` | run several commands in order |
+| `batch` | run several commands in order (256 at most; results past 8 MiB in all are left out) |
 | `new_document` | blank, sample, letter, resume, report; opens beside the open documents |
 | `open_document` / `save_document` | docx, doc (open only), odt, rtf, html, md, tex, txt, json; save also pdf, png |
 | `list_documents` | the open documents: `id`, `title`, `path`, `dirty`, `active` |
@@ -320,8 +364,10 @@ with `file.exportPdf` or `file.exportPng` and no `path` hands the PDF or page ba
 An agent on another machine (a sandbox) is invited with
 `{"action": "invite", "name": "Sandbox", "remote": true}`: never the owner, no file unless
 `files` names some, and a key that stops working after a day unless `expiresIn` (seconds) says
-otherwise; `uses: 1` lets it join once. It will reach the room through a relay this computer
-dials out to, with no tunnel to run (#75, #76); see
+otherwise; `uses: 1` lets it join once. It reaches the room over HTTP with the key
+([MCP over HTTP](#mcp-over-http)), through a relay this computer dials out to, with no tunnel to
+run ([relay.md](relay.md), #76): the invite's reply has the URL (`url`) and an MCP client
+configuration (`mcpConfig`); see
 [Agents on other machines](control-protocol.md#agents-on-other-machines). Only an invite's key
 goes to a sandbox, never the window's.
 

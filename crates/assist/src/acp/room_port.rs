@@ -536,6 +536,71 @@ mod tests {
         assert_eq!(call(5, "document.inspect", json!({}))["error"], json!("unauthorized"));
     }
 
+    /// An MCP client over Streamable HTTP (#75), with nothing but a URL and an invite's key:
+    /// its text lands in the window's document as a tracked change in its name, in the 2026-07-28
+    /// shape (no handshake) and the 2025-06-18 one; the window's own key and a key taken back are
+    /// refused.
+    #[test]
+    fn an_mcp_client_over_http_edits_the_shared_document_as_a_suggester() {
+        use wordcraft_mcp::http::{Endpoint, Options};
+        let lobby = Lobby::default();
+        let port = RoomPort::open(&lobby).unwrap();
+        let (mut session, room, mut own) = share(&lobby);
+        let key = room.invite_on("Sandbox", Role::Suggester, wordcraft_engine::room::Terms { remote: true, ..Default::default() }).unwrap();
+        let endpoint = Endpoint::connecting(Options { hosts: None, ..Options::default() }, &port.addr().to_string());
+        let post = |key: &str, body: Value, headers: &[(&str, &str)]| {
+            let mut h = vec![("Content-Type".to_string(), "application/json".to_string()), ("Authorization".to_string(), format!("Bearer {key}"))];
+            h.extend(headers.iter().map(|(n, v)| (n.to_string(), v.to_string())));
+            let req =
+                wordcraft_http::Request { method: "POST".into(), target: "/mcp".into(), headers: h, body: body.to_string().into_bytes(), peer: None };
+            let resp = endpoint.handle(&req);
+            (resp.status, serde_json::from_slice::<Value>(&resp.body).unwrap_or(Value::Null))
+        };
+        let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}});
+        let tool = |id: u32, name: &str, arguments: Value| {
+            let body = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": arguments, "_meta": meta}});
+            post(&key, body, &[("MCP-Protocol-Version", "2026-07-28"), ("Mcp-Method", "tools/call"), ("Mcp-Name", name)])
+        };
+        let (status, r) = tool(1, "select_text", json!({"text": "two"}));
+        assert_eq!((status, r["result"]["isError"].clone()), (200, json!(false)), "{r}");
+        let (status, r) = tool(2, "type_text", json!({"text": "2"}));
+        assert_eq!((status, r["result"]["isError"].clone()), (200, json!(false)), "{r}");
+        for _ in 0..500 {
+            let _ = own.lend(&mut session, Replica::sync);
+            if session.doc.revisions.iter().any(|r| r.author == "Sandbox") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(session.doc.revisions.iter().any(|r| r.author == "Sandbox"), "no tracked change in the agent's name");
+        // A 2025-06-18 client with the same key works on the same copy.
+        let (status, r) = post(
+            &key,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}),
+            &[],
+        );
+        assert_eq!((status, r["result"]["protocolVersion"].clone()), (200, json!("2025-06-18")));
+        let (_, r) = post(
+            &key,
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "inspect_document", "arguments": {}}}),
+            &[("MCP-Protocol-Version", "2025-06-18")],
+        );
+        assert!(r["result"]["content"][0]["text"].as_str().unwrap_or_default().contains("2"), "{r}");
+        assert_eq!(room.participants().iter().filter(|p| p.name == "Sandbox").count(), 1, "one participant, one copy");
+        assert_eq!(endpoint.keys(), 1);
+        // A key the room never handed out, then the invite taken back: refused, and the
+        // connection goes.
+        let (status, _) = post(&"0".repeat(32), json!({"jsonrpc": "2.0", "id": 5, "method": "tools/list"}), &[]);
+        assert_eq!(status, 401);
+        assert!(room.revoke(&key));
+        let (status, r) = tool(6, "inspect_document", json!({}));
+        assert_eq!(status, 401, "the request that finds the key taken back says so: {r}");
+        assert_eq!(endpoint.keys(), 0, "and its connection goes");
+        let (status, r) = tool(7, "inspect_document", json!({}));
+        assert_eq!(status, 401, "{r}");
+        assert_eq!(endpoint.keys(), 0);
+    }
+
     #[test]
     fn the_port_holds_a_bounded_number_of_copies() {
         let lobby = Lobby::default();
