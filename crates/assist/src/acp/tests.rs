@@ -1018,6 +1018,25 @@ fn a_stop_while_a_change_is_answered_leaves_what_runs_unknown_so_the_next_turn_s
     c.ask("Again");
     assert_eq!(set_config(&c), [pair("the-model", "deep"), pair("the-model", "fast")]);
     assert_eq!(line(&c).map(|l| l.0), Some("Fast".to_string()));
+    // No prompt had gone to this session: the next one has the note, and the menus what it offers.
+    let prompt = c.report()["prompt"].as_array().unwrap().iter().map(|b| b.as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert!(prompt.first().is_some_and(|note| note.contains("writing assistant inside WordCraft")), "{prompt:?}");
+    assert_eq!(c.a.offered().unwrap().models.len(), 2);
+}
+
+#[test]
+fn a_session_stopped_before_its_first_prompt_still_says_what_it_offers() {
+    let script = Script { set_ms: 300, refuse_set: Some("not now".into()), ..configured(vec![vec![say("Hi")]]) };
+    let mut c = Chat::with(&script);
+    c.a.choose(Some("deep".into()), None);
+    c.a.ask("Hello", None).unwrap();
+    c.until("the agent started", |c| c.tool(START_ROW).is_some_and(|t| t.status == ToolStatus::Completed));
+    std::thread::sleep(Duration::from_millis(50));
+    c.a.cancel();
+    assert!(c.a.wait_idle(WAIT));
+    assert_eq!(c.a.offered(), None);
+    c.ask("Again");
+    assert_eq!(c.a.offered().unwrap().models.len(), 2, "though no change went through");
 }
 
 #[test]

@@ -239,6 +239,9 @@ pub struct AuthMethod {
     pub description: String,
 }
 
+/// Most messages from the agent read between two turns before the next one goes on.
+const MAX_CATCH_UP: usize = 4096;
+
 /// The agent running for a conversation.
 struct Running {
     process: Process,
@@ -249,6 +252,10 @@ struct Running {
     config: Config,
     /// What the model and the level were before WordCraft changed them: Default goes back to it.
     before: (Option<String>, Option<String>),
+    /// Whether a prompt went to this session. A turn can stop before its first one, while a
+    /// choice is set, and the next turn then has what the first would have sent: the note, which
+    /// the agent can't work without, and what it offers, for the menus.
+    prompted: bool,
 }
 
 /// An ACP agent as a backend.
@@ -373,7 +380,7 @@ impl Acp {
                 Ok(result) => {
                     let session = result.get("sessionId").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 1024);
                     let session = session.ok_or_else(|| format!("{name} started no session"))?.to_string();
-                    return Ok(Some(Running { process, folder, session, config: Config::parse(&result), before: (None, None) }));
+                    return Ok(Some(Running { process, folder, session, config: Config::parse(&result), before: (None, None), prompted: false }));
                 }
                 Err(e) if e.code == AUTH_REQUIRED && !signed_in => {
                     if !self.sign_in(&mut process, &methods, ctx)? {
@@ -556,9 +563,14 @@ impl Acp {
     }
 
     /// Take what the agent sent since the last turn, doing what a turn does with it: its config
-    /// options may have changed, which decides what the next prompt needs set first.
+    /// options may have changed, which decides what the next prompt needs set first. At most
+    /// [`MAX_CATCH_UP`] messages, and not past a Stop: an agent that keeps writing would otherwise
+    /// hold the turn here, where nothing else looks at either. What is left is read in the turn.
     fn catch_up(&mut self, ctx: &mut TurnCtx<'_>) -> Result<(), String> {
-        loop {
+        for _ in 0..MAX_CATCH_UP {
+            if ctx.is_cancelled() {
+                return Ok(());
+            }
             let Some(running) = self.running.as_mut() else { return Ok(()) };
             let message = match running.process.next(Duration::ZERO) {
                 None | Some(Incoming::Closed) => return Ok(()),
@@ -571,6 +583,7 @@ impl Acp {
                 Message::Response { .. } | Message::Notification { .. } | Message::Invalid => {}
             }
         }
+        Ok(())
     }
 
     /// Show tool call `update` (a `tool_call`, a `tool_call_update` or a permission request's
@@ -784,9 +797,10 @@ impl Backend for Acp {
         if ctx.is_cancelled() {
             return Ok(StopReason::Cancelled);
         }
-        self.show_config(ctx, fresh || changed);
+        let first = self.running.as_ref().is_some_and(|r| !r.prompted);
+        self.show_config(ctx, first || changed);
         // A new session gets the note, which the agent's model reads first.
-        let note = if fresh { self.note.as_deref() } else { None };
+        let note = if first { self.note.as_deref() } else { None };
         let prompt: Vec<Value> = [note, turn.context.as_deref(), Some(turn.prompt.as_str())]
             .into_iter()
             .flatten()
@@ -796,7 +810,10 @@ impl Backend for Acp {
         let Some(running) = self.running.as_mut() else { return Err(format!("{} isn't running", self.spec.label)) };
         let session = running.session.clone();
         let ended = match running.process.request("session/prompt", json!({"sessionId": session, "prompt": prompt})) {
-            Ok(id) => self.finish_turn(id, ctx),
+            Ok(id) => {
+                running.prompted = true;
+                self.finish_turn(id, ctx)
+            }
             Err(e) => Err(format!("{}: {e}", self.spec.label)),
         };
         if ended.is_err() && self.running.as_mut().is_some_and(|r| !r.process.is_running()) {
