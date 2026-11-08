@@ -1454,3 +1454,77 @@ fn a_control_click_on_reject_all_tells_the_assistant_nothing() {
     ask(h.state_mut(), "Again", None);
     assert!(!context_of(&seen, 1).contains(SAID), "{}", context_of(&seen, 1));
 }
+
+/// Two runs of the assistant's insertion, "a" and "b", with Helper's insertion "X" between them.
+fn split_by_helper(steps: Vec<Step>) -> (WordApp, std::sync::Arc<std::sync::Mutex<wordcraft_assist::Seen>>) {
+    let mut a = window("one");
+    let fake = Fake::new().then(vec![Step::tool("type_text", json!({"text": "ab"}))]).then(steps);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Write", None);
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Suggester).unwrap();
+    helper.run("select.text", &json!({"text": "a"})).unwrap();
+    helper.run("caret.right", &json!({})).unwrap();
+    helper.run("text.insert", &json!({"text": "X"})).unwrap();
+    helper.send();
+    settle(&mut a);
+    assert_eq!(a.session.doc.final_text(StoryRef::Body), "aXbone");
+    (a, seen)
+}
+
+/// Rejecting someone else's insertion between two runs of the assistant's joins them: the
+/// assistant's change is still there, undecided.
+#[test]
+fn someone_else_s_change_between_the_assistant_s_runs_says_nothing_of_them() {
+    const SAID: &str = "What the person did with your changes";
+    let (mut a, seen) = split_by_helper(vec![]);
+    a.run("review.rejectAll", json!({"author": "Helper"})).unwrap();
+    settle(&mut a);
+    assert_eq!(wordcraft_engine::cmd::review::changes_of(&a.session, "Test Assistant").unwrap().len(), 1, "joined, not resolved");
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains(SAID), "{}", context_of(&seen, 1));
+}
+
+/// Accepting another's deletion inside the assistant's insertion shortens it: not a decision on it.
+#[test]
+fn someone_else_s_deletion_inside_the_assistant_s_insertion_says_nothing_of_it() {
+    const SAID: &str = "What the person did with your changes";
+    let mut a = window("one");
+    let fake = Fake::new().then(vec![Step::tool("type_text", json!({"text": "abcd"}))]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Write", None);
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Suggester).unwrap();
+    helper.run("select.text", &json!({"text": "bc"})).unwrap();
+    helper.run("text.delete", &json!({})).unwrap();
+    helper.send();
+    settle(&mut a);
+    a.run("review.acceptAll", json!({"author": "Helper"})).unwrap();
+    settle(&mut a);
+    assert_eq!(accepted(&a), "adone", "the deletion was accepted");
+    assert!(wordcraft_engine::cmd::review::changes_by(&a.session, "Test Assistant") > 0, "the insertion is still undecided");
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains(SAID), "{}", context_of(&seen, 1));
+}
+
+/// Two changes in one revision: Accept of one says that one, and Accept All says both.
+#[test]
+fn one_of_two_changes_of_a_revision_is_told_apart() {
+    let (mut a, seen) = split_by_helper(vec![Step::say("Noted.")]);
+    let before = wordcraft_engine::cmd::review::changes_of(&a.session, "Test Assistant").unwrap();
+    assert_eq!(before.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    assert_eq!(before[0].rev, before[1].rev, "one revision holds both");
+    a.run("select.text", json!({"text": "a"})).unwrap();
+    a.run("review.accept", json!({})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(context.contains("accepted your insertion: \"a\""), "{context}");
+    assert!(!context.contains("\"b\""), "{context}");
+    a.run("review.acceptAll", json!({})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "And again", None);
+    assert!(context_of(&seen, 2).contains("accepted your insertion: \"b\""), "{}", context_of(&seen, 2));
+}

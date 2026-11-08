@@ -1168,10 +1168,42 @@ fn changes_of_one_author_are_whole_and_leave_the_others_out() {
     s.author = "Ana".into();
     s.run("caret.docStart", &json!({})).unwrap();
     s.run("text.insert", &json!({"text": "Ana "})).unwrap();
-    let bot = super::changes_of(&s, "Bot");
+    let bot = super::changes_of(&s, "Bot").unwrap();
     let kinds: Vec<(&str, &str)> = bot.iter().map(|c| (c.kind, c.text.as_str())).collect();
     assert_eq!(kinds, [("insert", "plain bold"), ("delete", "two")]);
-    assert_eq!(super::changes_of(&s, "Nobody"), []);
+    assert_eq!(super::changes_of(&s, "Nobody"), Some(vec![]));
+}
+
+/// A paragraph with many of one author's changes costs the person's click a bounded amount: each
+/// change keeps only the start of its text, and past the most changes there is no list at all.
+#[test]
+fn changes_of_one_author_are_bounded() {
+    let mut s = Session::new(Document::from_text(""));
+    s.author = "Bot".into();
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    s.run("text.insert", &json!({"text": "é".repeat(5000)})).unwrap();
+    let list = super::changes_of(&s, "Bot").unwrap();
+    assert_eq!(list[0].text.chars().count(), super::AUTHORED_TEXT_CHARS);
+
+    let at_the_most = many_changes(super::MOST_AUTHORED_CHANGES);
+    assert_eq!(super::changes_of(&at_the_most, "Bot").unwrap().len(), super::MOST_AUTHORED_CHANGES);
+    assert_eq!(super::changes_of(&many_changes(super::MOST_AUTHORED_CHANGES + 1), "Bot"), None);
+}
+
+/// One paragraph holding `n` of Bot's insertions, one character each, with text of no one's between.
+fn many_changes(n: usize) -> Session {
+    let mut s = Session::new(Document::from_text(&"ab".repeat(n)));
+    s.doc.revisions.push(wordcraft_doc::Revision::new(wordcraft_doc::RevisionKind::Insert, "Bot", "2026-11-09T00:00:00Z"));
+    let rev = (s.doc.revisions.len() - 1) as u32;
+    let para = s.doc.para_mut(wordcraft_doc::StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
+    let props = para.runs[0].props.clone();
+    para.runs = (0..n)
+        .flat_map(|_| {
+            let inserted = wordcraft_doc::CharProps { ins: Some(rev), ..props.clone() };
+            [wordcraft_doc::Run { len: 1, props: inserted }, wordcraft_doc::Run { len: 1, props: props.clone() }]
+        })
+        .collect();
+    s
 }
 
 /// The assistant pane's Accept all / Reject all from this assistant: one reviewer's changes are

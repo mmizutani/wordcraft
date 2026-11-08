@@ -587,33 +587,55 @@ pub fn changes_by(s: &Session, author: &str) -> usize {
         .sum()
 }
 
+/// Most characters of a change's text [`changes_of`] keeps: what feedback to a model quotes.
+pub const AUTHORED_TEXT_CHARS: usize = 120;
+
+/// Most changes [`changes_of`] lists; past this it gives none rather than make the person's click
+/// wait.
+pub const MOST_AUTHORED_CHANGES: usize = 4096;
+
 /// One of an author's tracked changes in the document: what the window compares before and after
-/// the person resolves some (#86). Neighbouring runs of one change are one here.
+/// the person resolves some (#86). Neighbouring runs of one change are one here. A revision can
+/// hold several changes (an author's in one second share it), so it doesn't name one alone.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AuthoredChange {
     /// `insert`, `delete`, `format`…, as the Reviewing Pane names it.
     pub kind: &'static str,
+    pub rev: u32,
+    /// The start of its text, at most [`AUTHORED_TEXT_CHARS`] characters, objects left out.
     pub text: String,
 }
 
 /// The tracked changes `author` made across the document, in every story, as [`changes_by`] counts
 /// them but for a deletion hidden under someone else's insertion, which the reviewing list doesn't
-/// show either.
-pub fn changes_of(s: &Session, author: &str) -> Vec<AuthoredChange> {
-    let theirs = |rev: Option<u32>| rev.and_then(|r| s.doc.revisions.get(r as usize)).is_some_and(|r| r.author == author);
+/// show either. `None` when there are more than [`MOST_AUTHORED_CHANGES`]. Each change's text is
+/// read from its paragraph, without copying the paragraph, so the work stays bounded by the
+/// paragraphs' runs however long they are.
+pub fn changes_of(s: &Session, author: &str) -> Option<Vec<AuthoredChange>> {
+    let theirs = |rev: u32| s.doc.revisions.get(rev as usize).is_some_and(|r| r.author == author);
     let stories = std::iter::once(StoryRef::Body).chain(s.doc.parts.keys().map(|id| StoryRef::Part(*id)));
     let mut out = Vec::new();
     for story in stories {
-        let mut spans: Vec<Change> = Vec::new();
-        for c in changes_in(s, story).into_iter().filter(|c| theirs(c.rev)) {
-            match spans.last_mut().filter(|l| l.kind == c.kind && l.rev == c.rev && l.b == c.a) {
-                Some(last) => last.b = c.b,
-                None => spans.push(c),
+        let mut spans: Vec<(Change, u32)> = Vec::new();
+        for c in changes_in(s, story) {
+            let Some(rev) = c.rev.filter(|r| theirs(*r)) else { continue };
+            match spans.last_mut().filter(|(l, r)| l.kind == c.kind && *r == rev && l.b == c.a) {
+                Some((last, _)) => last.b = c.b,
+                None => spans.push((c, rev)),
+            }
+            if out.len().saturating_add(spans.len()) > MOST_AUTHORED_CHANGES {
+                return None;
             }
         }
-        out.extend(spans.iter().map(|c| AuthoredChange { kind: c.kind, text: s.doc.copy_range(&c.a, &c.b).plain_text() }));
+        out.extend(spans.iter().map(|(c, rev)| AuthoredChange { kind: c.kind, rev: *rev, text: start_of(s, c) }));
     }
-    out
+    Some(out)
+}
+
+/// The start of the text of `c`, whose ends are in one paragraph.
+fn start_of(s: &Session, c: &Change) -> String {
+    let text = s.doc.para(c.a.story, &c.a.path).and_then(|p| p.text.get(c.a.off..c.b.off)).unwrap_or_default();
+    text.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(AUTHORED_TEXT_CHARS).collect()
 }
 
 pub(super) fn list_changes(s: &mut Session, _: &Value) -> CmdResult {

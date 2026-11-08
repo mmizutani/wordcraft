@@ -28,7 +28,7 @@
 //! Signing in to ChatGPT (#19) is [`chatgpt`]'s: File › Options › Account and the pane start it,
 //! and [`tick`] takes how it ended, so ChatGPT is offered ready at once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -489,7 +489,7 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
 /// [`review_ended`] compares.
 pub(crate) fn review_started(app: &WordApp, id: &str) -> Option<Vec<AuthoredChange>> {
     decision(id)?;
-    Some(changes_of(&app.session, app.conversation()?.name()))
+    changes_of(&app.session, app.conversation()?.name())
 }
 
 /// The person's Accept or Reject `id` ran: the conversation's changes `before` it that are gone
@@ -498,16 +498,34 @@ pub(crate) fn review_started(app: &WordApp, id: &str) -> Option<Vec<AuthoredChan
 /// through [`WordApp::execute`], and a macro's step has an id of its own.
 pub(crate) fn review_ended(app: &mut WordApp, id: &str, before: Vec<AuthoredChange>) {
     let (Some(decision), Some(name)) = (decision(id), app.conversation().map(|a| a.name().to_string())) else { return };
+    let Some(after) = changes_of(&app.session, &name) else { return };
+    for change in resolved(before, after) {
+        app.assist.feedback.record(decision, change.kind, &change.text);
+    }
+}
+
+/// The changes of `before` that `after` doesn't have, unless one of `after`'s is new: a change with
+/// the same kind and revision that altered without being resolved. Resolving someone else's change
+/// inside it shortens it, and between two of its runs joins them. So does accepting part of it,
+/// which then says nothing: feedback to a model had better miss a decision than invent one. A
+/// revision alone can't tell: it may hold several changes, of which one was resolved.
+fn resolved(before: Vec<AuthoredChange>, after: Vec<AuthoredChange>) -> Vec<AuthoredChange> {
     let mut left: HashMap<AuthoredChange, usize> = HashMap::new();
-    for change in changes_of(&app.session, &name) {
+    for change in after {
         *left.entry(change).or_default() += 1;
     }
-    for change in before {
-        match left.get_mut(&change) {
-            Some(n) if *n > 0 => *n -= 1,
-            _ => app.assist.feedback.record(decision, change.kind, &change.text),
-        }
-    }
+    let gone: Vec<AuthoredChange> = before
+        .into_iter()
+        .filter(|change| match left.get_mut(change) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    let altered: HashSet<(&str, u32)> = left.iter().filter(|(_, n)| **n > 0).map(|(c, _)| (c.kind, c.rev)).collect();
+    gone.into_iter().filter(|c| !altered.contains(&(c.kind, c.rev))).collect()
 }
 
 /// What command `id` decides about a change, when it is the person's Accept or Reject.
