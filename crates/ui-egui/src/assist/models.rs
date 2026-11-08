@@ -124,7 +124,10 @@ fn offered_menus(o: &Offered, saved: &ModelChoice) -> Menus {
         Some(m) => level_rows(m.efforts.iter().map(String::as_str), m.default_effort.as_deref()),
         None => o.efforts.iter().map(|l| Row { name: Some(l.name.clone()), ..plain_row(&l.id) }).collect(),
     };
-    let effort = saved.effort.as_ref().filter(|id| efforts.iter().any(|e| e.id == **id)).or(o.effort.as_ref()).cloned();
+    // Of what this model takes: what is chosen, else its default, else what the session has.
+    let listed = |id: &&String| efforts.iter().any(|e: &Row| e.id == **id);
+    let tagged = efforts.iter().find(|e| e.is_default).map(|e| &e.id);
+    let effort = saved.effort.as_ref().filter(listed).or(tagged).or(o.effort.as_ref().filter(listed)).cloned();
     Menus {
         models: o.models.iter().map(model_row).collect(),
         chosen_model: chosen,
