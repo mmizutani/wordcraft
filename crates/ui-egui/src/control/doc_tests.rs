@@ -136,3 +136,19 @@ fn chatgpt_sign_in_addressed_to_another_document_is_an_error() {
     assert!(a.session.ui_requests.iter().all(|q| q.get("assist").is_none()), "nothing queued");
     assert_eq!(a.session.document_id(), second);
 }
+
+/// The choice of model and effort is the window's: addressed to a document it is refused rather
+/// than answered with a change no one made.
+#[test]
+fn the_assistants_model_and_effort_cant_be_addressed_to_a_document() {
+    let mut a = app();
+    let (first, _) = two_documents(&mut a);
+    a.session.assistant.window = true;
+    for (command, params) in [("assist.model", json!({"id": "gpt-x"})), ("assist.effort", json!({"level": "high"})), ("assist.model", json!({}))] {
+        let r = send(&mut a, "engine.execute", json!({"command": command, "params": params, "doc": first}));
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(r["error"].as_str().unwrap_or_default().contains("without `doc`"), "{r}");
+    }
+    assert!(a.session.prefs.assistant.models.is_empty());
+    assert!(a.session.ui_requests.is_empty());
+}
