@@ -590,8 +590,10 @@ pub fn changes_by(s: &Session, author: &str) -> usize {
 /// Most characters of a change's text [`changes_of`] keeps: what feedback to a model quotes.
 pub const AUTHORED_TEXT_CHARS: usize = 120;
 
-/// Most changes [`changes_of`] lists; past this it gives none rather than make the person's click
-/// wait.
+/// Most changes [`changes_of`] keeps and the window compares; past this it gives none. This bounds
+/// the snapshot, not the walk that finds them.
+// ponytail: the walk is `changes_in`, as for `changes_by`, proportional to the document's tracked
+// runs. Make `changes_in` stream, for all its callers, if a click shows up in a profile.
 pub const MOST_AUTHORED_CHANGES: usize = 4096;
 
 /// One of an author's tracked changes in the document: what the window compares before and after
