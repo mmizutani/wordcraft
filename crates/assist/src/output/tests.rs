@@ -235,19 +235,23 @@ fn a_full_transcript_keeps_its_entries_where_they_are() {
     let mut s = session();
     let mut t = Transcript::default();
     t.asked("Rewrite");
-    rewrite(&mut s, "two", "2");
-    note(&mut t, &s);
     for n in 0..crate::transcript::MAX_ENTRIES {
         t.record(&crate::Event::Error { message: format!("entry {n}") });
     }
+    rewrite(&mut s, "two", "2");
+    note(&mut t, &s);
+    for n in 0..4 {
+        t.record(&crate::Event::Error { message: format!("later {n}") });
+    }
     let before: Vec<Entry> = t.entries().filter(|e| matches!(e, Entry::Error { .. })).cloned().collect();
-    // One row ends and one comes in at once, in a transcript that trims as one comes in.
+    // One row ends and others come in at once, in a transcript that trims as they come in.
     s.run("select.text", &json!({"text": "2"})).unwrap();
     s.run("review.accept", &json!({})).unwrap();
     rewrite(&mut s, "five", "5");
     note(&mut t, &s);
     let after: Vec<Entry> = t.entries().filter(|e| matches!(e, Entry::Error { .. })).cloned().collect();
     assert!(before.ends_with(&after), "no answer or error was overwritten");
+    assert!(listed(&t).iter().any(|r| r.1 == "2" && r.2 == OutputState::Accepted), "{:?}", listed(&t));
 }
 
 #[test]
