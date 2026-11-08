@@ -1,18 +1,21 @@
 //! What the assistant remembers across conversations (#86), from the window's side: the file is
 //! [`wordcraft_assist::memory`]'s, and this holds what was last read of it, carries out the
-//! `assist.memory*` commands, and draws the list in File › Options › Assistant.
+//! `assist.memory*` commands, and draws the list in File › Options › Assistant and the card a
+//! proposal shows in the Assistant pane.
 //!
 //! Only the person changes it. The window refuses a write from a script or an agent, a click or
 //! key the control channel made and a macro's step: a document can tell a model to keep something,
 //! and a kept preference acts on later documents.
 
-use egui::{RichText, Ui};
+use egui::{RichText, Stroke, Ui};
 use serde_json::{Value, json};
+use wordcraft_assist::ProposalAnswer;
 use wordcraft_assist::memory::{ForModel, MAX_TEXT, Memory};
 
 use crate::WordApp;
 use crate::i18n::fmt;
 use crate::options::{note, section};
+use crate::theme::Tokens;
 
 /// Why a script or an agent can't change what the assistant remembers.
 pub(crate) const YOURS: &str = "Only you can change what the assistant remembers: use File › Options › Assistant, and click the button yourself";
@@ -35,6 +38,8 @@ pub(crate) struct MemoryState {
     new: String,
     /// The item being edited on the page, and its text so far.
     editing: Option<(String, String)>,
+    /// The proposal being edited in the pane, and its text so far.
+    editing_proposal: Option<(u64, String)>,
 }
 
 /// Read the file again, if there is a settings folder.
@@ -45,8 +50,10 @@ fn reload(app: &mut WordApp) {
     }
 }
 
-/// What the next turn carries, read fresh: another WordCraft's keep counts.
+/// What the next turn carries, read fresh: another WordCraft's keep counts. Nothing without a
+/// folder to keep it in, so the model isn't asked to propose what no click could keep.
 pub(crate) fn for_turn(app: &mut WordApp) -> Option<String> {
+    app.services.settings_dir.as_ref()?;
     reload(app);
     app.assist.memory.memory.for_model().text
 }
@@ -71,6 +78,9 @@ pub(crate) fn write(app: &mut WordApp, what: &str, req: &Value) -> Result<Value,
     let dir = app.services.settings_dir.clone().ok_or(NO_FOLDER)?;
     let text = req.get("text").and_then(Value::as_str);
     let id = req.get("id").and_then(Value::as_str).unwrap_or("");
+    if what == "memory.keep" || what == "memory.dismiss" {
+        return answer(app, &dir, what == "memory.keep", req);
+    }
     let r = Memory::update(&dir, |m| match what {
         "memory.add" => {
             let now = wordcraft_engine::cmd::now_iso();
@@ -90,6 +100,94 @@ pub(crate) fn write(app: &mut WordApp, what: &str, req: &Value) -> Result<Value,
     });
     reload(app);
     r
+}
+
+/// The person's Keep or Not this on proposal `req["proposal"]` of the conversation: what it says,
+/// or what they edited it to, is kept, or its text is said no to. A proposal that isn't waiting
+/// changes nothing. It is marked answered only once the file has the answer.
+fn answer(app: &mut WordApp, dir: &std::path::Path, keep: bool, req: &Value) -> Result<Value, String> {
+    let id = req.get("proposal").and_then(Value::as_u64).unwrap_or(0);
+    let proposed = app.conversation().and_then(|a| a.transcript().pending_proposal(id)).map(str::to_string);
+    let proposed = proposed.ok_or("that proposal isn't waiting for an answer")?;
+    let r = if keep {
+        let text = req.get("text").and_then(Value::as_str).unwrap_or(&proposed);
+        let now = wordcraft_engine::cmd::now_iso();
+        Memory::update(dir, |m| m.add(text, &now).map(|item| json!({"id": item.id})))
+    } else {
+        Memory::update(dir, |m| {
+            m.dismiss(&proposed);
+            Ok(json!({"dismissed": id}))
+        })
+    };
+    reload(app);
+    if r.is_ok()
+        && let Some(a) = app.conversation_mut()
+    {
+        a.answer_proposal(id, if keep { ProposalAnswer::Kept } else { ProposalAnswer::Dismissed });
+    }
+    r
+}
+
+/// A proposal in the Assistant pane: what it says and, while it waits, Keep, Edit and Not this.
+/// None for one the person already kept or said no to, or while memory is off. The text is the
+/// model's, which a document may have prompted, so it is shown whole before anything is stored.
+pub(crate) fn proposal_card(app: &mut WordApp, ui: &mut Ui, t: &Tokens, id: u64, text: &str, answer: Option<ProposalAnswer>) {
+    let memory = &app.assist.memory.memory;
+    let shows = app.services.settings_dir.is_some() && memory.enabled && (answer.is_some() || !memory.known(text));
+    if !shows {
+        return;
+    }
+    let waiting = answer.is_none();
+    let stroke = if waiting { Stroke::new(1.5, t.accent) } else { Stroke::new(1.0, t.border_strong) };
+    egui::Frame::NONE.stroke(stroke).corner_radius(6).inner_margin(6).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        match answer {
+            None => {
+                ui.label(RichText::new(tl!("Keep this for every conversation?")).small().color(t.text_dim));
+                waiting_card(app, ui, t, id, text);
+            }
+            Some(answer) => {
+                let said = if answer == ProposalAnswer::Kept { tl!("Kept") } else { tl!("Not kept") };
+                ui.label(RichText::new(said).small().color(t.text_dim));
+                ui.add(egui::Label::new(RichText::new(text).small().color(t.text_dim)).wrap());
+            }
+        }
+    });
+}
+
+/// A waiting proposal's text, or the box it is being edited in, and its buttons.
+fn waiting_card(app: &mut WordApp, ui: &mut Ui, t: &Tokens, id: u64, text: &str) {
+    let editing = app.assist.memory.editing_proposal.take().filter(|(i, _)| *i == id);
+    let Some((_, mut edited)) = editing else {
+        ui.add(egui::Label::new(RichText::new(text).font(crate::theme::semibold(12.0)).color(t.text)).wrap());
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(tl!("Keep")).clicked() {
+                let _ = app.run("assist.memory.keep", json!({"proposal": id}));
+            }
+            if ui.button(tl!("Edit")).clicked() {
+                app.assist.memory.editing_proposal = Some((id, text.to_string()));
+            }
+            if ui.button(tl!("Not this")).clicked() {
+                let _ = app.run("assist.memory.dismiss", json!({"proposal": id}));
+            }
+        });
+        return;
+    };
+    ui.add(egui::TextEdit::multiline(&mut edited).char_limit(MAX_TEXT).desired_rows(2).desired_width(f32::INFINITY));
+    let mut open = true;
+    ui.horizontal_wrapped(|ui| {
+        if ui.add_enabled(!edited.trim().is_empty(), egui::Button::new(tl!("Keep"))).clicked()
+            && app.run("assist.memory.keep", json!({"proposal": id, "text": edited})).is_ok()
+        {
+            open = false;
+        }
+        if ui.button(tl!("Cancel")).clicked() {
+            open = false;
+        }
+    });
+    if open {
+        app.assist.memory.editing_proposal = Some((id, edited));
+    }
 }
 
 /// The section of File › Options › Assistant.

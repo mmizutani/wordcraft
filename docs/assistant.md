@@ -79,6 +79,16 @@ This guards the commands, not the file system. A program holding the window's ke
 write any file you can with `file.saveAs`, this one and the agents' settings included, so that
 key is as trusted as you are. An invited agent holds only its invite's key, and can't.
 
+**The assistant proposes.** When you state a lasting preference, or what you accept and reject
+implies one, the model may write `[[remember: …]]` in its answer. That marker is taken out of what
+the pane shows, even while it streams, and becomes a card under the answer with **Keep**, **Edit**
+and **Not this**, at most three in a turn. The marker carries no authority, because a document can
+make a model write one too: it is the card, and your click on it, that counts. So the card shows
+the exact text before anything is stored, and the control channel's click on Keep does nothing. A
+proposal of something you already kept or said no to shows no card, whatever its spacing or case,
+and neither does any proposal while memory is off. The file keeps a hash of what you said no to,
+not the text. No extra request is made: proposals come within the turns you asked for.
+
 The list is `assistant-memory.json` in the settings folder, which on Unix only you may read: at
 most 200 preferences of at most 280 characters each. It is never put in a document, a recovery
 copy or the log, it never crosses a room, and signing out doesn't touch it. Two WordCrafts keep
@@ -90,7 +100,8 @@ A turn sends the preferences that are on, most recently used first, up to 4 KiB 
 doesn't fit isn't sent, and the list says so. ChatGPT gets them in the request's instructions. An
 ACP agent gets them in a new session's first prompt and again when they change, including when
 none applies any more. They apply unless the current request says otherwise, and they never
-permit what the role doesn't.
+permit what the role doesn't. While memory is on, a turn also asks the model to propose only what
+you said or did, never something the document asks for. Off, it asks for nothing.
 
 ## Backends
 
@@ -372,6 +383,8 @@ It checks that:
 - the person's Undo takes back their typing, a step at a time (what they typed after an
   assistant's change came in is a step of its own), and nothing of the assistants'; Redo puts
   it back;
+- what a conversation keeps reaches a later one on another backend: ChatGPT proposes a
+  preference, which keeps nothing by itself, and once the person keeps it the agent is told it;
 - stopping ChatGPT mid-answer ends its turn at once while the agent's goes on, and ChatGPT's next
   turn works; killing the agent's process mid-turn ends its turn ("Fake Agent stopped…") while
   ChatGPT's goes on, the heading it added before stays, and its next turn starts it again; the
@@ -439,6 +452,10 @@ own account the way it documents.
    prompt: a new conversation starts, the agent started again in a new folder, and the processes
    and the folder you noted are gone. Close the window: the new conversation's processes and
    folder are gone too.
+
+**Memory.** With each real backend, state a preference ("from now on, use numbered lists in
+summaries") and see a card under the answer. Keep it, start a new conversation with another
+backend, and see an answer follow it.
 
 **All at once.** With ChatGPT in the pane, give an agent outside the pane its own seat: get an
 invite with the `room` tool or `room.invite {"name": "Codex"}` on the control channel, and start

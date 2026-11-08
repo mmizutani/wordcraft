@@ -28,8 +28,9 @@
 //!
 //! What the assistant remembers across conversations (#86) is a file only the person writes:
 //! `assist.memory` reads it, for the window's key holder, and `assist.memory.add`, `.edit`,
-//! `.remove`, `.clear` and `.enabled` change it from File › Options › Assistant. Documents are
-//! untrusted and a kept preference outlasts them, so these writes are [`person_only`] too.
+//! `.remove`, `.clear` and `.enabled` change it from File › Options › Assistant, and `.keep` and
+//! `.dismiss` answer what the model proposes in the Assistant pane. Documents are untrusted and a
+//! kept preference outlasts them, so these writes are [`person_only`] too.
 //!
 //! A writing action is a prompt of ours ([`prompts`]) asked like any other, so its edits are the
 //! assistant's: tracked changes in its name while it is a suggester. The window gives the
@@ -199,6 +200,14 @@ pub fn specs() -> Vec<CommandSpec> {
             .params(r#"{"value": bool} → off, nothing is sent and items stay until cleared. Yours alone, as `assist.memory.add` is"#)
             .when(memory_here)
             .pure(),
+        CommandSpec::new("assist.memory.keep", "Keep This Preference", "Home › Assistant", memory_keep)
+            .params(r#"{"proposal": number, "text"?: string (at most 280 characters, in place of what it proposed)} → the conversation's proposal becomes a preference. Yours alone, as `assist.memory.add` is"#)
+            .when(memory_here)
+            .pure(),
+        CommandSpec::new("assist.memory.dismiss", "Not This Preference", "Home › Assistant", memory_dismiss)
+            .params(r#"{"proposal": number} → the conversation's proposal goes, and the assistant's proposing it again shows nothing. Yours alone, as `assist.memory.add` is"#)
+            .when(memory_here)
+            .pure(),
         CommandSpec::new("assist.draft", "Draft with the Assistant", "Home › Assistant", draft)
             .params(r#"{"about": string (what to write)} → the assistant writes it at the caret (after the selection, if there is one)"#)
             .when(can_ask)
@@ -312,6 +321,27 @@ fn memory_remove(s: &mut Session, v: &Value) -> CmdResult {
     let id = memory_id(v)?;
     s.push_ui_request(json!({"assist": "memory.remove", "id": id}));
     Ok(json!({"removed": true}))
+}
+
+/// The proposal in `v["proposal"]`: a number from 1, as the conversation gives it.
+fn memory_proposal(v: &Value) -> Result<u64, CmdError> {
+    v.get("proposal")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+        .ok_or_else(|| CmdError::Params("`proposal`: the conversation's, a whole number from 1".into()))
+}
+
+fn memory_keep(s: &mut Session, v: &Value) -> CmdResult {
+    let proposal = memory_proposal(v)?;
+    let text = if v.get("text").is_some_and(|t| !t.is_null()) { Some(memory_text(v)?) } else { None };
+    s.push_ui_request(json!({"assist": "memory.keep", "proposal": proposal, "text": text}));
+    Ok(json!({"kept": true}))
+}
+
+fn memory_dismiss(s: &mut Session, v: &Value) -> CmdResult {
+    let proposal = memory_proposal(v)?;
+    s.push_ui_request(json!({"assist": "memory.dismiss", "proposal": proposal}));
+    Ok(json!({"dismissed": true}))
 }
 
 fn memory_enabled(s: &mut Session, v: &Value) -> CmdResult {

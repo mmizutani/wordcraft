@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use serde::Serialize;
 
 use crate::backend::{Answer, Event, PermissionRequest, PlanEntry, StopReason, ToolCall};
+use crate::markers::{Markers, Piece};
 
 /// Most entries a transcript keeps.
 pub const MAX_ENTRIES: usize = 2048;
@@ -17,6 +18,17 @@ pub const MAX_BYTES: usize = 4 << 20;
 /// Most bytes of text one answer or thought keeps: what streams in after it is left out, and
 /// the entry ends with "…".
 pub const MAX_ENTRY_BYTES: usize = 256 << 10;
+
+/// Most proposals one turn shows; more are dropped.
+pub const MAX_PROPOSALS: u8 = 3;
+
+/// What the person said to a proposal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProposalAnswer {
+    Kept,
+    Dismissed,
+}
 
 /// One entry of a transcript.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -34,6 +46,9 @@ pub enum Entry {
     Plan { entries: Vec<PlanEntry> },
     /// A permission request, and its answer once given.
     Permission { request: PermissionRequest, answer: Option<Answer> },
+    /// The model proposes that the person keep a preference ([`crate::memory`]). It carries no
+    /// authority: only the person's click on the card stores anything.
+    Proposal { id: u64, text: String, answer: Option<ProposalAnswer> },
     /// Which model answered.
     Model { name: String },
     /// The turn stopped other than by finishing its answer.
@@ -48,6 +63,7 @@ impl Entry {
             Entry::Asked { text }
             | Entry::Answer { text }
             | Entry::Thought { text }
+            | Entry::Proposal { text, .. }
             | Entry::Model { name: text }
             | Entry::Error { message: text } => text.len(),
             Entry::Tool(t) => t.title.len() + t.detail.len() + t.id.len(),
@@ -69,6 +85,15 @@ pub struct Transcript {
     /// Where the current turn's entries start, counted from the front.
     #[serde(skip)]
     turn_start: usize,
+    /// The start of a marker waiting for the rest of it.
+    #[serde(skip)]
+    markers: Markers,
+    /// The last proposal's number.
+    #[serde(skip)]
+    last_proposal: u64,
+    /// How many proposals the current turn has shown.
+    #[serde(skip)]
+    proposed: u8,
 }
 
 impl Transcript {
@@ -105,14 +130,28 @@ impl Transcript {
 
     /// The person asked `text`: a new turn starts.
     pub fn asked(&mut self, text: &str) {
+        self.flush_markers();
         self.turn_start = self.entries.len();
+        self.proposed = 0;
         self.push(Entry::Asked { text: text.to_string() });
     }
 
     /// Add what `event` says.
     pub fn record(&mut self, event: &Event) {
+        if !matches!(event, Event::Text { .. }) {
+            self.flush_markers();
+        }
         match event {
-            Event::Text { text } => self.append(text, |e| matches!(e, Entry::Answer { .. }), |t| Entry::Answer { text: t }),
+            Event::Text { text } => {
+                for piece in self.markers.feed(text) {
+                    match piece {
+                        Piece::Text(t) => self.answer(&t),
+                        Piece::Remember(t) => self.propose(&t),
+                        // What shaped the answer is AS7.4's: for now the marker is only taken out.
+                        Piece::Used(_) => {}
+                    }
+                }
+            }
             Event::Thought { text } => self.append(text, |e| matches!(e, Entry::Thought { .. }), |t| Entry::Thought { text: t }),
             Event::Tool(call) => {
                 let i = self.in_turn().find(|(_, e)| matches!(e, Entry::Tool(t) if t.id == call.id)).map(|(i, _)| i);
@@ -148,6 +187,54 @@ impl Transcript {
                 }
             }
             Event::Error { message } => self.push(Entry::Error { message: message.clone() }),
+        }
+    }
+
+    /// The proposal `id`'s text, while the person hasn't answered it.
+    pub fn pending_proposal(&self, id: u64) -> Option<&str> {
+        self.entries.iter().rev().find_map(|e| match e {
+            Entry::Proposal { id: i, text, answer: None } if *i == id => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    /// The person answered proposal `id`.
+    pub fn answer_proposal(&mut self, id: u64, answer: ProposalAnswer) {
+        let found = self.entries.iter_mut().rev().find_map(|e| match e {
+            Entry::Proposal { id: i, answer: slot, .. } if *i == id => Some(slot),
+            _ => None,
+        });
+        if let Some(slot) = found {
+            *slot = Some(answer);
+        }
+    }
+
+    /// A piece of the answer. Only white space right after a proposal starts no entry of its own.
+    fn answer(&mut self, text: &str) {
+        if text.trim().is_empty() && matches!(self.entries.back(), Some(Entry::Proposal { .. })) {
+            return;
+        }
+        self.append(text, |e| matches!(e, Entry::Answer { .. }), |t| Entry::Answer { text: t });
+    }
+
+    /// The model proposes `text`, within the most a turn shows. An empty one or a second of the
+    /// same text in a turn is dropped. Numbered through the conversation.
+    fn propose(&mut self, text: &str) {
+        let Some(text) = crate::memory::clean(text) else { return };
+        let again = self.in_turn().any(|(_, e)| matches!(e, Entry::Proposal { text: t, .. } if *t == text));
+        if self.proposed >= MAX_PROPOSALS || again {
+            return;
+        }
+        self.proposed += 1;
+        self.last_proposal = self.last_proposal.saturating_add(1);
+        self.push(Entry::Proposal { id: self.last_proposal, text, answer: None });
+    }
+
+    /// What was held back as the start of a marker was only text.
+    fn flush_markers(&mut self) {
+        let held = self.markers.flush();
+        if !held.is_empty() {
+            self.answer(&held);
         }
     }
 

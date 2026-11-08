@@ -42,6 +42,7 @@ pub mod chatgpt;
 pub mod context;
 mod fake;
 mod feedback;
+mod markers;
 pub mod memory;
 pub mod offers;
 pub mod tools;
@@ -56,7 +57,7 @@ pub use context::{Caps, Context};
 pub use fake::{FAKE_ID, Fake, HOLD, Seen, Step};
 pub use feedback::{Decision, Feedback};
 pub use offers::{Host, Offer, Readiness};
-pub use transcript::{Entry, Transcript};
+pub use transcript::{Entry, ProposalAnswer, Transcript};
 
 /// The note a conversation's first turn carries, which the backend gives its model before the
 /// person's prompt: which document, the assistant's name and role, whether its edits are

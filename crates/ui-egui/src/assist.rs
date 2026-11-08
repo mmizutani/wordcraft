@@ -633,6 +633,7 @@ pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
         Entry::Tool(call) => vec![call.title.clone(), call.detail.clone()],
         Entry::Plan { entries } => entries.iter().map(|p| p.content.clone()).collect(),
         Entry::Permission { request, .. } => std::iter::once(request.title.clone()).chain(request.options.iter().map(|o| o.name.clone())).collect(),
+        Entry::Proposal { text, .. } => vec![text.clone()],
         Entry::Model { name } => vec![name.clone()],
         Entry::Stopped { .. } => vec![],
         Entry::Error { message } => vec![message.clone()],

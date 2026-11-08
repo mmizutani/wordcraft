@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use super::{BUDGET, DAMAGED_SUFFIX, FILE, ForModel, MAX_ITEMS, MAX_TEXT, Memory, NONE_APPLY, PREFACE};
+use super::{ASK, BUDGET, DAMAGED_SUFFIX, FILE, ForModel, MAX_ITEMS, MAX_TEXT, Memory, NO_LIST, PREFACE};
 
 const NOW: &str = "2026-11-08T10:00:00Z";
 
@@ -185,7 +185,8 @@ fn memory(texts: &[&str]) -> Memory {
 
 #[test]
 fn off_or_disabled_sends_nothing_and_most_recently_used_goes_first() {
-    assert_eq!(Memory::default().for_model(), ForModel::default());
+    let empty = Memory::default().for_model();
+    assert_eq!(empty.text, Some(format!("{ASK}\n\n{NO_LIST}")), "on with nothing kept, it may still propose");
     let mut m = memory(&["One.", "Two.", "Three."]);
     m.edit("m2", None, Some(true)).unwrap();
     m.items[0].last_used = Some("2026-11-09T00:00:00Z".into());
@@ -193,15 +194,25 @@ fn off_or_disabled_sends_nothing_and_most_recently_used_goes_first() {
     assert_eq!(sent.sent, ["m1", "m3"]);
     assert_eq!(sent.left_out, Vec::<String>::new());
     let text = sent.text.unwrap();
-    assert!(text.starts_with(PREFACE) && text.ends_with(r#"[{"id":"m1","text":"One."},{"id":"m3","text":"Three."}]"#), "{text}");
+    assert!(text.starts_with(ASK) && text.contains(PREFACE), "{text}");
+    assert!(text.ends_with(r#"[{"id":"m1","text":"One."},{"id":"m3","text":"Three."}]"#), "{text}");
     m.enabled = false;
-    assert_eq!(m.for_model(), ForModel::default());
+    assert_eq!(m.for_model(), ForModel::default(), "off asks for nothing and sends nothing");
     m.enabled = true;
     for id in ["m1", "m3"] {
         m.edit(id, None, Some(true)).unwrap();
     }
-    assert_eq!(m.for_model(), ForModel::default(), "every item off");
-    assert!(!NONE_APPLY.is_empty());
+    assert_eq!(m.for_model().sent, Vec::<String>::new(), "every item off");
+    assert!(m.for_model().text.unwrap().ends_with(NO_LIST));
+}
+
+#[test]
+fn a_proposal_of_an_item_or_a_dismissed_text_is_known() {
+    let mut m = memory(&["Use numbered lists."]);
+    m.dismiss("Never use  Oxford commas");
+    assert!(m.known("  use NUMBERED lists. "));
+    assert!(m.known("never use oxford commas"));
+    assert!(!m.known("Something else."));
 }
 
 /// For any text, what is sent stays in the budget, escaped as it goes: quotes double in JSON.
@@ -218,7 +229,7 @@ fn what_is_sent_stays_within_the_budget() {
         assert!(!sent.left_out.is_empty(), "{one}: the rest didn't fit");
         assert_eq!(sent.sent.len() + sent.left_out.len(), MAX_ITEMS, "{one}");
         // What is listed is what went: the list is valid JSON naming exactly those ids.
-        let list = text.lines().nth(1).unwrap();
+        let list = text.lines().last().unwrap();
         let v: serde_json::Value = serde_json::from_str(list).unwrap();
         let ids: Vec<&str> = v.as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
         assert_eq!(ids, sent.sent.iter().map(String::as_str).collect::<Vec<_>>(), "{one}");
