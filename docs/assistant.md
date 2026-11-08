@@ -77,10 +77,14 @@ line; an address an agent fetched, which opens only on your own click. An agent'
 say where it looked is listed by its title. **Output** lists the tracked changes and comments this
 conversation made, newest first and by turn, by the name it joined under, while the pane is open:
 each with its words cut short, Show, and for a change, Accept and Reject of that change alone. A
-change someone resolved, you or anyone in the room, says how it ended, read from the text: an
-insertion whose words are still where they were was accepted, a deletion's the other way round, and
-a formatting change or a move says only that it was resolved. A comment says whether it is open,
-resolved or deleted. At most 256 changes are listed, and the rest are counted; Review has them all.
+change someone resolved, you or anyone in the room, says how it ended, read from how many times its
+words are in its paragraph: fewer than before means an insertion was rejected or a deletion
+accepted, as many means the other way round. A formatting change, a move, or a change in a paragraph
+longer than 64 KiB says only that it was resolved. A comment says whether it is open, resolved or
+deleted. At most 256 changes and 64 comments are listed, and the rest are counted; Review has them
+all, and while some are past the limit no row is said to have ended. Rows that ended go first when
+the list is full. `review.accept` and `review.reject` take an `author`, which leaves anyone else's
+changes in the selection alone.
 Accept all and Reject all stay under both views. **Properties**
 says which assistant it is, with the version an agent gives, the document it works on, its role,
 whether its edits are tracked, the model that answered, and what the last turn used: tokens for
