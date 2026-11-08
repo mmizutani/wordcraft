@@ -720,6 +720,7 @@ fn the_menus_follow_what_the_backend_offers_and_what_is_chosen() {
     assert_eq!((m.chosen_model.as_deref(), m.running_model.as_deref()), (Some("deep"), Some("Deep")));
     assert_eq!(ids(&m.efforts), ["low", "max"]);
     assert_eq!(m.efforts.iter().filter(|e| e.is_default).map(|e| e.id.as_str()).collect::<Vec<_>>(), ["low"]);
+    assert_eq!(m.effort.as_deref(), Some("low"), "its default, not the session's level, which it doesn't take");
     // What isn't offered is refused, and what was chosen stays.
     let e = a.execute("assist.model", json!({"id": "gone"})).unwrap_err();
     assert!(e.contains("gone") && e.contains("fast, deep"), "{e}");
@@ -819,6 +820,7 @@ fn the_menus_show_in_the_prompt_row_and_are_disabled_during_a_turn() {
     h.get_by_label("Low (default)").click();
     h.run_steps(2);
     assert_eq!(h.state().session.prefs.assistant.models["fake"].effort, None);
+    assert_eq!(shows(&h, "Effort:").as_deref(), Some("Low"), "the default it went back to is ticked");
     // With no level tagged, a Default row of its own does the same.
     h.state_mut().execute("assist.model", json!({"id": "fast"})).unwrap();
     h.state_mut().execute("assist.effort", json!({"level": "think"})).unwrap();
