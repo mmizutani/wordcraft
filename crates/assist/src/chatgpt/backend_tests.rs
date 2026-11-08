@@ -866,6 +866,29 @@ fn an_effort_refused_in_the_stream_corrects_the_line_already_shown() {
 }
 
 #[test]
+fn an_effort_refused_in_the_stream_corrects_the_line_even_if_the_retry_fails() {
+    let failed = json!({"type": "response.failed", "response": {"status": "failed", "error": {"code": "unsupported_value", "param": "reasoning.effort", "message": "no"}}});
+    let first = Reply::sse(&[json!({"type": "response.created", "response": {"model": "gpt-6-luna"}}), failed]);
+    let mut c = listing(real_list(), vec![first, refusal(400, "bad_request", "No.")]);
+    c.ask("Hello");
+    assert_eq!(c.bodies().len(), 2);
+    assert!(c.error().is_some());
+    assert_eq!(model_line(&c), Some(("GPT-6-Luna".to_string(), None, false)));
+}
+
+#[test]
+fn a_list_with_nothing_usable_is_read_again_next_turn() {
+    let mut c = listing(Reply::json(200, &json!({})), vec![says("Hi.")]);
+    c.ask("Hello");
+    assert!(c.error().unwrap().contains("offers no model"), "{:?}", c.error());
+    *c.script.models.lock().unwrap() = Some(real_list());
+    c.ask("Again");
+    assert_eq!(c.error(), None);
+    assert_eq!(c.bodies()[0]["model"], "gpt-6-luna");
+    assert_eq!(c.server.to("/v1/models").len(), 2);
+}
+
+#[test]
 fn a_refused_effort_stays_left_out_until_the_model_changes() {
     let mut c = listing(real_list(), vec![effort_refused(), says("Hi."), says("Again."), says("Other.")]);
     c.ask("Hello");

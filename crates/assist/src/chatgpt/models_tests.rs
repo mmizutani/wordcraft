@@ -107,6 +107,7 @@ fn the_list_survives_junk_levels_huge_lists_and_control_characters() {
         {"slug": "a", "display_name": "A\u{0}\u{7}\u{202E}!", "supported_reasoning_levels": junk_levels, "default_reasoning_level": {"effort": []}},
         {"slug": "b", "display_name": "n".repeat(10_000), "description": "d".repeat(10_000), "supported_reasoning_levels": many},
         {"slug": "c", "display_name": 7, "description": [], "supported_reasoning_levels": "low", "default_reasoning_level": 9},
+        {"slug": "d", "display_name": " \u{0}\u{202E}"},
     ]}));
     assert_eq!(models[0].name, "A!");
     assert_eq!(models[0].efforts, ["low", "high"]);
@@ -114,4 +115,5 @@ fn the_list_survives_junk_levels_huge_lists_and_control_characters() {
     assert_eq!(models[1].efforts.len(), 16);
     assert_eq!((models[1].name.chars().count(), models[1].description.as_ref().map(|d| d.chars().count())), (80, Some(300)));
     assert_eq!((models[2].name.as_str(), models[2].efforts.len(), models[2].description.clone()), ("c", 0, None));
+    assert_eq!(models[3].name, "d", "a name with nothing to show is its id");
 }

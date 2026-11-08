@@ -155,7 +155,8 @@ impl ChatGpt {
                 return Ok(None);
             };
             match (read, &model) {
-                (Ok(list), _) => self.listed = Some(list),
+                // A list with nothing usable in it isn't kept: the next turn reads it again.
+                (Ok(list), _) => self.listed = Some(list).filter(|l| !l.is_empty()),
                 (Err(e), Some(_)) if !matches!(e, AuthError::NotSignedIn | AuthError::SignInAgain | AuthError::Denied) => {
                     log::info!("ChatGPT: the models can't be listed ({e}); the turn runs what was chosen");
                 }
@@ -959,8 +960,12 @@ fn fallback_notes(resolved: &Resolved, model: Option<&str>, effort: Option<&str>
 /// ChatGPT refused the level asked for: the turn goes on without one, and says so.
 fn effort_not_applied(progress: &mut Progress, ctx: &TurnCtx<'_>) {
     if let Some(effort) = progress.running.effort.take() {
-        progress.shown = None;
         ctx.emit(Event::Note { text: format!("ChatGPT didn't take {effort} effort for {}: it wasn't applied.", progress.running.name) });
+        // A line the stream already showed says what was refused: it changes now, in case the
+        // retry never gets as far.
+        if progress.shown.take().is_some() {
+            show_model(None, None, progress, ctx);
+        }
     }
 }
 

@@ -82,12 +82,13 @@ pub(crate) fn models_in(json: &Value) -> Vec<ModelOption> {
         .filter(|m| m.get("visibility").and_then(Value::as_str).is_none_or(|v| v == "list"))
         .filter_map(|m| {
             let id = m.get("slug").or_else(|| m.get("id")).and_then(Value::as_str).filter(|s| valid_model(s))?;
-            let name = m.get("display_name").and_then(Value::as_str).unwrap_or(id);
+            let name: String = m.get("display_name").and_then(Value::as_str).map(|n| label(n).chars().take(MAX_NAME).collect()).unwrap_or_default();
+            let name = if name.trim().is_empty() { id.to_string() } else { name };
             let description = m.get("description").and_then(Value::as_str).map(|d| label(d).chars().take(MAX_DESCRIPTION).collect());
             let efforts = levels_in(m);
             let offered = |level: &String| efforts.is_empty() || efforts.contains(level);
             let default_effort = m.get("default_reasoning_level").and_then(level_in).filter(offered);
-            Some(ModelOption { id: id.to_string(), name: label(name).chars().take(MAX_NAME).collect(), description, efforts, default_effort })
+            Some(ModelOption { id: id.to_string(), name, description, efforts, default_effort })
         })
         .take(MAX_MODELS)
         .collect()
