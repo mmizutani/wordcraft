@@ -45,6 +45,13 @@ pub struct Script {
     pub turns: Vec<Vec<Step>>,
     /// Turns by prompt: a prompt whose last text block is one of these does its list instead.
     pub replies: BTreeMap<String, Vec<Step>>,
+    /// The `configOptions` `session/new` answers with, when it has any.
+    pub config_options: Option<Value>,
+    /// What `session/set_config_option` answers with for a value: all the options, which a model
+    /// may change (else the ones it has, with that value current).
+    pub after_set: BTreeMap<String, Value>,
+    /// `session/set_config_option` is refused with this message.
+    pub refuse_set: Option<String>,
 }
 
 /// One thing a fake agent does in a turn.
@@ -71,6 +78,8 @@ pub enum Step {
     },
     /// Its plan: one entry per string, the first in progress.
     Plan { entries: Vec<String> },
+    /// Say its config options have changed to `options` (a `config_option_update`).
+    ConfigUpdate { options: Value },
     /// Ask permission for tool call `id` (options "allow" and "reject"), then say what came
     /// back: "permission: allow", "permission: reject" or "permission: cancelled".
     Ask { id: String, title: String },
@@ -92,7 +101,8 @@ pub enum Step {
     },
     /// Say, as JSON, what it was given: its folder (`cwd`, `cwdEmpty`), what `session/new`
     /// had (`session`), its `WORDCRAFT_*` environment (`env`), the prompt's text blocks
-    /// (`prompt`) and its process id (`pid`).
+    /// (`prompt`), its process id (`pid`) and the `session/set_config_option` requests it had
+    /// (`setConfig`).
     Report,
     /// Make `calls` on the first MCP server `session/new` gave, started the way an agent starts
     /// it (its command, args and env), and say each result on a line of its own: "<tool>: ok
@@ -154,7 +164,18 @@ pub fn run(script: &Script) -> i32 {
     if reader.is_err() {
         return 70;
     }
-    let mut agent = Agent { script, rx, authenticated: false, session: Value::Null, prompt: Vec::new(), turn: 0, next_id: 1, cancelled: false };
+    let mut agent = Agent {
+        script,
+        rx,
+        authenticated: false,
+        session: Value::Null,
+        prompt: Vec::new(),
+        turn: 0,
+        next_id: 1,
+        cancelled: false,
+        config: script.config_options.clone(),
+        set: Vec::new(),
+    };
     agent.serve()
 }
 
@@ -170,6 +191,10 @@ struct Agent<'a> {
     next_id: i64,
     /// Whether the client sent `session/cancel` in this turn.
     cancelled: bool,
+    /// Its config options as they stand.
+    config: Option<Value>,
+    /// The `session/set_config_option` requests it had, in order.
+    set: Vec<Value>,
 }
 
 impl Agent<'_> {
@@ -223,7 +248,28 @@ impl Agent<'_> {
             "session/new" if self.script.needs_auth && !self.authenticated => fail(id, -32000, "Authentication required"),
             "session/new" => {
                 self.session = params;
-                reply(id, json!({"sessionId": SESSION}));
+                match &self.config {
+                    Some(config) => reply(id, json!({"sessionId": SESSION, "configOptions": config})),
+                    None => reply(id, json!({"sessionId": SESSION})),
+                }
+            }
+            "session/set_config_option" => {
+                self.set.push(params.clone());
+                if let Some(why) = &self.script.refuse_set {
+                    fail(id, -32602, why);
+                    return None;
+                }
+                let value = params.get("value").and_then(Value::as_str).unwrap_or_default();
+                let config_id = params.get("configId").and_then(Value::as_str).unwrap_or_default();
+                let mut config = self.script.after_set.get(value).cloned().or_else(|| self.config.clone()).unwrap_or(Value::Null);
+                if !self.script.after_set.contains_key(value)
+                    && let Some(option) =
+                        config.as_array_mut().and_then(|o| o.iter_mut().find(|o| o.get("id").and_then(Value::as_str) == Some(config_id)))
+                {
+                    option["currentValue"] = json!(value);
+                }
+                self.config = Some(config.clone());
+                reply(id, json!({"configOptions": config}));
             }
             "session/prompt" => return self.prompt(id, &params),
             _ => fail(id, -32601, "Method not found"),
@@ -289,6 +335,10 @@ impl Agent<'_> {
                     "sessionUpdate": "tool_call_update", "toolCallId": call, "status": status,
                     "content": [{"type": "content", "content": {"type": "text", "text": text}}],
                 })),
+                Step::ConfigUpdate { options } => {
+                    self.config = Some(options.clone());
+                    update(json!({"sessionUpdate": "config_option_update", "configOptions": options}));
+                }
                 Step::Plan { entries } => {
                     let entries: Vec<Value> = entries
                         .iter()
@@ -380,6 +430,7 @@ impl Agent<'_> {
             "env": env,
             "prompt": self.prompt,
             "pid": std::process::id(),
+            "setConfig": self.set,
         })
     }
 

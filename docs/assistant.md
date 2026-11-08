@@ -141,6 +141,19 @@ the Default row and says so on hover. A read that fails shows the reason under t
 stop a turn that has a saved choice, and is tried again the next time the pane opens. A conversation
 reads the list once, and again if the person chooses a model its copy doesn't have.
 
+**An agent's menus.** An ACP agent says what it offers through its session config options: the ones
+with category `model` and `thought_level`, groups flattened. WordCraft leaves other categories and
+`modes` alone, and booleans stay off, since it doesn't advertise them. Before the first prompt, and
+on any turn whose choice differs from the current value, it sends `session/set_config_option`, whose
+answer holds the whole set, since a model can change the levels. A value the agent no longer offers
+is skipped with a note, and one it refuses is said, without stopping the turn. Going back to Default
+sets what WordCraft changed back to what it was. `config_option_update` changes the menus and the
+turn's line.
+
+An agent starts on its first turn, so until then the menus have Default only and say so on hover.
+An agent that offers neither option has no menus. The line shows the current model option's name,
+or nothing: the agent's own name and version aren't a model.
+
 **The commands.** `assist.model {"id"?: string | null}` and `assist.effort {"level"?: string | null}`
 choose for the assistant in use: leave the param out to read, and `null` goes back to the default.
 Each answers with the backend, what is chosen, what the last turn says ran and what the menus
@@ -444,6 +457,9 @@ own account the way it documents.
    "Start" and the agent's name while it starts, and asks you to sign the agent in if it needs
    to; the section comes in as tracked changes in the agent's name, with its plan and tool calls
    in the pane. A permission request the agent makes waits in the pane for your answer.
+   If the agent offers a model or a thought level, the menus beside Send list them after this
+   first turn. Choose another and send a prompt: the line shows it, and the agent keeps the
+   conversation. Note in #84 which agents offer which.
 3. Ask it to save the document somewhere, or to read a file on your computer: it says it can't.
 4. Ask it to rewrite the whole document and press Stop: it stops, and the next prompt goes on.
 5. Pi only: its tool calls are `wordcraft-cli call` commands in its shell (see [Pi](#pi)).

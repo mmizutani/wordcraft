@@ -19,6 +19,7 @@
 //!
 //! Desktop only: the web build starts no process.
 
+mod config;
 pub mod fake_agent;
 pub mod presets;
 mod room_port;
@@ -39,6 +40,7 @@ use crate::backend::{
     Answer, Backend, BackendInfo, Event, MAX_OPTIONS, MAX_PLAN, PermissionKind, PermissionOption, PermissionPolicy, PermissionRequest, PlanEntry,
     PlanStatus, Priority, Seat, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, label,
 };
+use config::{Config, Select};
 pub use room_port::RoomPort;
 pub use rpc::{AUTH_REQUIRED, MAX_LINE, METHOD_NOT_FOUND, STDERR_TAIL};
 use rpc::{Incoming, Message, Process, RpcError, classify};
@@ -243,6 +245,10 @@ struct Running {
     /// Its folder: new and empty, removed when it stops.
     folder: Folder,
     session: String,
+    /// The session's config options, as the agent last said them.
+    config: Config,
+    /// What the model and the level were before WordCraft changed them: Default goes back to it.
+    before: (Option<String>, Option<String>),
 }
 
 /// An ACP agent as a backend.
@@ -301,18 +307,15 @@ impl Acp {
             Err(e) => (ToolStatus::Failed, e.clone()),
         };
         ctx.emit(Event::Tool(ToolCall { status, detail, ..row }));
-        let Some((running, agent)) = started? else { return Ok(false) };
+        let Some(running) = started? else { return Ok(false) };
         self.running = Some(running);
-        if let Some(name) = agent {
-            ctx.emit(Event::Model { name, effort: None, asked: false });
-        }
         Ok(true)
     }
 
     /// Start the agent: its process in a new empty folder, `initialize`, and a session (signing
-    /// in first when it asks for that and the person picks a way), with what it says it is.
-    /// `None` when the turn was stopped meanwhile.
-    fn start(&mut self, ctx: &mut TurnCtx<'_>) -> Result<Option<(Running, Option<String>)>, String> {
+    /// in first when it asks for that and the person picks a way). `None` when the turn was
+    /// stopped meanwhile.
+    fn start(&mut self, ctx: &mut TurnCtx<'_>) -> Result<Option<Running>, String> {
         let name = self.name().to_string();
         let (mcp_servers, reach_env) = self.reach()?;
         if !self.approve_setup(ctx)? || ctx.is_cancelled() {
@@ -350,7 +353,9 @@ impl Acp {
             let theirs = version.map_or_else(|| "an unknown version".to_string(), |v| format!("version {v}"));
             return Err(format!("{name} speaks {theirs} of the Agent Client Protocol, and WordCraft speaks version {PROTOCOL_VERSION}"));
         }
-        let agent = agent_info(&init);
+        if let Some(agent) = agent_info(&init) {
+            log::info!("assistant: {name} says it is {agent}");
+        }
         let methods = auth_methods(&init);
         let new_session = json!({"cwd": cwd, "mcpServers": mcp_servers});
         let mut signed_in = false;
@@ -361,7 +366,7 @@ impl Acp {
                 Ok(result) => {
                     let session = result.get("sessionId").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 1024);
                     let session = session.ok_or_else(|| format!("{name} started no session"))?.to_string();
-                    return Ok(Some((Running { process, folder, session }, agent)));
+                    return Ok(Some(Running { process, folder, session, config: Config::parse(&result), before: (None, None) }));
                 }
                 Err(e) if e.code == AUTH_REQUIRED && !signed_in => {
                     if !self.sign_in(&mut process, &methods, ctx)? {
@@ -436,6 +441,68 @@ impl Acp {
         if let Some(mut running) = self.running.take() {
             running.process.stop(grace);
             running.folder.remove();
+        }
+    }
+
+    /// Set what the person chose for this turn, model first: its answer may change the levels.
+    /// A value it no longer offers is skipped, with a note, and so is one it refuses: neither stops
+    /// the turn. Nothing chosen goes back to what WordCraft changed, if it changed anything.
+    /// Whether anything changed.
+    fn apply_choice(&mut self, turn: &Turn, ctx: &TurnCtx<'_>) -> Result<bool, String> {
+        let mut changed = false;
+        for (is_model, wanted) in [(true, turn.model.as_ref()), (false, turn.effort.as_ref())] {
+            let name = self.name().to_string();
+            let timeout = self.spec.start_timeout;
+            let Some(running) = self.running.as_mut() else { break };
+            let (option, before) =
+                if is_model { (&running.config.model, &mut running.before.0) } else { (&running.config.thought, &mut running.before.1) };
+            let Some(Select { id, current, .. }) = option.as_ref() else { continue };
+            let Some(target) = wanted.or(before.as_ref()).cloned() else { continue };
+            if option.as_ref().is_some_and(|o| !o.offers(&target)) {
+                if wanted.is_some() {
+                    ctx.emit(Event::Note { text: format!("{name} doesn't offer {target} now: it goes on with {current}.") });
+                }
+                continue;
+            }
+            if target != *current {
+                if wanted.is_some() && before.is_none() {
+                    *before = Some(current.clone());
+                }
+                let params = json!({"sessionId": running.session, "configId": id, "value": target});
+                let asked = running.process.request("session/set_config_option", params)?;
+                match wait_for(&mut running.process, asked, Instant::now() + timeout, ctx, &name)? {
+                    None => return Ok(changed),
+                    Some(Ok(answer)) if answer.get("configOptions").is_some() => {
+                        running.config = Config::parse(&answer);
+                        changed = true;
+                    }
+                    Some(Ok(_)) => {
+                        // The protocol says it answers with all of them; this one didn't.
+                        let option = if is_model { &mut running.config.model } else { &mut running.config.thought };
+                        if let Some(option) = option {
+                            option.current = target;
+                        }
+                        changed = true;
+                    }
+                    Some(Err(e)) => ctx.emit(Event::Note { text: format!("{name} didn't change to {target}: {}", e.message) }),
+                }
+            }
+            if wanted.is_none() {
+                let before = if is_model { &mut running.before.0 } else { &mut running.before.1 };
+                *before = None;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Tell the pane what the session's config options offer and which model runs.
+    fn show_config(&self, ctx: &TurnCtx<'_>, offer: bool) {
+        let Some(running) = &self.running else { return };
+        if offer {
+            ctx.emit(Event::Options(running.config.offered()));
+        }
+        if let Some((name, effort)) = running.config.line() {
+            ctx.emit(Event::Model { name, effort, asked: false });
         }
     }
 
@@ -514,6 +581,12 @@ impl Acp {
             Some("plan") => {
                 let entries = update.get("entries").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
                 ctx.emit(Event::Plan { entries: entries.iter().filter_map(plan_entry).take(MAX_PLAN).collect() });
+            }
+            Some("config_option_update") => {
+                if let Some(running) = self.running.as_mut() {
+                    running.config = Config::parse(update);
+                }
+                self.show_config(ctx, true);
             }
             // The person's prompt echoed, modes, commands, usage…: nothing to show.
             _ => {}
@@ -637,6 +710,11 @@ impl Backend for Acp {
         if fresh && !self.start_shown(ctx)? {
             return Ok(StopReason::Cancelled);
         }
+        let changed = self.apply_choice(turn, ctx)?;
+        if ctx.is_cancelled() {
+            return Ok(StopReason::Cancelled);
+        }
+        self.show_config(ctx, fresh || changed);
         // A new session gets the note, which the agent's model reads first.
         let note = if fresh { self.note.as_deref() } else { None };
         let prompt: Vec<Value> = [note, turn.context.as_deref(), Some(turn.prompt.as_str())]

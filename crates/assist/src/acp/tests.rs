@@ -282,7 +282,7 @@ fn an_agent_streams_its_answer_thoughts_tool_calls_and_plan() {
     c.ask("Hi");
     let start = c.tool(START_ROW).unwrap();
     assert_eq!((start.title.as_str(), start.status), ("Start Fake Agent", ToolStatus::Completed));
-    assert!(c.turn().contains(&Entry::Model { name: "Fake Agent 1.0".into(), effort: None, asked: false }), "{:?}", c.turn());
+    assert!(!c.turn().iter().any(|e| matches!(e, Entry::Model { .. })), "the agent's own name and version aren't a model: {:?}", c.turn());
     assert!(c.turn().contains(&Entry::Thought { text: "Pondering".into() }));
     let t1 = c.tool("t1").unwrap();
     assert_eq!((t1.title.as_str(), t1.kind.as_str(), t1.status), ("Read the document", "read", ToolStatus::Completed));
@@ -802,4 +802,181 @@ fn permission_options_plans_and_stop_reasons_map_from_the_protocol() {
 fn an_agent_is_named_by_its_label() {
     let spec = AgentSpec::new(" Claude Code\u{7} ", Launch::new("claude-agent-acp", Vec::<String>::new()));
     assert_eq!((spec.id.as_str(), spec.label.as_str(), spec.author.as_str()), ("acp:claude-code", "Claude Code", "Claude Code"));
+}
+
+/// An agent's config options: its model, a level for how hard it thinks, and what WordCraft leaves
+/// alone.
+fn options(model: &str, level: &str) -> Value {
+    json!([
+        {"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": "ask", "options": [{"value": "ask", "name": "Ask"}]},
+        {"id": "brave", "name": "Brave", "category": "model", "type": "boolean", "currentValue": true},
+        {"id": "the-model", "name": "Model", "category": "model", "type": "select", "currentValue": model, "options": [
+            {"group": "fast", "name": "Fast ones", "options": [{"value": "fast", "name": "Fast", "description": "Quick"}]},
+            {"group": "deep", "name": "Deep ones", "options": [{"value": "deep", "name": "Deep"}]},
+        ]},
+        {"id": "the-level", "name": "Thinking", "category": "thought_level", "currentValue": level, "options": [
+            {"value": "skim", "name": "Skim"}, {"value": "think", "name": "Think hard"},
+        ]},
+    ])
+}
+
+fn configured(turns_: Vec<Vec<Step>>) -> Script {
+    Script { config_options: Some(options("fast", "skim")), ..turns(turns_) }
+}
+
+/// What the agent's last report says it was asked to set.
+fn set_config(c: &Chat) -> Vec<(String, String)> {
+    let report = c.report();
+    let asked = report["setConfig"].as_array().unwrap();
+    asked.iter().map(|s| (s["configId"].as_str().unwrap().to_string(), s["value"].as_str().unwrap().to_string())).collect()
+}
+
+fn pair(a: &str, b: &str) -> (String, String) {
+    (a.to_string(), b.to_string())
+}
+
+fn line(c: &Chat) -> Option<(String, Option<String>)> {
+    c.turn().into_iter().find_map(|e| match e {
+        Entry::Model { name, effort, .. } => Some((name, effort)),
+        _ => None,
+    })
+}
+
+fn notes(c: &Chat) -> Vec<String> {
+    c.turn()
+        .into_iter()
+        .filter_map(|e| match e {
+            Entry::Note { text } => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_choice_reaches_the_agent_before_its_first_prompt() {
+    let mut c = Chat::with(&configured(vec![vec![Step::Report]]));
+    c.a.choose(Some("deep".into()), Some("think".into()));
+    c.ask("Hello");
+    assert_eq!(set_config(&c), [pair("the-model", "deep"), pair("the-level", "think")]);
+    assert_eq!(line(&c), Some(("Deep".to_string(), Some("Think hard".to_string()))));
+    let offered = c.a.offered().unwrap().clone();
+    assert_eq!(offered.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["fast", "deep"], "groups flattened");
+    assert_eq!(offered.models[0].description.as_deref(), Some("Quick"));
+    assert_eq!(offered.efforts.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["Skim", "Think hard"]);
+    assert_eq!((offered.model.as_deref(), offered.effort.as_deref()), (Some("deep"), Some("think")));
+}
+
+#[test]
+fn nothing_is_set_when_nothing_is_chosen_or_it_already_runs() {
+    let mut c = Chat::with(&configured(vec![vec![Step::Report], vec![Step::Report]]));
+    c.ask("Hello");
+    assert_eq!(set_config(&c), []);
+    assert_eq!(line(&c), Some(("Fast".to_string(), Some("Skim".to_string()))), "the line says what the agent has");
+    c.a.choose(Some("fast".into()), Some("skim".into()));
+    c.ask("Again");
+    assert_eq!(set_config(&c), []);
+}
+
+#[test]
+fn a_later_turn_sets_only_what_changed_and_the_conversation_goes_on() {
+    let mut c = Chat::with(&configured(vec![vec![Step::Report], vec![Step::Report], vec![Step::Report]]));
+    c.ask("First");
+    let pid = c.report()["pid"].clone();
+    c.a.choose(None, Some("think".into()));
+    c.ask("Second");
+    assert_eq!(set_config(&c), [pair("the-level", "think")]);
+    assert_eq!(c.report()["pid"], pid, "the same agent");
+    // Going back to the default sets what WordCraft changed back to what it was.
+    c.a.choose(None, None);
+    c.ask("Third");
+    assert_eq!(set_config(&c), [pair("the-level", "think"), pair("the-level", "skim")]);
+    assert_eq!(line(&c), Some(("Fast".to_string(), Some("Skim".to_string()))));
+}
+
+#[test]
+fn a_value_no_longer_offered_is_skipped_with_a_note() {
+    let mut c = Chat::with(&configured(vec![vec![Step::Report]]));
+    c.a.choose(Some("gone".into()), Some("think".into()));
+    c.ask("Hello");
+    assert_eq!(set_config(&c), [pair("the-level", "think")], "the rest is applied");
+    let says = notes(&c);
+    assert!(says.iter().any(|n| n.contains("gone") && n.contains("fast")), "{says:?}");
+    assert_eq!(c.error(), None);
+}
+
+#[test]
+fn a_model_change_can_change_the_levels_and_the_answer_replaces_them() {
+    let after = json!([
+        {"id": "the-model", "category": "model", "currentValue": "deep", "options": [{"value": "fast", "name": "Fast"}, {"value": "deep", "name": "Deep"}]},
+        {"id": "the-level", "category": "thought_level", "currentValue": "max", "options": [{"value": "max", "name": "Max"}]},
+    ]);
+    let script = Script { after_set: [("deep".to_string(), after)].into_iter().collect(), ..configured(vec![vec![Step::Report]]) };
+    let mut c = Chat::with(&script);
+    c.a.choose(Some("deep".into()), Some("think".into()));
+    c.ask("Hello");
+    assert_eq!(set_config(&c), [pair("the-model", "deep")], "the level is checked against the new set");
+    assert!(notes(&c).iter().any(|n| n.contains("think")), "{:?}", notes(&c));
+    let offered = c.a.offered().unwrap();
+    assert_eq!(offered.efforts.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(), ["max"]);
+    assert_eq!(line(&c), Some(("Deep".to_string(), Some("Max".to_string()))));
+}
+
+#[test]
+fn a_config_option_update_changes_what_is_offered_and_the_line() {
+    let mut c = Chat::with(&configured(vec![vec![Step::ConfigUpdate { options: options("deep", "think") }, say("Done")]]));
+    c.ask("Hello");
+    assert_eq!(c.a.offered().unwrap().model.as_deref(), Some("deep"));
+    assert_eq!(line(&c), Some(("Deep".to_string(), Some("Think hard".to_string()))));
+    assert_eq!(c.turn().iter().filter(|e| matches!(e, Entry::Model { .. })).count(), 1, "the line is replaced");
+    assert_eq!(c.answer(), "Done");
+}
+
+#[test]
+fn a_refused_change_is_said_and_the_turn_goes_on() {
+    let script = Script { refuse_set: Some("not now".into()), ..configured(vec![vec![say("Hi")]]) };
+    let mut c = Chat::with(&script);
+    c.a.choose(Some("deep".into()), None);
+    c.ask("Hello");
+    assert!(notes(&c).iter().any(|n| n.contains("deep") && n.contains("not now")), "{:?}", notes(&c));
+    assert_eq!((c.answer().as_str(), c.error()), ("Hi", None));
+    assert_eq!(line(&c), Some(("Fast".to_string(), Some("Skim".to_string()))));
+}
+
+#[test]
+fn an_agent_with_no_options_says_so_and_a_choice_goes_nowhere() {
+    let mut c = Chat::with(&turns(vec![vec![Step::Report]]));
+    c.a.choose(Some("deep".into()), Some("think".into()));
+    c.ask("Hello");
+    assert_eq!(set_config(&c), []);
+    assert_eq!(c.a.offered(), Some(&crate::Offered::default()));
+    assert_eq!((line(&c), notes(&c)), (None, vec![]));
+}
+
+#[test]
+fn junk_options_are_skipped_and_never_panic() {
+    let many: Vec<Value> = (0..1000).map(|i| json!({"value": format!("m{i}"), "name": "n\u{202E}\u{0}ame"})).collect();
+    let junk = json!([
+        7, null, "x", [], {}, {"id": 7}, {"category": "model"},
+        {"id": "no-current", "category": "model", "options": [{"value": "a"}]},
+        {"id": "no-values", "category": "model", "currentValue": "a", "options": []},
+        {"id": "not-a-list", "category": "model", "currentValue": "a", "options": "a"},
+        {"id": "another-type", "category": "model", "type": "slider", "currentValue": "a", "options": [{"value": "a"}]},
+        {"id": "two\nlines", "category": "model", "currentValue": "a", "options": [{"value": "a"}]},
+        {"id": "only-junk", "category": "model", "currentValue": "a", "options": [7, {"value": ""}, {"value": 3}, {"value": "two\nlines"}, {"value": "x".repeat(200)}]},
+        {"id": "the-model", "category": "model", "currentValue": "m0", "options": many},
+        {"id": "the-level", "category": "thought_level", "currentValue": "gone", "options": [{"value": "a", "name": "  "}, {"value": "a", "name": "again"}]},
+    ]);
+    let script = Script { config_options: Some(junk), ..turns(vec![vec![say("Hi"), Step::ConfigUpdate { options: json!("junk") }, say(" there")]]) };
+    let mut c = Chat::with(&script);
+    c.ask("Hello");
+    assert_eq!(c.error(), None);
+    // The update said nothing usable: the options went away, as it said.
+    assert_eq!(c.a.offered(), Some(&crate::Offered::default()));
+    assert_eq!(line(&c).map(|l| l.0), Some("name".to_string()), "held to the pane's limits");
+    let parsed = super::config::Config::parse(&json!({"configOptions": script.config_options.clone()}));
+    let offered = parsed.offered();
+    assert_eq!(offered.models.len(), 64);
+    assert_eq!(offered.models[0].name, "name");
+    assert_eq!(offered.efforts.iter().map(|l| (l.id.as_str(), l.name.as_str())).collect::<Vec<_>>(), [("a", "a")], "once, named by its value");
+    assert_eq!(parsed.line().map(|l| l.1), Some(None), "a current level it doesn't list has no name");
 }
