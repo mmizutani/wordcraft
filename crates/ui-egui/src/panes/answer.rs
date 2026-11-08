@@ -103,20 +103,25 @@ fn inline(app: &mut WordApp, ui: &mut Ui, t: &Tokens, spans: &[Span], size: f32)
 fn link(app: &mut WordApp, ui: &mut Ui, t: &Tokens, span: &Span, address: &str, size: f32, last_of_link: bool) {
     if opens(address) {
         let words = rich(span, t, size).color(ui.visuals().hyperlink_color);
-        let r = ui.add(egui::Link::new(words)).on_hover_text(address);
-        if r.clicked() {
-            // A click the control channel made doesn't open what a model wrote.
-            if app.input_from_control(ui.ctx()) {
-                app.assist.notice = Some(tl!("Only you can open a link in an answer: click it yourself.").to_string());
-            } else {
-                app.canvas.open_url = Some(address.to_string());
-            }
-        }
+        web_link(app, ui, words, address);
     } else {
         ui.add(egui::Label::new(rich(span, t, size)).wrap());
     }
     if last_of_link && span.text.trim() != address {
         ui.add(egui::Label::new(RichText::new(beside(address)).small().color(t.text_dim)).wrap()).on_hover_text(address);
+    }
+}
+
+/// A link to web `address` from what a model wrote: it opens on the person's click only.
+pub(super) fn web_link(app: &mut WordApp, ui: &mut Ui, words: RichText, address: &str) {
+    let r = ui.add(egui::Link::new(words)).on_hover_text(address);
+    if r.clicked() {
+        // A click the control channel made doesn't open what a model wrote.
+        if app.input_from_control(ui.ctx()) {
+            app.assist.notice = Some(tl!("Only you can open a link in an answer: click it yourself.").to_string());
+        } else {
+            app.canvas.open_url = Some(address.to_string());
+        }
     }
 }
 

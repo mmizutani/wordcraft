@@ -268,7 +268,7 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
         Entry::Model { name } => {
             ui.label(RichText::new(fmt(tl!("Model: {name}"), &[("name", name)])).small().color(t.text_dim));
         }
-        Entry::Agent { .. } | Entry::Usage(_) => {}
+        Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) => {}
         Entry::Stopped { stop } => {
             if let Some(says) = stop.says() {
                 // Stopped by the person reads as a note; any other stop is news to them.

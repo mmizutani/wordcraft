@@ -15,8 +15,8 @@
 //! `CRAFT_LANGUAGE_PACK_INDEX` for a local pack index). `{"assistScript": [[step, …], …]}` has the
 //! next assistant conversation use the scripted assistant, one list of steps per turn: `{"say":
 //! text}`, `{"think": text}`, `{"tool": name, "args": {…}}`, `{"plan": [text, …]}` (an entry
-//! may be `{"content": text, "status": "completed|in_progress|pending"}`), `{"usage": {…}}` (what
-//! the turn used), `{"hold": true}` (the turn goes on running, to show it under way) or
+//! may be `{"content": text, "status": "completed|in_progress|pending"}`), `{"emit": event}` (an event
+//! as a backend sends it, what a turn used or an agent's tool call), `{"hold": true}` (the turn goes on running, to show it under way) or
 //! `{"ask": title}` (a
 //! permission request: the pane asks it in a turn the person asked for, such as one started with
 //! `{"run": "assist.ask", "params": {"prompt": …}}`, and answers it per `assist.allowUnattended`
@@ -250,9 +250,8 @@ fn scripted_assistant(turns: &[serde_json::Value]) -> Result<wordcraft_assist::F
             )
         } else if let Some(t) = s.get("ask") {
             Step::Ask(text(t))
-        } else if let Some(usage) = s.get("usage") {
-            let usage = serde_json::from_value(usage.clone()).map_err(|e| format!("usage: {e}"))?;
-            Step::Emit(wordcraft_assist::Event::Usage(usage))
+        } else if let Some(event) = s.get("emit") {
+            Step::Emit(serde_json::from_value(event.clone()).map_err(|e| format!("emit: {e}"))?)
         } else if s.get("hold").is_some() {
             Step::Hold
         } else {

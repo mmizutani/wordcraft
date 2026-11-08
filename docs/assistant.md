@@ -66,7 +66,14 @@ text are formatted, and the rest shows as plain text.
 Once there is a conversation, tabs under the role switch it with its **Details**, which keeps
 updating during a turn and reads only the conversation's own record, so the two can't disagree.
 Each section folds. **Steps** lists each turn under what you asked: the agent's plan when it gave
-one, else the turn's tool calls by title, with the same marks as the conversation. **Properties**
+one, else the turn's tool calls by title, with the same marks as the conversation. **Sources**
+lists what each turn read. Its first row says what WordCraft gave the model: the selection or
+where the caret is, how many paragraphs around it, the outline, and how much of the 32 KiB it took,
+with a note when the selection was cut. That comes from the pass that wrote the text the model got,
+so it can't disagree with it. Under it come the turn's reads and searches, each once: WordCraft's
+own tools by name, where a row for a paragraph goes to it; a file an agent read by its path and
+line; an address an agent fetched, which opens only on your own click. An agent's read that doesn't
+say where it looked is listed by its title. **Properties**
 says which assistant it is, with the version an agent gives, the document it works on, its role,
 whether its edits are tracked, the model that answered, and what the last turn used: tokens for
 ChatGPT, added up over the requests of a turn, with a link to your plan's usage page because a plan

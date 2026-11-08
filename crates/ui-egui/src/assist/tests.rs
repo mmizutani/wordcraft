@@ -1439,7 +1439,7 @@ fn running(mut steps: Vec<Step>) -> egui_kittest::Harness<'static, WordApp> {
     use wordcraft_assist::Entry;
     steps.push(Step::say("End of the script."));
     steps.push(Step::Hold);
-    let mut app = window("one two three");
+    let mut app = window("one two three\nsecond paragraph");
     app.assist_with(Box::new(Fake::new().then(steps)));
     let mut h = harness(app);
     h.state_mut().run("assist.ask", json!({"prompt": "Do the thing"})).unwrap();
@@ -1470,8 +1470,8 @@ fn details_shows_steps_and_properties_during_a_turn_and_answers_the_same_to_a_sc
     h.get_by_label("Details").click();
     h.run_steps(2);
     assert!(h.query_by_label("End of the script.").is_none(), "the view changed");
-    assert!(h.query_by_label("Do the thing").is_some(), "the turn names its steps");
-    assert!(h.query_by_label("get_text").is_some(), "{:?}", h.state().conversation().map(|c| c.details()));
+    assert!(h.query_all_by_label("Do the thing").count() >= 1, "the turn names its steps");
+    assert!(h.query_all_by_label("get_text").count() >= 1, "{:?}", h.state().conversation().map(|c| c.details()));
     for row in ["Scripted assistant (for testing)", "Suggester", "Tracked, in its name", "scripted", "1200 in, 80 out"] {
         assert!(h.query_by_label(row).is_some(), "{row}");
     }
@@ -1497,10 +1497,11 @@ fn a_section_of_details_folds() {
     let mut h = running(vec![Step::tool("get_text", json!({}))]);
     h.get_by_label("Details").click();
     h.run_steps(2);
-    assert!(h.query_by_label("get_text").is_some());
+    let rows = h.query_all_by_label("get_text").count();
+    assert!(rows > 0);
     h.get_by_label("Steps").click();
     h.run_steps(3);
-    assert!(h.query_by_label("get_text").is_none(), "folded");
+    assert_eq!(h.query_all_by_label("get_text").count(), rows - 1, "folded");
     h.state_mut().run("assist.cancel", json!({})).unwrap();
 }
 
@@ -1554,4 +1555,69 @@ fn usage_arriving_after_a_piece_of_an_answer_leaves_it_arriving() {
     h.run_steps(2);
     assert!(h.query_by_label("half written").is_some(), "its open marker is still closed for it");
     h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn sources_say_what_a_turn_was_given_and_what_it_read() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::{Event, Source, SourceKind, ToolCall, ToolStatus};
+    let source = |kind, title: &str, target: &str| Source { kind, title: title.into(), target: Some(target.into()) };
+    let agent_read = ToolCall {
+        id: "a".into(),
+        title: "Agent read".into(),
+        kind: "read".into(),
+        status: ToolStatus::Completed,
+        detail: String::new(),
+        changes: None,
+        sources: vec![
+            source(SourceKind::File, "/home/a/notes.md:3", "/home/a/notes.md"),
+            source(SourceKind::Web, "https://example.com/page", "https://example.com/page"),
+            source(SourceKind::Web, "file:///etc/passwd", "file:///etc/passwd"),
+        ],
+    };
+    let mut h = running(vec![
+        Step::tool("get_text", json!({})),
+        Step::tool("execute", json!({"command": "document.paragraph", "params": {"path": [1]}})),
+        Step::Emit(Event::Tool(agent_read)),
+    ]);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    h.get_by_label("Steps").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("/home/a/notes.md:3").is_some(), "a file shows its path");
+    assert!(h.query_by_label_contains("Given: where the caret is").is_some());
+    assert!(h.query_by_label("get_text").is_some(), "WordCraft's own read");
+    let web = h.get_by_role_and_label(egui::accesskit::Role::Link, "https://example.com/page");
+    drop(web);
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Link, "file:///etc/passwd").is_none(), "only a web address is a link");
+    let paragraph = h.get_by_role_and_label(egui::accesskit::Role::Link, "execute document.paragraph");
+    paragraph.click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.sel.focus.path.last(), 1, "a paragraph's row goes to it");
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_turn_records_what_it_was_given_as_the_model_got_it() {
+    use wordcraft_assist::Entry;
+    let mut a = window("one two three");
+    let fake = Fake::new().then(vec![Step::say("Hi")]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.run("select.text", json!({"text": "two"})).unwrap();
+    ask(&mut a, "Go", None);
+    settle(&mut a);
+    let sent = a
+        .conversation()
+        .unwrap()
+        .transcript()
+        .entries()
+        .find_map(|e| if let Entry::Context(s) = e { Some(s.clone()) } else { None })
+        .expect("the turn recorded it");
+    assert_eq!(sent.selection_bytes, 3);
+    let turns = seen.lock().unwrap();
+    let context = turns.turns[0].context.as_deref().unwrap_or_default();
+    assert_eq!(sent.bytes as usize, context.len(), "{context}");
 }

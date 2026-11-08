@@ -11,7 +11,7 @@ use wordcraft_doc::change::Anchor;
 use wordcraft_engine::room::{Replica, Room, RoomError, hosted};
 use wordcraft_mcp::tools::{ToolResult, call_tool, tool_definitions};
 
-use crate::backend::{Cancel, ToolHost, ToolOutput, ToolSpec, Versions, cut};
+use crate::backend::{Cancel, Source, SourceKind, ToolHost, ToolOutput, ToolSpec, Versions, cut};
 
 /// The MCP tools an assistant's model gets: those that read and edit one document. Not the
 /// ones that open, save or switch documents, drive the window or share the document.
@@ -285,6 +285,17 @@ pub fn kind(name: &str) -> &'static str {
         "select_text" | "type_text" | "execute" | "batch" => "edit",
         _ => "other",
     }
+}
+
+/// What a call of WordCraft's own tools reads, for the pane's Sources: the shared document, and
+/// the paragraph when it names one. A call that changes the document reads nothing here.
+pub fn sources(name: &str, args: &Value) -> Vec<Source> {
+    let command = args.get("command").and_then(Value::as_str).unwrap_or_default();
+    if !matches!(kind(name), "read" | "search") && !command.starts_with("document.") {
+        return Vec::new();
+    }
+    let path = args.pointer("/params/path").and_then(Value::as_array).filter(|p| !p.is_empty() && p.iter().all(Value::is_u64));
+    vec![Source { kind: SourceKind::Document, title: title(name, args), target: path.map(|p| Value::from(p.clone()).to_string()) }]
 }
 
 /// A call's result in a line or two, for its row in the pane.

@@ -413,7 +413,7 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
         start(app, role)?;
     }
     let caps = Caps::default();
-    let context = Context::of(&app.session, &caps).to_text(&caps);
+    let (context, sent) = Context::of(&app.session, &caps).rendered(&caps);
     // The person's selection, by paragraph id: the assistant's copy finds it there, though the
     // paragraphs moved with edits it has and the window hasn't yet.
     let doc = &app.session.doc;
@@ -442,6 +442,7 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     let policy = if app.assist.by_person { PermissionPolicy::Ask } else { unattended(app) };
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
     a.ask_with_policy(prompt, Some(context), selection, policy).map_err(|e| e.to_string())?;
+    a.gave(sent);
     let (name, role, tracked) = (a.name().to_string(), a.role(), a.tracked());
     Ok(json!({"asked": true, "assistant": name, "role": role.name(), "tracked": tracked}))
 }
@@ -575,11 +576,15 @@ pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
     match e {
         Entry::Asked { text } | Entry::Thought { text } => vec![text.clone()],
         Entry::Answer { text } => crate::panes::answer::shown_texts(text),
-        Entry::Tool(call) => vec![call.title.clone(), call.detail.clone()],
+        Entry::Tool(call) => {
+            let sources = call.sources.iter().flat_map(|s| [s.title.clone(), s.target.clone().unwrap_or_default()]);
+            [call.title.clone(), call.detail.clone()].into_iter().chain(sources).collect()
+        }
         Entry::Plan { entries } => entries.iter().map(|p| p.content.clone()).collect(),
         Entry::Permission { request, .. } => std::iter::once(request.title.clone()).chain(request.options.iter().map(|o| o.name.clone())).collect(),
         Entry::Model { name } | Entry::Agent { name } => vec![name.clone()],
         Entry::Usage(u) => u.cost.iter().cloned().collect(),
+        Entry::Context(sent) => vec![sent.document.clone()],
         Entry::Stopped { .. } => vec![],
         Entry::Error { message } => vec![message.clone()],
     }

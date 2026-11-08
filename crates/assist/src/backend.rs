@@ -27,6 +27,9 @@ pub const MAX_LABEL: usize = 500;
 /// Most entries in a plan; more are dropped.
 pub const MAX_PLAN: usize = 64;
 
+/// Most sources one tool call lists.
+pub const MAX_SOURCES: usize = 16;
+
 /// Most bytes of a cost as an agent gives it.
 const MAX_COST: usize = 64;
 
@@ -152,6 +155,34 @@ pub struct ToolCall {
     /// which the assistant changed the document through WordCraft (its MCP server, or
     /// `wordcraft-cli call`).
     pub changes: Option<Versions>,
+    /// What it read or looked for, at most [`MAX_SOURCES`].
+    #[serde(default)]
+    pub sources: Vec<Source>,
+}
+
+/// Where something a turn read is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SourceKind {
+    /// The shared document.
+    Document,
+    /// A file on this computer.
+    File,
+    /// A web address.
+    Web,
+    /// An agent's own tool, which doesn't say where it looked.
+    Other,
+}
+
+/// Something a turn read.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Source {
+    pub kind: SourceKind,
+    /// What it is, as the pane lists it.
+    pub title: String,
+    /// Where it is: a paragraph's path in the document, as JSON, a file's path or an address.
+    pub target: Option<String>,
 }
 
 /// The versions of the shared document from the first a tool call's changes made to the last.
@@ -329,7 +360,19 @@ impl Event {
         match self {
             Event::Text { text: t } => Event::Text { text: text(t) },
             Event::Thought { text: t } => Event::Thought { text: text(t) },
-            Event::Tool(t) => Event::Tool(ToolCall { id: label(&t.id), title: label(&t.title), kind: label(&t.kind), detail: text(t.detail), ..t }),
+            Event::Tool(t) => {
+                let sources =
+                    t.sources.into_iter().take(MAX_SOURCES).map(|s| Source { title: label(&s.title), target: s.target.map(|t| label(&t)), ..s });
+                Event::Tool(ToolCall {
+                    id: label(&t.id),
+                    title: label(&t.title),
+                    kind: label(&t.kind),
+                    detail: text(t.detail),
+                    changes: t.changes,
+                    status: t.status,
+                    sources: sources.collect(),
+                })
+            }
             Event::Plan { entries } => {
                 Event::Plan { entries: entries.into_iter().take(MAX_PLAN).map(|e| PlanEntry { content: label(&e.content), ..e }).collect() }
             }
@@ -685,6 +728,7 @@ impl TurnCtx<'_> {
         let id = if id.is_empty() { format!("call-{}", self.calls) } else { id.to_string() };
         let title = crate::tools::title(name, args);
         let kind = crate::tools::kind(name).to_string();
+        let sources = crate::tools::sources(name, args);
         if self.is_cancelled() {
             return ToolOutput::error("stopped: the person stopped this turn");
         }
@@ -695,11 +739,12 @@ impl TurnCtx<'_> {
             status: ToolStatus::InProgress,
             detail: String::new(),
             changes: None,
+            sources: sources.clone(),
         }));
         let out = if self.is_cancelled() { ToolOutput::error("stopped: the person stopped this turn") } else { self.tools.call(name, args) };
         let status = if out.ok { ToolStatus::Completed } else { ToolStatus::Failed };
         let detail = crate::tools::summary(&out);
-        self.emit(Event::Tool(ToolCall { id, title, kind, status, detail, changes: out.changes }));
+        self.emit(Event::Tool(ToolCall { id, title, kind, status, detail, changes: out.changes, sources }));
         out
     }
 

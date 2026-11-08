@@ -837,3 +837,42 @@ fn a_cost_is_shown_as_the_agent_gave_it() {
     let used = c.a.details().usage.expect("the agent said what it cost");
     assert_eq!(used.cost.as_deref(), Some("0.25 USD"));
 }
+
+#[test]
+fn an_agent_s_locations_and_fetches_reach_sources_and_junk_is_ignored() {
+    use crate::backend::SourceKind;
+    let send = |update: serde_json::Value| Step::Send { update };
+    let script = turns(vec![vec![
+        send(json!({"sessionUpdate": "tool_call", "toolCallId": "r", "title": "Read", "kind": "read", "status": "completed", "locations": [
+            {"path": "/home/a/notes.md", "line": 12}, {"path": "/home/a/b.md"}, {"path": 7}, {"line": 2}, "junk", {"path": "  "},
+        ]})),
+        send(
+            json!({"sessionUpdate": "tool_call", "toolCallId": "f", "title": "Fetch", "kind": "fetch", "status": "completed", "rawInput": {"url": "https://example.com/page"}}),
+        ),
+        send(json!({"sessionUpdate": "tool_call", "toolCallId": "l", "title": "Fetch a link", "kind": "fetch", "status": "completed",
+            "content": [{"type": "content", "content": {"type": "resource_link", "name": "x", "uri": "https://example.com/linked"}}]})),
+        send(
+            json!({"sessionUpdate": "tool_call", "toolCallId": "j", "title": "Fetch junk", "kind": "fetch", "status": "completed", "rawInput": {"url": "file:///etc/passwd"}}),
+        ),
+        send(
+            json!({"sessionUpdate": "tool_call", "toolCallId": "s", "title": "Search", "kind": "search", "status": "in_progress", "locations": "junk"}),
+        ),
+        send(json!({"sessionUpdate": "tool_call_update", "toolCallId": "r", "status": "completed"})),
+    ]]);
+    let mut c = Chat::with(&script);
+    c.ask("Read");
+    let sources = c.a.details().turns.remove(0).sources;
+    let listed: Vec<(SourceKind, &str, Option<&str>)> = sources.iter().map(|s| (s.kind, s.title.as_str(), s.target.as_deref())).collect();
+    assert_eq!(
+        listed,
+        [
+            (SourceKind::File, "/home/a/notes.md:12", Some("/home/a/notes.md")),
+            (SourceKind::File, "/home/a/b.md", Some("/home/a/b.md")),
+            (SourceKind::Web, "https://example.com/page", Some("https://example.com/page")),
+            (SourceKind::Web, "https://example.com/linked", Some("https://example.com/linked")),
+            (SourceKind::Other, "Fetch junk", None),
+            (SourceKind::Other, "Search", None),
+        ],
+        "an update that says nothing of them keeps what the call said"
+    );
+}

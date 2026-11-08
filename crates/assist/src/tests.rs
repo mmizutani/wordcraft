@@ -539,6 +539,7 @@ fn hostile_permission_requests_and_events_are_held_to_the_pane_s_limits() {
             status: ToolStatus::Completed,
             detail: "d".repeat(4000),
             changes: None,
+            sources: Vec::new(),
         }));
     }
     assert!(t.len() <= crate::transcript::MAX_ENTRIES);
@@ -1114,7 +1115,15 @@ mod details {
     use crate::transcript::{MAX_ENTRIES, StepState, Transcript};
 
     fn call(id: &str, status: ToolStatus) -> Event {
-        Event::Tool(ToolCall { id: id.into(), title: format!("Call {id}"), kind: "read".into(), status, detail: String::new(), changes: None })
+        Event::Tool(ToolCall {
+            id: id.into(),
+            title: format!("Call {id}"),
+            kind: "read".into(),
+            status,
+            detail: String::new(),
+            changes: None,
+            sources: Vec::new(),
+        })
     }
 
     fn plan(entries: &[(&str, PlanStatus)]) -> Event {
@@ -1206,5 +1215,132 @@ mod details {
         assert_eq!(details.turns[0].asked, None, "the prompt was trimmed");
         assert_eq!(details.turns[0].steps.len(), t.len(), "every step left is a row, and none that went");
         assert_eq!(details.usage, None);
+    }
+}
+
+mod sources {
+    use serde_json::json;
+
+    use crate::backend::{Event, Source, SourceKind, ToolCall, ToolStatus};
+    use crate::context::{Caps, Context};
+    use crate::tools;
+    use crate::transcript::{MAX_TURN_SOURCES, Transcript};
+
+    fn context() -> Context {
+        Context {
+            title: "Report".into(),
+            selection: "Selected words.".into(),
+            before: (1..=3).map(|n| format!("Before-{n} text.")).collect(),
+            after: (1..=3).map(|n| format!("After-{n} text.")).collect(),
+            outline: (1..=4).map(|n| (1, format!("Head-{n}"))).collect(),
+            words: 100,
+            ..Context::default()
+        }
+    }
+
+    #[test]
+    fn what_is_said_to_be_sent_is_what_the_text_holds_at_every_cap() {
+        let c = context();
+        for total_bytes in 0..=600 {
+            let caps = Caps { total_bytes, ..Caps::default() };
+            let (text, sent) = c.rendered(&caps);
+            assert_eq!(text.matches("Before-").count() as u32, sent.before, "before, at {total_bytes}: {text}");
+            assert_eq!(text.matches("After-").count() as u32, sent.after, "after, at {total_bytes}: {text}");
+            assert_eq!(text.matches("Head-").count() as u32, sent.headings, "headings, at {total_bytes}: {text}");
+            assert_eq!(sent.bytes as usize, text.len());
+            assert_eq!(sent.cap as usize, total_bytes);
+            assert_eq!(text, c.to_text(&caps));
+            let selected = "Selected words.".get(..sent.selection_bytes as usize).unwrap_or_default();
+            assert!(text.contains(&format!("<<<\n{selected}\n>>>")) || sent.selection_bytes == 0, "at {total_bytes}: {text}");
+            assert_eq!(text.contains("Selected words"), sent.selection_bytes >= 14, "at {total_bytes}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_selection_larger_than_the_cap_says_it_was_cut_and_how_much_went() {
+        let c = Context { selection: "s".repeat(4096), ..context() };
+        let caps = Caps { total_bytes: 1024, ..Caps::default() };
+        let (text, sent) = c.rendered(&caps);
+        assert!(sent.selection_cut);
+        assert!(sent.selection_bytes > 0 && (sent.selection_bytes as usize) < 1024, "{sent:?}");
+        assert_eq!(text.matches('s').count() >= sent.selection_bytes as usize, true);
+        assert!(text.contains(&"s".repeat(sent.selection_bytes as usize)));
+        assert!(!text.contains(&"s".repeat(sent.selection_bytes as usize + 1)), "no more than it says");
+        assert!(sent.bytes <= sent.cap);
+    }
+
+    #[test]
+    fn a_caret_gives_no_selection() {
+        let (_, sent) = Context { selection: String::new(), ..context() }.rendered(&Caps::default());
+        assert_eq!((sent.selection_bytes, sent.selection_cut), (0, false));
+    }
+
+    #[test]
+    fn wordcraft_s_tools_say_what_they_read() {
+        let document =
+            |title: &str, target: Option<&str>| Source { kind: SourceKind::Document, title: title.into(), target: target.map(str::to_string) };
+        assert_eq!(tools::sources("get_text", &json!({})), [document("get_text", None)]);
+        assert_eq!(tools::sources("list_commands", &json!({"query": "table"})), [document("list_commands", None)]);
+        assert_eq!(
+            tools::sources("execute", &json!({"command": "document.paragraph", "params": {"path": [2]}})),
+            [document("execute document.paragraph", Some("[2]"))]
+        );
+        assert_eq!(
+            tools::sources("execute", &json!({"command": "document.paragraph", "params": {"path": ["junk"]}})),
+            [document("execute document.paragraph", None)]
+        );
+        assert_eq!(tools::sources("type_text", &json!({"text": "x"})), []);
+        assert_eq!(tools::sources("execute", &json!({"command": "format.bold"})), []);
+    }
+
+    #[test]
+    fn details_lists_a_turn_s_reads_once_each_and_holds_to_a_limit() {
+        let call = |id: usize, sources: Vec<Source>, kind: &str| {
+            Event::Tool(ToolCall {
+                id: id.to_string(),
+                title: format!("Call {id}"),
+                kind: kind.into(),
+                status: ToolStatus::Completed,
+                detail: String::new(),
+                changes: None,
+                sources,
+            })
+        };
+        let file = |n: usize| Source { kind: SourceKind::File, title: format!("/f{n}"), target: Some(format!("/f{n}")) };
+        let mut t = Transcript::default();
+        t.asked("Read");
+        t.sent(Default::default());
+        t.record(&call(0, vec![file(0)], "read"));
+        t.record(&call(1, vec![file(0)], "read"));
+        t.record(&call(2, Vec::new(), "search"));
+        t.record(&call(3, Vec::new(), "edit"));
+        let turn = t.details().turns.remove(0);
+        assert!(turn.context.is_some());
+        assert_eq!(turn.sources, [file(0), Source { kind: SourceKind::Other, title: "Call 2".into(), target: None }]);
+
+        t.asked("Read more");
+        for n in 0..MAX_TURN_SOURCES + 5 {
+            t.record(&call(100 + n, vec![file(n)], "read"));
+        }
+        let turn = t.details().turns.remove(1);
+        assert_eq!((turn.sources.len(), turn.more_sources), (MAX_TURN_SOURCES, 5));
+    }
+
+    #[test]
+    fn a_tool_call_s_sources_are_held_to_the_pane_s_limits() {
+        let hostile = Source { kind: SourceKind::File, title: "/\u{202E}evil\nline".into(), target: Some("/\u{202E}evil".into()) };
+        let call = ToolCall {
+            id: "a".into(),
+            title: "t".into(),
+            kind: "read".into(),
+            status: ToolStatus::Completed,
+            detail: String::new(),
+            changes: None,
+            sources: vec![hostile; 100],
+        };
+        let Event::Tool(call) = Event::Tool(call).bounded() else { panic!() };
+        assert_eq!(call.sources.len(), crate::backend::MAX_SOURCES);
+        assert_eq!(call.sources[0].title, "/evilline");
+        assert_eq!(call.sources[0].target.as_deref(), Some("/evil"));
     }
 }

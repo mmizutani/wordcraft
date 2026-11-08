@@ -6,7 +6,8 @@ use std::collections::VecDeque;
 
 use serde::Serialize;
 
-use crate::backend::{Answer, Event, PermissionRequest, PlanEntry, PlanStatus, StopReason, ToolCall, ToolStatus, Usage, label};
+use crate::backend::{Answer, Event, PermissionRequest, PlanEntry, PlanStatus, Source, SourceKind, StopReason, ToolCall, ToolStatus, Usage, label};
+use crate::context::Sent;
 
 /// Most entries a transcript keeps.
 pub const MAX_ENTRIES: usize = 2048;
@@ -40,6 +41,8 @@ pub enum Entry {
     Agent { name: String },
     /// What the turn used, as it last said. Details shows it; the conversation doesn't.
     Usage(Usage),
+    /// What the turn gave the model of the document. Details shows it; the conversation doesn't.
+    Context(Sent),
     /// The turn stopped other than by finishing its answer.
     Stopped { stop: StopReason },
     /// The turn failed.
@@ -50,7 +53,7 @@ impl Entry {
     /// Whether only Details shows it: the conversation goes on as if it weren't there, and an
     /// answer that arrives in pieces around it stays one answer.
     pub fn details_only(&self) -> bool {
-        matches!(self, Entry::Agent { .. } | Entry::Usage(_))
+        matches!(self, Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_))
     }
 
     fn bytes(&self) -> usize {
@@ -61,15 +64,22 @@ impl Entry {
             | Entry::Model { name: text }
             | Entry::Agent { name: text }
             | Entry::Error { message: text } => text.len(),
-            Entry::Tool(t) => t.title.len() + t.detail.len() + t.id.len(),
+            Entry::Tool(t) => {
+                let sources = t.sources.iter().map(|s| s.title.len() + s.target.as_ref().map_or(0, String::len));
+                t.title.len() + t.detail.len() + t.id.len() + sources.sum::<usize>()
+            }
             Entry::Plan { entries } => entries.iter().map(|e| e.content.len()).sum(),
             Entry::Permission { request, .. } => request.title.len() + request.options.iter().map(|o| o.name.len() + o.id.len()).sum::<usize>(),
             Entry::Usage(u) => u.cost.as_ref().map_or(0, String::len),
+            Entry::Context(sent) => sent.document.len(),
             Entry::Stopped { .. } => 0,
         }
         .saturating_add(16)
     }
 }
+
+/// Most sources Details lists for one turn.
+pub const MAX_TURN_SOURCES: usize = 64;
 
 /// Most characters of a prompt where Details names its turn.
 const ASKED_CHARS: usize = 80;
@@ -100,6 +110,12 @@ pub struct TurnDetails {
     pub asked: Option<String>,
     /// The plan when the agent gave one, else the tool calls.
     pub steps: Vec<Step>,
+    /// What the turn gave the model of the document.
+    pub context: Option<Sent>,
+    /// What its tool calls read and looked for, in order, each once, at most [`MAX_TURN_SOURCES`].
+    pub sources: Vec<Source>,
+    /// How many more [`TurnDetails::sources`] leaves out.
+    pub more_sources: u32,
 }
 
 /// What runs a conversation, which its transcript doesn't hold ([`crate::Assistant::details`]).
@@ -138,15 +154,37 @@ struct TurnBuilder {
     asked: Option<String>,
     plan: Option<Vec<Step>>,
     calls: Vec<Step>,
+    context: Option<Sent>,
+    sources: Vec<Source>,
+    more_sources: u32,
 }
 
 impl TurnBuilder {
     /// Add the turn to `turns`, if it has anything to show, and start another.
     fn finish(&mut self, turns: &mut Vec<TurnDetails>) {
-        let TurnBuilder { asked, plan, calls } = std::mem::take(self);
+        let TurnBuilder { asked, plan, calls, context, sources, more_sources } = std::mem::take(self);
         let steps = plan.unwrap_or(calls);
-        if asked.is_some() || !steps.is_empty() {
-            turns.push(TurnDetails { asked, steps });
+        if asked.is_some() || !steps.is_empty() || context.is_some() || !sources.is_empty() {
+            turns.push(TurnDetails { asked, steps, context, sources, more_sources });
+        }
+    }
+
+    /// What tool call `call` read. An agent's read that doesn't say where is listed by its title.
+    fn read(&mut self, call: &ToolCall) {
+        let unsaid = (call.sources.is_empty() && matches!(call.kind.as_str(), "read" | "search" | "fetch")).then(|| Source {
+            kind: SourceKind::Other,
+            title: call.title.clone(),
+            target: None,
+        });
+        for source in call.sources.iter().cloned().chain(unsaid) {
+            if self.sources.contains(&source) {
+                continue;
+            }
+            if self.sources.len() < MAX_TURN_SOURCES {
+                self.sources.push(source);
+            } else {
+                self.more_sources = self.more_sources.saturating_add(1);
+            }
         }
     }
 }
@@ -229,15 +267,22 @@ impl Transcript {
                         ToolStatus::Failed => StepState::Failed,
                     };
                     turn.calls.push(Step { title: call.title.clone(), state });
+                    turn.read(call);
                 }
                 Entry::Model { name, .. } => out.model = Some(name.clone()),
                 Entry::Agent { name } => out.agent = Some(name.clone()),
                 Entry::Usage(usage) => out.usage = Some(usage.clone()),
+                Entry::Context(sent) => turn.context = Some(sent.clone()),
                 Entry::Answer { .. } | Entry::Thought { .. } | Entry::Permission { .. } | Entry::Stopped { .. } | Entry::Error { .. } => {}
             }
         }
         turn.finish(&mut out.turns);
         out
+    }
+
+    /// What the turn that just started gave the model of the document.
+    pub fn sent(&mut self, sent: Sent) {
+        self.push(Entry::Context(sent));
     }
 
     /// The person asked `text`: a new turn starts.

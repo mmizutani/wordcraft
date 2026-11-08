@@ -5,6 +5,8 @@
 use wordcraft_doc::{Block, Blocks, Document, Paragraph, Path, Pos, StoryRef, para::OBJ};
 use wordcraft_engine::Session;
 
+use serde::{Deserialize, Serialize};
+
 use crate::backend::{cut, label};
 
 /// How much of the document a turn's context may carry.
@@ -39,6 +41,26 @@ impl Default for Caps {
             total_bytes: 32 << 10,
         }
     }
+}
+
+/// What a turn gave the model of the document, as [`Context::rendered`] wrote it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sent {
+    /// The document's title.
+    pub document: String,
+    /// Bytes of the selected text it carries; 0 for a caret.
+    pub selection_bytes: u32,
+    /// Whether the selected text is longer than what it carries.
+    pub selection_cut: bool,
+    /// Paragraphs before and after the selection it carries.
+    pub before: u32,
+    pub after: u32,
+    /// Headings of the outline it carries.
+    pub headings: u32,
+    /// Bytes of it all, of `cap`.
+    pub bytes: u32,
+    pub cap: u32,
 }
 
 /// The document around the selection, as text.
@@ -88,6 +110,12 @@ impl Context {
     /// the rest of its paragraphs. The selection is cut only when it doesn't fit alone, and then
     /// the text says so, so it never ends in the middle of the selection.
     pub fn to_text(&self, caps: &Caps) -> String {
+        self.rendered(caps).0
+    }
+
+    /// [`Context::to_text`], and what it carries: told by the one pass that decides, so the two
+    /// can't disagree.
+    pub fn rendered(&self, caps: &Caps) -> (String, Sent) {
         let total = caps.total_bytes;
         let mut head = String::new();
         if !self.title.is_empty() {
@@ -95,7 +123,7 @@ impl Context {
         }
         head.push_str(&format!("Words: {}\n", self.words));
         let mut left = total.saturating_sub(head.len());
-        let focus = self.focus(left);
+        let Focus { text: focus, selection_bytes, selection_cut } = self.focus(left);
         left = left.saturating_sub(focus.len());
         // The paragraphs nearest the selection, taking turns before and after it, while they fit.
         let what = if self.selection.is_empty() { "caret" } else { "selection" };
@@ -118,6 +146,7 @@ impl Context {
         let room = left.saturating_sub(outline_title.len().saturating_add(more.len()));
         let mut lines = String::new();
         let mut every_heading = true;
+        let mut headings = 0usize;
         for (level, text) in &self.outline {
             let indent = "  ".repeat(usize::from(level.saturating_sub(1)).min(8));
             let line = format!("{indent}- {text}\n");
@@ -126,6 +155,7 @@ impl Context {
                 break;
             }
             lines.push_str(&line);
+            headings = headings.saturating_add(1);
         }
         let mut out = head;
         if !lines.is_empty() {
@@ -150,17 +180,29 @@ impl Context {
                 out.push('\n');
             }
         }
-        cut(out, total)
+        let out = cut(out, total);
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let sent = Sent {
+            document: self.title.clone(),
+            selection_bytes: count(selection_bytes),
+            selection_cut,
+            before: count(nb),
+            after: count(na),
+            headings: count(headings),
+            bytes: count(out.len()),
+            cap: count(total),
+        };
+        (out, sent)
     }
 
     /// The selection (or where the caret is) with the rest of the paragraphs it is in, in at most
     /// `room` bytes, as far as the selection's own frame fits.
-    fn focus(&self, room: usize) -> String {
+    fn focus(&self, room: usize) -> Focus {
         if self.selection.is_empty() {
             let bare = "\nThe caret is here (nothing is selected).\n";
             let words = "\nThe caret is here (nothing is selected), in a paragraph that reads  before it and  after it.\n";
             let (lead, trail) = edge_quotes(&self.lead, &self.trail, room.saturating_sub(words.len()));
-            return match (lead.is_empty(), trail.is_empty()) {
+            let text = match (lead.is_empty(), trail.is_empty()) {
                 (true, true) => bare.to_string(),
                 (true, false) => format!("\nThe caret is here (nothing is selected), at the start of a paragraph that goes on {trail}.\n"),
                 (false, true) => format!("\nThe caret is here (nothing is selected), at the end of a paragraph that reads {lead}.\n"),
@@ -168,6 +210,7 @@ impl Context {
                     format!("\nThe caret is here (nothing is selected), in a paragraph that reads {lead} before it and {trail} after it.\n")
                 }
             };
+            return Focus { text, selection_bytes: 0, selection_cut: false };
         }
         let (open, close) = ("\nSelected text:\n<<<\n", "\n>>>\n");
         let notice = "(The selection is longer: read the rest with get_text or inspect_document.)\n";
@@ -175,7 +218,8 @@ impl Context {
         let selection = cut(self.selection.clone(), room.saturating_sub(frame));
         let shortened = selection.len() < self.selection.len();
         let mut out = format!("{open}{selection}{close}");
-        if self.selection_cut || shortened {
+        let selection_cut = self.selection_cut || shortened;
+        if selection_cut {
             out.push_str(notice);
         }
         let (before, after) = ("Just before it, in the same paragraph: \n", "Just after it, in the same paragraph: \n");
@@ -187,8 +231,15 @@ impl Context {
         if !trail.is_empty() {
             out.push_str(&format!("Just after it, in the same paragraph: {trail}\n"));
         }
-        out
+        Focus { text: out, selection_bytes: selection.len(), selection_cut }
     }
+}
+
+/// The part of a context around the selection ([`Context::focus`]).
+struct Focus {
+    text: String,
+    selection_bytes: usize,
+    selection_cut: bool,
 }
 
 /// Count `line` (with `title` when it is the first of its part) against `left`, when there is

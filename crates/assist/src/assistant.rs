@@ -24,6 +24,7 @@ use crate::backend::{
     Answer, Backend, BackendInfo, Cancel, Event, Events, MAX_QUEUED_EVENTS, NoTools, PermissionPolicy, PermissionRequest, Permissions, Seat,
     StopReason, ToolHost, Turn, TurnCtx, Waker,
 };
+use crate::context::Sent;
 use crate::tools::CopyTools;
 use crate::transcript::{Details, Entry, Properties, Transcript};
 
@@ -277,6 +278,11 @@ impl Assistant {
         self.first = false;
         self.busy = true;
         Ok(())
+    }
+
+    /// What the turn just asked was given of the document, for the pane's Sources.
+    pub fn gave(&mut self, sent: Sent) {
+        self.transcript.sent(sent);
     }
 
     /// Stop the turn that is running: its backend stops as soon as it can, and a permission
