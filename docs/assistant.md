@@ -61,7 +61,8 @@ whole. A picture shows only its description; nothing is fetched. A link is a wid
 the text, reachable by keyboard, with its address beside its words when they differ. Only a
 `http` or `https` address opens, and only on your own click: a click the control channel made
 leaves it closed and the pane says so. At most 64 KiB of an answer, 512 blocks and 4096 runs of
-text are formatted, and the rest shows as plain text.
+text are formatted, and the rest shows as plain text, as does a whole answer whose table would lose
+words to the limits a document's tables have.
 
 Once there is a conversation, tabs under the role switch it with its **Details**, which keeps
 updating during a turn and reads only the conversation's own record, so the two can't disagree.
@@ -71,7 +72,7 @@ lists what each turn read. Its first row says what WordCraft gave the model: the
 where the caret is, how many paragraphs around it, the outline, and how much of the 32 KiB it took,
 with a note when the selection was cut. That comes from the pass that wrote the text the model got,
 so it can't disagree with it. Under it come the turn's reads and searches, each once: WordCraft's
-own tools by name, where a row for a paragraph goes to it; a file an agent read by its path and
+own tools by name, where a row for a paragraph selects it, and says so if it has gone; a file an agent read by its path and
 line; an address an agent fetched, which opens only on your own click. An agent's read that doesn't
 say where it looked is listed by its title. **Properties**
 says which assistant it is, with the version an agent gives, the document it works on, its role,
