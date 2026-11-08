@@ -312,10 +312,37 @@ impl Transcript {
         self.more_output = more;
         let rows: Vec<(usize, OutputRow)> =
             self.entries.iter().enumerate().filter_map(|(i, e)| if let Entry::Output(row) = e { Some((i, row.clone())) } else { None }).collect();
-        for (i, row) in crate::output::reconcile(&rows, seen, more, ended) {
-            match i {
-                Some(i) => self.replace(i, Entry::Output(row)),
-                None => self.push(Entry::Output(row)),
+        // Rows are brought up to date before anything is added: what is added can trim the oldest
+        // entries, which moves the indexes.
+        let (known, new): (Vec<_>, Vec<_>) = crate::output::reconcile(&rows, seen, more, ended).into_iter().partition(|(i, _)| i.is_some());
+        for (i, row) in known {
+            if let Some(i) = i {
+                self.overwrite(i, Entry::Output(row));
+            }
+        }
+        self.trim();
+        for (_, row) in new {
+            self.push(Entry::Output(row));
+        }
+        self.prune_output();
+    }
+
+    /// Hold the list of what the conversation changed to [`crate::output::MAX_ROWS`]: the oldest
+    /// rows that ended go, so they never push the conversation out of the transcript.
+    fn prune_output(&mut self) {
+        let is_row = |e: &Entry| matches!(e, Entry::Output(_));
+        let mut extra = self.entries.iter().filter(|e| is_row(e)).count().saturating_sub(crate::output::MAX_ROWS);
+        let mut i = 0;
+        while extra > 0 && i < self.entries.len() {
+            let ended = matches!(self.entries.get(i), Some(Entry::Output(row)) if row.state != crate::output::OutputState::Open);
+            if ended && let Some(e) = self.entries.remove(i) {
+                self.bytes = self.bytes.saturating_sub(e.bytes());
+                if i < self.turn_start {
+                    self.turn_start = self.turn_start.saturating_sub(1);
+                }
+                extra = extra.saturating_sub(1);
+            } else {
+                i = i.saturating_add(1);
             }
         }
     }
@@ -412,11 +439,16 @@ impl Transcript {
     }
 
     fn replace(&mut self, i: usize, e: Entry) {
+        self.overwrite(i, e);
+        self.trim();
+    }
+
+    /// Put `e` at `i`, which moves nothing.
+    fn overwrite(&mut self, i: usize, e: Entry) {
         if let Some(slot) = self.entries.get_mut(i) {
             self.bytes = self.bytes.saturating_sub(slot.bytes()).saturating_add(e.bytes());
             *slot = e;
         }
-        self.trim();
     }
 
     /// Drop the oldest entries until it holds at most [`MAX_ENTRIES`] and [`MAX_BYTES`] (the

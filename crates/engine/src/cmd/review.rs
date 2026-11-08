@@ -57,9 +57,9 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("review.rejectAll", "Reject All Changes", "Review › Changes", |s, v| resolve_all_then(s, v, false))
             .params(r#"{"stopTracking"?: bool (also turn Track Changes off), "author"?: string (only this reviewer's changes)}"#),
         CommandSpec::new("review.accept", "Accept", "Review › Changes", |s, v| resolve_sel_then(s, v, true))
-            .params(r#"{"next"?: bool (then select the next change)}"#),
+            .params(r#"{"next"?: bool (then select the next change), "author"?: string (only this reviewer's changes in the selection)}"#),
         CommandSpec::new("review.reject", "Reject", "Review › Changes", |s, v| resolve_sel_then(s, v, false))
-            .params(r#"{"next"?: bool (then select the next change)}"#),
+            .params(r#"{"next"?: bool (then select the next change), "author"?: string (only this reviewer's changes in the selection)}"#),
         CommandSpec::new("review.nextChange", "Next Change", "Review › Changes", |s, _| nav_change(s, 1)).pure(),
         CommandSpec::new("review.previousChange", "Previous Change", "Review › Changes", |s, _| nav_change(s, -1)).pure(),
         CommandSpec::new("review.markup", "Display for Review", "Review › Tracking", |s, v| {

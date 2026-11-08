@@ -265,9 +265,20 @@ pub(super) fn resolve_all_then(s: &mut Session, v: &Value, accept: bool) -> CmdR
     Ok(out)
 }
 
-/// Accept or Reject at the selection; with `next`, the next change is selected afterwards.
+/// Accept or Reject at the selection; with `next`, the next change is selected afterwards; with
+/// `author`, only that reviewer's changes in the selection are resolved.
 pub(super) fn resolve_sel_then(s: &mut Session, v: &Value, accept: bool) -> CmdResult {
-    resolve_sel(s, accept, p::bool(v, "next") == Some(true))
+    let next = p::bool(v, "next") == Some(true);
+    match v.get("author") {
+        None | Some(Value::Null) => resolve_sel(s, accept, next, Which::All),
+        Some(Value::String(author)) if !author.trim().is_empty() => {
+            let author = author.trim();
+            let theirs: BTreeSet<u32> =
+                s.doc.revisions.iter().enumerate().filter(|(_, r)| r.author == author).filter_map(|(i, _)| u32::try_from(i).ok()).collect();
+            resolve_sel(s, accept, next, Which::Revisions(&theirs))
+        }
+        Some(_) => Err(CmdError::Params("`author` is the name of the reviewer whose changes to resolve".into())),
+    }
 }
 
 /// The span of the tracked change around `off` in `p`: its run, joined across the comment anchors
@@ -308,7 +319,8 @@ fn revision_span(p: &Paragraph, off: usize) -> Option<std::ops::Range<usize>> {
     Some(start..end)
 }
 
-fn resolve_sel(s: &mut Session, accept: bool, next: bool) -> CmdResult {
+fn resolve_sel(s: &mut Session, accept: bool, next: bool, which: Which) -> CmdResult {
+    let everyone = matches!(which, Which::All);
     let (a, b) = s.sel.ordered();
     // A caret right before a tracked paragraph mark (and no tracked text around it): that mark.
     let mut caret_mark = None;
@@ -332,7 +344,7 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool) -> CmdResult {
                 (a.clone(), a)
             }
             None => {
-                if resolve_cell(s, a.story, &a.path, accept)? {
+                if everyone && resolve_cell(s, a.story, &a.path, accept)? {
                     return if next { select_next_unresolved(s) } else { sel_result(s) };
                 }
                 return nav_change(s, 1);
@@ -350,8 +362,8 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool) -> CmdResult {
         // A paragraph's mark is in the selection when the selection goes on past it.
         let mark = path != b.path || caret_mark.as_ref() == Some(&path);
         let props = (ranged && (path != b.path || to > from)) || caret_props.as_ref() == Some(&path);
-        resolve_para(s, a.story, &path, (from, to), (mark, props), accept, Which::All)?;
-        if ranged {
+        resolve_para(s, a.story, &path, (from, to), (mark, props), accept, which)?;
+        if ranged && everyone {
             resolve_cell(s, a.story, &path, accept)?;
         }
     }
@@ -609,17 +621,24 @@ pub fn change_rows(s: &Session, author: &str, most: usize) -> (Vec<ChangeRow>, u
     let mut rows: Vec<ChangeRow> = Vec::new();
     let mut more = 0usize;
     for story in std::iter::once(StoryRef::Body).chain(s.doc.parts.keys().map(|id| StoryRef::Part(*id))) {
-        let mut last_rev = None;
+        // The piece before, and whether its change is past the limit: what joins it is too.
+        let mut before: Option<(&'static str, u32, Pos)> = None;
+        let mut omitted = false;
         for c in changes_in(s, story) {
             let Some(rev) = c.rev.filter(|r| theirs(*r)) else { continue };
-            let joins = last_rev == Some(rev) && rows.last().is_some_and(|l| l.kind == c.kind && l.b == c.a);
+            // `changes_in` joins a formatting change's own pieces: neighbours are others.
+            let joins = c.kind != "format" && before.as_ref().is_some_and(|(kind, r, end)| *kind == c.kind && *r == rev && *end == c.a);
+            before = Some((c.kind, rev, c.b.clone()));
             if !joins {
-                if rows.len() >= most {
+                omitted = rows.len() >= most;
+                if omitted {
                     more = more.saturating_add(1);
-                    continue;
+                } else {
+                    rows.push(ChangeRow { kind: c.kind, a: c.a.clone(), b: c.a.clone(), text: String::new() });
                 }
-                rows.push(ChangeRow { kind: c.kind, a: c.a.clone(), b: c.a.clone(), text: String::new() });
-                last_rev = Some(rev);
+            }
+            if omitted {
+                continue;
             }
             let Some(row) = rows.last_mut() else { continue };
             row.b = c.b.clone();

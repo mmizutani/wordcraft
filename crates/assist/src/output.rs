@@ -19,6 +19,9 @@ pub const MAX_ROWS: usize = 256;
 /// Most comments the list holds.
 const MAX_COMMENTS: usize = 64;
 
+/// Most bytes of a paragraph looked through for a change's words.
+const MAX_PARAGRAPH: usize = 64 << 10;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum OutputKind {
@@ -56,6 +59,10 @@ pub struct OutputRow {
     pub end: Option<Anchor>,
     /// A comment's id.
     pub comment: Option<u32>,
+    /// How many times its words were in its paragraph as it last stood; what [`ended`] compares.
+    /// `None` when the paragraph was too long to look through each time the document changes.
+    #[serde(skip)]
+    pub in_paragraph: Option<u32>,
 }
 
 impl OutputRow {
@@ -71,6 +78,7 @@ pub(crate) fn rows(session: &Session, name: &str) -> (Vec<OutputRow>, usize) {
     let doc = &session.doc;
     let (changes, more) = change_rows(session, name, MAX_ROWS);
     let changes = changes.into_iter().map(|c| OutputRow {
+        in_paragraph: occurrences(doc, doc.anchor_at(&c.a), &c.text),
         kind: match c.kind {
             "insert" => OutputKind::Insert,
             "delete" => OutputKind::Delete,
@@ -83,7 +91,8 @@ pub(crate) fn rows(session: &Session, name: &str) -> (Vec<OutputRow>, usize) {
         text: c.text,
         state: OutputState::Open,
     });
-    let comments = comment_rows(session, name, MAX_COMMENTS).into_iter().map(|c| {
+    let (comments, more_comments) = comment_rows(session, name, MAX_COMMENTS);
+    let comments = comments.into_iter().map(|c| {
         let at = c.at.as_ref().and_then(|p| doc.anchor_at(p));
         OutputRow {
             kind: OutputKind::Comment,
@@ -92,31 +101,45 @@ pub(crate) fn rows(session: &Session, name: &str) -> (Vec<OutputRow>, usize) {
             start: at,
             end: at,
             comment: Some(c.id),
+            in_paragraph: None,
         }
     });
-    (changes.chain(comments).collect(), more)
+    (changes.chain(comments).collect(), more.saturating_add(more_comments))
 }
 
-/// How change `row`, gone from the list, ended, read from `doc`: an insertion whose words are still
-/// where it was was accepted, a deletion whose words are still there was rejected, and either way
-/// round for words gone. A formatting change, a move, or one with no words can't say.
-pub(crate) fn ended(doc: &Document, row: &OutputRow) -> OutputState {
-    if matches!(row.kind, OutputKind::Format | OutputKind::Move) || row.text.is_empty() {
-        return OutputState::Resolved;
+/// How many times `words` are in the paragraph of `at`: 0 once it is gone. `None` when there is
+/// nothing to count, or the paragraph is too long to look through.
+fn occurrences(doc: &Document, at: Option<Anchor>, words: &str) -> Option<u32> {
+    if words.is_empty() {
+        return None;
     }
-    let still_there = row.start.and_then(|at| doc.pos_of(at, None)).is_some_and(|at| {
-        let text = doc.para(at.story, &at.path).and_then(|p| p.text.get(at.off..)).unwrap_or_default();
-        let mut shown = text.chars().filter(|c| *c != OBJ);
-        row.text.chars().all(|c| shown.next() == Some(c))
-    });
-    let insertion = row.kind == OutputKind::Insert;
-    if still_there == insertion { OutputState::Accepted } else { OutputState::Rejected }
+    let Some(at) = at.and_then(|at| doc.pos_of(at, None)) else { return Some(0) };
+    let text = doc.para(at.story, &at.path).map_or("", |p| p.text.as_str());
+    if text.len() > MAX_PARAGRAPH {
+        return None;
+    }
+    let count = if text.contains(OBJ) { text.replace(OBJ, "").matches(words).count() } else { text.matches(words).count() };
+    Some(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
+/// How change `row`, gone from the list, ended, read from `doc`. Its words were in its paragraph
+/// `in_paragraph` times. Fewer now: they went, so an insertion was rejected and a deletion accepted.
+/// As many: they stayed, the other way round. Counting holds where the same words are beside them
+/// and whatever else moved. A formatting change, a move, or one with no words can't say.
+pub(crate) fn ended(doc: &Document, row: &OutputRow) -> OutputState {
+    let (Some(before), true) = (row.in_paragraph, matches!(row.kind, OutputKind::Insert | OutputKind::Delete)) else {
+        return OutputState::Resolved;
+    };
+    let Some(now) = occurrences(doc, row.start, &row.text) else { return OutputState::Resolved };
+    let went = now < before;
+    if went == (row.kind == OutputKind::Delete) { OutputState::Accepted } else { OutputState::Rejected }
 }
 
 /// What to do with the transcript's `known` rows (with their indexes) given the rows `seen` in the
-/// document now: each row to write, at its index, or new. A change has no id, so one that is the
-/// same kind in the same paragraph with the same words is the same one, then one whose words hold
-/// the other's or are held by them: a change grows as its turn types on.
+/// document now: each row to write, at its index, or new. A change has no id, so the same change is
+/// the same kind and words in the same paragraph, the nearest such; then, if it is still open, one
+/// whose words hold the other's or are held by them, as a change grows while its turn types; then
+/// the same words in another paragraph, where a new paragraph mark took them.
 pub(crate) fn reconcile(
     known: &[(usize, OutputRow)],
     seen: Vec<OutputRow>,
@@ -125,33 +148,50 @@ pub(crate) fn reconcile(
 ) -> Vec<(Option<usize>, OutputRow)> {
     let mut taken = vec![false; known.len()];
     let mut out = Vec::new();
-    let mut unmatched = Vec::new();
-    // Exact matches first, so a later partial match can't take an exact one's row.
-    for row in seen {
-        match known.iter().enumerate().position(|(n, (_, k))| !taken.get(n).copied().unwrap_or(true) && same(k, &row, true)) {
-            Some(n) => take(n, known, &mut taken, row, &mut out),
-            None => unmatched.push(row),
+    let mut left = seen;
+    for matches in [Match::SameWords, Match::Grown, Match::Moved] {
+        let mut unmatched = Vec::new();
+        for row in left {
+            match nearest(known, &taken, &row, matches) {
+                Some(n) => take(n, known, &mut taken, row, &mut out),
+                None => unmatched.push(row),
+            }
         }
+        left = unmatched;
     }
-    for row in unmatched {
-        match known.iter().enumerate().position(|(n, (_, k))| !taken.get(n).copied().unwrap_or(true) && same(k, &row, false)) {
-            Some(n) => take(n, known, &mut taken, row, &mut out),
-            None => out.push((None, row)),
-        }
-    }
+    out.extend(left.into_iter().map(|row| (None, row)));
     for (n, (i, k)) in known.iter().enumerate() {
-        if taken.get(n).copied().unwrap_or(true) {
+        if taken.get(n).copied().unwrap_or(true) || more > 0 {
             continue;
         }
         let state = match (k.kind, k.state) {
             (OutputKind::Comment, OutputState::Deleted) => continue,
             (OutputKind::Comment, _) => OutputState::Deleted,
-            (_, OutputState::Open) if more == 0 => ended(k),
+            (_, OutputState::Open) => ended(k),
             _ => continue,
         };
         out.push((Some(*i), OutputRow { state, ..k.clone() }));
     }
     out
+}
+
+/// How far a row may be from one known and still be the same change.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Match {
+    SameWords,
+    Grown,
+    Moved,
+}
+
+/// The known row that is `row`, not taken yet: an open one first, then the nearest.
+fn nearest(known: &[(usize, OutputRow)], taken: &[bool], row: &OutputRow, matches: Match) -> Option<usize> {
+    let off = |r: &OutputRow| r.start.map_or(0, |a| a.off);
+    known
+        .iter()
+        .enumerate()
+        .filter(|(n, (_, k))| !taken.get(*n).copied().unwrap_or(true) && same(k, row, matches))
+        .min_by_key(|(_, (_, k))| (k.state != OutputState::Open, off(k).abs_diff(off(row))))
+        .map(|(n, _)| n)
 }
 
 /// Row `n` of `known` is `row` now: write it if it changed.
@@ -167,22 +207,20 @@ fn take(n: usize, known: &[(usize, OutputRow)], taken: &mut [bool], row: OutputR
 }
 
 /// Whether `known` and `row` are the same change or comment. A row that ended comes back only for
-/// the very same words: Undo brought it back.
-fn same(known: &OutputRow, row: &OutputRow, exactly: bool) -> bool {
+/// the same words in the same paragraph: Undo brought it back.
+fn same(known: &OutputRow, row: &OutputRow, matches: Match) -> bool {
     if known.comment.is_some() || row.comment.is_some() {
         return known.comment == row.comment;
     }
-    let block = |r: &OutputRow| r.start.map(|a| a.block);
-    if known.kind != row.kind || block(known) != block(row) {
-        return false;
-    }
-    if exactly {
-        return known.text == row.text;
-    }
-    known.state == OutputState::Open
-        && !known.text.is_empty()
-        && !row.text.is_empty()
-        && (known.text.contains(&row.text) || row.text.contains(&known.text))
+    let same_block = known.start.map(|a| a.block) == row.start.map(|a| a.block);
+    let open = known.state == OutputState::Open;
+    let words = !known.text.is_empty() && !row.text.is_empty();
+    known.kind == row.kind
+        && match matches {
+            Match::SameWords => same_block && known.text == row.text,
+            Match::Grown => same_block && open && words && (known.text.contains(&row.text) || row.text.contains(&known.text)),
+            Match::Moved => open && words && known.text == row.text,
+        }
 }
 
 #[cfg(test)]

@@ -242,16 +242,22 @@ pub struct CommentRow {
     pub resolved: bool,
 }
 
-/// The first `most` comments and replies `author` made, in the order of the document.
-pub fn comment_rows(s: &Session, author: &str, most: usize) -> Vec<CommentRow> {
-    let theirs = comment_list(s).into_iter().filter(|(id, _)| s.doc.comments.get(id).is_some_and(|c| c.author == author)).take(most);
-    theirs
+/// The first `most` comments and replies `author` made, in the order of the document, and how
+/// many more there are. Each one's text is its first paragraph's, read without copying the rest.
+pub fn comment_rows(s: &Session, author: &str, most: usize) -> (Vec<CommentRow>, usize) {
+    let theirs: Vec<_> = comment_list(s).into_iter().filter(|(id, _)| s.doc.comments.get(id).is_some_and(|c| c.author == author)).collect();
+    let more = theirs.len().saturating_sub(most);
+    let rows = theirs
+        .into_iter()
+        .take(most)
         .filter_map(|(id, at)| {
             let c = s.doc.comments.get(&id)?;
-            let text = s.doc.plain_text(StoryRef::Part(c.part)).chars().take(super::changes::ROW_TEXT_CHARS).collect();
+            let first = s.doc.para(StoryRef::Part(c.part), &wordcraft_doc::Path::top(0)).map(|p| p.text.as_str()).unwrap_or_default();
+            let text = first.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(super::changes::ROW_TEXT_CHARS).collect();
             Some(CommentRow { id, at, text, resolved: c.resolved })
         })
-        .collect()
+        .collect();
+    (rows, more)
 }
 
 pub(super) fn list_comments(s: &mut Session, _: &Value) -> CmdResult {

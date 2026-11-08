@@ -1244,3 +1244,26 @@ fn author_change_counts_include_headers_and_footnotes() {
     assert_eq!(s.doc.plain_text(StoryRef::Part(header)), original[0]);
     assert_eq!(s.doc.plain_text(StoryRef::Part(note)), original[1]);
 }
+
+#[test]
+fn accept_or_reject_by_author_leaves_others_changes_in_the_selection() {
+    let mut s = Session::new(wordcraft_doc::Document::from_text("one"));
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    s.author = "Colleague".into();
+    s.run("caret.docEnd", &json!({})).unwrap();
+    s.run("text.insert", &json!({"text": " two"})).unwrap();
+    s.author = "Assistant".into();
+    s.run("select.text", &json!({"text": " two"})).unwrap();
+    s.run("format.bold", &json!({})).unwrap();
+
+    s.run("select.text", &json!({"text": " two"})).unwrap();
+    s.run("review.reject", &json!({"author": "Assistant"})).unwrap();
+    assert_eq!(s.doc.plain_text(wordcraft_doc::StoryRef::Body), "one two", "the colleague's insertion stays");
+    assert!(super::changes_by(&s, "Colleague") > 0, "and stays tracked");
+    assert_eq!(super::changes_by(&s, "Assistant"), 0, "the assistant's formatting went");
+    // With no author, as it was: everything in the selection.
+    s.run("select.text", &json!({"text": " two"})).unwrap();
+    s.run("review.reject", &json!({})).unwrap();
+    assert_eq!(s.doc.plain_text(wordcraft_doc::StoryRef::Body), "one");
+    assert!(s.run("review.accept", &json!({"author": 7})).is_err());
+}

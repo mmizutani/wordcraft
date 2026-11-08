@@ -144,10 +144,6 @@ fn output_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, row: &OutputRow) {
         OutputKind::Move => tl!("Moved"),
         OutputKind::Comment => tl!("Comment"),
     };
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(kind).small().color(t.text_dim));
-        ui.add(egui::Label::new(RichText::new(&row.text).small().color(t.text)).wrap());
-    });
     let state = match row.state {
         OutputState::Open => None,
         OutputState::Accepted => Some(tl!("Accepted")),
@@ -155,31 +151,52 @@ fn output_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, row: &OutputRow) {
         OutputState::Resolved => Some(tl!("Resolved")),
         OutputState::Deleted => Some(tl!("Deleted")),
     };
-    ui.horizontal_wrapped(|ui| {
-        if let Some(state) = state {
-            ui.label(RichText::new(state).small().color(t.text_dim));
-        }
-        let open = row.state == OutputState::Open;
-        let there = open || (row.kind == OutputKind::Comment && row.state == OutputState::Resolved);
-        if let Some(range) = row.range().filter(|_| there) {
-            if ui.small_button(tl!("Show")).clicked() && app.run("select.range", range.clone()).is_ok() {
-                let tab = if row.kind == OutputKind::Comment { None } else { Some(json!({"tab": "Review"})) };
-                if let Some(tab) = tab {
-                    let _ = app.run("ui.tab", tab);
-                }
+    ui.scope(|ui| {
+        // Rows of text, not of controls: a wrapped row takes its height from this as it starts.
+        ui.spacing_mut().interact_size.y = 0.0;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(kind).small().color(t.text_dim));
+            ui.add(egui::Label::new(RichText::new(&row.text).small().color(t.text)).wrap());
+            if let Some(state) = state {
+                ui.label(RichText::new(state).small().color(t.text_dim));
             }
-            if open && row.kind != OutputKind::Comment {
-                let can = crate::widgets::enabled(app, "review.accept");
-                for (label, id) in [("Accept", "review.accept"), ("Reject", "review.reject")] {
-                    if ui.add_enabled(can, egui::Button::new(RichText::new(tl!(label)).small())).clicked()
-                        && app.run("select.range", range.clone()).is_ok()
-                    {
-                        let _ = app.run(id, json!({}));
-                    }
+        });
+    });
+    let open = row.state == OutputState::Open;
+    let there = open || (row.kind == OutputKind::Comment && row.state == OutputState::Resolved);
+    let Some(range) = row.range().filter(|_| there) else { return };
+    let name = app.conversation().map(|a| a.name().to_string()).unwrap_or_default();
+    ui.horizontal_wrapped(|ui| {
+        if ui.small_button(tl!("Show")).clicked() {
+            show(app, &range, row.kind != OutputKind::Comment);
+        }
+        if open && row.kind != OutputKind::Comment {
+            let can = crate::widgets::enabled(app, "review.accept");
+            for (label, id) in [("Accept", "review.accept"), ("Reject", "review.reject")] {
+                let button = ui.add_enabled(can, egui::Button::new(RichText::new(tl!(label)).small()));
+                // The assistant's change alone, though someone else's overlaps it.
+                if button.clicked() && select(app, &range) {
+                    let _ = app.run(id, json!({"author": name}));
                 }
             }
         }
     });
+}
+
+/// Select what a row names; it says so when that has gone.
+fn select(app: &mut WordApp, range: &serde_json::Value) -> bool {
+    let selected = app.run("select.range", range.clone()).is_ok();
+    if !selected {
+        app.assist.notice = Some(tl!("That isn't in the document any more.").to_string());
+    }
+    selected
+}
+
+/// Select what a row names, with Review open for a change.
+fn show(app: &mut WordApp, range: &serde_json::Value, review: bool) {
+    if select(app, range) && review {
+        let _ = app.run("ui.tab", json!({"tab": "Review"}));
+    }
 }
 
 fn row(ui: &mut Ui, t: &Tokens, step: &DetailStep) {

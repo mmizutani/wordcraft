@@ -166,3 +166,129 @@ fn only_details_shows_a_row() {
     assert_eq!(t.last_answer().as_deref(), Some("Rewriting"));
     assert!(t.entries().filter(|e| matches!(e, Entry::Output(_))).all(Entry::details_only));
 }
+
+#[test]
+fn a_change_of_words_that_repeat_keeps_its_row_and_its_verdict() {
+    let mut s = Session::new(Document::from_text("a cat b"));
+    s.author = AUTHOR.into();
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    let mut t = Transcript::default();
+    t.asked("Add");
+    s.run("caret.set", &json!({"pos": {"story": "body", "path": [0], "off": 0}})).unwrap();
+    s.run("text.insert", &json!({"text": "cat "})).unwrap();
+    s.run("caret.docEnd", &json!({})).unwrap();
+    s.run("text.insert", &json!({"text": " cat "})).unwrap();
+    note(&mut t, &s);
+    // Reject the first: "cat" is still there, the original and the other insertion.
+    s.run("select.text", &json!({"text": "cat ", "occurrence": 1})).unwrap();
+    s.run("review.reject", &json!({})).unwrap();
+    note(&mut t, &s);
+    let states: Vec<_> = listed(&t).into_iter().map(|r| (r.1, r.2)).collect();
+    assert_eq!(states, [("cat ".to_string(), OutputState::Rejected), (" cat ".to_string(), OutputState::Open)]);
+}
+
+#[test]
+fn accept_all_shifting_a_later_change_doesn_t_change_its_verdict() {
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Rewrite");
+    rewrite(&mut s, "one", "1");
+    rewrite(&mut s, "three", "3");
+    note(&mut t, &s);
+    s.run("review.acceptAll", &json!({})).unwrap();
+    note(&mut t, &s);
+    let states: Vec<_> = listed(&t).into_iter().map(|r| r.2).collect();
+    assert!(states.iter().all(|s| *s == OutputState::Accepted), "{:?}", listed(&t));
+}
+
+#[test]
+fn a_new_paragraph_mark_moves_a_change_without_a_new_row() {
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Add");
+    s.run("caret.set", &json!({"pos": {"story": "body", "path": [0], "off": 13}})).unwrap();
+    s.run("text.insert", &json!({"text": " end"})).unwrap();
+    note(&mut t, &s);
+    s.run("caret.set", &json!({"pos": {"story": "body", "path": [0], "off": 13}})).unwrap();
+    s.author = "Someone Else".into();
+    s.run("text.newParagraph", &json!({})).unwrap();
+    note(&mut t, &s);
+    assert_eq!(listed(&t), [(OutputKind::Insert, " end".to_string(), OutputState::Open)]);
+}
+
+#[test]
+fn two_formatting_changes_side_by_side_stay_two() {
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Format");
+    s.run("select.text", &json!({"text": "one"})).unwrap();
+    s.run("format.bold", &json!({})).unwrap();
+    s.run("select.text", &json!({"text": " two"})).unwrap();
+    s.run("format.italic", &json!({})).unwrap();
+    note(&mut t, &s);
+    let words: Vec<String> = listed(&t).into_iter().map(|r| r.1).collect();
+    assert_eq!(words, ["one", " two"]);
+}
+
+#[test]
+fn a_full_transcript_keeps_its_entries_where_they_are() {
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Rewrite");
+    rewrite(&mut s, "two", "2");
+    note(&mut t, &s);
+    for n in 0..crate::transcript::MAX_ENTRIES {
+        t.record(&crate::Event::Error { message: format!("entry {n}") });
+    }
+    let before: Vec<Entry> = t.entries().filter(|e| matches!(e, Entry::Error { .. })).cloned().collect();
+    // One row ends and one comes in at once, in a transcript that trims as one comes in.
+    s.run("select.text", &json!({"text": "2"})).unwrap();
+    s.run("review.accept", &json!({})).unwrap();
+    rewrite(&mut s, "five", "5");
+    note(&mut t, &s);
+    let after: Vec<Entry> = t.entries().filter(|e| matches!(e, Entry::Error { .. })).cloned().collect();
+    assert!(before.ends_with(&after), "no answer or error was overwritten");
+}
+
+#[test]
+fn rows_that_ended_go_before_they_push_the_conversation_out() {
+    let mut s = session();
+    s.run("caret.docEnd", &json!({})).unwrap();
+    let mut t = Transcript::default();
+    t.asked("Keep this prompt");
+    for n in 0..super::MAX_ROWS + 40 {
+        s.run("text.insert", &json!({"text": format!("<{n}>")})).unwrap();
+        note(&mut t, &s);
+        s.run("review.acceptAll", &json!({})).unwrap();
+        note(&mut t, &s);
+    }
+    let rows = t.entries().filter(|e| matches!(e, Entry::Output(_))).count();
+    assert!(rows <= super::MAX_ROWS, "{rows} rows");
+    assert!(t.entries().any(|e| matches!(e, Entry::Asked { text } if text == "Keep this prompt")));
+}
+
+#[test]
+fn a_comment_past_the_limit_isn_t_taken_for_deleted() {
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Comment");
+    for n in 0..super::MAX_COMMENTS {
+        s.run("caret.docEnd", &json!({})).unwrap();
+        s.run("review.newComment", &json!({"text": format!("c{n}")})).unwrap();
+    }
+    note(&mut t, &s);
+    s.run("caret.docStart", &json!({})).unwrap();
+    s.run("review.newComment", &json!({"text": "earlier"})).unwrap();
+    note(&mut t, &s);
+    assert!(listed(&t).iter().all(|r| r.2 != OutputState::Deleted), "{:?}", listed(&t).last());
+    assert_eq!(t.details().more_output, 1);
+}
+
+#[test]
+fn a_long_comment_is_read_only_as_far_as_its_row_shows() {
+    let mut s = session();
+    s.run("select.text", &json!({"text": "two"})).unwrap();
+    s.run("review.newComment", &json!({"text": "x".repeat(4096)})).unwrap();
+    let (rows, _) = rows(&s, AUTHOR);
+    assert_eq!(rows[0].text.chars().count(), wordcraft_engine::cmd::review::ROW_TEXT_CHARS);
+}
