@@ -1432,3 +1432,104 @@ fn a_huge_answer_draws_a_bounded_number_of_widgets_within_a_frame_budget() {
     let items = h.query_all_by_label("a").count();
     assert!((1..=wordcraft_assist::answer::MAX_BLOCKS).contains(&items), "{items} widgets");
 }
+
+/// A window with the pane open and a scripted turn holding on after `steps`.
+#[cfg(not(target_arch = "wasm32"))]
+fn running(mut steps: Vec<Step>) -> egui_kittest::Harness<'static, WordApp> {
+    use wordcraft_assist::Entry;
+    steps.push(Step::say("End of the script."));
+    steps.push(Step::Hold);
+    let mut app = window("one two three");
+    app.assist_with(Box::new(Fake::new().then(steps)));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Do the thing"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        let said = h
+            .state()
+            .conversation()
+            .is_some_and(|c| c.transcript().entries().any(|e| matches!(e, Entry::Answer { text } if text == "End of the script.")));
+        if said {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(2);
+    h
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn details_shows_steps_and_properties_during_a_turn_and_answers_the_same_to_a_script() {
+    use egui_kittest::kittest::Queryable;
+    let usage = wordcraft_assist::Usage { input_tokens: Some(1200), output_tokens: Some(80), ..Default::default() };
+    let mut h = running(vec![Step::tool("get_text", json!({})), Step::Emit(wordcraft_assist::Event::Usage(usage))]);
+    assert!(h.query_by_label("End of the script.").is_some(), "the conversation shows first");
+    assert!(h.query_by_label("Do the thing").is_some());
+
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("End of the script.").is_none(), "the view changed");
+    assert!(h.query_by_label("Do the thing").is_some(), "the turn names its steps");
+    assert!(h.query_by_label("get_text").is_some(), "{:?}", h.state().conversation().map(|c| c.details()));
+    for row in ["Scripted assistant (for testing)", "Suggester", "Tracked, in its name", "scripted", "1200 in, 80 out"] {
+        assert!(h.query_by_label(row).is_some(), "{row}");
+    }
+
+    let answer = h.state_mut().execute("assist.details", json!({})).unwrap();
+    assert_eq!(answer["properties"]["role"], "suggester");
+    assert_eq!(answer["properties"]["tracked"], true);
+    assert_eq!(answer["turns"][0]["asked"], "Do the thing");
+    assert_eq!(answer["turns"][0]["steps"][0]["title"], "get_text");
+    assert_eq!(answer["usage"]["inputTokens"], 1200);
+    assert_eq!(answer["model"], "scripted");
+
+    h.get_by_label("Conversation").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("End of the script.").is_some());
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_section_of_details_folds() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = running(vec![Step::tool("get_text", json!({}))]);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("get_text").is_some());
+    h.get_by_label("Steps").click();
+    h.run_steps(3);
+    assert!(h.query_by_label("get_text").is_none(), "folded");
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn details_gives_way_to_a_question_the_turn_waits_on() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = window("one");
+    app.assist_with(Box::new(Fake::new().then(vec![Step::say("Before."), Step::Hold])));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Go"})).unwrap();
+    h.run_steps(3);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    assert_eq!(h.state().assist.view, crate::assist::PaneView::Details);
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+    settle(h.state_mut());
+
+    h.state_mut().assist_with(Box::new(Fake::new().then(vec![Step::Ask("Run a command?".into())])));
+    h.state_mut().run("assist.ask", json!({"prompt": "Ask"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if h.state().conversation().is_some_and(|c| c.pending_permission().is_some()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(3);
+    assert_eq!(h.state().assist.view, crate::assist::PaneView::Conversation);
+    assert!(h.query_by_label("Run a command?").is_some(), "the person sees what the turn waits for");
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}

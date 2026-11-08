@@ -1108,3 +1108,83 @@ fn a_turn_starts_with_the_person_s_selection() {
     assert!(a.wait_idle(WAIT));
     assert_eq!(a.transcript().last_answer().as_deref(), Some("Still here."));
 }
+
+mod details {
+    use crate::backend::{Event, PlanEntry, PlanStatus, Priority, ToolCall, ToolStatus, Usage};
+    use crate::transcript::{MAX_ENTRIES, StepState, Transcript};
+
+    fn call(id: &str, status: ToolStatus) -> Event {
+        Event::Tool(ToolCall { id: id.into(), title: format!("Call {id}"), kind: "read".into(), status, detail: String::new(), changes: None })
+    }
+
+    fn plan(entries: &[(&str, PlanStatus)]) -> Event {
+        Event::Plan {
+            entries: entries.iter().map(|(c, status)| PlanEntry { content: (*c).into(), priority: Priority::Medium, status: *status }).collect(),
+        }
+    }
+
+    #[test]
+    fn steps_are_the_plan_when_the_agent_gave_one_else_the_tool_calls_by_turn() {
+        let mut t = Transcript::default();
+        t.asked("First");
+        t.record(&call("a", ToolStatus::Completed));
+        t.record(&call("b", ToolStatus::Failed));
+        t.record(&call("c", ToolStatus::InProgress));
+        t.asked("Second");
+        t.record(&call("d", ToolStatus::Completed));
+        t.record(&plan(&[("Read", PlanStatus::Completed), ("Edit", PlanStatus::InProgress), ("Check", PlanStatus::Pending)]));
+        t.asked("Third");
+
+        let details = t.details();
+        let turns: Vec<(Option<&str>, Vec<(&str, StepState)>)> =
+            details.turns.iter().map(|turn| (turn.asked.as_deref(), turn.steps.iter().map(|s| (s.title.as_str(), s.state)).collect())).collect();
+        assert_eq!(
+            turns,
+            [
+                (Some("First"), vec![("Call a", StepState::Done), ("Call b", StepState::Failed), ("Call c", StepState::Running)]),
+                (Some("Second"), vec![("Read", StepState::Done), ("Edit", StepState::Running), ("Check", StepState::Waiting)]),
+                (Some("Third"), vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_turn_names_itself_on_one_short_line() {
+        let mut t = Transcript::default();
+        t.asked(&format!("Line one\nline two {}", "x".repeat(200)));
+        let asked = t.details().turns[0].asked.clone().unwrap();
+        assert!(!asked.contains('\n') && asked.starts_with("Line one") && asked.ends_with('…') && asked.chars().count() <= 81, "{asked}");
+    }
+
+    #[test]
+    fn usage_and_who_ran_it_are_the_last_said() {
+        let mut t = Transcript::default();
+        t.asked("First");
+        t.record(&Event::Agent { name: "Agent 1".into() });
+        t.record(&Event::Model { name: "model-a".into() });
+        t.record(&Event::Usage(Usage { input_tokens: Some(1), ..Usage::default() }));
+        t.record(&Event::Usage(Usage { input_tokens: Some(2), ..Usage::default() }));
+        assert_eq!(t.entries().filter(|e| matches!(e, crate::Entry::Usage(_))).count(), 1, "a turn's usage is replaced");
+        t.asked("Second");
+        t.record(&Event::Model { name: "model-b".into() });
+        let details = t.details();
+        assert_eq!(details.agent.as_deref(), Some("Agent 1"));
+        assert_eq!(details.model.as_deref(), Some("model-b"));
+        assert_eq!(details.usage.and_then(|u| u.input_tokens), Some(2));
+    }
+
+    #[test]
+    fn trimming_the_oldest_entries_keeps_details_true_to_what_is_left() {
+        let mut t = Transcript::default();
+        t.asked("Gone soon");
+        t.record(&Event::Usage(Usage { input_tokens: Some(1), ..Usage::default() }));
+        for n in 0..MAX_ENTRIES {
+            t.record(&call(&n.to_string(), ToolStatus::Completed));
+        }
+        let details = t.details();
+        assert_eq!(details.turns.len(), 1);
+        assert_eq!(details.turns[0].asked, None, "the prompt was trimmed");
+        assert_eq!(details.turns[0].steps.len(), t.len(), "every step left is a row, and none that went");
+        assert_eq!(details.usage, None);
+    }
+}

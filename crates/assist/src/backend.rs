@@ -27,6 +27,9 @@ pub const MAX_LABEL: usize = 500;
 /// Most entries in a plan; more are dropped.
 pub const MAX_PLAN: usize = 64;
 
+/// Most bytes of a cost as an agent gives it.
+const MAX_COST: usize = 64;
+
 /// What a backend is: the pane's backend picker shows it, and the assistant joins the shared
 /// document under its author name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,6 +270,20 @@ pub enum PermissionPolicy {
     Allow,
 }
 
+/// What a turn used, as its backend says: what it doesn't say stays empty and isn't shown.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Usage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    /// Tokens of the session's context in use, and how many it holds (an agent's).
+    pub context_used: Option<u64>,
+    pub context_size: Option<u64>,
+    /// What the session has cost so far, as the agent gave it, with its currency.
+    pub cost: Option<String>,
+}
+
 /// What a turn sends back while it runs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "event")]
@@ -285,6 +302,10 @@ pub enum Event {
     Answered { id: u64, answer: Answer },
     /// Which model answered.
     Model { name: String },
+    /// What the agent says it is: its name and version.
+    Agent { name: String },
+    /// What the turn has used so far: it replaces what it said before.
+    Usage(Usage),
     /// The turn ended.
     Done { stop: StopReason },
     /// The turn failed: why, said plainly. The turn ended.
@@ -314,6 +335,8 @@ impl Event {
             }
             Event::Permission(r) => Event::Permission(PermissionRequest { id: r.id, ..PermissionRequest::bounded(&r.title, r.options) }),
             Event::Model { name } => Event::Model { name: label(&name) },
+            Event::Agent { name } => Event::Agent { name: label(&name) },
+            Event::Usage(u) => Event::Usage(Usage { cost: u.cost.map(|c| cut(label(&c), MAX_COST)), ..u }),
             Event::Error { message } => Event::Error { message: text(message) },
             e @ (Event::Answered { .. } | Event::Done { .. }) => e,
         }

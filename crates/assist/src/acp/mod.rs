@@ -37,7 +37,7 @@ use wordcraft_mcp::Backend as _;
 
 use crate::backend::{
     Answer, Backend, BackendInfo, Event, MAX_OPTIONS, MAX_PLAN, PermissionKind, PermissionOption, PermissionPolicy, PermissionRequest, PlanEntry,
-    PlanStatus, Priority, Seat, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, label,
+    PlanStatus, Priority, Seat, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, Usage, label,
 };
 pub use room_port::RoomPort;
 pub use rpc::{AUTH_REQUIRED, MAX_LINE, METHOD_NOT_FOUND, STDERR_TAIL};
@@ -304,7 +304,7 @@ impl Acp {
         let Some((running, agent)) = started? else { return Ok(false) };
         self.running = Some(running);
         if let Some(name) = agent {
-            ctx.emit(Event::Model { name });
+            ctx.emit(Event::Agent { name });
         }
         Ok(true)
     }
@@ -515,7 +515,12 @@ impl Acp {
                 let entries = update.get("entries").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
                 ctx.emit(Event::Plan { entries: entries.iter().filter_map(plan_entry).take(MAX_PLAN).collect() });
             }
-            // The person's prompt echoed, modes, commands, usage…: nothing to show.
+            Some("usage_update") => {
+                if let Some(usage) = usage_update(update) {
+                    ctx.emit(Event::Usage(usage));
+                }
+            }
+            // The person's prompt echoed, modes, commands…: nothing to show.
             _ => {}
         }
     }
@@ -738,6 +743,19 @@ fn content_text(block: &Value) -> String {
         Some("resource") => "[resource]".into(),
         _ => String::new(),
     }
+}
+
+/// What a `usage_update` says: how much of the session's context is in use and how much it holds,
+/// and what the session has cost, as the agent gave it. `None` when it says nothing usable.
+fn usage_update(update: &Value) -> Option<Usage> {
+    let number = |key: &str| update.get(key).and_then(Value::as_u64);
+    let cost = update.get("cost").and_then(|cost| {
+        let amount = cost.get("amount").filter(|a| a.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0))?;
+        let currency = cost.get("currency").and_then(Value::as_str).map(label).filter(|c| !c.trim().is_empty())?;
+        Some(format!("{amount} {currency}"))
+    });
+    let usage = Usage { context_used: number("used"), context_size: number("size"), cost, ..Usage::default() };
+    (usage != Usage::default()).then_some(usage)
 }
 
 /// Most characters of a tool call's detail.

@@ -32,7 +32,7 @@ use super::auth::{self, AuthError, access_token};
 use super::http::{self, Reply, redact};
 use super::sse;
 use super::{AUTHOR, Endpoints, ID, USAGE_PAGE};
-use crate::backend::{Backend, BackendInfo, Cancel, Event, Seat, StopReason, ToolSpec, Turn, TurnCtx, cut};
+use crate::backend::{Backend, BackendInfo, Cancel, Event, Seat, StopReason, ToolSpec, Turn, TurnCtx, Usage, cut};
 
 /// Most requests (model rounds) one turn makes.
 pub const MAX_ROUNDS: usize = 25;
@@ -401,6 +401,8 @@ struct Progress {
     tools: Vec<String>,
     /// Whether the pane was told which model answers.
     model_shown: bool,
+    /// What this turn's answers have used so far.
+    usage: Usage,
 }
 
 /// One answer, as its stream gave it.
@@ -825,8 +827,12 @@ fn on_event(event: &Value, answer: &mut Answer, progress: &mut Progress, ctx: &T
             ctx.emit(Event::Thought { text: "\n\n".into() });
         }
         "response.output_item.done" => return keep(event.get("item"), answer, progress, ctx),
-        "response.completed" => return completed(event.get("response"), answer, progress, ctx),
+        "response.completed" => {
+            show_usage(event.get("response"), progress, ctx);
+            return completed(event.get("response"), answer, progress, ctx);
+        }
         "response.incomplete" => {
+            show_usage(event.get("response"), progress, ctx);
             let reason = event.pointer("/response/incomplete_details/reason").and_then(Value::as_str).unwrap_or_default();
             return Step::Incomplete(match reason {
                 "content_filter" => StopReason::Refusal,
@@ -840,6 +846,28 @@ fn on_event(event: &Value, answer: &mut Answer, progress: &mut Progress, ctx: &T
         _ => {}
     }
     Step::Continue
+}
+
+/// Tell the pane what the turn has used, with this answer's `usage` added: a turn with tool calls
+/// makes a request per round. An answer without one, or with junk in it, adds nothing.
+fn show_usage(response: Option<&Value>, progress: &mut Progress, ctx: &TurnCtx<'_>) {
+    let Some(usage) = response.and_then(|r| r.get("usage")) else { return };
+    let number = |path: &str| usage.pointer(path).and_then(Value::as_u64);
+    let added = [
+        (&mut progress.usage.input_tokens, number("/input_tokens")),
+        (&mut progress.usage.output_tokens, number("/output_tokens")),
+        (&mut progress.usage.reasoning_tokens, number("/output_tokens_details/reasoning_tokens")),
+    ];
+    let mut any = false;
+    for (total, n) in added {
+        if let Some(n) = n {
+            *total = Some(total.unwrap_or(0).saturating_add(n));
+            any = true;
+        }
+    }
+    if any {
+        ctx.emit(Event::Usage(progress.usage.clone()));
+    }
 }
 
 /// Tell the pane which model answers, once a turn.

@@ -11,6 +11,10 @@
 //! into what to write at the caret. Everything it does goes through the `assist.*` and `review.*`
 //! commands, but for the answer to a permission request: that is the person's click alone, which
 //! no script can give for them.
+//!
+//! Once there is a conversation, tabs under the role switch it with its Details
+//! ([`super::assistant_details`]): the conversation's steps and what runs it, read from the same
+//! transcript.
 
 use egui::{Color32, RichText, Stroke, Ui, vec2};
 use serde_json::json;
@@ -19,7 +23,7 @@ use wordcraft_engine::AssistantPrefs;
 use wordcraft_engine::room::Role;
 
 use super::{Tokens, WordApp, regular, semibold};
-use crate::assist::{chosen, role_label, role_note};
+use crate::assist::{PaneView, chosen, role_label, role_note};
 use crate::i18n::fmt;
 
 /// Rows the prompt box shows.
@@ -47,13 +51,17 @@ pub(super) fn assistant(app: &mut WordApp, ui: &mut Ui) {
             let _ = app.run("assist.useDocument", json!({}));
         }
     }
+    let view = if app.conversation().is_some() { tabs(app, ui) } else { PaneView::Conversation };
     ui.separator();
     // The conversation takes the height that the buttons and the prompt box under it leave, as
     // they measured on the last frame.
     let bottom_id = ui.scope_id().with("assistant_bottom");
     let bottom = ui.data(|d| d.get_temp::<f32>(bottom_id)).unwrap_or(BOTTOM);
     let height = (ui.available_height() - bottom - 3.0 * ui.spacing().item_spacing.y - 6.0).max(MIN_TRANSCRIPT);
-    transcript(app, ui, &t, height);
+    match view {
+        PaneView::Conversation => transcript(app, ui, &t, height),
+        PaneView::Details => super::assistant_details::details(app, ui, &t, height),
+    }
     ui.separator();
     let bottom = ui
         .vertical(|ui| {
@@ -170,6 +178,18 @@ fn who(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     }
 }
 
+/// The tabs that switch the conversation with its Details: the view to show.
+fn tabs(app: &mut WordApp, ui: &mut Ui) -> PaneView {
+    ui.horizontal(|ui| {
+        for (view, label) in [(PaneView::Conversation, "Conversation"), (PaneView::Details, "Details")] {
+            if ui.selectable_label(app.assist.view == view, tl!(label)).clicked() {
+                app.assist.view = view;
+            }
+        }
+    });
+    app.assist.view
+}
+
 /// The conversation so far.
 fn transcript(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
     let entries: Vec<Entry> = app.conversation().map(|a| a.transcript().entries().cloned().collect()).unwrap_or_default();
@@ -183,6 +203,10 @@ fn transcript(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
             ui.label(RichText::new(tl!("Ask the assistant to draft, rewrite or check your writing. It works in the document like a collaborator: with the Suggester role, every edit is a tracked change for you to accept or reject.")).color(t.text_dim));
         }
         for (i, e) in entries.iter().enumerate() {
+            // Details shows these.
+            if matches!(e, Entry::Agent { .. } | Entry::Usage(_)) {
+                continue;
+            }
             let streaming = busy && i.saturating_add(1) == entries.len();
             entry(app, ui, t, i, e, waiting, streaming);
             ui.add_space(6.0);
@@ -198,7 +222,7 @@ fn transcript(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
     });
 }
 
-fn wrapped(ui: &mut Ui, text: RichText) {
+pub(super) fn wrapped(ui: &mut Ui, text: RichText) {
     ui.add(egui::Label::new(text).wrap());
 }
 
@@ -244,6 +268,7 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
         Entry::Model { name } => {
             ui.label(RichText::new(fmt(tl!("Model: {name}"), &[("name", name)])).small().color(t.text_dim));
         }
+        Entry::Agent { .. } | Entry::Usage(_) => {}
         Entry::Stopped { stop } => {
             if let Some(says) = stop.says() {
                 // Stopped by the person reads as a note; any other stop is news to them.
@@ -346,7 +371,7 @@ fn permission(app: &mut WordApp, ui: &mut Ui, t: &Tokens, request: &PermissionRe
 /// How a tool call or a plan entry stands, drawn: an open ring (waiting), a dot (running), a
 /// tick (done) or a cross (failed).
 #[derive(Clone, Copy)]
-enum Mark {
+pub(super) enum Mark {
     Waiting,
     Running,
     Done,
@@ -354,7 +379,7 @@ enum Mark {
 }
 
 impl Mark {
-    fn paint(self, ui: &mut Ui, t: &Tokens) {
+    pub(super) fn paint(self, ui: &mut Ui, t: &Tokens) {
         let (r, _) = ui.allocate_exact_size(vec2(14.0, 16.0), egui::Sense::hover());
         let c = r.center();
         let p = ui.painter();

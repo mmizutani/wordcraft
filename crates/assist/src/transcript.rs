@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 
 use serde::Serialize;
 
-use crate::backend::{Answer, Event, PermissionRequest, PlanEntry, StopReason, ToolCall};
+use crate::backend::{Answer, Event, PermissionRequest, PlanEntry, PlanStatus, StopReason, ToolCall, ToolStatus, Usage, label};
 
 /// Most entries a transcript keeps.
 pub const MAX_ENTRIES: usize = 2048;
@@ -36,6 +36,10 @@ pub enum Entry {
     Permission { request: PermissionRequest, answer: Option<Answer> },
     /// Which model answered.
     Model { name: String },
+    /// What the agent says it is. Details shows it; the conversation doesn't.
+    Agent { name: String },
+    /// What the turn used, as it last said. Details shows it; the conversation doesn't.
+    Usage(Usage),
     /// The turn stopped other than by finishing its answer.
     Stopped { stop: StopReason },
     /// The turn failed.
@@ -49,14 +53,102 @@ impl Entry {
             | Entry::Answer { text }
             | Entry::Thought { text }
             | Entry::Model { name: text }
+            | Entry::Agent { name: text }
             | Entry::Error { message: text } => text.len(),
             Entry::Tool(t) => t.title.len() + t.detail.len() + t.id.len(),
             Entry::Plan { entries } => entries.iter().map(|e| e.content.len()).sum(),
             Entry::Permission { request, .. } => request.title.len() + request.options.iter().map(|o| o.name.len() + o.id.len()).sum::<usize>(),
+            Entry::Usage(u) => u.cost.as_ref().map_or(0, String::len),
             Entry::Stopped { .. } => 0,
         }
         .saturating_add(16)
     }
+}
+
+/// Most characters of a prompt where Details names its turn.
+const ASKED_CHARS: usize = 80;
+
+/// How far a step has got: the pane's marks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StepState {
+    Waiting,
+    Running,
+    Done,
+    Failed,
+}
+
+/// One step of a turn: an entry of its plan, or a tool call.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Step {
+    pub title: String,
+    pub state: StepState,
+}
+
+/// One turn, as Details shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnDetails {
+    /// What the person asked, on one line and cut short. `None` when trimming took it.
+    pub asked: Option<String>,
+    /// The plan when the agent gave one, else the tool calls.
+    pub steps: Vec<Step>,
+}
+
+/// What runs a conversation, which its transcript doesn't hold ([`crate::Assistant::details`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Properties {
+    /// The backend's name in the picker.
+    pub backend: String,
+    /// The name it joined the document under.
+    pub name: String,
+    /// The shared document's title.
+    pub document: String,
+    pub role: String,
+    /// Whether its edits are tracked changes.
+    pub tracked: bool,
+}
+
+/// A conversation in summary: what the pane's Details shows, and `assist.details` answers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Details {
+    pub properties: Option<Properties>,
+    /// Oldest first.
+    pub turns: Vec<TurnDetails>,
+    /// What the agent says it is, with its version.
+    pub agent: Option<String>,
+    /// The model that answered last.
+    pub model: Option<String>,
+    /// What the last turn that said used.
+    pub usage: Option<Usage>,
+}
+
+/// The turn [`Transcript::details`] is reading.
+#[derive(Default)]
+struct TurnBuilder {
+    asked: Option<String>,
+    plan: Option<Vec<Step>>,
+    calls: Vec<Step>,
+}
+
+impl TurnBuilder {
+    /// Add the turn to `turns`, if it has anything to show, and start another.
+    fn finish(&mut self, turns: &mut Vec<TurnDetails>) {
+        let TurnBuilder { asked, plan, calls } = std::mem::take(self);
+        let steps = plan.unwrap_or(calls);
+        if asked.is_some() || !steps.is_empty() {
+            turns.push(TurnDetails { asked, steps });
+        }
+    }
+}
+
+/// `text` on one line, cut short.
+fn short(text: &str) -> String {
+    let line = label(text);
+    if line.chars().count() > ASKED_CHARS { line.chars().take(ASKED_CHARS).chain(['…']).collect() } else { line }
 }
 
 /// A conversation's entries, oldest first.
@@ -103,6 +195,45 @@ impl Transcript {
         if pieces.is_empty() { None } else { Some(pieces.join("\n\n")) }
     }
 
+    /// What the entries say about the conversation, turn by turn: what the pane's Details shows
+    /// and `assist.details` answers. It keeps nothing of its own, so it can't disagree with the
+    /// conversation, and what was trimmed from it is gone from here too.
+    pub fn details(&self) -> Details {
+        let mut out = Details::default();
+        let mut turn = TurnBuilder::default();
+        for entry in &self.entries {
+            match entry {
+                Entry::Asked { text } => {
+                    turn.finish(&mut out.turns);
+                    turn.asked = Some(short(text));
+                }
+                Entry::Plan { entries } => {
+                    let state = |s: PlanStatus| match s {
+                        PlanStatus::Pending => StepState::Waiting,
+                        PlanStatus::InProgress => StepState::Running,
+                        PlanStatus::Completed => StepState::Done,
+                    };
+                    turn.plan = Some(entries.iter().map(|p| Step { title: p.content.clone(), state: state(p.status) }).collect());
+                }
+                Entry::Tool(call) => {
+                    let state = match call.status {
+                        ToolStatus::Pending => StepState::Waiting,
+                        ToolStatus::InProgress => StepState::Running,
+                        ToolStatus::Completed => StepState::Done,
+                        ToolStatus::Failed => StepState::Failed,
+                    };
+                    turn.calls.push(Step { title: call.title.clone(), state });
+                }
+                Entry::Model { name, .. } => out.model = Some(name.clone()),
+                Entry::Agent { name } => out.agent = Some(name.clone()),
+                Entry::Usage(usage) => out.usage = Some(usage.clone()),
+                Entry::Answer { .. } | Entry::Thought { .. } | Entry::Permission { .. } | Entry::Stopped { .. } | Entry::Error { .. } => {}
+            }
+        }
+        turn.finish(&mut out.turns);
+        out
+    }
+
     /// The person asked `text`: a new turn starts.
     pub fn asked(&mut self, text: &str) {
         self.turn_start = self.entries.len();
@@ -140,6 +271,18 @@ impl Transcript {
             Event::Model { name } => {
                 if !self.in_turn().any(|(_, e)| matches!(e, Entry::Model { name: n } if n == name)) {
                     self.push(Entry::Model { name: name.clone() });
+                }
+            }
+            Event::Agent { name } => {
+                if !self.in_turn().any(|(_, e)| matches!(e, Entry::Agent { name: n } if n == name)) {
+                    self.push(Entry::Agent { name: name.clone() });
+                }
+            }
+            Event::Usage(usage) => {
+                let i = self.in_turn().find(|(_, e)| matches!(e, Entry::Usage(_))).map(|(i, _)| i);
+                match i {
+                    Some(i) => self.replace(i, Entry::Usage(usage.clone())),
+                    None => self.push(Entry::Usage(usage.clone())),
                 }
             }
             Event::Done { stop } => {

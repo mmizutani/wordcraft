@@ -61,6 +61,8 @@ pub(crate) struct AssistState {
     /// Frames left in which the prompt box takes the keyboard: a few, as the click that opened
     /// the pane hands the keyboard back to the page.
     pub(crate) focus_prompt: u8,
+    /// What the pane shows: the conversation, or what the assistant is doing and what runs it.
+    pub(crate) view: PaneView,
     /// Why the last prompt didn't start, or a change couldn't be shown, for the pane.
     pub(crate) notice: Option<String>,
     /// The command running now is the person's ([`WordApp::run`]: the pane, a menu, a
@@ -85,6 +87,14 @@ pub(crate) struct AssistState {
     pub(crate) setup: Option<crate::options::agent_setup::AgentSetup>,
     /// The ChatGPT sign-in (#19): who is signed in, and a sign-in or sign-out under way.
     pub(crate) chatgpt: chatgpt::ChatGptState,
+}
+
+/// What the Assistant pane shows under its role.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PaneView {
+    #[default]
+    Conversation,
+    Details,
 }
 
 /// One conversation, and the document it is about.
@@ -194,6 +204,8 @@ pub(crate) fn tick(app: &mut WordApp) {
         if app.assist.opened_for != Some(id) {
             app.assist.opened_for = Some(id);
             app.session.view.assistant_pane = true;
+            // The question is in the conversation.
+            app.assist.view = PaneView::Conversation;
         } else if !app.session.view.assistant_pane
             && let Some(a) = app.conversation_mut()
         {
@@ -277,6 +289,7 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
             Ok(json!({"switched": switched}))
         }
         "backend" => backend(app, req.get("id").and_then(Value::as_str)),
+        "details" => details(app),
         "show" => {
             let last = req.get("version").and_then(Value::as_u64).unwrap_or(0);
             show_change(app, req.get("from").and_then(Value::as_u64).unwrap_or(last), last)
@@ -288,6 +301,12 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
     };
     app.session.assistant = status(app);
     r
+}
+
+/// The conversation in summary, as the pane's Details shows it. Empty without a conversation.
+fn details(app: &WordApp) -> Result<Value, String> {
+    let details = app.conversation().map(Assistant::details).unwrap_or_default();
+    serde_json::to_value(details).map_err(|e| e.to_string())
 }
 
 /// The assistants offered, whether each is ready, and the one chosen; with `id`, choose it.
@@ -559,7 +578,8 @@ pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
         Entry::Tool(call) => vec![call.title.clone(), call.detail.clone()],
         Entry::Plan { entries } => entries.iter().map(|p| p.content.clone()).collect(),
         Entry::Permission { request, .. } => std::iter::once(request.title.clone()).chain(request.options.iter().map(|o| o.name.clone())).collect(),
-        Entry::Model { name } => vec![name.clone()],
+        Entry::Model { name } | Entry::Agent { name } => vec![name.clone()],
+        Entry::Usage(u) => u.cost.iter().cloned().collect(),
         Entry::Stopped { .. } => vec![],
         Entry::Error { message } => vec![message.clone()],
     }

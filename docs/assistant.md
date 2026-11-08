@@ -63,6 +63,18 @@ the text, reachable by keyboard, with its address beside its words when they dif
 leaves it closed and the pane says so. At most 64 KiB of an answer, 512 blocks and 4096 runs of
 text are formatted, and the rest shows as plain text.
 
+Once there is a conversation, tabs under the role switch it with its **Details**, which keeps
+updating during a turn and reads only the conversation's own record, so the two can't disagree.
+Each section folds. **Steps** lists each turn under what you asked: the agent's plan when it gave
+one, else the turn's tool calls by title, with the same marks as the conversation. **Properties**
+says which assistant it is, with the version an agent gives, the document it works on, its role,
+whether its edits are tracked, the model that answered, and what the last turn used: tokens for
+ChatGPT, added up over the requests of a turn, with a link to your plan's usage page because a plan
+has no price per request, and how much of its context and money the session has used when an agent
+says, its cost as the agent gave it. A row with nothing to say doesn't show. When a turn starts
+waiting on a question for you, the pane goes back to the conversation, where the question is.
+`assist.details` answers a script with the same summary.
+
 ## Backends
 
 | Id | Backend | What runs it |

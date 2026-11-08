@@ -114,6 +114,8 @@ pub enum Step {
     Fail { code: i64, message: String },
     /// Wait `ms` milliseconds (at most a minute).
     Sleep { ms: u64 },
+    /// Send this `session/update` as it is.
+    Send { update: Value },
 }
 
 /// One MCP tool call ([`Step::Mcp`]).
@@ -280,6 +282,7 @@ impl Agent<'_> {
             }
             match step {
                 Step::Say { text } => say(&text),
+                Step::Send { update: raw } => update(raw),
                 Step::Think { text } => update(json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": text}})),
                 Step::Tool { id: call, title, kind } => {
                     let kind = if kind.is_empty() { "other".to_string() } else { kind };

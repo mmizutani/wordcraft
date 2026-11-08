@@ -706,3 +706,37 @@ fn earlier_tool_outputs_are_cut_and_earlier_turns_kept_as_words() {
 fn bodies_input(c: &Chat, n: usize) -> Vec<Value> {
     c.bodies()[n]["input"].as_array().unwrap().clone()
 }
+
+#[test]
+fn what_each_request_used_adds_up_and_reaches_details() {
+    let usage = |input: u64, output: u64, reasoning: u64| {
+        json!({"type": "response.completed", "response": {"status": "completed", "usage": {
+            "input_tokens": input, "output_tokens": output, "output_tokens_details": {"reasoning_tokens": reasoning},
+        }}})
+    };
+    let call =
+        json!({"type": "response.output_item.done", "item": {"type": "function_call", "call_id": "c1", "name": "get_text", "arguments": "{}"}});
+    let rounds =
+        vec![Reply::sse(&[created(), call, usage(100, 10, 4)]), Reply::sse(&[created(), delta("Done."), message("Done."), usage(200, 20, 6)])];
+    let mut c = chat("one two three", replies(rounds));
+    c.assistant.ask("Read it", None).unwrap();
+    assert!(c.assistant.wait_idle(WAIT));
+    let used = c.assistant.details().usage.expect("the turn says what it used");
+    assert_eq!((used.input_tokens, used.output_tokens, used.reasoning_tokens), (Some(300), Some(30), Some(10)));
+    assert_eq!(used.context_used, None);
+}
+
+#[test]
+fn a_stream_with_no_usage_or_junk_in_it_says_nothing_used() {
+    let none = json!({"type": "response.completed", "response": {"status": "completed"}});
+    let junk = json!({"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": "lots", "output_tokens": -1}}});
+    let mut c = chat(
+        "one",
+        replies(vec![Reply::sse(&[created(), delta("A"), message("A"), none]), Reply::sse(&[created(), delta("B"), message("B"), junk])]),
+    );
+    for prompt in ["One", "Two"] {
+        c.assistant.ask(prompt, None).unwrap();
+        assert!(c.assistant.wait_idle(WAIT));
+        assert_eq!(c.assistant.details().usage, None);
+    }
+}

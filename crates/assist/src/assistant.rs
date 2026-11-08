@@ -25,7 +25,7 @@ use crate::backend::{
     StopReason, ToolHost, Turn, TurnCtx, Waker,
 };
 use crate::tools::CopyTools;
-use crate::transcript::{Entry, Transcript};
+use crate::transcript::{Details, Entry, Properties, Transcript};
 
 /// Most events [`Assistant::poll`] takes at once, so a chatty backend can't hold up a frame.
 pub const MAX_EVENTS_PER_POLL: usize = 512;
@@ -186,6 +186,21 @@ impl Assistant {
     /// The conversation so far.
     pub fn transcript(&self) -> &Transcript {
         &self.transcript
+    }
+
+    /// The conversation in summary, with what runs it: what the pane's Details shows and
+    /// `assist.details` answers.
+    pub fn details(&self) -> Details {
+        Details {
+            properties: Some(Properties {
+                backend: self.info.label.clone(),
+                name: self.seat.name.clone(),
+                document: self.seat.document.clone(),
+                role: self.seat.role.name().to_string(),
+                tracked: self.seat.tracked(),
+            }),
+            ..self.transcript.details()
+        }
     }
 
     /// Whether a turn is running.

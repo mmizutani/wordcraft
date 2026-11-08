@@ -19,6 +19,9 @@
 //! `assist.showChange` selects what one of the assistant's tool calls changed, by the version of
 //! the shared document it made.
 //!
+//! `assist.details` answers what the Assistant pane's Details shows: the conversation's steps, and
+//! what runs it.
+//!
 //! Sign in with ChatGPT (#19): `assist.chatgpt.signIn` has the window open the browser to sign
 //! in, `assist.chatgpt.cancelSignIn` stops a sign-in that waits for it, and
 //! `assist.chatgpt.signOut` revokes and deletes the sign-in (File › Options › Account, and the
@@ -124,6 +127,13 @@ pub fn specs() -> Vec<CommandSpec> {
             .params(r#"{"id"?: string (one the window offers; omit to list them)} → the assistants offered, whether each is ready, and the one chosen"#)
             .when(in_window)
             .pure(),
+        CommandSpec::new("assist.details", "Assistant Details", "Home › Assistant", |s, _| {
+            s.push_ui_request(json!({"assist": "details"}));
+            Ok(json!({}))
+        })
+        .params(r#"{} → the conversation in summary, as the Assistant pane's Details shows it: what runs it (`properties`), its `turns` with their `steps`, the `agent`, the `model` and what it used (`usage`)"#)
+        .when(in_window)
+        .pure(),
         CommandSpec::new("assist.defaultRole", "Assistants Join As", "File › Options › Assistant", default_role)
             .params(r#"{"value"?: "viewer|commenter|suggester|editor" (omit to read it; never owner)}"#)
             .pure(),
