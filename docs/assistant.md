@@ -74,7 +74,14 @@ with a note when the selection was cut. That comes from the pass that wrote the 
 so it can't disagree with it. Under it come the turn's reads and searches, each once: WordCraft's
 own tools by name, where a row for a paragraph selects it, and says so if it has gone; a file an agent read by its path and
 line; an address an agent fetched, which opens only on your own click. An agent's read that doesn't
-say where it looked is listed by its title. **Properties**
+say where it looked is listed by its title. **Output** lists the tracked changes and comments this
+conversation made, newest first and by turn, by the name it joined under, while the pane is open:
+each with its words cut short, Show, and for a change, Accept and Reject of that change alone. A
+change someone resolved, you or anyone in the room, says how it ended, read from the text: an
+insertion whose words are still where they were was accepted, a deletion's the other way round, and
+a formatting change or a move says only that it was resolved. A comment says whether it is open,
+resolved or deleted. At most 256 changes are listed, and the rest are counted; Review has them all.
+Accept all and Reject all stay under both views. **Properties**
 says which assistant it is, with the version an agent gives, the document it works on, its role,
 whether its edits are tracked, the model that answered, and what the last turn used: tokens for
 ChatGPT, added up over the requests of a turn, with a link to your plan's usage page because a plan

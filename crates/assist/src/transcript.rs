@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::backend::{Answer, Event, PermissionRequest, PlanEntry, PlanStatus, Source, SourceKind, StopReason, ToolCall, ToolStatus, Usage, label};
 use crate::context::Sent;
+use crate::output::OutputRow;
 
 /// Most entries a transcript keeps.
 pub const MAX_ENTRIES: usize = 2048;
@@ -43,6 +44,9 @@ pub enum Entry {
     Usage(Usage),
     /// What the turn gave the model of the document. Details shows it; the conversation doesn't.
     Context(Sent),
+    /// A change or a comment the conversation made, as it last stood. Details shows it; the
+    /// conversation doesn't.
+    Output(OutputRow),
     /// The turn stopped other than by finishing its answer.
     Stopped { stop: StopReason },
     /// The turn failed.
@@ -53,7 +57,7 @@ impl Entry {
     /// Whether only Details shows it: the conversation goes on as if it weren't there, and an
     /// answer that arrives in pieces around it stays one answer.
     pub fn details_only(&self) -> bool {
-        matches!(self, Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_))
+        matches!(self, Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) | Entry::Output(_))
     }
 
     fn bytes(&self) -> usize {
@@ -72,6 +76,7 @@ impl Entry {
             Entry::Permission { request, .. } => request.title.len() + request.options.iter().map(|o| o.name.len() + o.id.len()).sum::<usize>(),
             Entry::Usage(u) => u.cost.as_ref().map_or(0, String::len),
             Entry::Context(sent) => sent.document.len(),
+            Entry::Output(row) => row.text.len(),
             Entry::Stopped { .. } => 0,
         }
         .saturating_add(16)
@@ -116,6 +121,8 @@ pub struct TurnDetails {
     pub sources: Vec<Source>,
     /// How many more [`TurnDetails::sources`] leaves out.
     pub more_sources: u32,
+    /// The changes and comments that first showed during it, oldest first.
+    pub output: Vec<OutputRow>,
 }
 
 /// What runs a conversation, which its transcript doesn't hold ([`crate::Assistant::details`]).
@@ -146,6 +153,8 @@ pub struct Details {
     pub model: Option<String>,
     /// What the last turn that said used.
     pub usage: Option<Usage>,
+    /// How many more changes there are than the list holds ([`crate::output::MAX_ROWS`]).
+    pub more_output: u32,
 }
 
 /// The turn [`Transcript::details`] is reading.
@@ -157,6 +166,7 @@ struct TurnBuilder<'a> {
     context: Option<Sent>,
     sources: Vec<Source>,
     more_sources: u32,
+    output: Vec<OutputRow>,
     /// The sources seen, listed or not, so each counts once.
     seen: HashSet<(SourceKind, &'a str, Option<&'a str>)>,
 }
@@ -164,10 +174,10 @@ struct TurnBuilder<'a> {
 impl<'a> TurnBuilder<'a> {
     /// Add the turn to `turns`, if it has anything to show, and start another.
     fn finish(&mut self, turns: &mut Vec<TurnDetails>) {
-        let TurnBuilder { asked, plan, calls, context, sources, more_sources, .. } = std::mem::take(self);
+        let TurnBuilder { asked, plan, calls, context, sources, more_sources, output, .. } = std::mem::take(self);
         let steps = plan.unwrap_or(calls);
-        if asked.is_some() || !steps.is_empty() || context.is_some() || !sources.is_empty() {
-            turns.push(TurnDetails { asked, steps, context, sources, more_sources });
+        if asked.is_some() || !steps.is_empty() || context.is_some() || !sources.is_empty() || !output.is_empty() {
+            turns.push(TurnDetails { asked, steps, context, sources, more_sources, output });
         }
     }
 
@@ -210,6 +220,9 @@ pub struct Transcript {
     /// Where the current turn's entries start, counted from the front.
     #[serde(skip)]
     turn_start: usize,
+    /// How many more changes the document has than the entries list ([`crate::output::MAX_ROWS`]).
+    #[serde(skip)]
+    more_output: usize,
 }
 
 impl Transcript {
@@ -248,7 +261,7 @@ impl Transcript {
     /// and `assist.details` answers. It keeps nothing of its own, so it can't disagree with the
     /// conversation, and what was trimmed from it is gone from here too.
     pub fn details(&self) -> Details {
-        let mut out = Details::default();
+        let mut out = Details { more_output: u32::try_from(self.more_output).unwrap_or(u32::MAX), ..Details::default() };
         let mut turn = TurnBuilder::default();
         for entry in &self.entries {
             match entry {
@@ -278,6 +291,7 @@ impl Transcript {
                 Entry::Agent { name } => out.agent = Some(name.clone()),
                 Entry::Usage(usage) => out.usage = Some(usage.clone()),
                 Entry::Context(sent) => turn.context = Some(sent.clone()),
+                Entry::Output(row) => turn.output.push(row.clone()),
                 Entry::Answer { .. } | Entry::Thought { .. } | Entry::Permission { .. } | Entry::Stopped { .. } | Entry::Error { .. } => {}
             }
         }
@@ -288,6 +302,22 @@ impl Transcript {
     /// What the turn that just started gave the model of the document.
     pub fn sent(&mut self, sent: Sent) {
         self.push(Entry::Context(sent));
+    }
+
+    /// The changes and comments the conversation has in the document now, from [`crate::output`]:
+    /// a row seen before is brought up to date, a new one joins the current turn, and one the
+    /// document no longer has ended, as `ended` says. `more`: the document has more changes than
+    /// `seen`, so a row missing from it may only be past the limit.
+    pub(crate) fn note_output(&mut self, seen: Vec<OutputRow>, more: usize, ended: impl Fn(&OutputRow) -> crate::output::OutputState) {
+        self.more_output = more;
+        let rows: Vec<(usize, OutputRow)> =
+            self.entries.iter().enumerate().filter_map(|(i, e)| if let Entry::Output(row) = e { Some((i, row.clone())) } else { None }).collect();
+        for (i, row) in crate::output::reconcile(&rows, seen, more, ended) {
+            match i {
+                Some(i) => self.replace(i, Entry::Output(row)),
+                None => self.push(Entry::Output(row)),
+            }
+        }
     }
 
     /// The person asked `text`: a new turn starts.

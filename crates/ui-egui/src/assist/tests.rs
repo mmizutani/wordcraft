@@ -1629,3 +1629,94 @@ fn a_turn_records_what_it_was_given_as_the_model_got_it() {
     let context = turns.turns[0].context.as_deref().unwrap_or_default();
     assert_eq!(sent.bytes as usize, context.len(), "{context}");
 }
+
+/// Replace "two" and "three", one tool call each, then hold the turn.
+#[cfg(not(target_arch = "wasm32"))]
+fn rewrite_both() -> Vec<Step> {
+    vec![
+        Step::tool("select_text", json!({"text": "two"})),
+        Step::tool("type_text", json!({"text": "2"})),
+        Step::tool("select_text", json!({"text": "three"})),
+        Step::tool("type_text", json!({"text": "3"})),
+    ]
+}
+
+/// Frames until the window has what the room took.
+#[cfg(not(target_arch = "wasm32"))]
+fn caught_up(h: &mut egui_kittest::Harness<'static, WordApp>) {
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if h.state().share_settled() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(3);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn accepting_a_row_of_output_changes_only_that_change() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = running(rewrite_both());
+    caught_up(&mut h);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    // The pane is short: the rows to click are in view with the sections above them folded.
+    h.get_by_label("Steps").click();
+    h.run_steps(2);
+    h.get_by_label("Sources").click();
+    h.run_steps(2);
+    let rows = |h: &egui_kittest::Harness<'static, WordApp>| wordcraft_engine::cmd::review::change_rows(&h.state().session, "Test Assistant", 16).0;
+    assert_eq!(rows(&h).len(), 4, "{:?}", rows(&h));
+    assert!(h.query_by_label("3").is_some() && h.query_by_label("three").is_some());
+    // Newest first: "three" and its Accept are the first row.
+    h.get_all_by_label("Accept").next().unwrap().click();
+    h.run_steps(3);
+    let left: Vec<String> = rows(&h).into_iter().map(|c| c.text).collect();
+    assert_eq!(left, ["2", "two", "3"], "only that change");
+    assert!(h.query_by_label("Accepted").is_some(), "the row says how it ended");
+
+    // Reject the next one, its deletion: only that one too.
+    h.get_all_by_label("Reject").next().unwrap().click();
+    h.run_steps(3);
+    let left: Vec<String> = rows(&h).into_iter().map(|c| c.text).collect();
+    assert_eq!(left, ["2", "two"]);
+    assert!(h.query_by_label("Rejected").is_some());
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_change_another_participant_resolved_updates_its_row() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_engine::room::Role;
+    let mut h = running(rewrite_both());
+    caught_up(&mut h);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_label("Accept").count(), 4);
+    let room = h.state().shared_room().expect("the document is shared");
+    let (_, key) = room.invite_numbered("Colleague", Role::Editor).unwrap();
+    let mut colleague = room.join_with(&key).unwrap();
+    colleague.run("select.text", &json!({"text": "2"})).unwrap();
+    colleague.run("review.accept", &json!({})).unwrap();
+    colleague.send();
+    caught_up(&mut h);
+    assert_eq!(h.query_all_by_label("Accept").count(), 3);
+    assert!(h.query_by_label("Accepted").is_some());
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn accept_all_stays_on_the_conversation() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = running(rewrite_both());
+    caught_up(&mut h);
+    assert!(h.query_by_label("Accept all").is_some());
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Accept all").is_some(), "it stays under both views");
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}

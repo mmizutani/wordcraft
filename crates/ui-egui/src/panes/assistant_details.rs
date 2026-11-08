@@ -5,7 +5,7 @@
 use egui::{RichText, Ui};
 use serde_json::json;
 use wordcraft_assist::answer::opens;
-use wordcraft_assist::{DetailStep, Details, Sent, Source, SourceKind, StepState, Usage};
+use wordcraft_assist::{DetailStep, Details, OutputKind, OutputRow, OutputState, Sent, Source, SourceKind, StepState, Usage};
 use wordcraft_engine::room::Role;
 
 use super::assistant::{Mark, wrapped};
@@ -21,6 +21,7 @@ pub(super) fn details(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
         ui.set_width(ui.available_width());
         section(ui, "Steps", |ui| steps(ui, t, &details));
         section(ui, "Sources", |ui| sources(app, ui, t, &details));
+        section(ui, "Output", |ui| output(app, ui, t, &details));
         section(ui, "Properties", |ui| properties(app, ui, t, &details));
     });
 }
@@ -111,6 +112,74 @@ fn source_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, source: &Source) {
         (SourceKind::Web, Some(address)) if opens(address) => super::answer::web_link(app, ui, words.color(ui.visuals().hyperlink_color), address),
         _ => wrapped(ui, words.color(t.text)),
     }
+}
+
+/// What each turn changed and commented on, newest first.
+fn output(app: &mut WordApp, ui: &mut Ui, t: &Tokens, details: &Details) {
+    let turns: Vec<_> = details.turns.iter().enumerate().rev().filter(|(_, turn)| !turn.output.is_empty()).collect();
+    if turns.is_empty() {
+        ui.label(RichText::new(tl!("No changes or comments yet.")).small().color(t.text_dim));
+    }
+    for (i, turn) in turns {
+        if let Some(asked) = &turn.asked {
+            wrapped(ui, RichText::new(asked).small().color(t.text_dim));
+        }
+        for (n, row) in turn.output.iter().enumerate().rev() {
+            ui.push_id((i, n), |ui| output_row(app, ui, t, row));
+        }
+        ui.add_space(4.0);
+    }
+    if details.more_output > 0 {
+        let more = details.more_output.to_string();
+        ui.label(RichText::new(fmt(tl!("and {count} more changes: see the Review tab"), &[("count", &more)])).small().color(t.text_dim));
+    }
+}
+
+/// A change or a comment: its kind and words, then how it ended, or Show, Accept and Reject.
+fn output_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, row: &OutputRow) {
+    let kind = match row.kind {
+        OutputKind::Insert => tl!("Added"),
+        OutputKind::Delete => tl!("Removed"),
+        OutputKind::Format => tl!("Formatted"),
+        OutputKind::Move => tl!("Moved"),
+        OutputKind::Comment => tl!("Comment"),
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(kind).small().color(t.text_dim));
+        ui.add(egui::Label::new(RichText::new(&row.text).small().color(t.text)).wrap());
+    });
+    let state = match row.state {
+        OutputState::Open => None,
+        OutputState::Accepted => Some(tl!("Accepted")),
+        OutputState::Rejected => Some(tl!("Rejected")),
+        OutputState::Resolved => Some(tl!("Resolved")),
+        OutputState::Deleted => Some(tl!("Deleted")),
+    };
+    ui.horizontal_wrapped(|ui| {
+        if let Some(state) = state {
+            ui.label(RichText::new(state).small().color(t.text_dim));
+        }
+        let open = row.state == OutputState::Open;
+        let there = open || (row.kind == OutputKind::Comment && row.state == OutputState::Resolved);
+        if let Some(range) = row.range().filter(|_| there) {
+            if ui.small_button(tl!("Show")).clicked() && app.run("select.range", range.clone()).is_ok() {
+                let tab = if row.kind == OutputKind::Comment { None } else { Some(json!({"tab": "Review"})) };
+                if let Some(tab) = tab {
+                    let _ = app.run("ui.tab", tab);
+                }
+            }
+            if open && row.kind != OutputKind::Comment {
+                let can = crate::widgets::enabled(app, "review.accept");
+                for (label, id) in [("Accept", "review.accept"), ("Reject", "review.reject")] {
+                    if ui.add_enabled(can, egui::Button::new(RichText::new(tl!(label)).small())).clicked()
+                        && app.run("select.range", range.clone()).is_ok()
+                    {
+                        let _ = app.run(id, json!({}));
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn row(ui: &mut Ui, t: &Tokens, step: &DetailStep) {

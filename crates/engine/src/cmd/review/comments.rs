@@ -231,6 +231,29 @@ pub fn comment_list(s: &Session) -> Vec<(u32, Option<Pos>)> {
     found
 }
 
+/// One of an author's comments in the document, for a list of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommentRow {
+    pub id: u32,
+    /// Where it is, when it has a place in the text.
+    pub at: Option<Pos>,
+    /// Its text, at most [`super::changes::ROW_TEXT_CHARS`] characters.
+    pub text: String,
+    pub resolved: bool,
+}
+
+/// The first `most` comments and replies `author` made, in the order of the document.
+pub fn comment_rows(s: &Session, author: &str, most: usize) -> Vec<CommentRow> {
+    let theirs = comment_list(s).into_iter().filter(|(id, _)| s.doc.comments.get(id).is_some_and(|c| c.author == author)).take(most);
+    theirs
+        .filter_map(|(id, at)| {
+            let c = s.doc.comments.get(&id)?;
+            let text = s.doc.plain_text(StoryRef::Part(c.part)).chars().take(super::changes::ROW_TEXT_CHARS).collect();
+            Some(CommentRow { id, at, text, resolved: c.resolved })
+        })
+        .collect()
+}
+
 pub(super) fn list_comments(s: &mut Session, _: &Value) -> CmdResult {
     let list = comment_list(s);
     Ok(Value::Array(

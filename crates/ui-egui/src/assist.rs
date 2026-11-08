@@ -61,6 +61,8 @@ pub(crate) struct AssistState {
     /// Frames left in which the prompt box takes the keyboard: a few, as the click that opened
     /// the pane hands the keyboard back to the page.
     pub(crate) focus_prompt: u8,
+    /// The document and its revision the conversation's record of what it changed last read.
+    output_at: Option<(u64, u64)>,
     /// What the pane shows: the conversation, or what the assistant is doing and what runs it.
     pub(crate) view: PaneView,
     /// Why the last prompt didn't start, or a change couldn't be shown, for the pane.
@@ -212,6 +214,7 @@ pub(crate) fn tick(app: &mut WordApp) {
             a.answer(id, Answer::Cancelled);
         }
     }
+    note_output(app);
     // A sign-in or a sign-out that ended changes what ChatGPT's offer says: ask again now.
     let account_changed = chatgpt::tick(app);
     let stale = account_changed
@@ -223,6 +226,21 @@ pub(crate) fn tick(app: &mut WordApp) {
         refresh_offers(app);
     }
     app.session.assistant = status(app);
+}
+
+/// While the pane is open, bring the conversation's record of what it changed up to date, when the
+/// document changed: the Review list forgets a change once it is resolved, and this remembers how
+/// it ended. It costs a walk of the document's tracked changes, as Accept all's count does.
+fn note_output(app: &mut WordApp) {
+    let document = app.session.document_id();
+    let at = (document, app.session.rev());
+    if !app.session.view.assistant_pane || app.assist.output_at == Some(at) {
+        return;
+    }
+    if let Some(c) = app.assist.conversation.as_mut().filter(|c| c.document == document) {
+        c.assistant.note_output(&app.session);
+        app.assist.output_at = Some(at);
+    }
 }
 
 /// After command `id` ran in the window with result `r`: for an `assist.*` command, act on the
@@ -585,6 +603,7 @@ pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
         Entry::Model { name } | Entry::Agent { name } => vec![name.clone()],
         Entry::Usage(u) => u.cost.iter().cloned().collect(),
         Entry::Context(sent) => vec![sent.document.clone()],
+        Entry::Output(row) => vec![row.text.clone()],
         Entry::Stopped { .. } => vec![],
         Entry::Error { message } => vec![message.clone()],
     }

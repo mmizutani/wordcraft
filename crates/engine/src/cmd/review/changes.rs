@@ -587,6 +587,52 @@ pub fn changes_by(s: &Session, author: &str) -> usize {
         .sum()
 }
 
+/// Most characters of a change's or a comment's text [`change_rows`] and [`comment_rows`] keep.
+pub const ROW_TEXT_CHARS: usize = 120;
+
+/// One of an author's tracked changes in the document, for a list of them. Neighbouring runs of one
+/// change are one here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeRow {
+    /// `insert`, `delete`, `format`…, as the Reviewing Pane names it.
+    pub kind: &'static str,
+    pub a: Pos,
+    pub b: Pos,
+    /// Its text, at most [`ROW_TEXT_CHARS`] characters, objects left out.
+    pub text: String,
+}
+
+/// The first `most` tracked changes `author` made across the document, in every story, and how many
+/// more there are. Each one's text is read from its paragraph without copying it.
+pub fn change_rows(s: &Session, author: &str, most: usize) -> (Vec<ChangeRow>, usize) {
+    let theirs = |rev: u32| s.doc.revisions.get(rev as usize).is_some_and(|r| r.author == author);
+    let mut rows: Vec<ChangeRow> = Vec::new();
+    let mut more = 0usize;
+    for story in std::iter::once(StoryRef::Body).chain(s.doc.parts.keys().map(|id| StoryRef::Part(*id))) {
+        let mut last_rev = None;
+        for c in changes_in(s, story) {
+            let Some(rev) = c.rev.filter(|r| theirs(*r)) else { continue };
+            let joins = last_rev == Some(rev) && rows.last().is_some_and(|l| l.kind == c.kind && l.b == c.a);
+            if !joins {
+                if rows.len() >= most {
+                    more = more.saturating_add(1);
+                    continue;
+                }
+                rows.push(ChangeRow { kind: c.kind, a: c.a.clone(), b: c.a.clone(), text: String::new() });
+                last_rev = Some(rev);
+            }
+            let Some(row) = rows.last_mut() else { continue };
+            row.b = c.b.clone();
+            if c.a.path == c.b.path {
+                let piece = s.doc.para(c.a.story, &c.a.path).and_then(|p| p.text.get(c.a.off..c.b.off)).unwrap_or_default();
+                let room = ROW_TEXT_CHARS.saturating_sub(row.text.chars().count());
+                row.text.extend(piece.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(room));
+            }
+        }
+    }
+    (rows, more)
+}
+
 pub(super) fn list_changes(s: &mut Session, _: &Value) -> CmdResult {
     let list = changes(s);
     Ok(Value::Array(

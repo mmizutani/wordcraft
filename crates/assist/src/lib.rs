@@ -39,6 +39,7 @@ pub mod chatgpt;
 pub mod context;
 mod fake;
 pub mod offers;
+pub mod output;
 pub mod tools;
 pub mod transcript;
 
@@ -50,6 +51,7 @@ pub use backend::{
 pub use context::{Caps, Context, Sent};
 pub use fake::{FAKE_ID, Fake, HOLD, Seen, Step};
 pub use offers::{Host, Offer, Readiness};
+pub use output::{OutputKind, OutputRow, OutputState};
 pub use transcript::{Details, Entry, Properties, Step as DetailStep, StepState, Transcript, TurnDetails};
 
 /// The note a conversation's first turn carries, which the backend gives its model before the

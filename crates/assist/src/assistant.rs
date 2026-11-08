@@ -280,6 +280,13 @@ impl Assistant {
         Ok(())
     }
 
+    /// Bring the conversation's record of what it changed up to date with `session`, the document
+    /// it is about, for the pane's Output.
+    pub fn note_output(&mut self, session: &wordcraft_engine::Session) {
+        let (seen, more) = crate::output::rows(session, &self.seat.name);
+        self.transcript.note_output(seen, more, |row| crate::output::ended(&session.doc, row));
+    }
+
     /// What the turn just asked was given of the document, for the pane's Sources.
     pub fn gave(&mut self, sent: Sent) {
         self.transcript.sent(sent);
