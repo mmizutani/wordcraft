@@ -243,3 +243,15 @@ fn a_bullet_list_ends_the_ordered_list_before_it() {
     let markers: Vec<&str> = f.blocks.iter().filter_map(|b| if let Block::Item { marker, .. } = b { Some(marker.as_str()) } else { None }).collect();
     assert_eq!(markers, ["1.", "•", "1."]);
 }
+
+#[test]
+fn two_code_blocks_stay_two() {
+    let f = format("```python\nprint(1)\n```\n\n```sh\necho done\n```\n", false);
+    assert_eq!(f.blocks, [Block::Code("print(1)".into()), Block::Code("echo done".into())]);
+    // With nothing between them, or arriving.
+    let f = format("```\na\n```\n```\nb", true);
+    assert_eq!(f.blocks, [Block::Code("a".into()), Block::Code("b".into())]);
+    // One block's own blank line and lines stay one.
+    let f = format("```\na\n\nb\n```\n", false);
+    assert_eq!(f.blocks, [Block::Code("a\n\nb".into())]);
+}
