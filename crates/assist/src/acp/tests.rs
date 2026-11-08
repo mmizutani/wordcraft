@@ -350,6 +350,25 @@ fn what_the_person_kept_is_said_again_after_a_failed_prompt() {
     assert_eq!(c.report()["prompt"], json!(["Saved: one.", "Again"]));
 }
 
+/// A new session has read nothing, whatever the last one was told: its first prompt failing, the
+/// next one says it again.
+#[test]
+fn a_new_session_s_failed_first_prompt_is_said_again() {
+    let mut script = Script::default();
+    script.replies.insert("Report".into(), vec![Step::Report]);
+    script.replies.insert("Crash".into(), vec![Step::Crash { code: 3, stderr: "gone".into() }]);
+    script.replies.insert("Fails".into(), vec![Step::Fail { code: -32000, message: "not now".into() }]);
+    let mut c = Chat::with(&script);
+    c.a.set_memory(Some("Saved: one.".into()));
+    c.ask("Report");
+    assert!(c.report()["prompt"].as_array().unwrap().iter().any(|b| b == "Saved: one."));
+    c.ask("Crash");
+    c.ask("Fails");
+    assert!(c.error().is_some(), "the new session's first prompt failed");
+    c.ask("Report");
+    assert_eq!(c.report()["prompt"], json!(["Saved: one.", "Report"]));
+}
+
 #[cfg(unix)]
 #[test]
 fn an_agent_folder_rejects_a_world_writable_parent() {

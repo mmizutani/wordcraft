@@ -440,6 +440,8 @@ impl Acp {
             running.process.stop(grace);
             running.folder.remove();
         }
+        // The next session has read nothing yet.
+        self.memory_told = None;
     }
 
     /// Show tool call `update` (a `tool_call`, a `tool_call_update` or a permission request's
