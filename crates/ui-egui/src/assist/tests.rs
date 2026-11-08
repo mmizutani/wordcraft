@@ -618,6 +618,28 @@ fn until(h: &mut egui_kittest::Harness<'static, WordApp>, done: impl Fn(&WordApp
     panic!("the window never gets there");
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_transcript_line_shows_the_model_and_effort_and_a_note_says_what_changed() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::Event;
+    let model = |effort: &str, asked| Step::Emit(Event::Model { name: "GPT-6-Luna".into(), effort: Some(effort.into()), asked });
+    let note = Step::Emit(Event::Note { text: "ChatGPT didn't take ultra effort for GPT-6-Luna: it wasn't applied.".into() });
+    let mut app = window("one two three");
+    app.assist_with(Box::new(
+        Fake::new().then(vec![model("medium", false), note, Step::say("Hi.")]).then(vec![model("xhigh", true), Step::say("Again.")]),
+    ));
+    let mut h = harness(app);
+    h.state_mut().execute("assist.ask", json!({"prompt": "Hello"})).unwrap();
+    until(&mut h, idle);
+    assert!(h.query_by_label("GPT-6-Luna · Medium").is_some());
+    assert!(h.query_by_label("scripted").is_none(), "what the backend said last replaces what it said first");
+    assert!(h.query_by_label("ChatGPT didn't take ultra effort for GPT-6-Luna: it wasn't applied.").is_some());
+    h.state_mut().execute("assist.ask", json!({"prompt": "Again"})).unwrap();
+    until(&mut h, idle);
+    assert!(h.query_by_label("GPT-6-Luna · Extra High (requested)").is_some(), "a level no one confirmed says so");
+}
+
 fn waiting(a: &WordApp) -> bool {
     a.conversation().is_some_and(|c| c.pending_permission().is_some())
 }

@@ -46,6 +46,22 @@ pub struct BackendInfo {
     pub in_process_tools: bool,
 }
 
+/// One model a backend offers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOption {
+    /// What a request names it.
+    pub id: String,
+    /// What the picker shows.
+    pub name: String,
+    /// Hover text.
+    pub description: Option<String>,
+    /// The reasoning levels it takes, as offered; empty means unknown.
+    pub efforts: Vec<String>,
+    /// The level it runs at unless told otherwise, when the backend says.
+    pub default_effort: Option<String>,
+}
+
 /// The assistant's place in the shared document, which the backend gets when the conversation
 /// starts ([`Backend::begin`]): who it is, and the key of the invite it joined with, which an
 /// agent outside the process connects with (WordCraft's MCP server, `WORDCRAFT_CONTROL_KEY`).
@@ -283,8 +299,12 @@ pub enum Event {
     Permission(PermissionRequest),
     /// A permission request was answered, by the person or by the conversation's policy.
     Answered { id: u64, answer: Answer },
-    /// Which model answered.
-    Model { name: String },
+    /// Which model answers and at what reasoning level, once known. A later one this turn
+    /// replaces it. `asked`: the level is what was asked for, as the backend didn't say what ran.
+    Model { name: String, effort: Option<String>, asked: bool },
+    /// Something the person should know about the turn, which goes on: what ran instead of what
+    /// they chose, or a level that wasn't applied.
+    Note { text: String },
     /// The turn ended.
     Done { stop: StopReason },
     /// The turn failed: why, said plainly. The turn ended.
@@ -313,7 +333,8 @@ impl Event {
                 Event::Plan { entries: entries.into_iter().take(MAX_PLAN).map(|e| PlanEntry { content: label(&e.content), ..e }).collect() }
             }
             Event::Permission(r) => Event::Permission(PermissionRequest { id: r.id, ..PermissionRequest::bounded(&r.title, r.options) }),
-            Event::Model { name } => Event::Model { name: label(&name) },
+            Event::Model { name, effort, asked } => Event::Model { name: label(&name), effort: effort.map(|e| label(&e)), asked },
+            Event::Note { text: t } => Event::Note { text: text(t) },
             Event::Error { message } => Event::Error { message: text(message) },
             e @ (Event::Answered { .. } | Event::Done { .. }) => e,
         }

@@ -239,9 +239,8 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
             }
         }
         Entry::Permission { request, answer } => permission(app, ui, t, request, answer.as_ref(), waiting == Some(request.id)),
-        Entry::Model { name } => {
-            ui.label(RichText::new(fmt(tl!("Model: {name}"), &[("name", name)])).small().color(t.text_dim));
-        }
+        Entry::Model { name, effort, asked } => model_line(ui, t, name, effort.as_deref(), *asked),
+        Entry::Note { text } => wrapped(ui, RichText::new(text).small().italics().color(t.orange)),
         Entry::Stopped { stop } => {
             if let Some(says) = stop.says() {
                 // Stopped by the person reads as a note; any other stop is news to them.
@@ -251,6 +250,19 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
         }
         // A failed turn says why; the turn itself ends with its own event.
         Entry::Error { message } => wrapped(ui, RichText::new(message).color(t.red)),
+    }
+}
+
+/// Which model answers and at what reasoning level. A level the backend didn't confirm says so.
+fn model_line(ui: &mut Ui, t: &Tokens, name: &str, effort: Option<&str>, asked: bool) {
+    let line = match effort.map(crate::assist::effort_word) {
+        Some(effort) if asked => fmt(tl!("{name} · {effort} (requested)"), &[("name", name), ("effort", effort)]),
+        Some(effort) => fmt(tl!("{name} · {effort}"), &[("name", name), ("effort", effort)]),
+        None => name.to_string(),
+    };
+    let shown = ui.label(RichText::new(line).small().color(t.text_dim));
+    if asked {
+        shown.on_hover_text(tl!("This is the effort WordCraft asked for: the answer didn't say which one ran."));
     }
 }
 

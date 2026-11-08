@@ -548,6 +548,22 @@ pub(crate) fn role_note(role: Role) -> &'static str {
     }
 }
 
+/// A reasoning level as the pane shows it: its name for the levels ChatGPT's list has, else as
+/// the backend gave it (an agent's own names).
+pub(crate) fn effort_word(level: &str) -> &str {
+    match level {
+        "none" => tl!("None"),
+        "minimal" => tl!("Minimal"),
+        "low" => tl!("Low"),
+        "medium" => tl!("Medium"),
+        "high" => tl!("High"),
+        "xhigh" => tl!("Extra High"),
+        "max" => tl!("Max"),
+        "ultra" => tl!("Ultra"),
+        other => other,
+    }
+}
+
 /// The texts an entry of the conversation shows as the assistant or its backend wrote them,
 /// which the interface audit leaves untranslated.
 #[cfg(test)]
@@ -558,7 +574,8 @@ pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
         Entry::Tool(call) => vec![call.title.clone(), call.detail.clone()],
         Entry::Plan { entries } => entries.iter().map(|p| p.content.clone()).collect(),
         Entry::Permission { request, .. } => std::iter::once(request.title.clone()).chain(request.options.iter().map(|o| o.name.clone())).collect(),
-        Entry::Model { name } => vec![name.clone()],
+        Entry::Model { name, effort, .. } => std::iter::once(name.clone()).chain(effort.clone()).collect(),
+        Entry::Note { text } => vec![text.clone()],
         Entry::Stopped { .. } => vec![],
         Entry::Error { message } => vec![message.clone()],
     }

@@ -30,9 +30,10 @@ use serde_json::{Value, json};
 
 use super::auth::{self, AuthError, access_token};
 use super::http::{self, Reply, redact};
+use super::models::{self, Resolved, valid_model};
 use super::sse;
 use super::{AUTHOR, Endpoints, ID, USAGE_PAGE};
-use crate::backend::{Backend, BackendInfo, Cancel, Event, Seat, StopReason, ToolSpec, Turn, TurnCtx, cut};
+use crate::backend::{Backend, BackendInfo, Cancel, Event, ModelOption, Seat, StopReason, ToolSpec, Turn, TurnCtx, cut};
 
 /// Most requests (model rounds) one turn makes.
 pub const MAX_ROUNDS: usize = 25;
@@ -102,15 +103,18 @@ pub struct ChatGpt {
     settings: PathBuf,
     endpoints: Endpoints,
     tuning: Tuning,
-    /// The model the list offered first, once it was read (used when none was chosen).
-    listed: Option<String>,
+    /// The account's models, once they were read.
+    listed: Option<Vec<ModelOption>>,
     /// What every request's `instructions` say: the note, and how to work.
     instructions: String,
     /// The earlier turns, as input items, and their size.
     earlier: VecDeque<Value>,
     earlier_bytes: usize,
-    /// Request fields ChatGPT said it doesn't support here: left out from then on.
+    /// Request fields ChatGPT said it doesn't support here: left out until the model or the
+    /// reasoning level changes (a level one model refuses, another may take).
     unsupported: Vec<String>,
+    /// The model and level the last turn resolved to, which `unsupported` is about.
+    ran: Option<(String, Option<String>)>,
 }
 
 impl ChatGpt {
@@ -130,6 +134,7 @@ impl ChatGpt {
             earlier: VecDeque::new(),
             earlier_bytes: 0,
             unsupported: Vec::new(),
+            ran: None,
         }
     }
 
@@ -138,28 +143,41 @@ impl ChatGpt {
         ChatGpt { tuning, ..self }
     }
 
-    /// The model for this turn: the one the person chose, else the first the account's list
-    /// offers (read once). None when the turn was stopped meanwhile.
-    fn model(&mut self, ctx: &TurnCtx<'_>) -> Result<Option<String>, String> {
-        if let Some(chosen) = auth::chosen_model(&self.settings) {
-            return Ok(Some(chosen));
+    /// What this turn runs ([`models::resolve`]), reading the account's list the first time.
+    /// None when the turn was stopped meanwhile. A list that can't be read doesn't stop a turn
+    /// with a choice: the choice runs as it is, and the next turn reads the list again.
+    fn resolved(&mut self, ctx: &TurnCtx<'_>) -> Result<Option<Resolved>, String> {
+        let model = auth::chosen_model(&self.settings);
+        let effort: Option<String> = None;
+        if self.listed.is_none() {
+            let (settings, endpoints) = (self.settings.clone(), self.endpoints.clone());
+            let Some(read) = off_thread(ctx.cancel(), move || models::models_with(&settings, &endpoints))? else {
+                return Ok(None);
+            };
+            match (read, &model) {
+                (Ok(list), _) => self.listed = Some(list),
+                (Err(e), Some(_)) if !matches!(e, AuthError::NotSignedIn | AuthError::SignInAgain | AuthError::Denied) => {
+                    log::info!("ChatGPT: the models can't be listed ({e}); the turn runs what was chosen");
+                }
+                (Err(e), _) => return Err(auth_says(&e)),
+            }
         }
-        if let Some(listed) = &self.listed {
-            return Ok(Some(listed.clone()));
+        let listed = self.listed.as_deref().unwrap_or_default();
+        if let Some(resolved) = models::resolve(listed, model.as_deref(), effort.as_deref()) {
+            return Ok(Some(resolved));
         }
-        let (settings, endpoints) = (self.settings.clone(), self.endpoints.clone());
-        let Some(models) = off_thread(ctx.cancel(), move || auth::models_with(&settings, &endpoints))? else {
-            return Ok(None);
-        };
-        let first = models.map_err(|e| auth_says(&e))?.into_iter().next().ok_or("ChatGPT offers no model to this account.")?;
-        self.listed = Some(first.slug.clone());
-        Ok(Some(first.slug))
+        let id = model.filter(|m| valid_model(m)).ok_or("ChatGPT offers no model to this account.")?;
+        Ok(Some(Resolved { name: id.clone(), id, effort, model_gone: false, effort_gone: false }))
     }
 
-    /// A request's body: the model, the instructions, the history and this turn's items, the
-    /// tools.
-    fn body(&self, model: &str, tools: &[ToolSpec], items: &[Value]) -> Value {
+    /// A request's body: the model and reasoning level, the instructions, the history and this
+    /// turn's items, the tools.
+    fn body(&self, model: &str, effort: Option<&str>, tools: &[ToolSpec], items: &[Value]) -> Value {
         let input: Vec<Value> = self.earlier.iter().chain(items).cloned().collect();
+        let mut reasoning = json!({"summary": "auto"});
+        if let Some(effort) = effort {
+            reasoning["effort"] = json!(effort);
+        }
         let mut body = json!({
             "model": model,
             "instructions": self.instructions,
@@ -167,27 +185,38 @@ impl ChatGpt {
             "store": false,
             "stream": true,
             "include": ["reasoning.encrypted_content"],
-            "reasoning": {"summary": "auto"},
+            "reasoning": reasoning,
         });
         if !tools.is_empty() {
             body["tools"] = json!([namespace(tools)]);
         }
-        if let Some(fields) = body.as_object_mut() {
-            for field in &self.unsupported {
-                fields.remove(field);
-            }
+        for field in &self.unsupported {
+            leave_out(&mut body, field);
         }
         body
+    }
+
+    /// Whether the effort asked for this model was refused.
+    fn effort_refused(&self) -> bool {
+        self.unsupported.iter().any(|f| f == EFFORT || f == REASONING)
     }
 
     /// The turn's rounds: a request, the tool calls its answer makes, and the next request
     /// with their outputs, until an answer makes none.
     fn rounds(&mut self, ctx: &mut TurnCtx<'_>, progress: &mut Progress) -> Result<StopReason, String> {
-        let Some(model) = self.model(ctx)? else {
+        let Some(resolved) = self.resolved(ctx)? else {
             return Ok(StopReason::Cancelled);
         };
+        let ran = (resolved.id.clone(), resolved.effort.clone());
+        if self.ran.as_ref() != Some(&ran) {
+            self.unsupported.clear();
+            self.ran = Some(ran);
+        }
+        fallback_notes(&resolved, auth::chosen_model(&self.settings).as_deref(), None, ctx);
+        let Resolved { id: model, name, effort, .. } = resolved;
+        progress.running = Running { id: model.clone(), name, effort: effort.filter(|_| !self.effort_refused()) };
         for round in 1..=self.tuning.max_rounds.max(1) {
-            let mut body = self.body(&model, ctx.tools(), &progress.items);
+            let mut body = self.body(&model, progress.running.effort.as_deref(), ctx.tools(), &progress.items);
             let answer = match self.exchange(ctx, &mut body, progress)? {
                 Outcome::Cancelled => return Ok(StopReason::Cancelled),
                 Outcome::Incomplete(answer, stop) => {
@@ -196,8 +225,10 @@ impl ChatGpt {
                 }
                 Outcome::Completed(answer) => answer,
             };
-            // The model asked for, when the answer didn't say which one answered.
-            show_model(Some(&model), progress, ctx);
+            // What was asked for, when the answer didn't say what ran.
+            if progress.shown.is_none() {
+                show_model(None, None, progress, ctx);
+            }
             let Answer { items, calls, refused, .. } = answer;
             progress.items.extend(items);
             if calls.is_empty() {
@@ -240,8 +271,9 @@ impl ChatGpt {
                 Decision::Retry(wait) => wait,
                 Decision::Without(field) => {
                     log::info!("ChatGPT: the request goes on without `{field}`, which isn't supported here");
-                    if let Some(fields) = body.as_object_mut() {
-                        fields.remove(&field);
+                    leave_out(body, &field);
+                    if field == EFFORT || field == REASONING {
+                        effort_not_applied(progress, ctx);
                     }
                     self.unsupported.push(field);
                     Duration::ZERO
@@ -399,8 +431,27 @@ struct Progress {
     said: String,
     /// The tools it called, in order.
     tools: Vec<String>,
-    /// Whether the pane was told which model answers.
-    model_shown: bool,
+    /// What this turn asks for.
+    running: Running,
+    /// What the pane was last told runs.
+    shown: Option<Shown>,
+}
+
+/// What a turn asks for, as its requests say it.
+#[derive(Default)]
+struct Running {
+    id: String,
+    name: String,
+    /// `None` once ChatGPT refused it.
+    effort: Option<String>,
+}
+
+/// What the pane was told ([`Event::Model`]).
+#[derive(Clone, PartialEq, Eq)]
+struct Shown {
+    name: String,
+    effort: Option<String>,
+    asked: bool,
 }
 
 /// One answer, as its stream gave it.
@@ -572,15 +623,40 @@ fn decide(failure: &Failure, tries: u32, fresh: bool, tuning: &Tuning, dropped: 
     }
 }
 
-/// The request field to leave out when ChatGPT says `param` isn't supported: the reasoning
-/// summary, or the encrypted reasoning.
+/// The request field that says how hard the model reasons.
+const EFFORT: &str = "reasoning.effort";
+
+/// The request's whole reasoning object.
+const REASONING: &str = "reasoning";
+
+/// The request field to leave out when ChatGPT says `param` isn't supported: the reasoning level
+/// or the reasoning summary, alone, so refusing one doesn't lose the other; or all of the
+/// reasoning, or the encrypted reasoning.
 fn droppable(code: &str, param: Option<&str>) -> Option<String> {
     let unsupported = matches!(code, "subscription_sharing_unsupported_capability" | "unsupported_parameter" | "unsupported_value");
     let param = param.filter(|_| unsupported)?;
-    ["reasoning", "include"]
+    [EFFORT, "reasoning.summary", REASONING, "include"]
         .into_iter()
         .find(|f| param == *f || param.starts_with(&format!("{f}.")) || param.starts_with(&format!("{f}[")))
         .map(str::to_string)
+}
+
+/// Take `field` out of a request's body: a top-level field, or `parent.child`, the parent going
+/// with its last child.
+fn leave_out(body: &mut Value, field: &str) {
+    let Some(fields) = body.as_object_mut() else { return };
+    match field.split_once('.') {
+        None => {
+            fields.remove(field);
+        }
+        Some((parent, child)) => {
+            let Some(inner) = fields.get_mut(parent).and_then(Value::as_object_mut) else { return };
+            inner.remove(child);
+            if inner.is_empty() {
+                fields.remove(parent);
+            }
+        }
+    }
 }
 
 /// What a request thread sends the turn.
@@ -806,7 +882,8 @@ fn on_event(event: &Value, answer: &mut Answer, progress: &mut Progress, ctx: &T
     let text = |name: &str| event.get(name).and_then(Value::as_str).unwrap_or_default();
     match text("type") {
         "response.created" | "response.in_progress" => {
-            show_model(event.pointer("/response/model").and_then(Value::as_str), progress, ctx);
+            let (model, effort) = (event.pointer("/response/model"), event.pointer("/response/reasoning/effort"));
+            show_model(model.and_then(Value::as_str), effort.and_then(Value::as_str), progress, ctx);
         }
         "response.output_text.delta" => {
             answer.streamed = true;
@@ -842,11 +919,48 @@ fn on_event(event: &Value, answer: &mut Answer, progress: &mut Progress, ctx: &T
     Step::Continue
 }
 
-/// Tell the pane which model answers, once a turn.
-fn show_model(model: Option<&str>, progress: &mut Progress, ctx: &TurnCtx<'_>) {
-    if let Some(name) = model.filter(|m| !m.trim().is_empty() && !progress.model_shown) {
-        progress.model_shown = true;
-        ctx.emit(Event::Model { name: name.to_string() });
+/// Tell the pane which model answers and at what level: `model` and `effort` are what the
+/// answer says, and what the turn asked for stands in for what it doesn't.
+fn show_model(model: Option<&str>, effort: Option<&str>, progress: &mut Progress, ctx: &TurnCtx<'_>) {
+    let model = model.map(str::trim).filter(|m| !m.is_empty());
+    let name = model.filter(|m| !same_model(m, &progress.running.id)).unwrap_or(&progress.running.name).to_string();
+    let said = effort.map(str::trim).filter(|e| !e.is_empty());
+    let line = Shown {
+        name,
+        effort: said.map(str::to_string).or_else(|| progress.running.effort.clone()),
+        asked: said.is_none() && progress.running.effort.is_some(),
+    };
+    // A later event that doesn't report the level leaves what an earlier one reported.
+    let settled = progress.shown.as_ref().is_some_and(|s| *s == line || (said.is_none() && !s.asked && s.name == line.name));
+    if !settled && !line.name.is_empty() {
+        ctx.emit(Event::Model { name: line.name.clone(), effort: line.effort.clone(), asked: line.asked });
+        progress.shown = Some(line);
+    }
+}
+
+/// Whether the answer's `answered` is the model `asked` for: the same, or a dated form of it
+/// (`gpt-x-2026-01-01`).
+fn same_model(answered: &str, asked: &str) -> bool {
+    answered == asked
+        || answered.strip_prefix(asked).and_then(|rest| rest.strip_prefix('-')).is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// Say what runs instead of what the person chose.
+fn fallback_notes(resolved: &Resolved, model: Option<&str>, effort: Option<&str>, ctx: &TurnCtx<'_>) {
+    if let Some(chosen) = model.filter(|_| resolved.model_gone) {
+        ctx.emit(Event::Note { text: format!("{chosen} isn't offered to this account now: {} runs instead.", resolved.name) });
+    }
+    if let Some(chosen) = effort.filter(|_| resolved.effort_gone) {
+        let instead = resolved.effort.as_deref().map_or("no level asked for".to_string(), |e| format!("{e} instead"));
+        ctx.emit(Event::Note { text: format!("{} doesn't offer {chosen} effort: it runs at {instead}.", resolved.name) });
+    }
+}
+
+/// ChatGPT refused the level asked for: the turn goes on without one, and says so.
+fn effort_not_applied(progress: &mut Progress, ctx: &TurnCtx<'_>) {
+    if let Some(effort) = progress.running.effort.take() {
+        progress.shown = None;
+        ctx.emit(Event::Note { text: format!("ChatGPT didn't take {effort} effort for {}: it wasn't applied.", progress.running.name) });
     }
 }
 
