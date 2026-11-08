@@ -186,10 +186,10 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
             if id.starts_with("ui.") {
                 return err(format!("`{id}` works on the window: make the document active first (view.switchWindows {{\"id\": {doc}}})"));
             }
-            // Signing in to ChatGPT or out of it is the person's alone (#19): addressed to a
-            // document it is an error, as through `WordApp::execute`, and nothing is queued.
+            // Signing in to ChatGPT or out of it (#19) and what the assistant remembers (#86) are
+            // the person's alone: addressed to a document it is an error, as through `WordApp::execute`, and nothing is queued.
             if wordcraft_engine::cmd::assist::person_only(id) {
-                return err(crate::assist::chatgpt::YOURS);
+                return err(if id.starts_with("assist.memory.") { crate::assist::memory::YOURS } else { crate::assist::chatgpt::YOURS });
             }
             // Close, with the same guard as the window's: unsaved changes need `force`. Closing
             // the shared document stops sharing first, and checks what the room took last.

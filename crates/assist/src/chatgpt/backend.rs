@@ -106,6 +106,8 @@ pub struct ChatGpt {
     listed: Option<String>,
     /// What every request's `instructions` say: the note, and how to work.
     instructions: String,
+    /// What this turn's requests add to them of what the person kept.
+    memory: Option<String>,
     /// The earlier turns, as input items, and their size.
     earlier: VecDeque<Value>,
     earlier_bytes: usize,
@@ -127,6 +129,7 @@ impl ChatGpt {
             tuning: Tuning::default(),
             listed: None,
             instructions: instructions("You are ChatGPT, a writing assistant inside WordCraft, a word processor."),
+            memory: None,
             earlier: VecDeque::new(),
             earlier_bytes: 0,
             unsupported: Vec::new(),
@@ -160,9 +163,13 @@ impl ChatGpt {
     /// tools.
     fn body(&self, model: &str, tools: &[ToolSpec], items: &[Value]) -> Value {
         let input: Vec<Value> = self.earlier.iter().chain(items).cloned().collect();
+        let instructions = match &self.memory {
+            Some(memory) => format!("{}\n\n{memory}", self.instructions),
+            None => self.instructions.clone(),
+        };
         let mut body = json!({
             "model": model,
-            "instructions": self.instructions,
+            "instructions": instructions,
             "input": input,
             "store": false,
             "stream": true,
@@ -340,6 +347,7 @@ impl Backend for ChatGpt {
         if let Some(note) = turn.note.as_deref().filter(|n| !n.trim().is_empty()) {
             self.instructions = instructions(note);
         }
+        self.memory.clone_from(&turn.memory);
         let mut progress = Progress { items: vec![user_message(turn)], ..Progress::default() };
         let result = self.rounds(ctx, &mut progress);
         self.remember(&turn.prompt, &progress);

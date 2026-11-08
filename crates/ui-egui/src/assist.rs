@@ -21,6 +21,8 @@
 //! What the person accepts and rejects of the conversation's changes starts the next turn's
 //! context (#86, [`review_ended`]); nothing of it is stored.
 //!
+//! What the person keeps for every later conversation is [`memory`]'s (#86).
+//!
 //! The web app (#26) has the pane and the commands but no assistant: its backends would sign in
 //! through a loopback port or start agents, which take the desktop app ([`desktop`]). The pane
 //! says so, and the buttons' tooltips too.
@@ -40,6 +42,7 @@ use wordcraft_engine::room::Role;
 use crate::WordApp;
 
 pub(crate) mod chatgpt;
+pub(crate) mod memory;
 
 /// Seconds between two askings of what is offered while the pane is open (a sign-in or an
 /// install done meanwhile shows up).
@@ -93,6 +96,8 @@ pub(crate) struct AssistState {
     pub(crate) setup: Option<crate::options::agent_setup::AgentSetup>,
     /// The ChatGPT sign-in (#19): who is signed in, and a sign-in or sign-out under way.
     pub(crate) chatgpt: chatgpt::ChatGptState,
+    /// What the assistant remembers across conversations (#86), as last read.
+    pub(crate) memory: memory::MemoryState,
 }
 
 /// One conversation, and the document it is about.
@@ -292,6 +297,8 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
         "chatgptSignIn" => chatgpt::sign_in(app),
         "chatgptCancel" => chatgpt::cancel(app),
         "chatgptSignOut" => chatgpt::sign_out(app),
+        "memory" => memory::read(app),
+        what if what.starts_with("memory.") => memory::write(app, what, req),
         other => Err(format!("`{}`: not an assistant request", other.chars().take(40).collect::<String>())),
     };
     app.session.assistant = status(app);
@@ -432,7 +439,9 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     // come before this command returns, and must not find a setting from before.
     sync_unattended(app);
     let policy = if app.assist.by_person { PermissionPolicy::Ask } else { unattended(app) };
+    let kept = memory::for_turn(app);
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
+    a.set_memory(kept);
     a.ask_with_policy(prompt, Some(context), selection, policy).map_err(|e| e.to_string())?;
     let (name, role, tracked) = (a.name().to_string(), a.role(), a.tracked());
     app.assist.feedback.clear();

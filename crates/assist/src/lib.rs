@@ -22,6 +22,8 @@
 //!   caps on a document of any size.
 //! - [`Feedback`]: what the person accepted and rejected of the assistant's changes since its last
 //!   turn, which the next turn's context starts with. Nothing of it is stored.
+//! - [`memory`]: what the person keeps for every later conversation with every backend, which
+//!   only their own click writes.
 //! - [`offers`]: the backends the pane offers on this host, and how one is made by its id.
 //! - `acp` (desktop only): ACP agents (Claude Code, Codex, Pi…) as backends, each a process
 //!   WordCraft starts and speaks the Agent Client Protocol with.
@@ -40,6 +42,7 @@ pub mod chatgpt;
 pub mod context;
 mod fake;
 mod feedback;
+pub mod memory;
 pub mod offers;
 pub mod tools;
 pub mod transcript;

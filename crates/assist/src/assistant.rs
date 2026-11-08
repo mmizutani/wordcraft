@@ -108,6 +108,8 @@ pub struct Assistant {
     busy: bool,
     /// Whether the next turn is the conversation's first, which carries the note.
     first: bool,
+    /// What each turn from now on carries of what the person kept ([`Assistant::set_memory`]).
+    memory: Option<String>,
     ended: bool,
 }
 
@@ -154,6 +156,7 @@ impl Assistant {
             transcript: Transcript::default(),
             busy: false,
             first: true,
+            memory: None,
             ended: false,
         })
     }
@@ -196,6 +199,11 @@ impl Assistant {
     /// Whether the conversation ended ([`Assistant::end`]).
     pub fn has_ended(&self) -> bool {
         self.ended
+    }
+
+    /// What the next turns carry of what the person kept ([`crate::memory::Memory::for_model`]).
+    pub fn set_memory(&mut self, memory: Option<String>) {
+        self.memory = memory;
     }
 
     /// Ask `prompt`, with `context` (the document around the selection, [`crate::Context`]):
@@ -250,7 +258,7 @@ impl Assistant {
             return Err(AssistError::Prompt(format!("the prompt is longer than {} KB", MAX_PROMPT >> 10)));
         }
         let note = self.first.then(|| crate::note(&self.seat, self.info.in_process_tools));
-        let turn = Turn { prompt: prompt.to_string(), context, note, selection };
+        let turn = Turn { prompt: prompt.to_string(), context, note, memory: self.memory.clone(), selection };
         // Cleared before the turn is sent: a Stop from now on ends this turn, even one the
         // thread hasn't started yet.
         self.cancel.clear();

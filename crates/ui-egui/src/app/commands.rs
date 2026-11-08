@@ -458,10 +458,13 @@ impl WordApp {
         }
         // The assistant's, from a command `execute` didn't run (it answers those itself): a step
         // of another command, such as a macro. Signing in to ChatGPT or out of it is never one:
-        // anyone may have written the macro the person runs (#19).
+        // anyone may have written the macro the person runs (#19). Nor is changing what the
+        // assistant remembers (#86), for the same reason.
         if let Some(what) = req.get("assist") {
             let r = if what.as_str().is_some_and(|w| w.starts_with("chatgpt")) {
                 Err(crate::assist::chatgpt::YOURS.to_string())
+            } else if what.as_str().is_some_and(|w| w.starts_with("memory.")) {
+                Err(crate::assist::memory::YOURS.to_string())
             } else {
                 crate::assist::handle(self, req)
             };

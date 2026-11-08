@@ -61,6 +61,37 @@ conversation. Nothing of it is stored, and a new conversation starts without it.
 Accept and Reject count: not another participant's, a script's, a macro's, or a click the control
 channel made.
 
+## Memory
+
+What you keep reaches every later conversation with every backend. File › Options › Assistant
+has the list: add a preference, edit it, turn it off, remove it or clear them all, and turn the
+whole thing off with **Give the assistant what you kept**. Off, nothing is sent and what you
+kept stays until you clear it. `assist.memory` reads the list for whoever holds the window's key.
+
+**Only your own click stores anything.** Documents are untrusted: a shared document, a received
+file or a comment can tell a model to remember something, and a stored preference would act on
+later documents. So `assist.memory.add`, `.edit`, `.remove`, `.clear` and `.enabled` refuse a
+script, an agent, a click or key the control channel made and a macro's step, as signing in to
+ChatGPT does, and they take no key and go on no ribbon or toolbar. An invited participant's copy
+refuses them at every role.
+
+This guards the commands, not the file system. A program holding the window's key can already
+write any file you can with `file.saveAs`, this one and the agents' settings included, so that
+key is as trusted as you are. An invited agent holds only its invite's key, and can't.
+
+The list is `assistant-memory.json` in the settings folder, which on Unix only you may read: at
+most 200 preferences of at most 280 characters each. It is never put in a document, a recovery
+copy or the log, it never crosses a room, and signing out doesn't touch it. Two WordCrafts keep
+each other's changes: each write takes a lock and reads the file again. A file that can't be read
+whole is moved aside as `assistant-memory.json.damaged` before the next write, never replaced in
+silence. It is plain JSON, so you can copy it to another computer.
+
+A turn sends the preferences that are on, most recently used first, up to 4 KiB in all. What
+doesn't fit isn't sent, and the list says so. ChatGPT gets them in the request's instructions. An
+ACP agent gets them in a new session's first prompt and again when they change, including when
+none applies any more. They apply unless the current request says otherwise, and they never
+permit what the role doesn't.
+
 ## Backends
 
 | Id | Backend | What runs it |
@@ -278,7 +309,7 @@ What the agent sends its model, and where, is its business: Claude Code talks to
 Codex to OpenAI and Pi to the providers you set it up with, under your account with them. Each
 turn WordCraft gives it your prompt and the selection with the paragraphs around it and the
 outline, held to 32 KiB in all, and what you accepted and rejected of its changes since its last
-turn, held to 2 KiB; the first turn adds a note that says which document it works
+turn, held to 2 KiB; what you kept ([Memory](#memory)), held to 4 KiB; the first turn adds a note that says which document it works
 on, its name and role, and how to use the `wordcraft` tools (for Pi, `wordcraft-cli call`).
 Through those it can read the whole shared document.
 
