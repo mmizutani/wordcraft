@@ -1419,11 +1419,16 @@ fn a_link_in_an_answer_says_where_it_goes_and_opens_only_on_the_person_s_click()
 
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
-fn a_huge_answer_draws_within_a_frame_budget() {
+fn a_huge_answer_draws_a_bounded_number_of_widgets_within_a_frame_budget() {
+    use egui_kittest::kittest::Queryable;
     // A debug build's budget on a busy machine, as `the_window_never_waits_for_its_assistants`.
+    // What keeps a frame short is the number of widgets: a debug frame takes about 18 ms with the
+    // limit and 80 ms without, too close to time on a shared machine.
     const BUDGET: Duration = Duration::from_secs(1);
     let mut h = answered(&"- a\n".repeat(64 << 10));
     let at = std::time::Instant::now();
     h.run_steps(1);
     assert!(at.elapsed() < BUDGET, "a frame took {:?}", at.elapsed());
+    let items = h.query_all_by_label("a").count();
+    assert!((1..=wordcraft_assist::answer::MAX_BLOCKS).contains(&items), "{items} widgets");
 }
