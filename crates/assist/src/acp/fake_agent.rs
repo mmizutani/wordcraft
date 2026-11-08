@@ -40,6 +40,8 @@ pub struct Script {
     pub needs_auth: bool,
     /// Whether it never answers anything.
     pub silent: bool,
+    /// Whether it says it takes `resource` blocks in a prompt.
+    pub embedded_context: bool,
     /// The turns, in order: the n-th `session/prompt` does the n-th list, and one after the
     /// last says nothing.
     pub turns: Vec<Vec<Step>>,
@@ -92,7 +94,7 @@ pub enum Step {
     },
     /// Say, as JSON, what it was given: its folder (`cwd`, `cwdEmpty`), what `session/new`
     /// had (`session`), its `WORDCRAFT_*` environment (`env`), the prompt's text blocks
-    /// (`prompt`) and its process id (`pid`).
+    /// (`prompt`) and `resource` blocks (`resources`), and its process id (`pid`).
     Report,
     /// Make `calls` on the first MCP server `session/new` gave, started the way an agent starts
     /// it (its command, args and env), and say each result on a line of its own: "<tool>: ok
@@ -156,7 +158,17 @@ pub fn run(script: &Script) -> i32 {
     if reader.is_err() {
         return 70;
     }
-    let mut agent = Agent { script, rx, authenticated: false, session: Value::Null, prompt: Vec::new(), turn: 0, next_id: 1, cancelled: false };
+    let mut agent = Agent {
+        script,
+        rx,
+        authenticated: false,
+        session: Value::Null,
+        prompt: Vec::new(),
+        resources: Vec::new(),
+        turn: 0,
+        next_id: 1,
+        cancelled: false,
+    };
     agent.serve()
 }
 
@@ -168,6 +180,7 @@ struct Agent<'a> {
     session: Value,
     /// The current prompt's text blocks.
     prompt: Vec<String>,
+    resources: Vec<String>,
     turn: usize,
     next_id: i64,
     /// Whether the client sent `session/cancel` in this turn.
@@ -208,7 +221,7 @@ impl Agent<'_> {
                     .collect();
                 send(&json!({"jsonrpc": "2.0", "id": id, "result": {
                     "protocolVersion": self.script.protocol.unwrap_or(1),
-                    "agentCapabilities": {"loadSession": false, "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false}},
+                    "agentCapabilities": {"loadSession": false, "promptCapabilities": {"image": false, "audio": false, "embeddedContext": self.script.embedded_context}},
                     "authMethods": methods,
                     "agentInfo": {"name": "fake-agent", "title": title, "version": "1.0"},
                 }}));
@@ -272,6 +285,7 @@ impl Agent<'_> {
         self.cancelled = false;
         let blocks = params.get("prompt").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
         self.prompt = blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).map(str::to_string).collect();
+        self.resources = blocks.iter().filter_map(|b| b.pointer("/resource/text").and_then(Value::as_str)).map(str::to_string).collect();
         let last = self.prompt.last().map(|t| t.trim().to_string()).unwrap_or_default();
         let steps = self.script.replies.get(&last).or_else(|| self.script.turns.get(self.turn)).cloned().unwrap_or_default();
         self.turn = self.turn.saturating_add(1);
@@ -382,6 +396,7 @@ impl Agent<'_> {
             "session": self.session,
             "env": env,
             "prompt": self.prompt,
+            "resources": self.resources,
             "pid": std::process::id(),
         })
     }

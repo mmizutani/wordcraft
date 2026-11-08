@@ -75,7 +75,7 @@ impl Entry {
             Entry::Plan { entries } => entries.iter().map(|e| e.content.len()).sum(),
             Entry::Permission { request, .. } => request.title.len() + request.options.iter().map(|o| o.name.len() + o.id.len()).sum::<usize>(),
             Entry::Usage(u) => u.cost.as_ref().map_or(0, String::len),
-            Entry::Context(sent) => sent.document.len(),
+            Entry::Context(sent) => sent.document.len() + sent.knowledge.iter().map(|s| s.name.len()).sum::<usize>(),
             Entry::Output(row) => row.text.len(),
             Entry::Stopped { .. } => 0,
         }

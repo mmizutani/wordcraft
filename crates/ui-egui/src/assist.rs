@@ -28,7 +28,10 @@
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use wordcraft_assist::{Answer, Assistant, Backend, Caps, Context, Host, Offer, Options, PermissionPolicy, Readiness};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+
+use wordcraft_assist::knowledge::{self, MAX_SOURCES};
+use wordcraft_assist::{Answer, Assistant, Backend, Caps, Context, Host, Knowledge, Offer, Options, PermissionPolicy, Readiness};
 use wordcraft_engine::cmd::assist::AssistantStatus;
 use wordcraft_engine::room::Role;
 
@@ -61,6 +64,12 @@ pub(crate) struct AssistState {
     /// Frames left in which the prompt box takes the keyboard: a few, as the click that opened
     /// the pane hands the keyboard back to the page.
     pub(crate) focus_prompt: u8,
+    /// The sources attached for the conversation: they carry on until a new one starts.
+    pub(crate) knowledge: Vec<Knowledge>,
+    /// Sources being read off the frame thread.
+    adding: Vec<Receiver<Result<Knowledge, String>>>,
+    /// Sources' Add shows what to add.
+    pub(crate) add_open: bool,
     /// The document and its revision the conversation's record of what it changed last read.
     output_at: Option<(u64, u64)>,
     /// What the pane shows: the conversation, or what the assistant is doing and what runs it.
@@ -215,6 +224,7 @@ pub(crate) fn tick(app: &mut WordApp) {
         }
     }
     note_output(app);
+    take_sources(app);
     // A sign-in or a sign-out that ended changes what ChatGPT's offer says: ask again now.
     let account_changed = chatgpt::tick(app);
     let stale = account_changed
@@ -308,6 +318,15 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
         }
         "backend" => backend(app, req.get("id").and_then(Value::as_str)),
         "details" => details(app),
+        "knowledge" => {
+            if let Some(n) = req.get("remove").and_then(Value::as_u64) {
+                remove_source(app, usize::try_from(n).unwrap_or(usize::MAX)).map(|()| ())?;
+            }
+            if let Some(path) = req.get("add").and_then(Value::as_str) {
+                add_source_file(app, path);
+            }
+            Ok(sources_json(app))
+        }
         "show" => {
             let last = req.get("version").and_then(Value::as_u64).unwrap_or(0);
             show_change(app, req.get("from").and_then(Value::as_u64).unwrap_or(last), last)
@@ -325,6 +344,95 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
 fn details(app: &WordApp) -> Result<Value, String> {
     let details = app.conversation().map(Assistant::details).unwrap_or_default();
     serde_json::to_value(details).map_err(|e| e.to_string())
+}
+
+/// What `assist.knowledge` answers.
+fn sources_json(app: &WordApp) -> Value {
+    let sources: Vec<Value> =
+        app.assist.knowledge.iter().map(|s| json!({"name": s.name, "bytes": s.text.len(), "size": s.size, "cut": s.cut})).collect();
+    json!({"sources": sources, "pending": app.assist.adding.len(), "error": app.assist.notice})
+}
+
+/// Whether there is room for one more source.
+fn source_room(app: &mut WordApp) -> bool {
+    let room = app.assist.knowledge.len().saturating_add(app.assist.adding.len()) < MAX_SOURCES;
+    if !room {
+        app.assist.notice = Some(format!("a conversation holds at most {MAX_SOURCES} sources: remove one first"));
+    }
+    room
+}
+
+/// Read the file at `path` as a source, off the frame thread: a large one takes time to import.
+/// Whoever asked has had the file rule applied, or chose the file themselves.
+pub(crate) fn add_source_file(app: &mut WordApp, path: &str) {
+    if !source_room(app) {
+        return;
+    }
+    let path = std::path::PathBuf::from(path);
+    let (tx, rx) = channel();
+    let wake = app.ctx.clone();
+    let reading = std::thread::Builder::new().name("assistant source".into()).spawn(move || {
+        let _ = tx.send(read_source(&path));
+        if let Some(ctx) = wake {
+            ctx.request_repaint();
+        }
+    });
+    match reading {
+        Ok(_) => app.assist.adding.push(rx),
+        Err(e) => app.assist.notice = Some(format!("the source couldn't be read: {e}")),
+    }
+}
+
+/// Most bytes of a file read as a source: its text is cut to much less, but only after importing it.
+const MAX_SOURCE_FILE: u64 = 64 << 20;
+
+/// `path` as a source, through the importers documents open with.
+fn read_source(path: &std::path::Path) -> Result<Knowledge, String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let fail = |why: String| format!("{name} couldn't be read as a source: {why}");
+    let size = std::fs::metadata(path).map_err(|e| fail(e.to_string()))?.len();
+    if size > MAX_SOURCE_FILE {
+        return Err(fail(format!("it is larger than {} MB", MAX_SOURCE_FILE >> 20)));
+    }
+    let doc = wordcraft_engine::io::open_path(path).map_err(fail)?;
+    Ok(Knowledge::new(&name, &doc.plain_text(wordcraft_doc::StoryRef::Body)))
+}
+
+/// Attach open document `id` as a source.
+pub(crate) fn add_source_document(app: &mut WordApp, id: u64, name: &str) {
+    if source_room(app) {
+        match app.session.with_document(id, |s| s.doc.plain_text(wordcraft_doc::StoryRef::Body)) {
+            Ok(text) => app.assist.knowledge.push(Knowledge::new(name, &text)),
+            Err(e) => app.assist.notice = Some(e.to_string()),
+        }
+    }
+}
+
+/// Remove source `n`.
+pub(crate) fn remove_source(app: &mut WordApp, n: usize) -> Result<(), String> {
+    if n >= app.assist.knowledge.len() {
+        return Err(format!("`remove`: there are {} sources", app.assist.knowledge.len()));
+    }
+    app.assist.knowledge.remove(n);
+    Ok(())
+}
+
+/// Take the sources that were read.
+fn take_sources(app: &mut WordApp) {
+    let mut adding = std::mem::take(&mut app.assist.adding);
+    adding.retain(|rx| match rx.try_recv() {
+        Ok(Ok(source)) => {
+            app.assist.knowledge.push(source);
+            false
+        }
+        Ok(Err(why)) => {
+            app.assist.notice = Some(why);
+            false
+        }
+        Err(TryRecvError::Empty) => true,
+        Err(TryRecvError::Disconnected) => false,
+    });
+    app.assist.adding = adding;
 }
 
 /// The assistants offered, whether each is ready, and the one chosen; with `id`, choose it.
@@ -431,7 +539,9 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
         start(app, role)?;
     }
     let caps = Caps::default();
-    let (context, sent) = Context::of(&app.session, &caps).rendered(&caps);
+    let (context, mut sent) = Context::of(&app.session, &caps).rendered(&caps);
+    let (carried, sources) = knowledge::for_turn(&app.assist.knowledge);
+    sent.knowledge = sources;
     // The person's selection, by paragraph id: the assistant's copy finds it there, though the
     // paragraphs moved with edits it has and the window hasn't yet.
     let doc = &app.session.doc;
@@ -459,6 +569,7 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     sync_unattended(app);
     let policy = if app.assist.by_person { PermissionPolicy::Ask } else { unattended(app) };
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
+    a.set_knowledge(carried);
     a.ask_with_policy(prompt, Some(context), selection, policy).map_err(|e| e.to_string())?;
     a.gave(sent);
     let (name, role, tracked) = (a.name().to_string(), a.role(), a.tracked());
@@ -487,6 +598,10 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
             wordcraft_assist::offers::make(&id, &host(app))?
         }
     };
+    // Sources belong to their conversation: those attached before the first go with it.
+    if app.assist.conversation.is_some() {
+        app.assist.knowledge.clear();
+    }
     end(app);
     if !app.shows_shared_document() {
         app.share_document(None)?;
@@ -602,7 +717,7 @@ pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
         Entry::Permission { request, .. } => std::iter::once(request.title.clone()).chain(request.options.iter().map(|o| o.name.clone())).collect(),
         Entry::Model { name } | Entry::Agent { name } => vec![name.clone()],
         Entry::Usage(u) => u.cost.iter().cloned().collect(),
-        Entry::Context(sent) => vec![sent.document.clone()],
+        Entry::Context(sent) => std::iter::once(sent.document.clone()).chain(sent.knowledge.iter().map(|s| s.name.clone())).collect(),
         Entry::Output(row) => vec![row.text.clone()],
         Entry::Stopped { .. } => vec![],
         Entry::Error { message } => vec![message.clone()],

@@ -51,7 +51,8 @@ pub(super) fn assistant(app: &mut WordApp, ui: &mut Ui) {
             let _ = app.run("assist.useDocument", json!({}));
         }
     }
-    let view = if app.conversation().is_some() { tabs(app, ui) } else { PaneView::Conversation };
+    // Sources can be attached before a conversation starts; the web app runs no assistant (#26).
+    let view = if app.conversation().is_some() || crate::assist::desktop(app) { tabs(app, ui) } else { PaneView::Conversation };
     ui.separator();
     // The conversation takes the height that the buttons and the prompt box under it leave, as
     // they measured on the last frame.

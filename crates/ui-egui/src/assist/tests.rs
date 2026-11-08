@@ -1720,3 +1720,166 @@ fn accept_all_stays_on_the_conversation() {
     assert!(h.query_by_label("Accept all").is_some(), "it stays under both views");
     h.state_mut().run("assist.cancel", json!({})).unwrap();
 }
+
+/// A temporary file with `text`, and the folder that holds it.
+#[cfg(not(target_arch = "wasm32"))]
+fn source_file(name: &str, text: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("wordcraft-source-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    (dir, path)
+}
+
+/// Frames until no source is being read.
+#[cfg(not(target_arch = "wasm32"))]
+fn sources_read(a: &mut WordApp) -> Value {
+    for _ in 0..4000 {
+        super::tick(a);
+        let now = a.execute("assist.knowledge", json!({})).unwrap();
+        if now["pending"] == 0 {
+            return now;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the source isn't read");
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_source_over_the_limit_is_cut_says_so_and_reaches_the_turn_until_removed() {
+    use wordcraft_assist::Entry;
+    let (dir, path) = source_file("big.txt", &"word ".repeat(20 << 10));
+    let mut a = window("one");
+    let fake = Fake::new().then(vec![Step::say("A")]).then(vec![Step::say("B")]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    let now = sources_read(&mut a);
+    assert_eq!(now["sources"][0]["name"], "big.txt");
+    assert_eq!(now["sources"][0]["cut"], true, "{now}");
+    assert_eq!(now["sources"][0]["bytes"], 64 << 10, "{now}");
+
+    ask(&mut a, "Use it", None);
+    settle(&mut a);
+    let context = |a: &WordApp| {
+        a.conversation().unwrap().transcript().entries().rev().find_map(|e| if let Entry::Context(s) = e { Some(s.clone()) } else { None }).unwrap()
+    };
+    assert_eq!(context(&a).knowledge[0].name, "big.txt");
+    assert!(context(&a).knowledge[0].cut);
+    assert_eq!(seen.lock().unwrap().turns[0].knowledge[0].text.len(), 64 << 10);
+
+    a.execute("assist.knowledge", json!({"remove": 0})).unwrap();
+    ask(&mut a, "Without it", None);
+    settle(&mut a);
+    assert!(context(&a).knowledge.is_empty());
+    assert!(seen.lock().unwrap().turns[1].knowledge.is_empty(), "removing a source stops it reaching the next turn");
+    assert!(a.execute("assist.knowledge", json!({"remove": 5})).is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn sources_hold_to_their_number_and_a_file_that_can_t_be_read_says_why() {
+    let (dir, path) = source_file("small.txt", "words");
+    let mut a = window("one");
+    a.assist_with(Box::new(Fake::new()));
+    a.execute("assist.knowledge", json!({"add": dir.join("missing.txt").to_string_lossy()})).unwrap();
+    let now = sources_read(&mut a);
+    assert!(now["error"].as_str().unwrap_or_default().contains("missing.txt"), "{now}");
+    for _ in 0..12 {
+        a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    }
+    let now = sources_read(&mut a);
+    assert_eq!(now["sources"].as_array().unwrap().len(), wordcraft_assist::knowledge::MAX_SOURCES);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_script_s_path_is_held_to_the_file_rule() {
+    use wordcraft_engine::file_access::{AutomationRoots, confine};
+    let (dir, path) = source_file("secret.txt", "words");
+    let mut a = window("one");
+    a.assist_with(Box::new(Fake::new()));
+    let none = AutomationRoots::none();
+    let r = confine(Some(&none), || a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})));
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(sources_read(&mut a)["sources"], json!([]));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn adding_a_source_takes_the_person_s_click() {
+    use egui_kittest::kittest::Queryable;
+    let (dir, path) = source_file("picked.txt", "words");
+    let mut app = window("one two three");
+    let picked = path.to_string_lossy().into_owned();
+    app.services.pick_open = Some(Box::new(move |_| Some(picked.clone())));
+    let mut h = harness(app);
+    h.state_mut().assist.view = crate::assist::PaneView::Details;
+    h.state_mut().run("assist.pane", json!({"value": true})).unwrap();
+    h.run_steps(3);
+    let frame = |h: &mut egui_kittest::Harness<'_, WordApp>| {
+        let ctx = h.ctx.clone();
+        let mut raw = std::mem::take(h.input_mut());
+        h.state_mut().raw_input_hook(&ctx, &mut raw);
+        *h.input_mut() = raw;
+        h.step();
+    };
+    let pos = h.get_by_label("Add a source…").rect().center();
+    let (req, _rx) = crate::control::ControlRequest::new("ui.click", json!({"x": pos.x, "y": pos.y}));
+    let ctx = h.ctx.clone();
+    assert!(matches!(crate::control::handle(h.state_mut(), &ctx, &req), crate::control::Outcome::Done(_)));
+    for _ in 0..20 {
+        frame(&mut h);
+    }
+    assert!(!h.state().assist.add_open, "a click the control channel made opens nothing");
+    assert!(h.state().assist.notice.as_deref().is_some_and(|n| n.contains("Only you")), "{:?}", h.state().assist.notice);
+
+    h.get_by_label("Add a source…").click();
+    h.run_steps(2);
+    h.get_by_label("A file…").click();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if !h.state().assist.knowledge.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(h.state().assist.knowledge[0].name, "picked.txt");
+    h.run_steps(2);
+    assert!(h.query_by_label("picked.txt").is_some());
+    h.get_by_label("Remove").click();
+    h.run_steps(2);
+    assert!(h.state().assist.knowledge.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn sources_belong_to_their_conversation() {
+    let mut a = window("one");
+    a.assist_with(Box::new(Fake::new()));
+    a.assist.knowledge.push(wordcraft_assist::Knowledge::new("before.txt", "words"));
+    ask(&mut a, "First", None);
+    settle(&mut a);
+    assert_eq!(a.assist.knowledge.len(), 1, "what was attached before the first goes with it");
+    a.assist.knowledge.push(wordcraft_assist::Knowledge::new("more.txt", "words"));
+    ask(&mut a, "Another role", Some("viewer"));
+    settle(&mut a);
+    assert!(a.assist.knowledge.is_empty(), "a new conversation starts without them");
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn another_open_document_can_be_a_source() {
+    let mut a = window("first document");
+    let first = a.session.document_id();
+    a.execute("file.new", json!({})).unwrap();
+    assert_ne!(a.session.document_id(), first);
+    super::add_source_document(&mut a, first, "First");
+    assert_eq!(a.assist.knowledge[0].name, "First");
+    assert_eq!(a.assist.knowledge[0].text.trim_end(), "first document");
+}

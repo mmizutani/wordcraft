@@ -85,6 +85,8 @@ pub(crate) enum AfterPick {
     /// Add the picked folder to the folders agents can use, read-only (File › Options › Agents,
     /// #31).
     AgentFolder,
+    /// Attach the picked file to the assistant's conversation as a source.
+    AssistantSource,
 }
 
 /// What to do once Save As has written the document.
@@ -301,6 +303,11 @@ impl WordApp {
             AfterPick::AgentFolder => {
                 let Some(path) = picked else { return Ok(json!({"cancelled": true})) };
                 crate::options::add_agent_folder(self, &path)
+            }
+            AfterPick::AssistantSource => {
+                let Some(path) = picked else { return Ok(json!({"cancelled": true})) };
+                crate::assist::add_source_file(self, &path);
+                Ok(json!({"adding": path}))
             }
             AfterPick::Export { ext } => {
                 let Some(path) = picked else { return Ok(json!({"cancelled": true})) };

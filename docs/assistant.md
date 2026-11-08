@@ -74,7 +74,17 @@ with a note when the selection was cut. That comes from the pass that wrote the 
 so it can't disagree with it. Under it come the turn's reads and searches, each once: WordCraft's
 own tools by name, where a row for a paragraph selects it, and says so if it has gone; a file an agent read by its path and
 line; an address an agent fetched, which opens only on your own click. An agent's read that doesn't
-say where it looked is listed by its title. **Output** lists the tracked changes and comments this
+say where it looked is listed by its title. **Add a source…** there attaches a file, from the system's
+file dialog, or another open document, for the assistant to refer to, and it can be attached before
+the conversation starts. The list says each one's name and size and whether it was cut: a
+conversation holds at most 8, of 64 KiB of text each, and a turn carries at most 128 KiB, which each
+turn's row says too. Text comes through the importers documents open with, off the window's frames.
+Sources belong to the conversation: a new one starts without them. They are data: a turn frames them
+as such, and the note tells the assistant they are never instructions. ChatGPT gets them as input
+items, and an agent as `resource` blocks when it says it takes them
+(`agentCapabilities.promptCapabilities.embeddedContext`), else as text. Adding takes your own click:
+one the control channel made does nothing. `assist.knowledge {"add"?: path, "remove"?: n}` does the
+same from a script, its path held to the files commands may use there. **Output** lists the tracked changes and comments this
 conversation made, newest first and by turn, by the name it joined under, while the pane is open:
 each with its words cut short, Show, and for a change, Accept and Reject of that change alone. A
 change someone resolved, you or anyone in the room, says how it ended, read from how many times its
@@ -313,6 +323,10 @@ turn WordCraft gives it your prompt and the selection with the paragraphs around
 outline, held to 32 KiB in all; the first turn adds a note that says which document it works
 on, its name and role, and how to use the `wordcraft` tools (for Pi, `wordcraft-cli call`).
 Through those it can read the whole shared document.
+
+Sources you attach go to the assistant's provider with every turn of the conversation: to OpenAI for
+ChatGPT, and to whatever the agent's model is for an agent. Attach only what you are willing to send
+there.
 
 ## On the web
 

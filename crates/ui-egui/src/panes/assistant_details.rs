@@ -11,6 +11,7 @@ use wordcraft_engine::room::Role;
 use super::assistant::{Mark, wrapped};
 use super::{Tokens, WordApp, semibold};
 use crate::assist::role_label;
+use crate::file_dialogs::{AfterPick, FileDialogRequest};
 use crate::i18n::fmt;
 
 /// Details, in `height` points.
@@ -53,6 +54,7 @@ fn steps(ui: &mut Ui, t: &Tokens, details: &Details) {
 
 /// What each turn gave the model and what it read, newest last.
 fn sources(app: &mut WordApp, ui: &mut Ui, t: &Tokens, details: &Details) {
+    attached(app, ui, t);
     for (i, turn) in details.turns.iter().enumerate() {
         if turn.context.is_none() && turn.sources.is_empty() {
             continue;
@@ -74,6 +76,59 @@ fn sources(app: &mut WordApp, ui: &mut Ui, t: &Tokens, details: &Details) {
     }
 }
 
+/// The sources attached for the conversation, each with its name, its size and whether it was cut,
+/// and the way to add one: the person's alone, as a program's click does nothing.
+fn attached(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
+    let rows: Vec<(String, String, bool)> = app.assist.knowledge.iter().map(|s| (s.name.clone(), size(s.size), s.cut)).collect();
+    for (n, (name, size, cut)) in rows.iter().enumerate() {
+        ui.push_id(("source", n), |ui| {
+            ui.scope(|ui| {
+                ui.spacing_mut().interact_size.y = 0.0;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(name).small().color(t.text));
+                    ui.label(RichText::new(size).small().color(t.text_dim));
+                    if *cut {
+                        ui.label(RichText::new(tl!("cut to fit")).small().color(t.orange));
+                    }
+                    if ui.small_button(tl!("Remove")).on_hover_text(fmt(tl!("Stop giving {name} to the assistant"), &[("name", name)])).clicked() {
+                        let _ = crate::assist::remove_source(app, n);
+                    }
+                });
+            });
+        });
+    }
+    let add = ui
+        .small_button(tl!("Add a source…"))
+        .on_hover_text(tl!("Give the assistant a file or another open document to refer to. Its text goes to the assistant's provider."));
+    if add.clicked() {
+        if app.input_from_control(ui.ctx()) {
+            app.assist.notice = Some(tl!("Only you can add a source: click it yourself.").to_string());
+        } else {
+            app.assist.add_open = !app.assist.add_open;
+        }
+    }
+    if !app.assist.add_open {
+        return;
+    }
+    let active = app.session.document_id();
+    let documents: Vec<_> = app.session.documents().into_iter().filter(|d| d.id != active).collect();
+    if ui.small_button(tl!("A file…")).clicked() && !app.input_from_control(ui.ctx()) {
+        app.assist.add_open = false;
+        let _ = app.ask_file(FileDialogRequest::Open { purpose: "document".into() }, AfterPick::AssistantSource);
+    }
+    for document in documents {
+        if ui.small_button(&document.title).clicked() && !app.input_from_control(ui.ctx()) {
+            app.assist.add_open = false;
+            crate::assist::add_source_document(app, document.id, &document.title);
+        }
+    }
+}
+
+/// `bytes` for a person to read.
+fn size(bytes: usize) -> String {
+    format!("{:.1} KiB", bytes as f64 / 1024.0)
+}
+
 /// What a turn gave the model, in one row, and a note when the selection was cut.
 fn context_row(ui: &mut Ui, t: &Tokens, sent: &Sent) {
     let kib = |bytes: u32| format!("{:.1}", f64::from(bytes) / 1024.0);
@@ -93,6 +148,15 @@ fn context_row(ui: &mut Ui, t: &Tokens, sent: &Sent) {
     wrapped(ui, RichText::new(line).small().color(t.text));
     if sent.selection_cut {
         wrapped(ui, RichText::new(tl!("The selection was cut to fit.")).small().color(t.orange));
+    }
+    for source in &sent.knowledge {
+        let line = fmt(tl!("Given: {name}, {size}"), &[("name", &source.name), ("size", &size(source.bytes as usize))]);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(line).small().color(t.text));
+            if source.cut {
+                ui.label(RichText::new(tl!("cut to fit")).small().color(t.orange));
+            }
+        });
     }
 }
 

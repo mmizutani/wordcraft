@@ -109,6 +109,8 @@ pub struct Assistant {
     busy: bool,
     /// Whether the next turn is the conversation's first, which carries the note.
     first: bool,
+    /// What the next turns carry of the sources the person attached.
+    knowledge: Vec<crate::knowledge::TurnSource>,
     ended: bool,
 }
 
@@ -155,6 +157,7 @@ impl Assistant {
             transcript: Transcript::default(),
             busy: false,
             first: true,
+            knowledge: Vec::new(),
             ended: false,
         })
     }
@@ -266,7 +269,7 @@ impl Assistant {
             return Err(AssistError::Prompt(format!("the prompt is longer than {} KB", MAX_PROMPT >> 10)));
         }
         let note = self.first.then(|| crate::note(&self.seat, self.info.in_process_tools));
-        let turn = Turn { prompt: prompt.to_string(), context, note, selection };
+        let turn = Turn { prompt: prompt.to_string(), context, note, selection, knowledge: self.knowledge.clone() };
         // Cleared before the turn is sent: a Stop from now on ends this turn, even one the
         // thread hasn't started yet.
         self.cancel.clear();
@@ -285,6 +288,11 @@ impl Assistant {
     pub fn note_output(&mut self, session: &wordcraft_engine::Session) {
         let (seen, more) = crate::output::rows(session, &self.seat.name);
         self.transcript.note_output(seen, more, |row| crate::output::ended(&session.doc, row));
+    }
+
+    /// What the next turns carry of the sources the person attached.
+    pub fn set_knowledge(&mut self, knowledge: Vec<crate::knowledge::TurnSource>) {
+        self.knowledge = knowledge;
     }
 
     /// What the turn just asked was given of the document, for the pane's Sources.

@@ -243,6 +243,8 @@ struct Running {
     /// Its folder: new and empty, removed when it stops.
     folder: Folder,
     session: String,
+    /// Whether it takes `resource` blocks in a prompt (`embeddedContext`).
+    embedded_context: bool,
 }
 
 /// An ACP agent as a backend.
@@ -352,6 +354,7 @@ impl Acp {
             return Err(format!("{name} speaks {theirs} of the Agent Client Protocol, and WordCraft speaks version {PROTOCOL_VERSION}"));
         }
         let agent = agent_info(&init);
+        let embedded_context = init.pointer("/agentCapabilities/promptCapabilities/embeddedContext").and_then(Value::as_bool).unwrap_or(false);
         let methods = auth_methods(&init);
         let new_session = json!({"cwd": cwd, "mcpServers": mcp_servers});
         let mut signed_in = false;
@@ -362,7 +365,7 @@ impl Acp {
                 Ok(result) => {
                     let session = result.get("sessionId").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 1024);
                     let session = session.ok_or_else(|| format!("{name} started no session"))?.to_string();
-                    return Ok(Some((Running { process, folder, session }, agent)));
+                    return Ok(Some((Running { process, folder, session, embedded_context }, agent)));
                 }
                 Err(e) if e.code == AUTH_REQUIRED && !signed_in => {
                     if !self.sign_in(&mut process, &methods, ctx)? {
@@ -652,13 +655,21 @@ impl Backend for Acp {
         }
         // A new session gets the note, which the agent's model reads first.
         let note = if fresh { self.note.as_deref() } else { None };
-        let prompt: Vec<Value> = [note, turn.context.as_deref(), Some(turn.prompt.as_str())]
-            .into_iter()
-            .flatten()
-            .filter(|t| !t.trim().is_empty())
-            .map(|t| json!({"type": "text", "text": t}))
-            .collect();
+        let text = |t: &str| json!({"type": "text", "text": t});
+        let before = [note, turn.context.as_deref()].into_iter().flatten().filter(|t| !t.trim().is_empty()).map(text);
         let Some(running) = self.running.as_mut() else { return Err(format!("{} isn't running", self.spec.label)) };
+        let embedded = running.embedded_context;
+        let sources = turn.knowledge.iter().enumerate().map(|(n, source)| {
+            if embedded {
+                let name: String = source.name.chars().map(|c| if c.is_alphanumeric() || c == '.' { c } else { '-' }).collect();
+                let framed = source.as_text();
+                json!({"type": "resource", "resource": {"uri": format!("wordcraft:source/{n}/{name}"), "mimeType": "text/plain", "text": framed}})
+            } else {
+                text(&source.as_text())
+            }
+        });
+        let asked = (!turn.prompt.trim().is_empty()).then(|| text(&turn.prompt));
+        let prompt: Vec<Value> = before.chain(sources).chain(asked).collect();
         let session = running.session.clone();
         let ended = match running.process.request("session/prompt", json!({"sessionId": session, "prompt": prompt})) {
             Ok(id) => self.finish_turn(id, ctx),

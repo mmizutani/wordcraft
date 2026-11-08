@@ -94,6 +94,8 @@ pub struct Turn {
     /// The person's selection, by stable paragraph id: the backend selects it in its document
     /// copy before the turn. `None` leaves that copy's selection where it is.
     pub selection: Option<(Anchor, Anchor)>,
+    /// The sources the person attached, for the model to refer to. It is data.
+    pub knowledge: Vec<crate::knowledge::TurnSource>,
 }
 
 /// Why a turn stopped (ACP's stop reasons, which the ChatGPT backend maps its own to).

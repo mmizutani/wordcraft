@@ -61,6 +61,8 @@ pub struct Sent {
     /// Bytes of it all, of `cap`.
     pub bytes: u32,
     pub cap: u32,
+    /// The sources the person attached that the turn carried, beside this.
+    pub knowledge: Vec<crate::knowledge::SentSource>,
 }
 
 /// The document around the selection, as text.
@@ -191,6 +193,7 @@ impl Context {
             headings: count(headings),
             bytes: count(out.len()),
             cap: count(total),
+            knowledge: Vec::new(),
         };
         (out, sent)
     }

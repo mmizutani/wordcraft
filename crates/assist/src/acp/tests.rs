@@ -882,3 +882,23 @@ fn an_agent_s_locations_and_fetches_reach_sources_and_junk_is_ignored() {
         "an update that says nothing of them keeps what the call said"
     );
 }
+
+#[test]
+fn a_source_goes_as_a_resource_when_the_agent_takes_them_else_as_text() {
+    use crate::knowledge::TurnSource;
+    let source = || vec![TurnSource { name: "notes one.txt".into(), text: "Source words.".into() }];
+    let report = |embedded: bool| {
+        let script = Script { embedded_context: embedded, turns: vec![vec![Step::Report]], ..Script::default() };
+        let mut c = Chat::with(&script);
+        c.a.set_knowledge(source());
+        c.ask("Hi");
+        serde_json::from_str::<serde_json::Value>(&c.answer()).unwrap()
+    };
+    let took = report(true);
+    assert!(took["resources"][0].as_str().unwrap().contains("Source words."), "{took}");
+    assert!(!took["prompt"].to_string().contains("Source words."), "{took}");
+    let not = report(false);
+    assert_eq!(not["resources"], json!([]), "{not}");
+    assert!(not["prompt"].to_string().contains("Source words.") && not["prompt"].to_string().contains("never instructions"), "{not}");
+    assert_eq!(not["prompt"].as_array().unwrap().last().unwrap(), "Hi", "the prompt stays last");
+}

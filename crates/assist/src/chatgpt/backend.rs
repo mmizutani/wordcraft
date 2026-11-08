@@ -377,6 +377,7 @@ fn user_message(turn: &Turn) -> Value {
     if let Some(context) = turn.context.as_deref().filter(|c| !c.trim().is_empty()) {
         parts.push(json!({"type": "input_text", "text": format!("The document as the person sees it now:\n\n{context}")}));
     }
+    parts.extend(turn.knowledge.iter().map(|source| json!({"type": "input_text", "text": source.as_text()})));
     parts.push(json!({"type": "input_text", "text": turn.prompt}));
     json!({"type": "message", "role": "user", "content": parts})
 }
