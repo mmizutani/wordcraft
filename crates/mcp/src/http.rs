@@ -522,7 +522,7 @@ fn failed(reply: &str) -> bool {
 fn status_of(reply: &str) -> u16 {
     let code = serde_json::from_str::<Value>(reply).ok().and_then(|v| v.get("error").and_then(|e| e.get("code")).and_then(Value::as_i64));
     match code {
-        Some(UNSUPPORTED_VERSION | HEADER_MISMATCH | -32021) => 400,
+        Some(UNSUPPORTED_VERSION | HEADER_MISMATCH) => 400,
         Some(METHOD_NOT_FOUND) => 404,
         _ => 200,
     }
