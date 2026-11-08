@@ -826,6 +826,20 @@ fn the_line_follows_what_the_stream_reports_and_keeps_it_through_events_that_don
     assert_eq!(model_line(&c), Some(("GPT-6-Luna".to_string(), Some("high".to_string()), false)));
 }
 
+#[test]
+fn an_effort_reported_only_at_the_end_of_the_stream_corrects_the_line() {
+    let started = json!({"type": "response.created", "response": {"model": "gpt-6-luna"}});
+    let report = json!({"model": "gpt-6-luna", "reasoning": {"effort": "high"}});
+    // Both ways a stream ends with an answer: it completed, or it was cut off.
+    let completed = json!({"type": "response.completed", "response": report});
+    let incomplete = json!({"type": "response.incomplete", "response": {"model": "gpt-6-luna", "reasoning": {"effort": "high"}, "incomplete_details": {"reason": "max_output_tokens"}}});
+    for end in [completed, incomplete] {
+        let mut c = listing(real_list(), vec![Reply::sse(&[started.clone(), message("Hi."), end.clone()])]);
+        c.ask("Hello");
+        assert_eq!(model_line(&c), Some(("GPT-6-Luna".to_string(), Some("high".to_string()), false)), "{end}");
+    }
+}
+
 /// `unsupported_value` on the effort, as the Responses API says it.
 fn effort_refused() -> Reply {
     Reply::json(
