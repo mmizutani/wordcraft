@@ -172,6 +172,10 @@ fn past_the_limit_nothing_comes_before_what_it_followed() {
     let f = format(&format!("{items}\n```\nfirst\n```\n\nmiddle\n\n```\nlast\n```\n"), false);
     let at = |word: &str| words(&f).find(word).unwrap_or_else(|| panic!("{word} is gone"));
     assert!(at("first") < at("middle") && at("middle") < at("last"), "{:?}", f.rest);
+    // A small block after one too big to draw goes after it too.
+    let f = format(&format!("{}\n\nafter", "*a* ".repeat(16_000)), false);
+    assert!(f.blocks.is_empty(), "{:?}", f.blocks.first());
+    assert!(f.rest.trim_end().ends_with("after"));
 }
 
 #[test]
