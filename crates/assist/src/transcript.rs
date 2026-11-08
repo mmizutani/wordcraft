@@ -198,14 +198,15 @@ impl Transcript {
         })
     }
 
-    /// The person answered proposal `id`.
-    pub fn answer_proposal(&mut self, id: u64, answer: ProposalAnswer) {
-        let found = self.entries.iter_mut().rev().find_map(|e| match e {
-            Entry::Proposal { id: i, answer: slot, .. } if *i == id => Some(slot),
+    /// The person answered proposal `id`: `kept`, what was stored, which they may have edited.
+    pub fn answer_proposal(&mut self, id: u64, answer: ProposalAnswer, kept: Option<&str>) {
+        let found = self.entries.iter().enumerate().rev().find_map(|(i, e)| match e {
+            Entry::Proposal { id: n, text, .. } if *n == id => Some((i, text.clone())),
             _ => None,
         });
-        if let Some(slot) = found {
-            *slot = Some(answer);
+        if let Some((i, text)) = found {
+            let text = kept.map_or(text, str::to_string);
+            self.replace(i, Entry::Proposal { id, text, answer: Some(answer) });
         }
     }
 

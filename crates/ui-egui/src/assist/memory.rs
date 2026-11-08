@@ -50,6 +50,11 @@ fn reload(app: &mut WordApp) {
     }
 }
 
+/// A new conversation numbers its proposals from 1 again: a draft of the last one's isn't for it.
+pub(crate) fn conversation_started(app: &mut WordApp) {
+    app.assist.memory.editing_proposal = None;
+}
+
 /// What the next turn carries, read fresh: another WordCraft's keep counts. Nothing without a
 /// folder to keep it in, so the model isn't asked to propose what no click could keep.
 pub(crate) fn for_turn(app: &mut WordApp) -> Option<String> {
@@ -109,23 +114,23 @@ fn answer(app: &mut WordApp, dir: &std::path::Path, keep: bool, req: &Value) -> 
     let id = req.get("proposal").and_then(Value::as_u64).unwrap_or(0);
     let proposed = app.conversation().and_then(|a| a.transcript().pending_proposal(id)).map(str::to_string);
     let proposed = proposed.ok_or("that proposal isn't waiting for an answer")?;
-    let r = if keep {
+    let kept = if keep {
         let text = req.get("text").and_then(Value::as_str).unwrap_or(&proposed);
         let now = wordcraft_engine::cmd::now_iso();
-        Memory::update(dir, |m| m.add(text, &now).map(|item| json!({"id": item.id})))
+        Memory::update(dir, |m| m.add(text, &now)).map(Some)
     } else {
         Memory::update(dir, |m| {
             m.dismiss(&proposed);
-            Ok(json!({"dismissed": id}))
+            Ok(None)
         })
     };
     reload(app);
-    if r.is_ok()
-        && let Some(a) = app.conversation_mut()
-    {
-        a.answer_proposal(id, if keep { ProposalAnswer::Kept } else { ProposalAnswer::Dismissed });
+    let kept = kept?;
+    if let Some(a) = app.conversation_mut() {
+        let said = if keep { ProposalAnswer::Kept } else { ProposalAnswer::Dismissed };
+        a.answer_proposal(id, said, kept.as_ref().map(|item| item.text.as_str()));
     }
-    r
+    Ok(kept.map_or(json!({"dismissed": id}), |item| json!({"id": item.id})))
 }
 
 /// A proposal in the Assistant pane: what it says and, while it waits, Keep, Edit and Not this.

@@ -490,6 +490,7 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
     app.assist.opened_for = None;
     // It may be about another document, whose turn shouldn't quote this one's text.
     app.assist.feedback.clear();
+    memory::conversation_started(app);
     sync_unattended(app);
     Ok(())
 }

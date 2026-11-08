@@ -1213,6 +1213,6 @@ fn a_proposal_s_text_is_cleaned_and_answered_once() {
     let text = t.pending_proposal(1).unwrap().to_string();
     assert!(text.starts_with("Use lists. y"), "{text}");
     assert_eq!(text.chars().count(), crate::memory::MAX_TEXT);
-    t.answer_proposal(1, crate::ProposalAnswer::Dismissed);
+    t.answer_proposal(1, crate::ProposalAnswer::Dismissed, None);
     assert_eq!(t.pending_proposal(1), None);
 }

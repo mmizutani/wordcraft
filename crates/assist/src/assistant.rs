@@ -317,11 +317,9 @@ impl Assistant {
         self.permissions.set_unattended(allow);
     }
 
-    /// The person answered proposal `id` ([`Entry::Proposal`]): what it proposed, if it was waiting.
-    pub fn answer_proposal(&mut self, id: u64, answer: crate::transcript::ProposalAnswer) -> Option<String> {
-        let text = self.transcript.pending_proposal(id)?.to_string();
-        self.transcript.answer_proposal(id, answer);
-        Some(text)
+    /// The person answered proposal `id` ([`Entry::Proposal`]): `kept`, what was stored.
+    pub fn answer_proposal(&mut self, id: u64, answer: crate::transcript::ProposalAnswer, kept: Option<&str>) {
+        self.transcript.answer_proposal(id, answer, kept);
     }
 
     /// The permission request the turn waits on for the person's answer, if one does.
