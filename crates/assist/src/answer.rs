@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use wordcraft_formats::markdown;
 use wordcraft_formats::model::{FBlock, Fmt, Inline, Kind, Para};
 
-use crate::backend::{cut, label, shown};
+use crate::backend::{MAX_LABEL, label, shown};
 
 /// Most bytes of an answer read as Markdown, so an answer as long as a transcript keeps
 /// ([`crate::transcript::MAX_ENTRY_BYTES`]) still takes one frame to read.
@@ -64,8 +64,8 @@ pub struct Formatted {
 /// Whether the window may open `address` on the person's click: a web address only, so a model
 /// can't have a click start a program or run a script.
 pub fn opens(address: &str) -> bool {
-    let lower = address.trim_start().get(..8).map(str::to_ascii_lowercase).unwrap_or_default();
-    lower.starts_with("https://") || lower.starts_with("http://")
+    let has = |scheme: &str| address.get(..scheme.len()).is_some_and(|start| start.eq_ignore_ascii_case(scheme));
+    has("https://") || has("http://")
 }
 
 /// Read `text` (an answer's) as Markdown. While it is `streaming`, what its last paragraph hasn't
@@ -88,7 +88,10 @@ fn split_at_line(text: &str, max: usize) -> (&str, &str) {
     if text.len() <= max {
         return (text, "");
     }
-    let end = cut(text.get(..max.saturating_add(4).min(text.len())).unwrap_or_default().to_string(), max).len();
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
     let end = text.get(..end).and_then(|t| t.rfind('\n')).map_or(end, |i| i.saturating_add(1));
     (text.get(..end).unwrap_or_default(), text.get(end..).unwrap_or_default())
 }
@@ -97,17 +100,13 @@ fn split_at_line(text: &str, max: usize) -> (&str, &str) {
 struct Builder {
     formatted: Formatted,
     spans: usize,
-    /// The next number of the ordered list open at each depth.
-    numbers: Vec<u32>,
+    /// The last number of the ordered list open at each depth.
+    numbers: Vec<Option<u32>>,
 }
 
 impl Builder {
     fn done(self) -> Formatted {
         self.formatted
-    }
-
-    fn full(&self) -> bool {
-        self.formatted.blocks.len() >= MAX_BLOCKS || self.spans >= MAX_SPANS
     }
 
     fn block(&mut self, block: &FBlock) {
@@ -138,7 +137,10 @@ impl Builder {
         let block = match (&p.kind, &p.list) {
             (Kind::Code, _) => {
                 let line = p.inlines.iter().map(inline_text).collect::<String>();
-                if let Some(Block::Code(code)) = self.formatted.blocks.last_mut() {
+                // Once something has gone to the plain text, what follows goes after it.
+                if self.formatted.rest.is_empty()
+                    && let Some(Block::Code(code)) = self.formatted.blocks.last_mut()
+                {
                     code.push('\n');
                     code.push_str(&line);
                     return;
@@ -152,11 +154,11 @@ impl Builder {
                 let level = usize::from(list.level);
                 self.numbers.truncate(level.saturating_add(1));
                 let marker = if list.ordered {
-                    self.numbers.resize(level.saturating_add(1), 0);
-                    let next = self.numbers.get_mut(level).map_or(list.start, |n| {
-                        *n = if *n == 0 { list.start } else { n.saturating_add(1) };
-                        *n
-                    });
+                    self.numbers.resize(level.saturating_add(1), None);
+                    let next = self.numbers.get(level).copied().flatten().map_or(list.start, |n| n.saturating_add(1));
+                    if let Some(n) = self.numbers.get_mut(level) {
+                        *n = Some(next);
+                    }
                     format!("{next}.")
                 } else {
                     "•".to_string()
@@ -172,16 +174,18 @@ impl Builder {
     }
 
     fn push(&mut self, block: Block) {
-        if self.full() {
+        let spans = self.spans.saturating_add(match &block {
+            Block::Para(s) | Block::Quote(s) | Block::Heading { spans: s, .. } | Block::Item { spans: s, .. } => s.len(),
+            Block::Code(_) | Block::Rule => 1,
+        });
+        // Past a limit everything goes to the plain text, so nothing comes before what it followed.
+        if self.formatted.blocks.len() >= MAX_BLOCKS || spans > MAX_SPANS || !self.formatted.rest.is_empty() {
             let rest = &mut self.formatted.rest;
             rest.push_str(&block_text(&block));
             rest.push('\n');
             return;
         }
-        self.spans = self.spans.saturating_add(match &block {
-            Block::Para(s) | Block::Quote(s) | Block::Heading { spans: s, .. } | Block::Item { spans: s, .. } => s.len(),
-            Block::Code(_) | Block::Rule => 1,
-        });
+        self.spans = spans;
         self.formatted.blocks.push(block);
     }
 }
@@ -223,7 +227,9 @@ fn spans(p: &Para, bold: bool) -> Vec<Span> {
 
 fn span_of(text: String, fmt: Option<&Fmt>, bold: bool) -> Span {
     let Some(f) = fmt else { return Span { text, bold, ..Span::default() } };
-    Span { text, bold: bold || f.bold, italic: f.italic, strike: f.strike, code: f.code, link: f.link.as_deref().map(label) }
+    // An address too long to show whole isn't a link: cut, it could go somewhere else.
+    let link = f.link.as_deref().filter(|l| l.chars().count() <= MAX_LABEL).map(label);
+    Span { text, bold: bold || f.bold, italic: f.italic, strike: f.strike, code: f.code, link }
 }
 
 /// The words of an inline: a picture's description, never the picture.
@@ -268,19 +274,18 @@ fn settled(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Whether `text` ends inside a code fence.
+/// Whether `text` ends inside a code fence, as the parser reads them: one closes on a line of
+/// nothing but at least as many of the same character.
 fn in_fence(text: &str) -> bool {
-    let mut open: Option<&str> = None;
+    let mut open: Option<(char, usize)> = None;
     for line in text.lines() {
-        let t = line.trim_start();
-        for fence in ["```", "~~~"] {
-            if t.starts_with(fence) {
-                match open {
-                    None => open = Some(fence),
-                    Some(f) if f == fence => open = None,
-                    Some(_) => {}
-                }
-            }
+        let t = line.trim();
+        let Some(c) = t.chars().next().filter(|c| matches!(c, '`' | '~')) else { continue };
+        let n = t.chars().take_while(|x| *x == c).count();
+        match open {
+            None if n >= 3 && (c != '`' || !t.get(n..).is_some_and(|info| info.contains('`'))) => open = Some((c, n)),
+            Some((f, at_least)) if f == c && n >= at_least && t.len() == n => open = None,
+            _ => {}
         }
     }
     open.is_some()
@@ -300,7 +305,7 @@ struct Scan {
 /// What `text`, one paragraph, left unfinished.
 fn scan(text: &str) -> Scan {
     let bytes = text.as_bytes();
-    let run_at = |i: usize| bytes.get(i..).map_or(1, |r| r.iter().take_while(|b| **b == bytes[i]).count());
+    let run_at = |i: usize, c: u8| bytes.get(i..).map_or(1, |r| r.iter().take_while(|b| **b == c).count());
     let mut open: Vec<&'static str> = Vec::new();
     let mut brackets: Vec<usize> = Vec::new();
     let mut hold_from = None;
@@ -314,7 +319,7 @@ fn scan(text: &str) -> Scan {
                 continue;
             }
             b'`' => {
-                let run = run_at(i);
+                let run = run_at(i, c);
                 let ends = i.saturating_add(run) == bytes.len();
                 match ticks {
                     Some(n) if n == run => ticks = None,
@@ -327,7 +332,7 @@ fn scan(text: &str) -> Scan {
             }
             _ if ticks.is_some() => {}
             b'*' | b'_' | b'~' => {
-                let run = run_at(i);
+                let run = run_at(i, c);
                 let before = i.checked_sub(1).and_then(|p| bytes.get(p)).copied();
                 let after = bytes.get(i.saturating_add(run)).copied();
                 let word = |b: Option<u8>| b.is_some_and(|b| b.is_ascii_alphanumeric());
@@ -343,8 +348,10 @@ fn scan(text: &str) -> Scan {
                     (b'_', 2) => toggle(&mut open, "__", opens, closes),
                     (b'*' | b'_', 3) => {
                         let (two, one) = if c == b'*' { ("**", "*") } else { ("__", "_") };
-                        toggle(&mut open, one, opens, closes);
-                        toggle(&mut open, two, opens, closes);
+                        // Closing, the one opened last goes first.
+                        let order = if open.last() == Some(&two) { [two, one] } else { [one, two] };
+                        toggle(&mut open, order[0], opens, closes);
+                        toggle(&mut open, order[1], opens, closes);
                     }
                     _ => {}
                 }
@@ -359,7 +366,18 @@ fn scan(text: &str) -> Scan {
             b'[' => brackets.push(i),
             b']' => {
                 // A link's address, not ended or not begun yet: all of the link waits for it.
-                let closes_link = |at: usize| bytes.get(at..).and_then(|r| r.iter().position(|b| *b == b')'));
+                // Its address may hold parentheses of its own, in pairs.
+                let closes_link = |at: usize| {
+                    let mut depth = 0usize;
+                    bytes.get(at..)?.iter().position(|b| {
+                        match b {
+                            b'(' => depth = depth.saturating_add(1),
+                            b')' => depth = depth.saturating_sub(1),
+                            _ => return false,
+                        }
+                        depth == 0
+                    })
+                };
                 match (brackets.pop(), bytes.get(i.saturating_add(1))) {
                     (Some(from), None) => {
                         hold_from = Some(from);

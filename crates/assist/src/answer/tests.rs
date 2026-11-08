@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{Block, Formatted, MAX_BLOCKS, Span, format, opens};
+use super::{Block, Formatted, MAX_BLOCKS, MAX_PARSED, MAX_SPANS, Span, format, opens};
 
 fn words(f: &Formatted) -> String {
     let span = |s: &[Span]| s.iter().map(|s| s.text.as_str()).collect::<String>();
@@ -49,7 +49,7 @@ fn a_link_keeps_its_address_and_only_web_addresses_open() {
     let Block::Para(spans) = &f.blocks[0] else { panic!("{f:?}") };
     let linked: Vec<_> = spans.iter().filter_map(|s| s.link.as_deref().map(|l| (s.text.as_str(), l))).collect();
     assert_eq!(linked, [("here", "https://example.com/a"), ("run", "file:///bin/sh")]);
-    assert!(opens("https://example.com/a") && opens("HTTP://example.com"));
+    assert!(opens("https://example.com/a") && opens("HTTP://example.com") && opens("http://é.com"));
     for address in ["file:///bin/sh", "javascript:alert(1)", "mailto:a@b.c", "wordcraft://x", "", "http:"] {
         assert!(!opens(address), "{address}");
     }
@@ -156,4 +156,60 @@ fn a_finished_answer_is_read_as_it_is() {
 fn an_open_code_fence_stays_code_as_it_arrives() {
     let f = format("```\nlet **a", true);
     assert_eq!(f.blocks, [Block::Code("let **a".into())]);
+}
+
+#[test]
+fn one_paragraph_holds_to_the_span_limit_too() {
+    let f = format(&"*a* ".repeat(16_000), false);
+    let spans: usize = f.blocks.iter().map(|b| if let Block::Para(s) = b { s.len() } else { 1 }).sum();
+    assert!(spans <= MAX_SPANS, "{spans} spans");
+    assert!(f.rest.contains('a'), "the words are still there");
+}
+
+#[test]
+fn past_the_limit_nothing_comes_before_what_it_followed() {
+    let items = "- item\n".repeat(MAX_BLOCKS - 1);
+    let f = format(&format!("{items}\n```\nfirst\n```\n\nmiddle\n\n```\nlast\n```\n"), false);
+    let at = |word: &str| words(&f).find(word).unwrap_or_else(|| panic!("{word} is gone"));
+    assert!(at("first") < at("middle") && at("middle") < at("last"), "{:?}", f.rest);
+}
+
+#[test]
+fn an_address_too_long_to_show_whole_is_not_a_link() {
+    let f = format(&format!("[download](https://example.com/{})", "a".repeat(600)), false);
+    let Block::Para(spans) = &f.blocks[0] else { panic!("{f:?}") };
+    assert_eq!(spans[0].text, "download");
+    assert_eq!(spans[0].link, None, "cut, it could go somewhere else");
+}
+
+#[test]
+fn triple_emphasis_closes_as_it_arrives() {
+    assert_eq!(words(&format("***x***", true)).trim_end(), "x");
+    assert_eq!(words(&format("___x___", true)).trim_end(), "x");
+}
+
+#[test]
+fn only_a_real_closing_fence_ends_a_code_block_as_it_arrives() {
+    let f = format("```\n```not-a-close\nx *a", true);
+    assert_eq!(f.blocks, [Block::Code("```not-a-close\nx *a".into())]);
+}
+
+#[test]
+fn a_link_with_parentheses_waits_for_its_whole_address() {
+    assert_eq!(words(&format("See [x](https://e.test/a(b)", true)).trim_end(), "See");
+    let f = format("See [x](https://e.test/a(b)) now", true);
+    assert_eq!(words(&f).trim_end(), "See x now");
+}
+
+#[test]
+fn a_character_across_the_read_limit_leaves_the_rest_formatted() {
+    let f = format(&format!("# H\n{}é", "a".repeat(MAX_PARSED - 5)), false);
+    assert!(matches!(&f.blocks[0], Block::Heading { .. }), "{:?}", f.blocks.first());
+}
+
+#[test]
+fn a_list_may_start_at_zero() {
+    let f = format("0. zero\n1. one\n2. two", false);
+    let markers: Vec<&str> = f.blocks.iter().filter_map(|b| if let Block::Item { marker, .. } = b { Some(marker.as_str()) } else { None }).collect();
+    assert_eq!(markers, ["0.", "1.", "2."]);
 }
