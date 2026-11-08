@@ -1528,3 +1528,36 @@ fn one_of_two_changes_of_a_revision_is_told_apart() {
     ask(&mut a, "And again", None);
     assert!(context_of(&seen, 2).contains("accepted your insertion: \"b\""), "{}", context_of(&seen, 2));
 }
+
+/// Drafting a new paragraph is the assistant's main edit: accepting one says its text.
+#[test]
+fn accepting_a_whole_paragraph_says_its_text() {
+    let mut a = window("old");
+    let draft = vec![Step::tool("type_text", json!({"text": "Whole"})), Step::tool("execute", json!({"command": "text.newParagraph"}))];
+    let fake = Fake::new().then(draft);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Draft", None);
+    a.run("review.acceptAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    assert_eq!(a.session.doc.final_text(StoryRef::Body), "Whole\nold");
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(context.contains("accepted your insertion: \"Whole\""), "{context}");
+}
+
+/// A change with no text of its own, such as a tracked paragraph mark, isn't worth a line.
+#[test]
+fn a_change_with_no_text_says_nothing() {
+    let mut a = window("old");
+    let draft = vec![Step::tool("execute", json!({"command": "text.newParagraph"}))];
+    let fake = Fake::new().then(draft);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Split", None);
+    a.run("review.acceptAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(!context.contains("What the person did with your changes"), "{context}");
+}

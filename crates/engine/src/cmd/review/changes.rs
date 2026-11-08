@@ -602,40 +602,57 @@ pub struct AuthoredChange {
     /// `insert`, `delete`, `format`…, as the Reviewing Pane names it.
     pub kind: &'static str,
     pub rev: u32,
-    /// The start of its text, at most [`AUTHORED_TEXT_CHARS`] characters, objects left out.
+    /// The start of its text, at most [`AUTHORED_TEXT_CHARS`] characters: objects left out, and a
+    /// line break for each paragraph mark.
     pub text: String,
 }
 
 /// The tracked changes `author` made across the document, in every story, as [`changes_by`] counts
 /// them but for a deletion hidden under someone else's insertion, which the reviewing list doesn't
 /// show either. `None` when there are more than [`MOST_AUTHORED_CHANGES`]. Each change's text is
-/// read from its paragraph, without copying the paragraph, so the work stays bounded by the
-/// paragraphs' runs however long they are.
+/// read from its paragraphs, without copying them, so the work stays bounded by the paragraphs'
+/// runs however long they are.
 pub fn changes_of(s: &Session, author: &str) -> Option<Vec<AuthoredChange>> {
     let theirs = |rev: u32| s.doc.revisions.get(rev as usize).is_some_and(|r| r.author == author);
     let stories = std::iter::once(StoryRef::Body).chain(s.doc.parts.keys().map(|id| StoryRef::Part(*id)));
     let mut out = Vec::new();
     for story in stories {
-        let mut spans: Vec<(Change, u32)> = Vec::new();
+        // Where the last one ends, to join what comes next to it.
+        let mut end: Option<Pos> = None;
+        let first = out.len();
         for c in changes_in(s, story) {
             let Some(rev) = c.rev.filter(|r| theirs(*r)) else { continue };
-            match spans.last_mut().filter(|(l, r)| l.kind == c.kind && *r == rev && l.b == c.a) {
-                Some((last, _)) => last.b = c.b,
-                None => spans.push((c, rev)),
+            let joins = end.as_ref() == Some(&c.a);
+            match out.get_mut(first..).and_then(<[AuthoredChange]>::last_mut).filter(|l| joins && l.kind == c.kind && l.rev == rev) {
+                Some(last) => add_text(s, &c, &mut last.text),
+                None => {
+                    let mut text = String::new();
+                    add_text(s, &c, &mut text);
+                    out.push(AuthoredChange { kind: c.kind, rev, text });
+                }
             }
-            if out.len().saturating_add(spans.len()) > MOST_AUTHORED_CHANGES {
+            if out.len() > MOST_AUTHORED_CHANGES {
                 return None;
             }
+            end = Some(c.b);
         }
-        out.extend(spans.iter().map(|(c, rev)| AuthoredChange { kind: c.kind, rev: *rev, text: start_of(s, c) }));
     }
     Some(out)
 }
 
-/// The start of the text of `c`, whose ends are in one paragraph.
-fn start_of(s: &Session, c: &Change) -> String {
-    let text = s.doc.para(c.a.story, &c.a.path).and_then(|p| p.text.get(c.a.off..c.b.off)).unwrap_or_default();
-    text.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(AUTHORED_TEXT_CHARS).collect()
+/// Add what piece `c` of a change holds to `text`, up to [`AUTHORED_TEXT_CHARS`] characters: the
+/// text of its range in one paragraph, or a line break for a paragraph mark, whose range ends in
+/// the next one.
+fn add_text(s: &Session, c: &Change, text: &mut String) {
+    let room = AUTHORED_TEXT_CHARS.saturating_sub(text.chars().count());
+    if c.a.path != c.b.path {
+        if room > 0 {
+            text.push('\n');
+        }
+        return;
+    }
+    let piece = s.doc.para(c.a.story, &c.a.path).and_then(|p| p.text.get(c.a.off..c.b.off)).unwrap_or_default();
+    text.extend(piece.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(room));
 }
 
 pub(super) fn list_changes(s: &mut Session, _: &Value) -> CmdResult {

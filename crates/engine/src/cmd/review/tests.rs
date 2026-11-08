@@ -1174,6 +1174,40 @@ fn changes_of_one_author_are_whole_and_leave_the_others_out() {
     assert_eq!(super::changes_of(&s, "Nobody"), Some(vec![]));
 }
 
+/// A tracked paragraph mark spans two paragraphs, and joins the text on either side of it: the
+/// text of the change runs on through it.
+#[test]
+fn changes_of_one_author_read_across_paragraphs() {
+    let tracked = |steps: &[(&str, serde_json::Value)]| {
+        let mut s = Session::new(Document::from_text("old"));
+        s.author = "Bot".into();
+        s.run("review.trackChanges", &json!({"value": true})).unwrap();
+        s.run("caret.docStart", &json!({})).unwrap();
+        for (id, params) in steps {
+            s.run(id, params).unwrap();
+        }
+        super::changes_of(&s, "Bot").unwrap()
+    };
+    let whole = tracked(&[("text.insert", json!({"text": "Whole"})), ("text.newParagraph", json!({}))]);
+    assert_eq!(whole.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["Whole\n"]);
+    let two = tracked(&[
+        ("text.insert", json!({"text": "First"})),
+        ("text.newParagraph", json!({})),
+        ("text.insert", json!({"text": "Second"})),
+        ("text.newParagraph", json!({})),
+    ]);
+    assert_eq!(two.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["First\nSecond\n"]);
+    // The bound holds across them, in characters.
+    let long = tracked(&[
+        ("text.insert", json!({"text": "é".repeat(100), "raw": true})),
+        ("text.newParagraph", json!({})),
+        ("text.insert", json!({"text": "ü".repeat(100)})),
+    ]);
+    assert_eq!(long.len(), 1);
+    assert_eq!(long[0].text.chars().count(), super::AUTHORED_TEXT_CHARS);
+    assert!(long[0].text.starts_with('é') && long[0].text.ends_with('ü'), "{}", long[0].text);
+}
+
 /// A paragraph with many of one author's changes costs the person's click a bounded amount: each
 /// change keeps only the start of its text, and past the most changes there is no list at all.
 #[test]

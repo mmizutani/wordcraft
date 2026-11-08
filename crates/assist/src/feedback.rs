@@ -49,7 +49,12 @@ impl Feedback {
         };
         // One line whatever the change holds: a label drops line breaks, so they become spaces first.
         let text: String = label(&text.replace(['\n', '\r', '\t'], " ")).chars().take(MAX_TEXT).collect();
-        let quoted = serde_json::to_string(&text).unwrap_or_default();
+        let text = text.trim();
+        // A paragraph mark alone, or formatting with no text: nothing to quote.
+        if text.is_empty() {
+            return;
+        }
+        let quoted = serde_json::to_string(text).unwrap_or_default();
         self.lines.push_back(format!("- {what} your {change}: {quoted}"));
         if self.lines.len() > MAX_DECISIONS {
             self.lines.pop_front();
