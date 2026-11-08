@@ -1588,8 +1588,7 @@ fn sources_say_what_a_turn_was_given_and_what_it_read() {
     assert!(h.query_by_label("/home/a/notes.md:3").is_some(), "a file shows its path");
     assert!(h.query_by_label_contains("Given: where the caret is").is_some());
     assert!(h.query_by_label("get_text").is_some(), "WordCraft's own read");
-    let web = h.get_by_role_and_label(egui::accesskit::Role::Link, "https://example.com/page");
-    drop(web);
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Link, "https://example.com/page").is_some(), "a web address is a link");
     assert!(h.query_by_role_and_label(egui::accesskit::Role::Link, "file:///etc/passwd").is_none(), "only a web address is a link");
     let paragraph = h.get_by_role_and_label(egui::accesskit::Role::Link, "execute document.paragraph");
     paragraph.click();

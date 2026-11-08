@@ -1263,7 +1263,6 @@ mod sources {
         let (text, sent) = c.rendered(&caps);
         assert!(sent.selection_cut);
         assert!(sent.selection_bytes > 0 && (sent.selection_bytes as usize) < 1024, "{sent:?}");
-        assert_eq!(text.matches('s').count() >= sent.selection_bytes as usize, true);
         assert!(text.contains(&"s".repeat(sent.selection_bytes as usize)));
         assert!(!text.contains(&"s".repeat(sent.selection_bytes as usize + 1)), "no more than it says");
         assert!(sent.bytes <= sent.cap);
