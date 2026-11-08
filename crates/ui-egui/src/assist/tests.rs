@@ -1533,3 +1533,25 @@ fn details_gives_way_to_a_question_the_turn_waits_on() {
     assert!(h.query_by_label("Run a command?").is_some(), "the person sees what the turn waits for");
     h.state_mut().run("assist.cancel", json!({})).unwrap();
 }
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn usage_arriving_after_a_piece_of_an_answer_leaves_it_arriving() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::Entry;
+    let usage = wordcraft_assist::Event::Usage(wordcraft_assist::Usage { context_used: Some(1), ..Default::default() });
+    let mut app = window("one");
+    app.assist_with(Box::new(Fake::new().then(vec![Step::say("**half written"), Step::Emit(usage), Step::Hold])));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Go"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if h.state().conversation().is_some_and(|c| c.transcript().entries().any(|e| matches!(e, Entry::Usage(_)))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(2);
+    assert!(h.query_by_label("half written").is_some(), "its open marker is still closed for it");
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}

@@ -47,6 +47,12 @@ pub enum Entry {
 }
 
 impl Entry {
+    /// Whether only Details shows it: the conversation goes on as if it weren't there, and an
+    /// answer that arrives in pieces around it stays one answer.
+    pub fn details_only(&self) -> bool {
+        matches!(self, Entry::Agent { .. } | Entry::Usage(_))
+    }
+
     fn bytes(&self) -> usize {
         match self {
             Entry::Asked { text }
@@ -299,10 +305,10 @@ impl Transcript {
         self.entries.iter().enumerate().skip(self.turn_start).rev()
     }
 
-    /// Add `text` to the current turn's last entry if `is` it and it is the newest, else start
+    /// Add `text` to the current turn's newest entry the conversation shows if `is` it, else start
     /// one with `make`.
     fn append(&mut self, text: &str, is: impl Fn(&Entry) -> bool, make: impl Fn(String) -> Entry) {
-        let newest = self.entries.len().checked_sub(1).filter(|i| *i >= self.turn_start);
+        let newest = self.in_turn().find(|(_, e)| !e.details_only()).map(|(i, _)| i);
         if let Some(i) = newest
             && let Some(e) = self.entries.get_mut(i)
             && is(e)

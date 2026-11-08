@@ -1174,6 +1174,18 @@ mod details {
     }
 
     #[test]
+    fn what_only_details_shows_doesn_t_split_an_answer() {
+        let mut t = Transcript::default();
+        t.asked("Hi");
+        t.record(&Event::Text { text: "**hel".into() });
+        t.record(&Event::Usage(Usage { context_used: Some(1), ..Usage::default() }));
+        t.record(&Event::Agent { name: "Agent 1".into() });
+        t.record(&Event::Text { text: "lo**".into() });
+        assert_eq!(t.last_answer().as_deref(), Some("**hello**"));
+        assert_eq!(t.entries().filter(|e| matches!(e, crate::Entry::Answer { .. })).count(), 1);
+    }
+
+    #[test]
     fn a_backend_s_cost_is_held_to_the_pane_s_limits() {
         let long = Event::Usage(Usage { cost: Some(format!("\u{202E}{}", "9".repeat(500))), ..Usage::default() }).bounded();
         let Event::Usage(usage) = long else { panic!("{long:?}") };

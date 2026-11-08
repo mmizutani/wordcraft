@@ -202,12 +202,12 @@ fn transcript(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
         if entries.is_empty() {
             ui.label(RichText::new(tl!("Ask the assistant to draft, rewrite or check your writing. It works in the document like a collaborator: with the Suggester role, every edit is a tracked change for you to accept or reject.")).color(t.text_dim));
         }
+        let newest = entries.iter().rposition(|e| !e.details_only());
         for (i, e) in entries.iter().enumerate() {
-            // Details shows these.
-            if matches!(e, Entry::Agent { .. } | Entry::Usage(_)) {
+            if e.details_only() {
                 continue;
             }
-            let streaming = busy && i.saturating_add(1) == entries.len();
+            let streaming = busy && newest == Some(i);
             entry(app, ui, t, i, e, waiting, streaming);
             ui.add_space(6.0);
         }
