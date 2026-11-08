@@ -36,10 +36,9 @@ pub(super) struct Edits {
     watched: VecDeque<Written>,
     /// A turn has started whose tool calls haven't been read yet.
     running: bool,
-    /// Since the last look, the person's own command changed the document, and a command of a
-    /// script's or an agent's did. The room can't tell them apart: both go through the person's
-    /// copy, so one of a script's means nothing is said.
-    person_changed: bool,
+    /// Since the last look, a command of a script's or an agent's changed the document in the
+    /// window. The room can't tell it from the person's own: both go through the person's copy, so
+    /// nothing is said.
     script_changed: bool,
     /// The document's revision as the command running now started.
     rev_before: u64,
@@ -48,10 +47,6 @@ pub(super) struct Edits {
 impl Edits {
     pub(super) fn turn_started(&mut self) {
         self.running = true;
-    }
-
-    pub(super) fn person_changed_it(&mut self) {
-        self.person_changed = true;
     }
 }
 
@@ -86,9 +81,7 @@ pub(super) fn tick(app: &mut WordApp) {
 /// Before a prompt, or an Accept or Reject: what the person changed of each text goes in the digest.
 pub(super) fn record(app: &mut WordApp) {
     read_again(app, true);
-    let edits = &mut app.assist.edits;
-    edits.person_changed = false;
-    edits.script_changed = false;
+    app.assist.edits.script_changed = false;
 }
 
 /// Accept or Reject ran: what it did to the text isn't an edit.
@@ -119,8 +112,7 @@ fn read_again(app: &mut WordApp, say: bool) {
     let Some(a) = app.conversation() else { return };
     let (room, name) = (a.room().clone(), a.name().to_string());
     let Some(person) = room.participants().into_iter().find(|p| p.role == Role::Owner).map(|p| p.name) else { return };
-    let edits = &app.assist.edits;
-    let say = say && edits.person_changed && !edits.script_changed;
+    let say = say && !app.assist.edits.script_changed;
     let now = room.version();
     let watched = std::mem::take(&mut app.assist.edits.watched);
     for mut w in watched {

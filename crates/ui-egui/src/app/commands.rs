@@ -345,13 +345,9 @@ impl WordApp {
         let person = !self.ctx.as_ref().map_or(self.synthetic_pending, |ctx| self.input_from_control(ctx));
         let by_person = std::mem::replace(&mut self.assist.by_person, person);
         let reviewing = if person { crate::assist::review_started(self, id) } else { None };
-        let rev = self.session.rev();
         let r = self.execute(id, params);
         if let (Some(before), true) = (reviewing, r.is_ok()) {
             crate::assist::review_ended(self, id, before);
-        }
-        if person && self.session.rev() != rev {
-            crate::assist::person_changed_it(self, id);
         }
         self.assist.by_person = by_person;
         if let (Err(e), Some(params)) = (&r, retry)

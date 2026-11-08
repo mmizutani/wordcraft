@@ -523,13 +523,6 @@ pub(crate) fn before_command(app: &mut WordApp, id: &str) {
     edits::command_starts(app);
 }
 
-/// The person ran a command that changed the document, other than Accept or Reject.
-pub(crate) fn person_changed_it(app: &mut WordApp, id: &str) {
-    if decision(id).is_none() {
-        app.assist.edits.person_changed_it();
-    }
-}
-
 /// The person's Accept or Reject `id` ran: the conversation's changes `before` it that are gone
 /// now are what the next turn hears about (#86). Only [`WordApp::execute_user`] calls this, for
 /// the person's own commands: another participant's decisions arrive through the room, a script's
