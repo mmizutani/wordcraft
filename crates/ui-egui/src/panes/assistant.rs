@@ -527,7 +527,8 @@ fn prompt(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     }
     let enter = r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.is_none());
     let id = if drafting { "assist.draft" } else { "assist.ask" };
-    let can_send = !busy && !app.assist.prompt.trim().is_empty() && crate::widgets::enabled(app, id);
+    let reading = crate::assist::sources_being_read(app);
+    let can_send = !busy && !reading && !app.assist.prompt.trim().is_empty() && crate::widgets::enabled(app, id);
     ui.horizontal(|ui| {
         let send_button = ui.add_enabled(can_send, egui::Button::new(if drafting { tl!("Write") } else { tl!("Send") }));
         let send_button = match app.session.why_disabled(id) {
@@ -538,6 +539,9 @@ fn prompt(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
             let text = app.assist.prompt.clone();
             let params = if drafting { json!({"about": text}) } else { json!({"prompt": text}) };
             send(app, id, params);
+        }
+        if reading {
+            ui.label(RichText::new(tl!("Reading a source…")).small().color(t.text_dim));
         }
         if ui.add_enabled(busy, egui::Button::new(tl!("Stop"))).clicked() {
             let _ = app.run("assist.cancel", json!({}));

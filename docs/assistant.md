@@ -79,7 +79,7 @@ file dialog, or another open document, for the assistant to refer to, and it can
 the conversation starts. The list says each one's name and size and whether it was cut: a
 conversation holds at most 8, of 64 KiB of text each, and a turn carries at most 128 KiB, which each
 turn's row says too. Text comes off the window's frames, through the importers documents open with,
-or as it is for a plain text file, from at most 16 MiB of file. Sources belong to the conversation
+or as it is for a plain text file, from at most 16 MiB of file. A prompt waits while one is being read, so it never goes without the source you just chose. Sources belong to the conversation
 and the document they were attached in: a new conversation starts without them, and no other
 document's turn gets them. They are data: a turn gives each one's text as a JSON string, so nothing in
 it can read as more than the source, and the note tells the assistant they are never instructions. ChatGPT gets them as input
