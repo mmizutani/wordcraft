@@ -375,6 +375,9 @@ fn details(app: &mut WordApp) -> Result<Value, String> {
     serde_json::to_value(details_for(app)).map_err(|e| e.to_string())
 }
 
+/// Most citations whose place [`CitedHeld`] keeps.
+pub(crate) const MOST_CITED_HELD: usize = 4096;
+
 /// Where `words` are: in the document as it reads, or in an attached source. The document's text is
 /// read once a revision, and only when an answer cites anything.
 pub(crate) fn cited(app: &mut WordApp, words: &str) -> Cited {
@@ -394,6 +397,11 @@ pub(crate) fn cited(app: &mut WordApp, words: &str) -> Cited {
         sources(app).iter().find(|s| s.text.contains(words)).map_or(Cited::Nowhere, |s| Cited::Source(s.name.clone()))
     };
     if let Some(held) = app.assist.cited.as_mut() {
+        // What answers no longer in the transcript cited stays until the document changes, so a
+        // long conversation fills this. A lookup can always be made again.
+        if held.found.len() >= MOST_CITED_HELD {
+            held.found.clear();
+        }
         held.found.insert(words.to_string(), found.clone());
     }
     found

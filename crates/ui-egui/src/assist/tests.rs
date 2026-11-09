@@ -2237,6 +2237,16 @@ fn a_citation_with_real_words_selects_them_and_one_with_invented_words_shows_no_
 }
 
 #[test]
+fn what_citations_looked_for_is_held_to_a_size_and_still_answers() {
+    let mut app = window("one two three");
+    for n in 0..crate::assist::MOST_CITED_HELD.saturating_add(10) {
+        assert_eq!(crate::assist::cited(&mut app, &format!("invented {n}")), crate::assist::Cited::Nowhere);
+    }
+    assert!(app.assist.cited.as_ref().is_some_and(|held| held.found.len() <= crate::assist::MOST_CITED_HELD));
+    assert_eq!(crate::assist::cited(&mut app, "two three"), crate::assist::Cited::Document);
+}
+
+#[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn a_citation_of_an_attached_source_has_a_chip_that_says_which() {
     let (dir, path) = source_file("notes.txt", "The source says this.");
