@@ -113,7 +113,7 @@ fn the_assistant_s_tool_calls_are_tracked_changes_in_its_name_and_the_window_see
     assert_eq!(tool_rows(t), [("select_text".to_string(), ToolStatus::Completed), ("type_text".to_string(), ToolStatus::Completed)]);
     let changed: Vec<Option<crate::Versions>> = t.entries().filter_map(|e| if let Entry::Tool(c) = e { Some(c.changes) } else { None }).collect();
     assert!(changed[0].is_none() && changed[1].is_some(), "the edit says which versions it made: {changed:?}");
-    assert!(t.entries().any(|e| matches!(e, Entry::Model { name } if name == "scripted")));
+    assert!(t.entries().any(|e| matches!(e, Entry::Model { name, .. } if name == "scripted")));
     // The backend began with its seat and got the note on the first turn only.
     let seen = fake_seen.lock().unwrap().clone();
     assert_eq!(seen.seat, Some(("Test Assistant".to_string(), Role::Suggester)));
@@ -1170,15 +1170,16 @@ mod details {
         let mut t = Transcript::default();
         t.asked("First");
         t.record(&Event::Agent { name: "Agent 1".into() });
-        t.record(&Event::Model { name: "model-a".into() });
+        t.record(&Event::Model { name: "model-a".into(), effort: Some("high".into()), asked: false });
         t.record(&Event::Usage(Usage { input_tokens: Some(1), ..Usage::default() }));
         t.record(&Event::Usage(Usage { input_tokens: Some(2), ..Usage::default() }));
         assert_eq!(t.entries().filter(|e| matches!(e, crate::Entry::Usage(_))).count(), 1, "a turn's usage is replaced");
         t.asked("Second");
-        t.record(&Event::Model { name: "model-b".into() });
+        t.record(&Event::Model { name: "model-b".into(), effort: Some("low".into()), asked: true });
         let details = t.details();
         assert_eq!(details.agent.as_deref(), Some("Agent 1"));
         assert_eq!(details.model.as_deref(), Some("model-b"));
+        assert_eq!((details.effort.as_deref(), details.effort_asked), (Some("low"), true));
         assert_eq!(details.usage.and_then(|u| u.input_tokens), Some(2));
     }
 
