@@ -127,6 +127,26 @@ fn resolve_cell(s: &mut Session, story: StoryRef, path: &wordcraft_doc::Path, ac
     Ok(true)
 }
 
+/// Resolve the section's tracked change at `at`, the caret: the change is listed where the section
+/// ends, at the end of its last paragraph or of the document. Whether there was one.
+fn resolve_section_at(s: &mut Session, at: &Pos, accept: bool, which: Which) -> Result<bool, CmdError> {
+    let in_paragraph = s.doc.para(at.story, &at.path).and_then(|p| p.section.as_ref().map(|x| (p.len(), x)));
+    if let Some((len, section)) = in_paragraph
+        && at.off == len
+        && which.has(section.fmt_change.as_ref().map(|ch| ch.rev))
+    {
+        if let Some(section) = s.doc.para_mut(at.story, &at.path)?.section.as_mut() {
+            fmt_revisions::resolve_section(section, accept);
+        }
+        return Ok(true);
+    }
+    if at.story == StoryRef::Body && *at == s.doc.end_of(StoryRef::Body) && which.has(s.doc.last_section.fmt_change.as_ref().map(|ch| ch.rev)) {
+        fmt_revisions::resolve_section(&mut s.doc.last_section, accept);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// A tracked change, for navigation and the Reviewing Pane: its range, kind (`insert`,
 /// `delete`, `format`), revision, and for a formatting change the properties it set.
 struct Change {
@@ -362,6 +382,9 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool, which: Which) -> CmdRe
             }
             None => {
                 if resolve_cell(s, a.story, &a.path, accept, which)? {
+                    return if next { select_next_unresolved(s) } else { sel_result(s) };
+                }
+                if resolve_section_at(s, &a, accept, which)? {
                     return if next { select_next_unresolved(s) } else { sel_result(s) };
                 }
                 return nav_change(s, 1);
@@ -672,6 +695,21 @@ pub fn change_rows(s: &Session, author: &str, most: usize) -> (Vec<ChangeRow>, u
                 let piece = s.doc.para(c.a.story, &c.a.path).and_then(|p| p.text.get(c.a.off..c.b.off)).unwrap_or_default();
                 let room = ROW_TEXT_CHARS.saturating_sub(row.text.chars().count());
                 row.text.extend(piece.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(room));
+            }
+        }
+        // Their deletion of someone's insertion shows in the list as the insertion: a change of
+        // theirs all the same.
+        for path in s.doc.para_paths(story) {
+            let Some(p) = s.doc.para(story, &path) else { continue };
+            for (r, _) in p.run_ranges().filter(|(_, c)| c.ins.is_some() && c.del.is_some_and(theirs)) {
+                if rows.len() >= most {
+                    more = more.saturating_add(1);
+                    continue;
+                }
+                let at = |off| Pos { story, path: path.clone(), off };
+                let text =
+                    p.text.get(r.clone()).unwrap_or_default().chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(ROW_TEXT_CHARS).collect();
+                rows.push(ChangeRow { kind: "delete", a: at(r.start), b: at(r.end), text });
             }
         }
     }
