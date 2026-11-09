@@ -156,16 +156,12 @@ impl Chips<'_> {
     }
 }
 
-/// A preference's chip: its words on hover, and a click shows it in Details › Memory.
+/// A preference's chip: its words on hover, and a click shows it in Details › Memory. Only for what
+/// a turn sent: the transcript checks each marker, but text can come to read as one once it is drawn.
 fn used_chip(app: &mut WordApp, ui: &mut Ui, t: &Tokens, used: &UsedChip) {
+    let Some(said) = app.conversation().and_then(|a| a.transcript().sent_preference(&used.id).map(str::to_string)) else { return };
     let words = RichText::new(crate::assist::memory::chip_label(used.number)).small().color(t.accent);
-    let mut chip = ui.small_button(words);
-    if chip.hovered()
-        && let Some(said) = app.conversation().and_then(|a| a.transcript().sent_preference(&used.id).map(str::to_string))
-    {
-        chip = chip.on_hover_text(said);
-    }
-    if chip.clicked() {
+    if ui.small_button(words).on_hover_text(said).clicked() {
         app.assist.view = crate::assist::PaneView::Details;
         app.assist.memory.show_list = true;
     }

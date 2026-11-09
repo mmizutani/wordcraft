@@ -552,13 +552,17 @@ impl Transcript {
     /// The preferences marked in the turn a tracked change dated `date` was made in: the last one
     /// started at or before then. Dates are as `wordcraft_engine::cmd::now_iso` writes them, which
     /// sort as they read.
-    pub fn marked_at(&self, date: &str) -> Vec<String> {
+    pub fn marked_at(&self, date: &str) -> Vec<crate::memory::SentPreference> {
+        let mut turn = None;
         let mut marked = Vec::new();
         for entry in &self.entries {
             match entry {
                 Entry::Context(sent) if sent.at.as_str() > date => break,
-                Entry::Context(_) => marked.clear(),
-                Entry::Used { id } => marked.push(id.clone()),
+                Entry::Context(sent) => {
+                    turn = Some(sent);
+                    marked.clear();
+                }
+                Entry::Used { id } => marked.extend(turn.and_then(|sent| sent.memory.iter().find(|p| p.id == *id)).cloned()),
                 _ => {}
             }
         }

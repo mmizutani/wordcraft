@@ -632,3 +632,28 @@ fn the_options_page_says_where_the_list_went() {
     assert!(h.query_by_label_contains("under Details › Memory").is_some());
     assert!(h.query_by_label("Use digits.").is_none());
 }
+
+/// Text that only reads as a marker once it is drawn shows no chip for what the turn never sent.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_chip_the_turn_didn_t_send_doesn_t_show() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    Memory::update(&folder.0, |m| m.add("Use digits.", "2026-11-09T10:00:00Z")).unwrap();
+    let mut a = window(&folder);
+    a.assist_with(Box::new(Fake::new().then(vec![Step::say("One[[us\u{F8FD}ed: 1 m999]] two.")])));
+    a.session.view.assistant_pane = true;
+    a.run("assist.ask", json!({"prompt": "Hello"})).unwrap();
+    settle(&mut a);
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 1200.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    assert!(h.query_by_label_contains("two.").is_some(), "the answer shows");
+    assert!(h.query_by_label("M1").is_none());
+}

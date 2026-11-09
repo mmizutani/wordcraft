@@ -123,7 +123,7 @@ impl Default for Memory {
 }
 
 /// A preference a turn sent, as it read then.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SentPreference {
     pub id: String,
     pub text: String,
@@ -346,9 +346,10 @@ impl Memory {
         }
     }
 
-    /// The person decided `changes` changes made under item `id`.
-    pub fn note_decided(&mut self, id: &str, decision: crate::feedback::Decision, changes: u64) {
-        let Some(item) = self.items.iter_mut().find(|i| i.id == id) else { return };
+    /// The person decided `changes` changes made under `sent`. Under an older wording than the
+    /// item's now, they say nothing about it.
+    pub fn note_decided(&mut self, sent: &SentPreference, decision: crate::feedback::Decision, changes: u64) {
+        let Some(item) = self.items.iter_mut().find(|i| i.id == sent.id && normalized(&i.text) == normalized(&sent.text)) else { return };
         let count = match decision {
             crate::feedback::Decision::Accepted => &mut item.accepted,
             crate::feedback::Decision::Rejected => &mut item.rejected,

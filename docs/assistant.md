@@ -177,7 +177,8 @@ request when a preference conflicts with it, and to say so in its answer.
 **When to ask again.** The list says how often each preference was used and what became of the
 changes made with it. `used` and `lastUsed` go up when a marker names a preference, once in a turn,
 and the last used go first in what the next turn sends. When you accept or reject a change the
-assistant made in a turn that marked a preference, that preference's `accepted` or `rejected` goes up.
+assistant made in a turn that marked a preference, that preference's `accepted` or `rejected` goes
+up, unless you have reworded it since.
 A change belongs to the last turn that started by its revision's date, so one made in the same
 second a new turn starts counts for that new turn. Only your own Accept and Reject count, not another
 participant's or a script's, and a change resolved once a new conversation has started counts for

@@ -291,12 +291,26 @@ fn what_a_marker_names_counts_and_comes_first_next_turn() {
 fn decisions_add_up_without_overflowing() {
     use crate::feedback::Decision;
     let mut m = memory(&["First."]);
-    m.note_decided("m1", Decision::Accepted, 2);
-    m.note_decided("m1", Decision::Rejected, 3);
-    m.note_decided("m999", Decision::Rejected, 3);
+    let first = m.preferences(&["m1".into()]).remove(0);
+    m.note_decided(&first, Decision::Accepted, 2);
+    m.note_decided(&first, Decision::Rejected, 3);
+    m.note_decided(&super::SentPreference { id: "m999".into(), text: "First.".into() }, Decision::Rejected, 3);
     assert_eq!((m.items[0].accepted, m.items[0].rejected), (2, 3));
-    m.note_decided("m1", Decision::Rejected, u64::MAX);
+    m.note_decided(&first, Decision::Rejected, u64::MAX);
     assert_eq!(m.items[0].rejected, u64::MAX);
+}
+
+#[test]
+fn a_change_made_under_an_old_wording_doesn_t_count_for_a_new_one() {
+    use crate::feedback::Decision;
+    let mut m = memory(&["First."]);
+    let sent = m.preferences(&["m1".into()]).remove(0);
+    m.edit("m1", Some("  FIRST. "), None).unwrap();
+    m.note_decided(&sent, Decision::Rejected, 1);
+    assert_eq!(m.items[0].rejected, 1, "the same wording");
+    m.edit("m1", Some("Another."), None).unwrap();
+    m.note_decided(&sent, Decision::Rejected, 1);
+    assert_eq!(m.items[0].rejected, 0);
 }
 
 #[test]

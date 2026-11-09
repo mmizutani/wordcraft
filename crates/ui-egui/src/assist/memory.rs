@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use egui::{RichText, Stroke, Ui};
 use serde_json::{Value, json};
-use wordcraft_assist::memory::{ForModel, Item, MAX_TEXT, Memory};
+use wordcraft_assist::memory::{ForModel, Item, MAX_TEXT, Memory, SentPreference};
 use wordcraft_assist::{Decision, ProposalAnswer, Sent};
 use wordcraft_engine::cmd::review::AuthoredChange;
 
@@ -102,10 +102,10 @@ pub(super) fn decided(app: &mut WordApp, decision: Decision, changes: &[Authored
     for change in changes {
         *by_date.entry(change.date.as_str()).or_default() += 1;
     }
-    let mut by_item: BTreeMap<String, u64> = BTreeMap::new();
+    let mut by_item: BTreeMap<SentPreference, u64> = BTreeMap::new();
     for (date, count) in by_date {
-        for id in a.transcript().marked_at(date) {
-            let total = by_item.entry(id).or_default();
+        for sent in a.transcript().marked_at(date) {
+            let total = by_item.entry(sent).or_default();
             *total = total.saturating_add(count);
         }
     }
@@ -113,8 +113,8 @@ pub(super) fn decided(app: &mut WordApp, decision: Decision, changes: &[Authored
         return;
     }
     let counted = Memory::count(&dir, |m| {
-        for (id, count) in &by_item {
-            m.note_decided(id, decision, *count);
+        for (sent, count) in &by_item {
+            m.note_decided(sent, decision, *count);
         }
     });
     if let Err(e) = counted {

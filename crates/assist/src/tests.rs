@@ -1359,12 +1359,13 @@ fn a_change_counts_for_the_last_turn_started_by_its_date() {
     sent_two(&mut t, "2026-11-09T10:05:00Z");
     sent_two(&mut t, "2026-11-09T10:09:00Z");
     t.record(&Event::Text { text: "[[used: m2]]".into() });
-    assert!(t.marked_at("2026-11-09T09:59:59Z").is_empty(), "before the conversation");
-    assert_eq!(t.marked_at("2026-11-09T10:00:00Z"), ["m1"], "as its turn started");
-    assert_eq!(t.marked_at("2026-11-09T10:04:59Z"), ["m1"]);
-    assert!(t.marked_at("2026-11-09T10:05:00Z").is_empty(), "a turn that marked nothing");
-    assert_eq!(t.marked_at("2026-11-09T10:09:00Z"), ["m2"]);
-    assert_eq!(t.marked_at("2026-11-09T11:00:00Z"), ["m2"]);
+    let marked = |date: &str| t.marked_at(date).into_iter().map(|p| p.text).collect::<Vec<_>>();
+    assert!(marked("2026-11-09T09:59:59Z").is_empty(), "before the conversation");
+    assert_eq!(marked("2026-11-09T10:00:00Z"), ["Text of m1."], "as its turn started");
+    assert_eq!(marked("2026-11-09T10:04:59Z"), ["Text of m1."]);
+    assert!(marked("2026-11-09T10:05:00Z").is_empty(), "a turn that marked nothing");
+    assert_eq!(marked("2026-11-09T10:09:00Z"), ["Text of m2."]);
+    assert_eq!(marked("2026-11-09T11:00:00Z"), ["Text of m2."]);
 }
 
 #[test]
