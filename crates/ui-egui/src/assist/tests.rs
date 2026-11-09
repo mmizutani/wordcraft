@@ -1935,3 +1935,24 @@ fn another_open_document_can_be_a_source() {
     assert!(text.len() < (64 << 10) + 64, "{}", text.len());
     assert!(wordcraft_assist::Knowledge::new("Long", &text).cut);
 }
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_source_attached_for_another_document_s_first_turn_reaches_it() {
+    let (dir, path) = source_file("for-b.txt", "words");
+    let mut a = window("document A");
+    a.assist_with(Box::new(Fake::new()));
+    ask(&mut a, "In A", None);
+    settle(&mut a);
+    a.execute("file.new", json!({})).unwrap();
+    a.execute("assist.useDocument", json!({})).unwrap();
+    a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    sources_read(&mut a);
+    let fake = Fake::new();
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "In B", None);
+    settle(&mut a);
+    assert_eq!(seen.lock().unwrap().turns[0].knowledge.first().map(|s| s.name.as_str()), Some("for-b.txt"));
+    let _ = std::fs::remove_dir_all(dir);
+}
