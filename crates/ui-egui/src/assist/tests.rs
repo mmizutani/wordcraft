@@ -2752,8 +2752,8 @@ fn accepting_a_row_of_output_reaches_the_next_turn_and_sources_says_so() {
         .unwrap()
         .transcript()
         .entries()
-        .filter_map(|e| if let Entry::Context(s) = e { Some(s.clone()) } else { None })
-        .last()
+        .rev()
+        .find_map(|e| if let Entry::Context(s) = e { Some(s.clone()) } else { None })
         .unwrap();
     assert_eq!((sent.bytes + sent.feedback + 2) as usize, context.len(), "what is given is all accounted for: {context}");
     h.get_by_label("Sources").click();
