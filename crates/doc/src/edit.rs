@@ -980,6 +980,8 @@ impl Document {
     pub fn final_text_in(&self, a: &Pos, b: &Pos, max: usize) -> String {
         let (a, b) = order(a, b);
         let mut out = String::new();
+        // ponytail: the budget bounds the text, not this list of the range's paragraphs, which is
+        // what formatting them allocates too. Make `walk_between` stop early if a profile shows it.
         for path in self.para_paths_in(&a, &b) {
             let Some(p) = self.para(a.story, &path) else { continue };
             let from = if path == a.path { a.off } else { 0 };

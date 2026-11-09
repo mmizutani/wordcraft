@@ -2002,6 +2002,29 @@ fn a_macro_s_edit_isn_t_the_person_s() {
     assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
 }
 
+/// Someone else's change past where a text is compared still counts against it.
+#[test]
+fn someone_else_s_change_past_the_compared_part_still_counts() {
+    let mut a = window("old");
+    let long = format!("Aaa {} there ", "x".repeat(2100));
+    let fake = Fake::new().then(vec![Step::tool("type_text", json!({"text": long}))]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Write", None);
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Editor).unwrap();
+    helper.run("select.text", &json!({"text": "there"})).unwrap();
+    helper.run("text.insert", &json!({"text": "planted"})).unwrap();
+    helper.send();
+    settle(&mut a);
+    ask(&mut a, "Theirs", None);
+    a.run("select.text", json!({"text": "Aaa"})).unwrap();
+    a.run("text.insert", json!({"text": "Bbb"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Mine", None);
+    assert!(!context_of(&seen, 2).contains("changed your text"), "{}", context_of(&seen, 2));
+}
+
 /// A text a script changed isn't watched again: the person's later edit of it would quote the
 /// script's words as what the assistant wrote.
 #[test]

@@ -109,8 +109,12 @@ pub(super) fn command_ended(app: &mut WordApp, id: &str) {
 
 /// Read each watched text as it is now, and with `say`, put what the person changed in the digest.
 /// A text the document no longer has, or that someone else may have changed, stops being watched:
-/// the assistant's own later changes too, whose new call is watched instead.
+/// the assistant's own later changes to it too, whose new call is watched instead.
 fn read_again(app: &mut WordApp, say: bool) {
+    // A script's change may be anywhere, past where a text is compared too.
+    if app.assist.edits.script_changed {
+        app.assist.edits.watched.clear();
+    }
     if app.assist.edits.watched.is_empty() {
         return;
     }
@@ -118,19 +122,25 @@ fn read_again(app: &mut WordApp, say: bool) {
     let Some(a) = app.conversation() else { return };
     let (room, name) = (a.room().clone(), a.name().to_string());
     let Some(person) = room.participants().into_iter().find(|p| p.role == Role::Owner).map(|p| p.name) else { return };
-    let say = say && !app.assist.edits.script_changed;
     let now = room.version();
     let watched = std::mem::take(&mut app.assist.edits.watched);
     for mut w in watched {
         let Some(text) = room.text_where_changed(w.first..=w.last, Some(&name), MAX_TEXT) else { continue };
+        // The hub no longer keeping those changes means it can't be said whose they were.
+        let names = room.changed_since(w.seen);
         if text != w.text {
-            // The hub no longer keeping those changes means it can't be said whose they were.
-            if app.assist.edits.script_changed || !room.changed_since(w.seen).is_some_and(|names| names.iter().all(|who| *who == person)) {
+            if !names.is_some_and(|names| names.iter().all(|who| *who == person)) {
                 continue;
             }
             if say {
                 app.assist.feedback.record_edit(&w.text, &text);
             }
+        } else if !names.is_some_and(|names| names.iter().all(|who| *who == person || *who == name)) {
+            // It reads the same as far as it is compared, but someone else changed the document,
+            // maybe past that: `seen` stays before their change, so the text's next difference
+            // counts it.
+            app.assist.edits.watched.push_back(w);
+            continue;
         }
         w.text = text;
         w.seen = now;
