@@ -676,13 +676,23 @@ pub fn change_rows(s: &Session, author: &str, most: usize) -> (Vec<ChangeRow>, u
     let mut more = 0usize;
     for story in std::iter::once(StoryRef::Body).chain(s.doc.parts.keys().map(|id| StoryRef::Part(*id))) {
         // The piece before, and whether its change is past the limit: what joins it is too.
-        let mut before: Option<(&'static str, u32, Pos)> = None;
+        let mut before: Option<(&'static str, u32, Pos, Pos)> = None;
         let mut omitted = false;
         for c in changes_in(s, story) {
             let Some(rev) = c.rev.filter(|r| theirs(*r)) else { continue };
             // `changes_in` joins a formatting change's own pieces: neighbours are others.
-            let joins = c.kind != "format" && before.as_ref().is_some_and(|(kind, r, end)| *kind == c.kind && *r == rev && *end == c.a);
-            before = Some((c.kind, rev, c.b.clone()));
+            let joins = before.as_ref().is_some_and(|(kind, r, start, end)| {
+                *kind == c.kind
+                    && *end == c.a
+                    && if c.kind == "format" {
+                        // A table's, a row's and a cell's changes share a caret, and Accept or
+                        // Reject there takes them all, so they are one row.
+                        *start == c.a && c.a == c.b
+                    } else {
+                        *r == rev
+                    }
+            });
+            before = Some((c.kind, rev, c.a.clone(), c.b.clone()));
             if !joins {
                 omitted = rows.len() >= most;
                 if omitted {
@@ -706,15 +716,21 @@ pub fn change_rows(s: &Session, author: &str, most: usize) -> (Vec<ChangeRow>, u
         // theirs all the same.
         for path in s.doc.para_paths(story) {
             let Some(p) = s.doc.para(story, &path) else { continue };
-            for (r, _) in p.run_ranges().filter(|(_, c)| c.ins.is_some() && c.del.is_some_and(theirs)) {
-                if rows.len() >= most {
-                    more = more.saturating_add(1);
-                    continue;
-                }
-                let at = |off| Pos { story, path: path.clone(), off };
+            let at = |off| Pos { story, path: path.clone(), off };
+            let runs = p.run_ranges().filter(|(_, c)| c.ins.is_some() && c.del.is_some_and(theirs)).map(|(r, _)| {
                 let text =
                     p.text.get(r.clone()).unwrap_or_default().chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(ROW_TEXT_CHARS).collect();
-                rows.push(ChangeRow { kind: "delete", a: at(r.start), b: at(r.end), text });
+                (at(r.start), at(r.end), text)
+            });
+            // A paragraph break of someone's that they took out.
+            let mark =
+                mark_change(s, story, &path).filter(|_| p.mark.ins.is_some() && p.mark.del.is_some_and(theirs)).map(|m| (m.a, m.b, String::new()));
+            for (a, b, text) in runs.chain(mark) {
+                if rows.len() >= most {
+                    more = more.saturating_add(1);
+                } else {
+                    rows.push(ChangeRow { kind: "delete", a, b, text });
+                }
             }
         }
     }
