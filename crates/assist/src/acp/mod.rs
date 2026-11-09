@@ -304,7 +304,7 @@ impl Acp {
         let Some((running, agent)) = started? else { return Ok(false) };
         self.running = Some(running);
         if let Some(name) = agent {
-            ctx.emit(Event::Model { name });
+            ctx.emit(Event::Model { name, effort: None, asked: false });
         }
         Ok(true)
     }

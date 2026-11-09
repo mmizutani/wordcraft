@@ -1146,6 +1146,8 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "ui.statusCount"
             | "ui.checkForUpdates"
             | "assist.backend"
+            | "assist.model"
+            | "assist.effort"
             | "assist.defaultRole"
             | "assist.allowUnattended"
             | "assist.chatgpt.signIn"
