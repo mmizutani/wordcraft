@@ -114,7 +114,7 @@ fn attached(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     let documents: Vec<_> = app.session.documents().into_iter().filter(|d| d.id != active).collect();
     if ui.small_button(tl!("A file…")).clicked() && !app.input_from_control(ui.ctx()) {
         app.assist.add_open = false;
-        let _ = app.ask_file(FileDialogRequest::Open { purpose: "document".into() }, AfterPick::AssistantSource);
+        let _ = app.ask_file(FileDialogRequest::Open { purpose: "document".into() }, AfterPick::AssistantSource { document: active });
     }
     for document in documents {
         if ui.small_button(&document.title).clicked() && !app.input_from_control(ui.ctx()) {
