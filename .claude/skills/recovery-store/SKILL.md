@@ -17,12 +17,13 @@ description: Model-check WordCraft's crash recovery (recovery copies, Slot, Stor
 | `NewestCopySurvives` | The newest copy a write confirmed, or a newer one, stays on disk until someone asks to discard it. | A crash during a later copy destroys the last good one. |
 | `NoPlaintextOfProtected` | A password-protected document's text is never in a recovery copy. | The document's text sits unencrypted in the profile folder. |
 | `RestoreOnlyReplacesBlank` | A restored copy replaces only a document that holds no text. | Restoring overwrites work. |
+| `RestoreNeverReplacesShared` | A restored copy never replaces a document a room shares, even one shared after the restore was asked for. It opens beside it. | Restoring puts an old copy in place of the document a room is editing, under the people editing it. |
 | `LiveOwnerIsAlone` (`RecoveryLock.tla`) | A record with a live owner is never scanned, listed, restored or discarded by another process. | Another window lists a running document's copy. Discarding it there, or a scan deleting its temporary file, takes away what a crash would have recovered; restoring it there gives two processes one record. |
 | `ReclaimOnlyEmpty` (`RecoveryLock.tla`) | Cleaning up an empty record, after a scan or a failed save, never deletes a committed copy. | A process that wrote its first copy and then crashed loses it to another process's cleanup. |
 
 ## When to run it
 
-Run it for any change to the files under Coverage: the order of the steps in `write_snapshot` or `discard`, what `Slot` records, when `tick` queues a job, what `open_held_restore` checks, how `lock`, `acquire` or `scan` use `owner.lock`, and any new way `dirty`, `rev` or `password` change.
+Run it for any change to the files under Coverage: the order of the steps in `write_snapshot` or `discard`, what `Slot` records, when `tick` queues a job, what `open_held_restore` checks, how `lock`, `acquire` or `scan` use `owner.lock`, how a room shares a document or applies another participant's change (`Room::host`, `reset_shared`, `apply_theirs`), and any new way `dirty`, `rev` or `password` change.
 
 ```bash
 sh .claude/skills/recovery-store/check.sh
@@ -36,11 +37,11 @@ It takes about two minutes. On a first run it downloads `tla2tools.jar` 1.7.4 fr
 | 1 | A rule broke in the main config. | Read the result, then decide bug or modelling error. |
 | 2 | A known finding no longer breaks its rule. | See Known findings. |
 | 3 | Covered code changed after the sync commit. | See Keep it in step with the code. |
-| 4 | Java or TLC could not run, or TLC stopped without a result (out of memory, a model that doesn't parse). | Read the output it names and fix the cause. Nothing was checked. |
+| 4 | Java or TLC could not run, or TLC stopped without a result (out of memory, a full disk, a model that doesn't parse). | Read the output it names and fix the cause. Nothing was checked. |
 
 ## Read every result with `/statechart`
 
-Give `/statechart` this folder's `RecoveryStore.tla` or `RecoveryLock.tla` and the config that broke. It shows each break as its shortest path, in the model's action names and values. When the main config passes, it reports that the graph is over its chart budget (`RecoveryStore.tla` has about 13 million states, `RecoveryLock.tla` about 1.4 million) and writes no chart; lower the constants in a scratch copy to see one. Tell the user a counterexample as that numbered path, translated through the tables under How the model maps to the code. If you want `/statechart`'s view module for plainer words, write it outside the repository: this repo holds no handwritten JavaScript.
+Give `/statechart` this folder's `RecoveryStore.tla` or `RecoveryLock.tla` and the config that broke. It shows each break as its shortest path, in the model's action names and values. When the main config passes, it reports that the graph is over its chart budget (`RecoveryStore.tla` has about 41 million states, `RecoveryLock.tla` about 1.4 million) and writes no chart; lower the constants in a scratch copy to see one. Tell the user a counterexample as that numbered path, translated through the tables under How the model maps to the code. If you want `/statechart`'s view module for plainer words, write it outside the repository: this repo holds no handwritten JavaScript.
 
 ## Bug or modelling error
 
@@ -62,7 +63,10 @@ Text values stand for document contents, and every blank document shares `Blank0
 | `RequestRestore`, `RequestDiscard` | `Session::recover`, filtered by `recovery_documents` |
 | `Tick` | `Recovery::tick`, with `DocRecovery` from `Session::recovery_docs` |
 | `Receive` | `Recovery::receive`, `Recovery::apply`, `Slot::apply` |
-| `ReceiveAndOpen`, `OpenHeld`, `Open` | `Session::recovery_tick`, `open_held_restore`, `set_document`, `Slot::adopt` |
+| `ReceiveAndOpen`, `OpenHeld`, `Open` | `Session::recovery_tick`, `open_held_restore`, `set_document`, `Slot::adopt`; `add_document` beside a shared document |
+| `ShareDocument` | `Room::host` (`room.rs`): `reset_shared` touches the document when the room's blocks need ids, then `shared_through` |
+| `StopSharing` | `stop_sharing` in `crates/ui-egui/src/share.rs`: `Room::close`, then one last `Replica::receive`, which is a `TheirEdit` just before |
+| `TheirEdit` | `Replica::receive` (`room/replica.rs`), through `lend_document` when another document is shown: `Session::apply_theirs` or `reset_shared`, then `touch` at the end of `follow_shared` (`session/shared.rs`) |
 | `WorkerScan` | `Store::scan` |
 | `WorkerWriteTemp`, `WorkerRename`, `WorkerSyncDir`, `WorkerPrune` | `Store::write_snapshot`, in that order |
 | `WorkerLoad` | `Store::load` |
@@ -93,7 +97,7 @@ In `RecoveryLock.tla`, one action is one system call, or a run of them nothing e
 
 ## Scope
 
-`RecoveryStore.tla` is checked with `MaxEdits = 2`, `MaxFaults = 1`, `MaxCrashes = 1`, three record ids: about 41 million states generated, 13 million distinct. `RecoveryLock.tla` is checked with three processes, `MaxOps = 8`, `MaxCrashes = 2`: about 7 million states generated, 1.4 million distinct. A pass covers these models at these bounds, not the whole app.
+`RecoveryStore.tla` is checked with `MaxEdits = 2`, `MaxFaults = 1`, `MaxCrashes = 1`, three record ids: about 162 million states generated, 41 million distinct. `RevisionBounded` in its config is not a promise of the code. It keeps the model finite: every action that bumps `rev` spends an edit, and one that doesn't breaks it within a few steps. Without it, TLC keeps finding new states and writes them to disk until the disk is full. `RecoveryLock.tla` is checked with three processes, `MaxOps = 8`, `MaxCrashes = 2`: about 7 million states generated, 1.4 million distinct. A pass covers these models at these bounds, not the whole app.
 
 Left out of `RecoveryLock.tla`:
 
@@ -106,7 +110,8 @@ Left out of `RecoveryLock.tla`:
 Left out of `RecoveryStore.tla`:
 
 - A second running process: `RecoveryLock.tla` covers `owner.lock` instead.
-- More than one open document. Another document exists only as `active = FALSE`; parked documents, closing one (`Recovery::close`) and a restore that opens beside a used document are out.
+- More than one open document. Another document exists only as `active = FALSE`; parked documents, closing one (`Recovery::close`) and a restore that opens beside a used or shared document are out. For a shared document the model checks only that it is not replaced.
+- The room itself: other participants, the hub, and what they see. `TheirEdit` stands for any change that reaches this window. `room.rs` and `room/replica.rs` are not covered files, so a change to when they call `reset_shared` or `apply_theirs` does not make `check.sh` exit 3.
 - The time intervals (`Slot.due`, `Slot.retry`): any tick may find them passed.
 - Corrupt or foreign files in the recovery folder, size and disk limits, `MAX_FILES` and `MAX_RECORDS`.
 - Discards interrupted partway: `WorkerDiscard` deletes a record's generations in one step.
@@ -126,6 +131,9 @@ Each rule has been seen failing on a broken variant, made in a scratch copy of t
 | `recovery_documents` lists the copy waiting in `held` | `Visible` leaves `held.id` in | `UnsavedWorkHasCopy` |
 | `wants_copy` ignores the password | `Tick` tests `dirty` alone | `NoPlaintextOfProtected` |
 | `open_held_restore` skips the revision check | `Open` tests `TRUE` | `RestoreOnlyReplacesBlank` |
+| `open_held_restore` replaces a document shared after the restore was asked for | `Open` tests `FALSE` for `shared` | `RestoreNeverReplacesShared` |
+| `follow_shared` applies another participant's change without `touch` | `TheirEdit` leaves `rev` and `dirty` | `UnsavedWorkHasCopy` |
+| None: the model's own mistake, a share touch with no edit budget | `ShareDocument` bumps `rev` without spending an edit | `RevisionBounded` |
 | `try_lock` ignores another process's lock | `LockTry` does not test `holder` | `LiveOwnerIsAlone` |
 | `lock` trusts the file it locked | `LockRecheck` tests `TRUE` | `LiveOwnerIsAlone` |
 | `discard` releases the lock before it unlinks | `DiscardDelete` releases `holder` | `LiveOwnerIsAlone` |
@@ -139,6 +147,8 @@ Each rule has been seen failing on a broken variant, made in a scratch copy of t
 With both, 0 of 9,001 waits across 20,000 first copies, and a process that loses this way gets an ordinary failed save, retried at the next interval.
 
 **Why `reclaim` is not `discard`.** `scan` and `save` look whether a record is empty with no lock held, and `discard` deletes every generation, as a discard the user asked for should. Without the second look, a process that commits its first copy and dies while the other's `lock` is retrying loses that copy. `cleaning_up_an_empty_record_keeps_a_copy_written_since_the_look` tests `reclaim` itself. No test can pause `scan` or `save` at that gap, so only `ReclaimOnlyEmpty` covers those two calling it.
+
+`is_untouched_blank` counting a shared document as used is not what keeps a shared document from being replaced. A document can be shared after its restore was asked for, so `open_held_restore`'s own check is the one that matters. Without it the model breaks, as the table shows. Without the blank check it cannot: only `Open`'s replacing branch sets `replacedShared`, and that branch needs the document not to be shared.
 
 Moving `sync_dir` after the prune while still sparing `previous` is not a break: the last confirmed copy stays on disk whichever way a crash lands. Reason a change through the model before calling it safe or unsafe.
 
@@ -154,13 +164,14 @@ When `check.sh` exits 2, replay the finding. If the code really is fixed, delete
 
 The sync commit is the last commit at which someone confirmed that the model describes the covered code. Keep it on `main`, because `check.sh` compares against it and a squash merge removes a branch's commits.
 
-sync-commit: 96083f9fa752f7057e948d2efa458ea50ce76cd9
+sync-commit: 9c8a0a756d164689dfc404dcca52f17690265584
 
 covered-files:
 - crates/engine/src/recovery.rs
 - crates/engine/src/recovery/desktop.rs
 - crates/engine/src/session/documents.rs
 - crates/engine/src/session/query.rs
+- crates/engine/src/session/shared.rs
 - crates/engine/src/session/snapshot.rs
 - crates/engine/src/cmd/file.rs
 
