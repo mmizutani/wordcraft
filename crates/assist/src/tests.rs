@@ -1233,7 +1233,7 @@ fn a_marker_goes_on_around_what_only_details_shows() {
     let mut t = Transcript::default();
     t.asked("Go");
     t.record(&Event::Text { text: "Done. [[remem".into() });
-    t.record(&Event::Usage(Default::default()));
+    t.record(&Event::Agent { name: "Some Agent".into() });
     t.record(&Event::Text { text: "ber: Use lists.]]".into() });
     t.record(&Event::Usage(Default::default()));
     t.record(&Event::Text { text: "\n".into() });
