@@ -105,7 +105,8 @@ longer than 64 KiB says only that it was resolved. A comment says whether it is 
 deleted. At most 256 changes and 64 comments are listed, and the rest are counted; Review has them
 all, and while some are past the limit no row is said to have ended. Rows that ended go first when
 the list is full. `review.accept` and `review.reject` take an `author`, which leaves anyone else's
-changes in the selection alone.
+changes in the selection alone, and a `kind` with it, for the one text that carries two changes of
+theirs.
 Accept all and Reject all stay under both views. **Properties**
 says which assistant it is, with the version an agent gives, the document it works on, its role,
 whether its edits are tracked, the model that answered, and what the last turn used: tokens for
