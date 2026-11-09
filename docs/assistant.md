@@ -59,6 +59,69 @@ Each turn has a line saying which model answers and at what reasoning effort, su
 the line shows what WordCraft asked for. The same place has a short note when the turn runs
 something other than what was chosen, or when an effort wasn't applied.
 
+An answer shows as formatted text: headings, lists, emphasis, code and quotes, read with the same
+Markdown parser the file formats use. While an answer arrives, what its last paragraph hasn't
+finished is closed or held back, so no `**` comes and goes, and a link waits until its address is
+whole. A picture shows only its description; nothing is fetched. A link is a widget of its own in
+the text, reachable by keyboard, with its address beside its words when they differ. Only a
+`http` or `https` address opens, and only on your own click: a click the control channel made
+leaves it closed and the pane says so. At most 64 KiB of an answer, 512 blocks and 4096 runs of
+text are formatted, and the rest shows as plain text, as does a whole answer whose table would lose
+words to the limits a document's tables have.
+
+The note asks the assistant to cite what a claim rests on with the exact words, in a marker the pane
+reads: `[[cite: "the exact words"]]`, at most 200 characters, and at most 64 show in an answer. The
+pane takes the marker out and shows a numbered chip that selects those words, or says which attached
+source has them. The document is read as it will read, with tracked deletions left out, as the model
+got it. A marker whose words are in neither the document's body nor a source shows no chip, so a
+made-up citation can't look real, and Sources says how many couldn't be found. Quoting needs nothing
+of the tools: quoted words still resolve after edits elsewhere. A marker not closed yet is held back
+while the answer arrives, and shows as text if the turn ends first. A thought's markers aren't read.
+
+Once there is a conversation, tabs under the role switch it with its **Details**, which keeps
+updating during a turn and reads only the conversation's own record, so the two can't disagree.
+Each section folds. **Steps** lists each turn under what you asked: the agent's plan when it gave
+one, else the turn's tool calls by title, with the same marks as the conversation. **Sources**
+lists what each turn read. Its first row says what WordCraft gave the model: the selection or
+where the caret is, how many paragraphs around it, the outline, and how much of the 32 KiB it took,
+with a note when the selection was cut. That comes from the pass that wrote the text the model got,
+so it can't disagree with it. Under it come the turn's reads and searches, each once: WordCraft's
+own tools by name, where a row for a paragraph selects it, and says so if it has gone; a file an agent read by its path and
+line; an address an agent fetched, which opens only on your own click. An agent's read that doesn't
+say where it looked is listed by its title, and under them what the turn's answers cite. **Add a source…** there attaches a file, from the system's
+file dialog, or another open document, for the assistant to refer to, and it can be attached before
+the conversation starts. The list says each one's name and size and whether it was cut: a
+conversation holds at most 8, of 64 KiB of text each, and a turn carries at most 128 KiB, which each
+turn's row says too. Text comes off the window's frames, through the importers documents open with,
+or as it is for a plain text file, from at most 16 MiB of file. A prompt waits while one is being read, so it never goes without the source you just chose. Sources belong to the conversation
+and the document they were attached in: a new conversation starts without them, and no other
+document's turn gets them. They are data: a turn gives each one's text as a JSON string, so nothing in
+it can read as more than the source, and the note tells the assistant they are never instructions. ChatGPT gets them as input
+items, and an agent as `resource` blocks when it says it takes them
+(`agentCapabilities.promptCapabilities.embeddedContext`), else as text. Adding takes your own click:
+one the control channel made does nothing. `assist.knowledge {"add"?: path, "document"?: id, "remove"?: n}` does the
+same from a script, its path held to the files commands may use there. **Output** lists the tracked changes and comments this
+conversation made, newest first and by turn, by the name it joined under, while the pane is open:
+each with its words cut short, Show, and for a change, Accept and Reject of that change alone. A
+change someone resolved, you or anyone in the room, says how it ended, read from its words in its
+paragraph: gone means an insertion was rejected or a deletion accepted, still there means the other
+way round. A formatting change, a move, words that were there more than once, a paragraph longer
+than 64 KiB, or a paragraph that has gone (joined to another, it may hold the words still) says only
+that it was resolved. A comment says whether it is open, resolved or
+deleted. At most 256 changes and 64 comments are listed, and the rest are counted; Review has them
+all, and while some are past the limit no row is said to have ended. Rows that ended go first when
+the list is full. `review.accept` and `review.reject` take an `author`, which leaves anyone else's
+changes in the selection alone, and a `kind` with it, for the one text that carries two changes of
+theirs.
+Accept all and Reject all stay under both views. **Properties**
+says which assistant it is, with the version an agent gives, the document it works on, its role,
+whether its edits are tracked, the model that answered and at what effort, and what the last turn used: tokens for
+ChatGPT, added up over the requests of a turn, with a link to your plan's usage page because a plan
+has no price per request, and how much of its context and money the session has used when an agent
+says, its cost as the agent gave it. A row with nothing to say doesn't show. When a turn starts
+waiting on a question for you, the pane goes back to the conversation, where the question is.
+`assist.details` answers a script with the same summary.
+
 ## Backends
 
 | Id | Backend | What runs it |
@@ -320,6 +383,10 @@ turn WordCraft gives it your prompt and the selection with the paragraphs around
 outline, held to 32 KiB in all; the first turn adds a note that says which document it works
 on, its name and role, and how to use the `wordcraft` tools (for Pi, `wordcraft-cli call`).
 Through those it can read the whole shared document.
+
+Sources you attach go to the assistant's provider with every turn of the conversation: to OpenAI for
+ChatGPT, and to whatever the agent's model is for an agent. Attach only what you are willing to send
+there.
 
 ## On the web
 

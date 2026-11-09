@@ -17,7 +17,9 @@ use wordcraft_engine::StylesPaneDock;
 use crate::WordApp;
 use crate::theme::{Tokens, regular, semibold};
 
+pub(crate) mod answer;
 mod assistant;
+mod assistant_details;
 mod comments;
 mod host;
 mod inspector;

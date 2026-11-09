@@ -1587,3 +1587,921 @@ fn the_share_page_leaves_the_assistant_s_role_to_the_assistant_pane() {
     a.execute("room.invite", json!({"name": "Ana", "role": "viewer"})).unwrap();
     assert_eq!(a.execute("room.role", json!({"name": "Ana", "role": "editor"})).unwrap()["changed"], true);
 }
+
+/// A window with the pane open and a turn of the scripted assistant that says `answer`, finished.
+#[cfg(not(target_arch = "wasm32"))]
+fn answered(answer: &str) -> egui_kittest::Harness<'static, WordApp> {
+    let mut app = window("one two three");
+    app.assist_with(Box::new(Fake::new().then(vec![Step::say(answer)])));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Answer"})).unwrap();
+    for _ in 0..4000 {
+        if !h.state().conversation().is_some_and(|c| c.is_busy()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+    h
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn an_answer_shows_formatted_and_not_its_markers() {
+    use egui_kittest::kittest::Queryable;
+    let h = answered("## Findings\n\n- **first** point\n\n> a quote\n\n```\nsome code\n```");
+    for shown in ["Findings", "first", " point", "a quote", "some code"] {
+        assert!(h.query_by_label(shown).is_some(), "{shown}");
+    }
+    for marker in ["## Findings", "**first**", "> a quote", "```"] {
+        assert!(h.query_by_label_contains(marker).is_none(), "{marker}");
+    }
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_link_in_an_answer_says_where_it_goes_and_opens_only_on_the_person_s_click() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = answered("See [the bank](https://example.com/not-the-bank) or [run this](file:///bin/sh).");
+    assert!(h.query_by_label(" (https://example.com/not-the-bank)").is_some(), "the address shows beside the words");
+    assert!(h.query_by_label(" (file:///bin/sh)").is_some());
+    // What isn't a web address isn't a link.
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Link, "run this").is_none());
+
+    // What the window asked to open, as its frames go.
+    let frame = |h: &mut egui_kittest::Harness<'_, WordApp>| {
+        let ctx = h.ctx.clone();
+        let mut raw = std::mem::take(h.input_mut());
+        h.state_mut().raw_input_hook(&ctx, &mut raw);
+        *h.input_mut() = raw;
+        h.step();
+        h.output()
+            .platform_output
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::OutputCommand::OpenUrl(u) if u.url == "https://example.com/not-the-bank"))
+    };
+    let pos = h.get_by_role_and_label(egui::accesskit::Role::Link, "the bank").rect().center();
+    let (req, _rx) = crate::control::ControlRequest::new("ui.click", json!({"x": pos.x, "y": pos.y}));
+    let ctx = h.ctx.clone();
+    assert!(matches!(crate::control::handle(h.state_mut(), &ctx, &req), crate::control::Outcome::Done(_)));
+    assert!(!(0..20).any(|_| frame(&mut h)), "a click the control channel made opens nothing");
+    assert!(h.state().assist.notice.as_deref().is_some_and(|n| n.contains("Only you")), "{:?}", h.state().assist.notice);
+
+    h.input_mut().events.push(egui::Event::PointerMoved(pos));
+    let mut opened = frame(&mut h);
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        opened |= frame(&mut h);
+    }
+    opened |= (0..3).any(|_| frame(&mut h));
+    assert!(opened, "the person's click opens it");
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_huge_answer_draws_a_bounded_number_of_widgets_within_a_frame_budget() {
+    use egui_kittest::kittest::Queryable;
+    // A debug build's budget on a busy machine, as `the_window_never_waits_for_its_assistants`.
+    // What keeps a frame short is the number of widgets: a debug frame takes about 18 ms with the
+    // limit and 80 ms without, too close to time on a shared machine.
+    const BUDGET: Duration = Duration::from_secs(1);
+    let mut h = answered(&"- a\n".repeat(64 << 10));
+    let at = std::time::Instant::now();
+    h.run_steps(1);
+    assert!(at.elapsed() < BUDGET, "a frame took {:?}", at.elapsed());
+    let items = h.query_all_by_label("a").count();
+    assert!((1..=wordcraft_assist::answer::MAX_BLOCKS).contains(&items), "{items} widgets");
+}
+
+/// A window with the pane open and a scripted turn holding on after `steps`.
+#[cfg(not(target_arch = "wasm32"))]
+fn running(mut steps: Vec<Step>) -> egui_kittest::Harness<'static, WordApp> {
+    use wordcraft_assist::Entry;
+    steps.push(Step::say("End of the script."));
+    steps.push(Step::Hold);
+    let mut app = window("one two three\nsecond paragraph");
+    app.assist_with(Box::new(Fake::new().then(steps)));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Do the thing"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        let said = h
+            .state()
+            .conversation()
+            .is_some_and(|c| c.transcript().entries().any(|e| matches!(e, Entry::Answer { text } if text == "End of the script.")));
+        if said {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(2);
+    h
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn details_shows_steps_and_properties_during_a_turn_and_answers_the_same_to_a_script() {
+    use egui_kittest::kittest::Queryable;
+    let usage = wordcraft_assist::Usage { input_tokens: Some(1200), output_tokens: Some(80), ..Default::default() };
+    let mut h = running(vec![Step::tool("get_text", json!({})), Step::Emit(wordcraft_assist::Event::Usage(usage))]);
+    assert!(h.query_by_label("End of the script.").is_some(), "the conversation shows first");
+    assert!(h.query_by_label("Do the thing").is_some());
+
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("End of the script.").is_none(), "the view changed");
+    assert!(h.query_all_by_label("Do the thing").count() >= 1, "the turn names its steps");
+    assert!(h.query_all_by_label("get_text").count() >= 1, "{:?}", h.state().conversation().map(|c| c.details()));
+    for row in ["Scripted assistant (for testing)", "Suggester", "Tracked, in its name", "scripted", "1200 in, 80 out"] {
+        assert!(h.query_by_label(row).is_some(), "{row}");
+    }
+
+    let answer = h.state_mut().execute("assist.details", json!({})).unwrap();
+    assert_eq!(answer["properties"]["role"], "suggester");
+    assert_eq!(answer["properties"]["tracked"], true);
+    assert_eq!(answer["turns"][0]["asked"], "Do the thing");
+    assert_eq!(answer["turns"][0]["steps"][0]["title"], "get_text");
+    assert_eq!(answer["usage"]["inputTokens"], 1200);
+    assert_eq!(answer["model"], "scripted");
+
+    h.get_by_label("Conversation").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("End of the script.").is_some());
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn details_says_at_what_effort_the_model_answered() {
+    use egui_kittest::kittest::Queryable;
+    let line = wordcraft_assist::Event::Model { name: "GPT-6-Luna".into(), effort: Some("high".into()), asked: true };
+    let mut h = running(vec![Step::Emit(line)]);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("GPT-6-Luna").is_some());
+    assert!(h.query_by_label("High (requested)").is_some());
+    let answer = h.state_mut().execute("assist.details", json!({})).unwrap();
+    assert_eq!((&answer["effort"], &answer["effortAsked"]), (&json!("high"), &json!(true)));
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_section_of_details_folds() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = running(vec![Step::tool("get_text", json!({}))]);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    let rows = h.query_all_by_label("get_text").count();
+    assert!(rows > 0);
+    h.get_by_label("Steps").click();
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("get_text").count(), rows - 1, "folded");
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn details_gives_way_to_a_question_the_turn_waits_on() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = window("one");
+    app.assist_with(Box::new(Fake::new().then(vec![Step::say("Before."), Step::Hold])));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Go"})).unwrap();
+    h.run_steps(3);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    assert_eq!(h.state().assist.view, crate::assist::PaneView::Details);
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+    settle(h.state_mut());
+
+    h.state_mut().assist_with(Box::new(Fake::new().then(vec![Step::Ask("Run a command?".into())])));
+    h.state_mut().run("assist.ask", json!({"prompt": "Ask"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if h.state().conversation().is_some_and(|c| c.pending_permission().is_some()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(3);
+    assert_eq!(h.state().assist.view, crate::assist::PaneView::Conversation);
+    assert!(h.query_by_label("Run a command?").is_some(), "the person sees what the turn waits for");
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn usage_arriving_after_a_piece_of_an_answer_leaves_it_arriving() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::Entry;
+    let usage = wordcraft_assist::Event::Usage(wordcraft_assist::Usage { context_used: Some(1), ..Default::default() });
+    let mut app = window("one");
+    app.assist_with(Box::new(Fake::new().then(vec![Step::say("**half written"), Step::Emit(usage), Step::Hold])));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Go"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if h.state().conversation().is_some_and(|c| c.transcript().entries().any(|e| matches!(e, Entry::Usage(_)))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(2);
+    assert!(h.query_by_label("half written").is_some(), "its open marker is still closed for it");
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn sources_say_what_a_turn_was_given_and_what_it_read() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::{Event, Source, SourceKind, ToolCall, ToolStatus};
+    let source = |kind, title: &str, target: &str| Source { kind, title: title.into(), target: Some(target.into()) };
+    let agent_read = ToolCall {
+        id: "a".into(),
+        title: "Agent read".into(),
+        kind: "read".into(),
+        status: ToolStatus::Completed,
+        detail: String::new(),
+        changes: None,
+        sources: vec![
+            source(SourceKind::File, "/home/a/notes.md:3", "/home/a/notes.md"),
+            source(SourceKind::Web, "https://example.com/page", "https://example.com/page"),
+            source(SourceKind::Web, "file:///etc/passwd", "file:///etc/passwd"),
+        ],
+    };
+    let mut h = running(vec![
+        Step::tool("get_text", json!({})),
+        Step::tool("execute", json!({"command": "document.paragraph", "params": {"path": [1]}})),
+        Step::Emit(Event::Tool(agent_read)),
+    ]);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    h.get_by_label("Steps").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("/home/a/notes.md:3").is_some(), "a file shows its path");
+    assert!(h.query_by_label_contains("Given: where the caret is").is_some());
+    assert!(h.query_by_label("get_text").is_some(), "WordCraft's own read");
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Link, "https://example.com/page").is_some(), "a web address is a link");
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Link, "file:///etc/passwd").is_none(), "only a web address is a link");
+    let paragraph = h.get_by_role_and_label(egui::accesskit::Role::Link, "execute document.paragraph");
+    paragraph.click();
+    h.run_steps(2);
+    let selected = h.state().session.doc.copy_range(&h.state().session.sel.anchor, &h.state().session.sel.focus).plain_text();
+    assert_eq!(selected.trim_end(), "second paragraph", "a paragraph's row selects it, by its id");
+
+    // A row for a paragraph that went says so: an old path could go somewhere else.
+    h.state_mut().execute("select.all", json!({})).unwrap();
+    h.state_mut().execute("text.insert", json!({"text": "Other"})).unwrap();
+    h.run_steps(2);
+    h.get_by_role_and_label(egui::accesskit::Role::Link, "execute document.paragraph").click();
+    h.run_steps(2);
+    assert!(h.state().assist.notice.as_deref().is_some_and(|n| n.contains("isn't in the document")), "{:?}", h.state().assist.notice);
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_turn_records_what_it_was_given_as_the_model_got_it() {
+    use wordcraft_assist::Entry;
+    let mut a = window("one two three");
+    let fake = Fake::new().then(vec![Step::say("Hi")]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.run("select.text", json!({"text": "two"})).unwrap();
+    ask(&mut a, "Go", None);
+    settle(&mut a);
+    let sent = a
+        .conversation()
+        .unwrap()
+        .transcript()
+        .entries()
+        .find_map(|e| if let Entry::Context(s) = e { Some(s.clone()) } else { None })
+        .expect("the turn recorded it");
+    assert_eq!(sent.selection_bytes, 3);
+    let turns = seen.lock().unwrap();
+    let context = turns.turns[0].context.as_deref().unwrap_or_default();
+    assert_eq!(sent.bytes as usize, context.len(), "{context}");
+}
+
+/// Replace "two" and "three", one tool call each, then hold the turn.
+#[cfg(not(target_arch = "wasm32"))]
+fn rewrite_both() -> Vec<Step> {
+    vec![
+        Step::tool("select_text", json!({"text": "two"})),
+        Step::tool("type_text", json!({"text": "2"})),
+        Step::tool("select_text", json!({"text": "three"})),
+        Step::tool("type_text", json!({"text": "3"})),
+    ]
+}
+
+/// Frames until the window has what the room took.
+#[cfg(not(target_arch = "wasm32"))]
+fn caught_up(h: &mut egui_kittest::Harness<'static, WordApp>) {
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if h.state().share_settled() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(3);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn accepting_a_row_of_output_changes_only_that_change() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = running(rewrite_both());
+    caught_up(&mut h);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    // The pane is short: the rows to click are in view with the sections above them folded.
+    h.get_by_label("Steps").click();
+    h.run_steps(2);
+    h.get_by_label("Sources").click();
+    h.run_steps(2);
+    let rows = |h: &egui_kittest::Harness<'static, WordApp>| wordcraft_engine::cmd::review::change_rows(&h.state().session, "Test Assistant", 16).0;
+    assert_eq!(rows(&h).len(), 4, "{:?}", rows(&h));
+    assert!(h.query_by_label("3").is_some() && h.query_by_label("three").is_some());
+    // Newest first: "three" and its Accept are the first row.
+    h.get_all_by_label("Accept").next().unwrap().click();
+    h.run_steps(3);
+    let left: Vec<String> = rows(&h).into_iter().map(|c| c.text).collect();
+    assert_eq!(left, ["2", "two", "3"], "only that change");
+    assert!(h.query_by_label("Accepted").is_some(), "the row says how it ended");
+
+    // Reject the next one, its deletion: only that one too.
+    h.get_all_by_label("Reject").next().unwrap().click();
+    h.run_steps(3);
+    let left: Vec<String> = rows(&h).into_iter().map(|c| c.text).collect();
+    assert_eq!(left, ["2", "two"]);
+    assert!(h.query_by_label("Rejected").is_some());
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_change_another_participant_resolved_updates_its_row() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_engine::room::Role;
+    let mut h = running(rewrite_both());
+    caught_up(&mut h);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_label("Accept").count(), 4);
+    let room = h.state().shared_room().expect("the document is shared");
+    let (_, key) = room.invite_numbered("Colleague", Role::Editor).unwrap();
+    let mut colleague = room.join_with(&key).unwrap();
+    colleague.run("select.text", &json!({"text": "2"})).unwrap();
+    colleague.run("review.accept", &json!({})).unwrap();
+    colleague.send();
+    caught_up(&mut h);
+    assert_eq!(h.query_all_by_label("Accept").count(), 3);
+    assert!(h.query_by_label("Accepted").is_some());
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn accept_all_stays_on_the_conversation() {
+    use egui_kittest::kittest::Queryable;
+    let mut h = running(rewrite_both());
+    caught_up(&mut h);
+    assert!(h.query_by_label("Accept all").is_some());
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Accept all").is_some(), "it stays under both views");
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+/// A temporary file with `text`, and the folder that holds it.
+#[cfg(not(target_arch = "wasm32"))]
+fn source_file(name: &str, text: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("wordcraft-source-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, text).unwrap();
+    (dir, path)
+}
+
+/// Frames until no source is being read.
+#[cfg(not(target_arch = "wasm32"))]
+fn sources_read(a: &mut WordApp) -> Value {
+    for _ in 0..4000 {
+        super::tick(a);
+        let now = a.execute("assist.knowledge", json!({})).unwrap();
+        if now["pending"] == 0 {
+            return now;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the source isn't read");
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_source_over_the_limit_is_cut_says_so_and_reaches_the_turn_until_removed() {
+    use wordcraft_assist::Entry;
+    let (dir, path) = source_file("big.txt", &"word ".repeat(20 << 10));
+    let mut a = window("one");
+    let fake = Fake::new().then(vec![Step::say("A")]).then(vec![Step::say("B")]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    let now = sources_read(&mut a);
+    assert_eq!(now["sources"][0]["name"], "big.txt");
+    assert_eq!(now["sources"][0]["cut"], true, "{now}");
+    assert_eq!(now["sources"][0]["bytes"], 64 << 10, "{now}");
+
+    ask(&mut a, "Use it", None);
+    settle(&mut a);
+    let context = |a: &WordApp| {
+        a.conversation().unwrap().transcript().entries().rev().find_map(|e| if let Entry::Context(s) = e { Some(s.clone()) } else { None }).unwrap()
+    };
+    assert_eq!(context(&a).knowledge[0].name, "big.txt");
+    assert!(context(&a).knowledge[0].cut);
+    assert_eq!(seen.lock().unwrap().turns[0].knowledge[0].text.len(), 64 << 10);
+
+    a.execute("assist.knowledge", json!({"remove": 0})).unwrap();
+    ask(&mut a, "Without it", None);
+    settle(&mut a);
+    assert!(context(&a).knowledge.is_empty());
+    assert!(seen.lock().unwrap().turns[1].knowledge.is_empty(), "removing a source stops it reaching the next turn");
+    assert!(a.execute("assist.knowledge", json!({"remove": 5})).is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn sources_hold_to_their_number_and_a_file_that_can_t_be_read_says_why() {
+    let (dir, path) = source_file("small.txt", "words");
+    let mut a = window("one");
+    a.assist_with(Box::new(Fake::new()));
+    a.execute("assist.knowledge", json!({"add": dir.join("missing.txt").to_string_lossy()})).unwrap();
+    let now = sources_read(&mut a);
+    assert!(now["error"].as_str().unwrap_or_default().contains("missing.txt"), "{now}");
+    for _ in 0..12 {
+        a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    }
+    let now = sources_read(&mut a);
+    assert_eq!(now["sources"].as_array().unwrap().len(), wordcraft_assist::knowledge::MAX_SOURCES);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_named_pipe_as_a_source_says_so_and_doesn_t_hold_up_the_turn() {
+    let (dir, _) = source_file("small.txt", "words");
+    let pipe = dir.join("pipe.txt");
+    assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+    let mut a = window("one");
+    a.assist_with(Box::new(Fake::new()));
+    a.execute("assist.knowledge", json!({"add": pipe.to_string_lossy()})).unwrap();
+    let now = sources_read(&mut a);
+    assert!(now["error"].as_str().unwrap_or_default().contains("pipe.txt"), "{now}");
+    assert!(!super::sources_being_read(&a));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_script_s_path_is_held_to_the_file_rule() {
+    use wordcraft_engine::file_access::{AutomationRoots, confine};
+    let (dir, path) = source_file("secret.txt", "words");
+    let mut a = window("one");
+    a.assist_with(Box::new(Fake::new()));
+    let none = AutomationRoots::none();
+    let r = confine(Some(&none), || a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})));
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(sources_read(&mut a)["sources"], json!([]));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn adding_a_source_takes_the_person_s_click() {
+    use egui_kittest::kittest::Queryable;
+    let (dir, path) = source_file("picked.txt", "words");
+    let mut app = window("one two three");
+    let picked = path.to_string_lossy().into_owned();
+    app.services.pick_open = Some(Box::new(move |_| Some(picked.clone())));
+    let mut h = harness(app);
+    h.state_mut().assist.view = crate::assist::PaneView::Details;
+    h.state_mut().run("assist.pane", json!({"value": true})).unwrap();
+    h.run_steps(3);
+    let frame = |h: &mut egui_kittest::Harness<'_, WordApp>| {
+        let ctx = h.ctx.clone();
+        let mut raw = std::mem::take(h.input_mut());
+        h.state_mut().raw_input_hook(&ctx, &mut raw);
+        *h.input_mut() = raw;
+        h.step();
+    };
+    let pos = h.get_by_label("Add a source…").rect().center();
+    let (req, _rx) = crate::control::ControlRequest::new("ui.click", json!({"x": pos.x, "y": pos.y}));
+    let ctx = h.ctx.clone();
+    assert!(matches!(crate::control::handle(h.state_mut(), &ctx, &req), crate::control::Outcome::Done(_)));
+    for _ in 0..20 {
+        frame(&mut h);
+    }
+    assert!(!h.state().assist.add_open, "a click the control channel made opens nothing");
+    assert!(h.state().assist.notice.as_deref().is_some_and(|n| n.contains("Only you")), "{:?}", h.state().assist.notice);
+
+    h.get_by_label("Add a source…").click();
+    h.run_steps(2);
+    h.get_by_label("A file…").click();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if !h.state().assist.knowledge.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(h.state().assist.knowledge[0].name, "picked.txt");
+    h.run_steps(2);
+    assert!(h.query_by_label("picked.txt").is_some());
+    h.get_by_label("Remove").click();
+    h.run_steps(2);
+    assert!(h.state().assist.knowledge.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_macro_attaches_another_open_document_to_the_conversation_in_this_window() {
+    let mut a = window("first document");
+    let first = a.session.document_id();
+    a.execute("file.new", json!({})).unwrap();
+    let step = json!({"command": "assist.knowledge", "params": {"document": first}});
+    a.execute("tools.macros", json!({"define": {"name": "Attach", "steps": [step]}})).unwrap();
+    a.run("tools.macros", json!({"run": "Attach"})).unwrap();
+    assert_eq!(super::sources(&a).iter().map(|s| s.text.trim_end()).collect::<Vec<_>>(), ["first document"]);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_pane_attaches_another_open_document_by_its_title() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = window("first document");
+    let first = app.session.document_id();
+    app.execute("file.new", json!({})).unwrap();
+    let title = app.session.documents().into_iter().find(|d| d.id == first).unwrap().title;
+    let mut h = harness(app);
+    h.state_mut().assist.view = crate::assist::PaneView::Details;
+    h.state_mut().run("assist.pane", json!({"value": true})).unwrap();
+    h.run_steps(3);
+    h.get_by_label("Add a source…").click();
+    h.run_steps(2);
+    h.get_all_by_label(&title).last().expect("its row").click();
+    h.run_steps(2);
+    let source = &h.state().assist.knowledge[0];
+    assert_eq!((source.name.as_str(), source.text.trim_end()), (title.as_str(), "first document"));
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn sources_belong_to_their_conversation() {
+    let mut a = window("one");
+    a.assist_with(Box::new(Fake::new()));
+    let (dir, path) = source_file("before.txt", "words");
+    a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    sources_read(&mut a);
+    ask(&mut a, "First", None);
+    settle(&mut a);
+    assert_eq!(a.assist.knowledge.len(), 1, "what was attached before the first goes with it");
+    a.assist.knowledge.push(wordcraft_assist::Knowledge::new("more.txt", "words"));
+    ask(&mut a, "Another role", Some("viewer"));
+    settle(&mut a);
+    assert!(a.assist.knowledge.is_empty(), "a new conversation starts without them");
+
+    // One still being read for this document doesn't land in another's new conversation.
+    a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    assert_eq!(a.assist.adding.len(), 1);
+    a.execute("file.new", json!({})).unwrap();
+    a.execute("assist.useDocument", json!({})).unwrap();
+    a.assist_with(Box::new(Fake::new()));
+    ask(&mut a, "In another document", None);
+    settle(&mut a);
+    assert_eq!(sources_read(&mut a)["sources"], json!([]));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_source_attached_in_one_document_doesn_t_reach_another() {
+    let mut a = window("first");
+    let fake = Fake::new();
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    let (dir, path) = source_file("private.txt", "words");
+    a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    assert_eq!(sources_read(&mut a)["sources"].as_array().unwrap().len(), 1);
+    a.execute("file.new", json!({})).unwrap();
+    assert_eq!(a.execute("assist.knowledge", json!({})).unwrap()["sources"], json!([]));
+    ask(&mut a, "First prompt, here", None);
+    settle(&mut a);
+    assert!(seen.lock().unwrap().turns[0].knowledge.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_plain_text_file_of_line_breaks_is_read_as_text_and_a_file_past_the_limit_refused() {
+    let (dir, breaks) = source_file("breaks.txt", &"\n".repeat(1 << 20));
+    let mut a = window("one");
+    a.assist_with(Box::new(Fake::new()));
+    a.execute("assist.knowledge", json!({"add": breaks.to_string_lossy()})).unwrap();
+    let now = sources_read(&mut a);
+    assert_eq!(now["sources"][0]["cut"], true, "{now}");
+    let big = dir.join("big.txt");
+    std::fs::write(&big, vec![b'x'; (super::MAX_SOURCE_FILE + 1) as usize]).unwrap();
+    a.execute("assist.knowledge", json!({"add": big.to_string_lossy()})).unwrap();
+    let now = sources_read(&mut a);
+    assert_eq!(now["sources"].as_array().unwrap().len(), 1, "{now}");
+    assert!(now["error"].as_str().unwrap_or_default().contains("larger than"), "{now}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn another_open_document_can_be_a_source() {
+    let mut a = window("first document");
+    let first = a.session.document_id();
+    a.execute("file.new", json!({})).unwrap();
+    assert_ne!(a.session.document_id(), first);
+    let title = a.session.documents().into_iter().find(|d| d.id == first).unwrap().title;
+    let answer = a.execute("assist.knowledge", json!({"document": first})).unwrap();
+    assert_eq!(answer["sources"][0]["name"], json!(title));
+    assert_eq!(a.assist.knowledge[0].text.trim_end(), "first document");
+    let shown = a.session.document_id();
+    for bad in [json!({"document": shown}), json!({"document": 999_999}), json!({"document": "first"})] {
+        assert!(a.execute("assist.knowledge", bad.clone()).is_err(), "{bad}");
+    }
+    assert_eq!(a.assist.knowledge.len(), 1);
+
+    // A field reads as its result, as the document does opened from a file.
+    let mut with_field = window("Before after");
+    let field = wordcraft_doc::para::InlineObject::Field {
+        instr: "PAGE".into(),
+        result: "SEVEN".into(),
+        locked: false,
+        dirty: false,
+        code: false,
+        form: String::new(),
+    };
+    with_field.session.doc.para_mut(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().insert_object(7, field, &Default::default()).unwrap();
+    assert!(super::text_for_source(&with_field.session.doc).contains("Before SEVEN"));
+
+    // A long one is read only as far as it takes to say it was cut.
+    let long = window(&"long words\n".repeat(64 << 10));
+    let text = super::text_for_source(&long.session.doc);
+    assert!(text.len() < (64 << 10) + 64, "{}", text.len());
+    assert!(wordcraft_assist::Knowledge::new("Long", &text).cut);
+
+    // So is one long paragraph, or one long field in it: nothing past the limit is copied.
+    let one = window(&"x".repeat(1 << 20));
+    assert!(super::text_for_source(&one.session.doc).len() < (64 << 10) + 64);
+    let mut long_field = window("Before after");
+    let field = wordcraft_doc::para::InlineObject::Field {
+        instr: "PAGE".into(),
+        result: "y".repeat(1 << 20),
+        locked: false,
+        dirty: false,
+        code: false,
+        form: String::new(),
+    };
+    long_field.session.doc.para_mut(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().insert_object(7, field, &Default::default()).unwrap();
+    assert!(super::text_for_source(&long_field.session.doc).len() < (64 << 10) + 64);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_citation_with_real_words_selects_them_and_one_with_invented_words_shows_no_chip() {
+    use egui_kittest::kittest::Queryable;
+    let answer = r#"It says two [[cite: "two three"]]. It also says [[cite: "made up words"]] nothing."#;
+    let mut h = answered(answer);
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "1").is_some(), "one chip");
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "2").is_none(), "an invented citation shows no chip");
+    assert!(h.query_by_label_contains("cite").is_none(), "the markers don't show");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "1").click();
+    h.run_steps(2);
+    let s = &h.state().session;
+    assert_eq!(s.doc.copy_range(&s.sel.anchor, &s.sel.focus).plain_text(), "two three", "the chip selects the words");
+
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    h.get_by_label("Steps").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("“two three”").is_some(), "Sources lists what was found");
+    assert!(h.query_by_label("One citation couldn't be found.").is_some(), "and says what wasn't");
+    assert!(h.query_by_label_contains("made up words").is_none());
+
+    let details = h.state_mut().execute("assist.details", json!({})).unwrap();
+    assert_eq!(details["turns"][0]["unfound"], 1);
+    assert_eq!(details["turns"][0]["citations"][0]["words"], "two three");
+}
+
+#[test]
+fn what_citations_looked_for_is_held_to_a_size_and_keeps_what_is_still_cited() {
+    use crate::assist::{Cited, MOST_CITED_HELD, cited};
+    let mut app = window("one two three");
+    assert_eq!(cited(&mut app, "two three"), Cited::Document);
+    // Looked for again, these would no longer be found: what comes back was held.
+    app.assist.cited.as_mut().unwrap().text.clear();
+    for n in 0..MOST_CITED_HELD.saturating_mul(2).saturating_add(10) {
+        cited(&mut app, &format!("invented {n}"));
+        if n % MOST_CITED_HELD == MOST_CITED_HELD - 1 {
+            assert_eq!(cited(&mut app, "two three"), Cited::Document, "it is still cited at {n}");
+        }
+    }
+    let held = app.assist.cited.as_ref().unwrap();
+    assert!(held.found.len() <= MOST_CITED_HELD && held.before.len() <= MOST_CITED_HELD);
+
+    // Long words fill it sooner.
+    for n in 0..8 {
+        cited(&mut app, &format!("{n}{}", "w".repeat(1 << 20)));
+    }
+    let bytes: usize = app.assist.cited.as_ref().unwrap().found.keys().map(String::len).sum();
+    assert!(bytes <= wordcraft_assist::transcript::MAX_BYTES + (2 << 20), "{bytes}");
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_citation_of_an_attached_source_has_a_chip_that_says_which() {
+    let (dir, path) = source_file("notes.txt", "The source says this.");
+    let mut app = window("one two three");
+    app.assist_with(Box::new(Fake::new().then(vec![Step::say(r#"Yes [[cite: "says this"]]."#)])));
+    app.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    sources_read(&mut app);
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Go"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if !h.state().conversation().is_some_and(|c| c.is_busy()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(2);
+    use egui_kittest::kittest::Queryable;
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "1").click();
+    h.run_steps(2);
+    assert!(h.state().assist.notice.as_deref().is_some_and(|n| n.contains("notes.txt")), "{:?}", h.state().assist.notice);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_citation_in_a_thought_isn_t_read() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = window("one two three");
+    app.assist_with(Box::new(Fake::new().then(vec![Step::Think(r#"Maybe [[cite: "two three"]]"#.into()), Step::say("Done.")])));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Go"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if !h.state().conversation().is_some_and(|c| c.is_busy()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(2);
+    h.get_by_label("Thinking").click();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("[[cite:").is_some(), "a thought shows as it came");
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "1").is_none(), "no chip");
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_source_replaced_by_another_leaves_no_chip_for_words_it_alone_had() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = window("one two three");
+    app.assist_with(Box::new(Fake::new().then(vec![Step::say(r#"Yes [[cite: "only the old one"]]."#)])));
+    let (dir, old) = source_file("old.txt", "only the old one");
+    let new = dir.join("new.txt");
+    std::fs::write(&new, "something else").unwrap();
+    app.execute("assist.knowledge", json!({"add": old.to_string_lossy()})).unwrap();
+    sources_read(&mut app);
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Go"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if !h.state().conversation().is_some_and(|c| c.is_busy()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(2);
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "1").is_some());
+    h.state_mut().execute("assist.knowledge", json!({"remove": 0})).unwrap();
+    h.run_steps(2);
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "1").is_none(), "its source is gone");
+    h.state_mut().execute("assist.knowledge", json!({"add": new.to_string_lossy()})).unwrap();
+    sources_read(h.state_mut());
+    h.run_steps(2);
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "1").is_none(), "the same number of sources, others' words");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_chip_selects_in_the_body_from_wherever_the_caret_is_and_past_a_deletion() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = window("one obsolete two");
+    app.execute("select.text", json!({"text": "obsolete "})).unwrap();
+    app.execute("review.trackChanges", json!({"value": true})).unwrap();
+    app.execute("text.delete", json!({})).unwrap();
+    app.assist_with(Box::new(Fake::new().then(vec![Step::say(r#"Yes [[cite: "one two"]] and [[cite: "obsolete"]]."#)])));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Go"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if !h.state().conversation().is_some_and(|c| c.is_busy()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(2);
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "2").is_none(), "words deleted aren't the document's");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "1").click();
+    h.run_steps(2);
+    let s = &h.state().session;
+    assert_eq!((s.sel.anchor.off, s.sel.focus.off), (0, "one obsolete two".len()));
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_source_attached_for_another_document_s_first_turn_reaches_it() {
+    let (dir, path) = source_file("for-b.txt", "words");
+    let mut a = window("document A");
+    a.assist_with(Box::new(Fake::new()));
+    ask(&mut a, "In A", None);
+    settle(&mut a);
+    a.execute("file.new", json!({})).unwrap();
+    a.execute("assist.useDocument", json!({})).unwrap();
+    a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    sources_read(&mut a);
+    let fake = Fake::new();
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "In B", None);
+    settle(&mut a);
+    assert_eq!(seen.lock().unwrap().turns[0].knowledge.first().map(|s| s.name.as_str()), Some("for-b.txt"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_prompt_waits_for_a_source_still_being_read() {
+    let (dir, path) = source_file("slow.txt", "words");
+    let mut a = window("one");
+    let fake = Fake::new();
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    // A read that hasn't ended, whatever the disk does.
+    let (held, rx) = std::sync::mpsc::channel();
+    a.assist.adding.push(rx);
+    let waited = a.execute("assist.ask", json!({"prompt": "Now"}));
+    assert!(waited.is_err() || a.assist.notice.as_deref().is_some_and(|n| n.contains("still being read")), "{waited:?}");
+    assert!(seen.lock().unwrap().turns.is_empty(), "no turn went without it");
+    drop(held);
+    sources_read(&mut a);
+    ask(&mut a, "Now", None);
+    settle(&mut a);
+    assert_eq!(seen.lock().unwrap().turns[0].knowledge.len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_plain_text_source_in_another_encoding_reads_as_its_words() {
+    let (dir, path) = source_file("utf16.txt", "");
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend("héllo".encode_utf16().flat_map(u16::to_le_bytes));
+    std::fs::write(&path, bytes).unwrap();
+    assert_eq!(super::read_source(&path).unwrap().text, "héllo");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_file_chosen_for_one_document_doesn_t_land_in_another() {
+    use crate::file_dialogs::AfterPick;
+    let (dir, path) = source_file("chosen.txt", "words");
+    let mut a = window("first");
+    let first = a.session.document_id();
+    a.execute("file.new", json!({})).unwrap();
+    let r = a.finish_pick(AfterPick::AssistantSource { document: first }, Some(path.to_string_lossy().into_owned()));
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(sources_read(&mut a)["sources"], json!([]));
+    assert!(a.assist.notice.as_deref().is_some_and(|n| n.contains("another document")), "{:?}", a.assist.notice);
+    let shown = a.session.document_id();
+    assert!(a.finish_pick(AfterPick::AssistantSource { document: shown }, Some(path.to_string_lossy().into_owned())).is_ok());
+    assert_eq!(sources_read(&mut a)["sources"].as_array().unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
