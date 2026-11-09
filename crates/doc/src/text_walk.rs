@@ -34,7 +34,7 @@ fn count_label_words(s: &str) -> usize {
 }
 
 /// A Han ideograph or kana letter (not CJK punctuation), which Word counts as one word.
-fn is_cjk_word(c: char) -> bool {
+pub fn is_cjk_word(c: char) -> bool {
     matches!(c,
         '\u{3005}'..='\u{3007}' // 々 〆 〇
         | '\u{3031}'..='\u{3035}' | '\u{303B}' // vertical kana repeat marks, 〻

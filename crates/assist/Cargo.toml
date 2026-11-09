@@ -21,6 +21,8 @@ thiserror = { workspace = true }
 log = { workspace = true }
 # What the person said no to is kept as a hash of its text (`memory`); also the PKCE hash.
 sha2 = { workspace = true }
+# Dates of case notes and balance assessments (`cases`): time goes through chrono.
+chrono = { workspace = true }
 
 # Desktop only. Sign in with ChatGPT and the ChatGPT backend (`chatgpt`): HTTPS and the operating
 # system's random numbers. ACP agents (`acp`): random numbers too, for the
