@@ -553,9 +553,11 @@ impl Work {
             // Reading the person's cases is file work, so it runs here, off the frame; what it
             // finds joins the turn's sources, as data, on every backend alike. A case that can't
             // be read makes it find nothing and say so: a memory failure never stops a turn.
+            let mut carried = Vec::new();
             if let Some(ask) = recall {
-                let recalled = ask.run(&mut self.told, self.backend.retains());
+                let recalled = ask.run(&self.told, self.backend.retains());
                 self.events.send(Event::Recalled(recalled.sent()));
+                carried = recalled.fresh_ids();
                 turn.knowledge.extend(recalled.into_sources());
             }
             // The person's selection, in the assistant's copy: WordCraft's own step, not a call
@@ -572,7 +574,15 @@ impl Work {
             let backend = &mut self.backend;
             let ended = guarded(|| backend.turn(&turn, &mut ctx));
             let stop = match ended {
-                Ok(stop) => stop,
+                Ok(stop) => {
+                    // The backend's session has the items only once it took the prompt, and the
+                    // session that took it is the one running now (an agent that exited was
+                    // replaced in the turn).
+                    if stop != StopReason::Cancelled {
+                        self.told.record(carried, self.backend.retains());
+                    }
+                    stop
+                }
                 Err(message) => {
                     self.events.send(Event::Error { message });
                     StopReason::EndTurn

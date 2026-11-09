@@ -338,6 +338,104 @@ fn what_the_person_kept_reaches_a_new_session_and_again_when_it_changes() {
     assert_eq!(blocks(&c), ["Still gone"]);
 }
 
+/// A shelf with one case holding one note, and what a turn of `c` asks to recall from it.
+struct Recalls {
+    dir: PathBuf,
+    shelf: crate::cases::Shelf,
+    at: crate::cases::CaseRef,
+}
+
+const RECALLED_NOTE: &str = "Cap liability at twelve months.";
+
+impl Recalls {
+    fn new(name: &str) -> Recalls {
+        use crate::cases::{Body, Click, NoteDraft, PersonOp, Quoted, Shelf, Topics};
+        let dir = std::env::temp_dir().join(format!("wordcraft-acp-recall-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Acme", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Acme MSA", "2026-11-10", 2).unwrap();
+        let draft = NoteDraft { body: Body::Pattern { rule: Quoted::parse(RECALLED_NOTE), traps: None }, how: None, topics: Topics::default() };
+        shelf.person(click, &at, PersonOp::AddNote(draft), crate::cases::Day::parse("2026-11-10").unwrap()).unwrap();
+        Recalls { dir, shelf, at }
+    }
+
+    fn ask(&self, c: &Chat) -> crate::cases::RecallAsk {
+        use crate::cases::{Alone, Day, RecallAsk};
+        let alone = Alone::check(&c._room, c._own.id(), c.a.name()).unwrap();
+        RecallAsk::new(self.shelf.clone(), self.at.clone(), "the liability cap", Day::parse("2026-11-10").unwrap(), alone)
+    }
+}
+
+impl Drop for Recalls {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Whether the agent's report shows the recalled note in the prompt.
+fn report_recalled(report: &Value) -> bool {
+    report["prompt"].as_array().unwrap().iter().any(|b| b.as_str().is_some_and(|t| t.contains(RECALLED_NOTE)))
+}
+
+/// An item is remembered as told only once the agent took the prompt: a prompt that failed may
+/// never have reached its model, so the next turn carries the item again.
+#[test]
+fn a_recalled_item_is_said_again_after_a_failed_prompt() {
+    let recalls = Recalls::new("failed");
+    let mut script = Script::default();
+    script.replies.insert("Report".into(), vec![Step::Report]);
+    script.replies.insert("Fails".into(), vec![Step::Fail { code: -32000, message: "not now".into() }]);
+    let mut c = Chat::with(&script);
+    c.a.set_recall(Some(recalls.ask(&c)));
+    c.ask("Fails");
+    assert!(c.error().is_some(), "the prompt failed");
+    c.a.set_recall(Some(recalls.ask(&c)));
+    c.ask("Report");
+    assert!(report_recalled(&c.report()), "the item was lost with the failed prompt: {}", c.report());
+    c.a.set_recall(Some(recalls.ask(&c)));
+    c.ask("Report");
+    assert!(!report_recalled(&c.report()), "the session had it: {}", c.report());
+}
+
+/// An agent that exited between turns takes nothing into the next session: the item goes to the
+/// new session's first prompt, and only once.
+#[cfg(unix)]
+#[test]
+fn a_recalled_item_is_said_again_to_the_session_started_after_the_agent_exited() {
+    let recalls = Recalls::new("exited");
+    let mut script = Script::default();
+    script.replies.insert("Report".into(), vec![Step::Report]);
+    script.replies.insert("Report then exit".into(), vec![Step::Report, Step::ExitAfter { code: 0 }]);
+    let mut c = Chat::with(&script);
+    c.a.set_recall(Some(recalls.ask(&c)));
+    c.ask("Report then exit");
+    let report = c.report();
+    assert!(report_recalled(&report), "{report}");
+    // The agent exits once it has answered: wait until it has (it is this process's child, left
+    // unreaped for the backend), so the next turn finds it exited rather than dying.
+    let pid = rustix::process::Pid::from_raw(i32::try_from(report["pid"].as_u64().unwrap()).unwrap()).unwrap();
+    let until = Instant::now() + WAIT;
+    loop {
+        use rustix::process::{WaitId, WaitIdOptions, waitid};
+        if matches!(waitid(WaitId::Pid(pid), WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT), Ok(Some(_))) {
+            break;
+        }
+        assert!(Instant::now() < until, "the agent is still running");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    c.a.set_recall(Some(recalls.ask(&c)));
+    c.ask("Report");
+    let report = c.report();
+    assert!(c.error().is_none(), "{:?}", c.turn());
+    assert!(report_recalled(&report), "the new session wasn't told: {report}");
+    c.a.set_recall(Some(recalls.ask(&c)));
+    c.ask("Report");
+    assert!(!report_recalled(&c.report()), "the new session had it: {}", c.report());
+}
+
 /// A prompt the agent refused may never have reached its model: the next turn says it again.
 #[test]
 fn what_the_person_kept_is_said_again_after_a_failed_prompt() {

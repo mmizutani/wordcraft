@@ -874,7 +874,12 @@ impl Backend for Acp {
         self.stop_agent(EXIT_GRACE);
     }
 
-    fn retains(&self) -> Option<u64> {
+    fn retains(&mut self) -> Option<u64> {
+        // An agent that exited since the last turn keeps nothing: the next turn starts a new
+        // session, whose number is read after it.
+        if self.running.as_mut().is_some_and(|r| !r.process.is_running()) {
+            return None;
+        }
         Some(self.sessions_ended)
     }
 }

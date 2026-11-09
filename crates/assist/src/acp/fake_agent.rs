@@ -98,6 +98,8 @@ pub enum Step {
     Hang,
     /// Write `stderr` to stderr and exit with `code`, in the middle of the turn.
     Crash { code: i32, stderr: String },
+    /// Answer this prompt, then exit with `code`: an agent gone between turns.
+    ExitAfter { code: i32 },
     /// Write what isn't JSON-RPC, or isn't what the protocol says: a JSON array, bytes that
     /// aren't UTF-8, a line longer than WordCraft reads, an answer to a request never made…
     Junk,
@@ -339,6 +341,7 @@ impl Agent<'_> {
         let steps = self.script.replies.get(&last).or_else(|| self.script.turns.get(self.turn)).cloned().unwrap_or_default();
         self.turn = self.turn.saturating_add(1);
         let mut later = None;
+        let mut exit_after = None;
         for step in steps {
             self.drain();
             if self.cancelled {
@@ -361,6 +364,7 @@ impl Agent<'_> {
                     update(json!({"sessionUpdate": "config_option_update", "configOptions": options}));
                 }
                 Step::ConfigUpdateAfter { options } => later = Some(options),
+                Step::ExitAfter { code } => exit_after = Some(code),
                 Step::Plan { entries } => {
                     let entries: Vec<Value> = entries
                         .iter()
@@ -437,7 +441,7 @@ impl Agent<'_> {
             self.config = Some(options.clone());
             update(json!({"sessionUpdate": "config_option_update", "configOptions": options}));
         }
-        None
+        exit_after
     }
 
     /// What it was given.

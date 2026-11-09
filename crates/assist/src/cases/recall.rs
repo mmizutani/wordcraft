@@ -319,7 +319,7 @@ impl RecallAsk {
     /// cases, rank, compose, and check once more before anything read leaves: reading takes
     /// long enough for someone to join. A case that can't be read makes it return nothing and
     /// say so: a memory failure never stops a turn.
-    pub(crate) fn run(self, told: &mut Told, retains: Option<u64>) -> Recalled {
+    pub(crate) fn run(self, told: &Told, retains: Option<u64>) -> Recalled {
         let others = |o: Others| Recalled::nothing(format!("{} can read this document", o.names.join(", ")));
         if let Err(o) = self.alone.recheck() {
             return others(o);
@@ -495,6 +495,11 @@ impl Recalled {
         self.sent.clone()
     }
 
+    /// The ids of the items this turn carries, for [`Told::record`] once the prompt was taken.
+    pub(crate) fn fresh_ids(&self) -> Vec<String> {
+        self.sent.items.iter().filter(|i| !i.again).map(|i| i.id.to_string()).collect()
+    }
+
     /// The items not sent to this session before, as one data-grade source; none when there are
     /// none.
     pub(crate) fn into_sources(self) -> Vec<TurnSource> {
@@ -520,17 +525,29 @@ pub struct Told {
 }
 
 impl Told {
-    /// Mark the items `retains`' session has had already, and remember the rest as sent now. With
-    /// `None` (ChatGPT, the fake) nothing is remembered: every turn carries what ranks.
-    fn filter(&mut self, recalled: &mut Recalled, retains: Option<u64>) {
+    /// Mark the items `retains`' session has had already. Nothing is remembered here: a prompt
+    /// can fail or be stopped before the agent reads it, so what was sent is recorded once the
+    /// turn ended well ([`Told::record`]). With `None` (ChatGPT, the fake, an agent that
+    /// exited) nothing is marked: the turn carries what ranks.
+    fn filter(&self, recalled: &mut Recalled, retains: Option<u64>) {
+        let Some(generation) = retains else { return };
+        if self.generation != Some(generation) {
+            return;
+        }
+        for item in &mut recalled.sent.items {
+            item.again = self.keys.contains(&item.id.to_string());
+        }
+    }
+
+    /// Remember `ids` as sent to `retains`' session, read once the prompt was taken: the session
+    /// that received it, not the one that ran when the turn was composed.
+    pub(crate) fn record(&mut self, ids: impl IntoIterator<Item = String>, retains: Option<u64>) {
         let Some(generation) = retains else { return };
         if self.generation != Some(generation) || self.keys.len() >= MAX_TOLD {
             self.generation = Some(generation);
             self.keys.clear();
         }
-        for item in &mut recalled.sent.items {
-            item.again = !self.keys.insert(item.id.to_string());
-        }
+        self.keys.extend(ids);
     }
 }
 
@@ -840,7 +857,12 @@ mod tests {
         let mut told = Told::default();
         let mut first = compose(&pool, &query);
         told.filter(&mut first, Some(0));
-        assert!(first.sent.items.iter().all(|i| !i.again) && first.into_sources().len() == 1);
+        assert!(first.sent.items.iter().all(|i| !i.again));
+        let mut lost = compose(&pool, &query);
+        told.filter(&mut lost, Some(0));
+        assert!(lost.sent.items.iter().all(|i| !i.again), "nothing is remembered until the prompt was taken");
+        told.record(first.fresh_ids(), Some(0));
+        assert_eq!(first.into_sources().len(), 1);
         let mut second = compose(&pool, &query);
         told.filter(&mut second, Some(0));
         assert!(second.sent.items.iter().all(|i| i.again), "{:?}", second.sent.items);

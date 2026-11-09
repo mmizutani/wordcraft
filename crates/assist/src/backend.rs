@@ -928,8 +928,9 @@ pub trait Backend: Send {
 
     /// When this backend's session keeps what it is sent, a number that changes with each new
     /// session (an ACP agent), so what was sent once needn't be sent again until then. `None`
-    /// when each turn starts without it: ChatGPT, the fake.
-    fn retains(&self) -> Option<u64> {
+    /// when each turn starts without it: ChatGPT, the fake, or an agent whose session is gone
+    /// and will be started again by the next turn.
+    fn retains(&mut self) -> Option<u64> {
         None
     }
 }
