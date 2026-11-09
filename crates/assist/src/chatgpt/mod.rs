@@ -8,7 +8,7 @@
 //!   this installation's host id ([`CLIENT_FILE`]), for every sign-in after it.
 //! - [`account`]: who is signed in, read from the file (no network).
 //! - [`SignOut`]: deletes the credentials and revokes their refresh token.
-//! - [`models`], [`choose_model`]: the models the account may use, and the one chosen.
+//! - [`models`], [`resolve`]: the models the account may use, and which one a turn runs.
 //! - [`ChatGpt`]: the backend. It calls the Responses API, streamed, with WordCraft's tools as
 //!   function tools that run in this process.
 //!
@@ -21,14 +21,15 @@
 mod auth;
 mod backend;
 mod http;
+mod models;
 mod sse;
 mod store;
 
 pub use auth::{
-    AuthError, CALLBACK_PATH, DEFAULT_PORT, Model, PLAN_SCOPE, SCOPES, SIGN_IN_WAIT, SignIn, SignInOptions, SignOut, SignedOut, choose_model,
-    chosen_model, models, models_with, sign_out, sign_out_with,
+    AuthError, CALLBACK_PATH, DEFAULT_PORT, PLAN_SCOPE, SCOPES, SIGN_IN_WAIT, SignIn, SignInOptions, SignOut, SignedOut, sign_out, sign_out_with,
 };
 pub use backend::{ChatGpt, MAX_ROUNDS};
+pub use models::{Resolved, models, models_with, resolve};
 pub use store::{Account, CLIENT_FILE, CREDENTIALS_FILE, account};
 
 use std::path::Path;
@@ -40,6 +41,13 @@ pub const ID: &str = "chatgpt";
 
 /// Its name in the picker, and the name the assistant joins the shared document under.
 pub const AUTHOR: &str = "ChatGPT";
+
+/// The model a person who chose none gets, when the account's list has it: a plan's usage is the
+/// person's to spend, and the list's first is not the cheap one.
+pub const DEFAULT_MODEL: &str = "gpt-6-luna";
+
+/// The reasoning level a person who chose none gets, when the model offers it.
+pub const DEFAULT_EFFORT: &str = "medium";
 
 /// Where the person sees and manages their plan's usage.
 pub const USAGE_PAGE: &str = "https://chatgpt.com/settings/usage";
@@ -131,5 +139,7 @@ pub(crate) fn offer(host: &Host) -> Offer {
 mod backend_tests;
 #[cfg(test)]
 mod fake_server;
+#[cfg(test)]
+mod models_tests;
 #[cfg(test)]
 mod tests;

@@ -21,7 +21,7 @@ use wordcraft_engine::AssistantPrefs;
 use wordcraft_engine::room::{Role, Room, RoomError};
 
 use crate::backend::{
-    Answer, Backend, BackendInfo, Cancel, Event, Events, MAX_QUEUED_EVENTS, NoTools, PermissionPolicy, PermissionRequest, Permissions, Seat,
+    Answer, Backend, BackendInfo, Cancel, Event, Events, MAX_QUEUED_EVENTS, NoTools, Offered, PermissionPolicy, PermissionRequest, Permissions, Seat,
     StopReason, ToolHost, Turn, TurnCtx, Waker,
 };
 use crate::tools::CopyTools;
@@ -108,6 +108,10 @@ pub struct Assistant {
     busy: bool,
     /// Whether the next turn is the conversation's first, which carries the note.
     first: bool,
+    /// The model and reasoning effort each turn carries ([`Assistant::choose`]).
+    choice: (Option<String>, Option<String>),
+    /// What the backend last said it offers, once it has.
+    offered: Option<Offered>,
     ended: bool,
 }
 
@@ -154,6 +158,8 @@ impl Assistant {
             transcript: Transcript::default(),
             busy: false,
             first: true,
+            choice: (None, None),
+            offered: None,
             ended: false,
         })
     }
@@ -213,6 +219,17 @@ impl Assistant {
         self.ended
     }
 
+    /// The model and reasoning effort the next turns carry: what the person chose for this
+    /// backend, `None` for its default. The conversation goes on.
+    pub fn choose(&mut self, model: Option<String>, effort: Option<String>) {
+        self.choice = (model, effort);
+    }
+
+    /// What the backend last said it offers to choose from: `None` until it has.
+    pub fn offered(&self) -> Option<&Offered> {
+        self.offered.as_ref()
+    }
+
     /// Ask `prompt`, with `context` (the document around the selection, [`crate::Context`]):
     /// a turn starts on the conversation's thread. Refused while a turn runs, once the
     /// conversation ended, and for an empty or too long prompt.
@@ -265,7 +282,8 @@ impl Assistant {
             return Err(AssistError::Prompt(format!("the prompt is longer than {} KB", MAX_PROMPT >> 10)));
         }
         let note = self.first.then(|| crate::note(&self.seat, self.info.in_process_tools));
-        let turn = Turn { prompt: prompt.to_string(), context, note, selection };
+        let (model, effort) = self.choice.clone();
+        let turn = Turn { prompt: prompt.to_string(), context, note, selection, model, effort };
         // Cleared before the turn is sent: a Stop from now on ends this turn, even one the
         // thread hasn't started yet.
         self.cancel.clear();
@@ -299,6 +317,9 @@ impl Assistant {
                     n += 1;
                     if e.ends_turn() {
                         self.busy = false;
+                    }
+                    if let Event::Options(offered) = &e {
+                        self.offered = Some(offered.clone());
                     }
                     self.transcript.record(&e);
                 }

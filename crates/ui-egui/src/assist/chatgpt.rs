@@ -90,6 +90,9 @@ pub(crate) struct ChatGptState {
     declined: bool,
     /// What the last sign-in or sign-out ended with.
     pub(crate) notice: Option<Notice>,
+    /// The models the account may use, as last read (#84).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) list: super::models::ModelList,
 }
 
 impl Default for ChatGptState {
@@ -112,6 +115,8 @@ impl Default for ChatGptState {
             #[cfg(not(target_arch = "wasm32"))]
             declined: false,
             notice: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            list: super::models::ModelList::Unread,
         }
     }
 }

@@ -76,6 +76,10 @@ fn properties(app: &mut WordApp, ui: &mut Ui, t: &Tokens, details: &Details) {
     if let Some(model) = &details.model {
         property(ui, t, tl!("Model"), model);
     }
+    if let Some(effort) = details.effort.as_deref().map(crate::assist::effort_word) {
+        let shown = if details.effort_asked { fmt(tl!("{effort} (requested)"), &[("effort", effort)]) } else { effort.to_string() };
+        property(ui, t, tl!("Effort"), &shown);
+    }
     if let Some(usage) = &details.usage {
         self::usage(ui, t, usage);
     }

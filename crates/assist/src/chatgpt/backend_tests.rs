@@ -14,7 +14,7 @@ use wordcraft_engine::room::{Replica, Room};
 use super::backend::Tuning;
 use super::fake_server::{Part, Reply, Request, Server};
 use super::tests::{Folder, Script, WAIT, eventually, expire, no_api, signed_in};
-use super::{AUTHOR, ChatGpt, Endpoints, ID, USAGE_PAGE, choose_model};
+use super::{AUTHOR, ChatGpt, Endpoints, ID, USAGE_PAGE};
 use crate::{Assistant, Backend, Entry, Options, StopReason, ToolStatus};
 
 /// The window: its session, showing `text`, shared under the name Minoru.
@@ -231,7 +231,7 @@ fn a_text_answer_streams_into_the_pane_and_names_the_model() {
     assert_eq!(c.answer().as_deref(), Some("Hello there."));
     assert_eq!((c.error(), c.stopped()), (None, None));
     let t = c.assistant.transcript();
-    assert!(t.entries().any(|e| matches!(e, Entry::Model { name } if name == "gpt-test-2026-01-01")), "{t:?}");
+    assert!(t.entries().any(|e| matches!(e, Entry::Model { name, .. } if name == "GPT Test")), "{t:?}");
     assert!(t.entries().any(|e| matches!(e, Entry::Thought { text } if text == "Reading the request.")));
     let request = &c.server.to("/v1/responses")[0];
     assert_eq!(request.header("authorization"), Some("Bearer access-0"));
@@ -260,7 +260,7 @@ fn a_request_is_what_the_responses_api_takes_from_a_chatgpt_plan() {
     let mut c = chat("one two three", replies(vec![says("Hi.")]));
     c.ask("Hello");
     let body = &c.bodies()[0];
-    assert_eq!(body["model"], "gpt-test", "the first model the account's list shows");
+    assert_eq!(body["model"], "gpt-test", "without gpt-6-luna, the first model the account's list shows");
     assert_eq!((&body["store"], &body["stream"]), (&json!(false), &json!(true)));
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     let instructions = body["instructions"].as_str().unwrap();
@@ -294,8 +294,8 @@ fn a_request_is_what_the_responses_api_takes_from_a_chatgpt_plan() {
     let names: Vec<&str> = functions.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names, crate::tools::TOOLS);
     assert!(functions.iter().all(|t| t["type"] == "function" && t["strict"] == false && t["parameters"].is_object()));
-    // The person's choice of model, from Options.
-    super::choose_model(c.folder.path(), Some("gpt-test-mini")).unwrap();
+    // The person's choice of model.
+    c.assistant.choose(Some("gpt-test-mini".into()), None);
     c.ask("Again");
     assert_eq!(c.bodies()[1]["model"], "gpt-test-mini");
 }
@@ -396,7 +396,8 @@ fn stop_ends_the_turn_mid_stream_and_before_the_answer_starts_without_waiting_fo
 #[test]
 fn a_stop_while_the_token_is_renewed_sends_nothing_even_once_the_next_turn_starts() {
     let mut c = chat("x", replies(vec![says("After.")]));
-    choose_model(c.folder.path(), Some("gpt-test")).unwrap();
+    // The list is read, so the next turn's token is taken for its request.
+    c.ask("First");
     expire(c.folder.path());
     *c.script.slow.lock().unwrap() = Duration::from_secs(1);
     c.assistant.ask("Hello", None).unwrap();
@@ -409,8 +410,8 @@ fn a_stop_while_the_token_is_renewed_sends_nothing_even_once_the_next_turn_start
     *c.script.slow.lock().unwrap() = Duration::ZERO;
     c.ask("Go on");
     assert_eq!(c.answer().as_deref(), Some("After."));
-    assert_eq!(c.bodies().len(), 1, "{:?}", c.bodies());
-    assert_eq!(bodies_input(&c, 0), [user("Go on")]);
+    assert_eq!(c.bodies().len(), 2, "{:?}", c.bodies());
+    assert_eq!(bodies_input(&c, 1), [user("First"), assistant("After."), user("Go on")]);
 }
 
 #[test]
@@ -585,8 +586,9 @@ fn an_unsupported_field_is_left_out_from_then_on() {
     c.ask("Again");
     let bodies = c.bodies();
     assert_eq!(bodies.len(), 3);
-    assert!(bodies[0].get("reasoning").is_some());
-    assert!(bodies[1].get("reasoning").is_none() && bodies[2].get("reasoning").is_none());
+    assert_eq!(bodies[0]["reasoning"], json!({"effort": "medium", "summary": "auto"}));
+    assert_eq!(bodies[1]["reasoning"], json!({"effort": "medium"}), "a refused summary doesn't lose the effort");
+    assert_eq!(bodies[2]["reasoning"], json!({"effort": "medium"}));
     assert!(bodies[2].get("include").is_some(), "only what was refused is left out");
     // Refused again without it: said, not looped.
     let c = asked(vec![unsupported.clone(), unsupported]);
@@ -739,4 +741,279 @@ fn a_stream_with_no_usage_or_junk_in_it_says_nothing_used() {
         assert!(c.assistant.wait_idle(WAIT));
         assert_eq!(c.assistant.details().usage, None);
     }
+}
+
+/// The two models the issue's list has, in its order: `gpt-6.1-sol` first.
+fn real_list() -> Reply {
+    Reply::json(
+        200,
+        &json!({"models": [
+            {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol", "default_reasoning_level": "low", "visibility": "list",
+             "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}, {"effort": "ultra"}]},
+            {"slug": "gpt-6-luna", "display_name": "GPT-6-Luna", "default_reasoning_level": "medium", "visibility": "list",
+             "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}]},
+        ]}),
+    )
+}
+
+/// A conversation whose account's list answers `list`, and its `/v1/responses` answers `replies`.
+fn listing(list: Reply, answers: Vec<Reply>) -> Chat {
+    let c = chat("one two three", replies(answers));
+    *c.script.models.lock().unwrap() = Some(list);
+    c
+}
+
+/// The last turn's notes.
+fn notes(c: &Chat) -> Vec<String> {
+    c.assistant
+        .transcript()
+        .entries()
+        .rev()
+        .take_while(|e| !matches!(e, Entry::Asked { .. }))
+        .filter_map(|e| match e {
+            Entry::Note { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The last turn's model line.
+fn model_line(c: &Chat) -> Option<(String, Option<String>, bool)> {
+    c.assistant.transcript().entries().rev().take_while(|e| !matches!(e, Entry::Asked { .. })).find_map(|e| match e {
+        Entry::Model { name, effort, asked } => Some((name.clone(), effort.clone(), *asked)),
+        _ => None,
+    })
+}
+
+/// An answer that says what ran.
+fn says_it_ran(model: &str, effort: Option<&str>) -> Reply {
+    let created = json!({"type": "response.created", "response": {"model": model, "reasoning": {"effort": effort, "summary": "auto"}}});
+    Reply::sse(&[created, delta("Hi."), message("Hi."), completed()])
+}
+
+#[test]
+fn with_nothing_chosen_the_request_asks_for_gpt_6_luna_at_medium_with_a_summary() {
+    let mut c = listing(real_list(), vec![says("Hi.")]);
+    c.ask("Hello");
+    let body = &c.bodies()[0];
+    assert_eq!(body["model"], "gpt-6-luna");
+    assert_eq!(body["reasoning"]["effort"], "medium");
+    assert_eq!(body["reasoning"]["summary"], "auto");
+}
+
+#[test]
+fn without_gpt_6_luna_the_first_runs_at_medium_or_else_at_its_default() {
+    let at = |levels: Value, default: &str| {
+        let list =
+            json!({"models": [{"slug": "gpt-a", "supported_reasoning_levels": levels, "default_reasoning_level": default}, {"slug": "gpt-b"}]});
+        let mut c = listing(Reply::json(200, &list), vec![says("Hi.")]);
+        c.ask("Hello");
+        let body = c.bodies()[0].clone();
+        assert_eq!(body["model"], "gpt-a");
+        body["reasoning"]["effort"].clone()
+    };
+    assert_eq!(at(json!(["low", "medium"]), "low"), "medium");
+    assert_eq!(at(json!(["low", "high"]), "high"), "high");
+}
+
+#[test]
+fn a_list_with_no_levels_sends_medium() {
+    let mut c = chat("x", replies(vec![says("Hi.")]));
+    c.ask("Hello");
+    assert_eq!(c.bodies()[0]["reasoning"], json!({"effort": "medium", "summary": "auto"}));
+}
+
+#[test]
+fn the_pane_shows_the_model_by_its_name_and_the_effort_that_ran() {
+    let mut c = listing(real_list(), vec![says_it_ran("gpt-6-luna-2026-10-01", Some("high"))]);
+    c.ask("Hello");
+    assert_eq!(model_line(&c), Some(("GPT-6-Luna".to_string(), Some("high".to_string()), false)));
+    // Another model than the one asked for is shown as the server named it.
+    let mut c = listing(real_list(), vec![says_it_ran("gpt-6-luna-mini", Some("high"))]);
+    c.ask("Hello");
+    assert_eq!(model_line(&c).map(|l| l.0), Some("gpt-6-luna-mini".to_string()));
+}
+
+#[test]
+fn a_stream_that_reports_no_effort_shows_what_was_asked_and_says_so() {
+    let mut c = listing(real_list(), vec![says_it_ran("gpt-6-luna", None)]);
+    c.ask("Hello");
+    assert_eq!(model_line(&c), Some(("GPT-6-Luna".to_string(), Some("medium".to_string()), true)));
+    // A stream that says nothing at all: the same, once the answer is complete.
+    let mut c = listing(real_list(), vec![Reply::sse(&[message("Hi."), completed()])]);
+    c.ask("Hello");
+    assert_eq!(model_line(&c), Some(("GPT-6-Luna".to_string(), Some("medium".to_string()), true)));
+}
+
+#[test]
+fn the_line_follows_what_the_stream_reports_and_keeps_it_through_events_that_dont() {
+    let event = |kind: &str, effort: Option<&str>| json!({"type": kind, "response": {"model": "gpt-6-luna", "reasoning": {"effort": effort}}});
+    let answer = Reply::sse(&[
+        event("response.created", None),
+        event("response.in_progress", Some("high")),
+        event("response.in_progress", None),
+        message("Hi."),
+        completed(),
+    ]);
+    let mut c = listing(real_list(), vec![answer]);
+    c.ask("Hello");
+    assert_eq!(model_line(&c), Some(("GPT-6-Luna".to_string(), Some("high".to_string()), false)));
+}
+
+#[test]
+fn an_effort_reported_only_at_the_end_of_the_stream_corrects_the_line() {
+    let started = json!({"type": "response.created", "response": {"model": "gpt-6-luna"}});
+    let report = json!({"model": "gpt-6-luna", "reasoning": {"effort": "high"}});
+    // Both ways a stream ends with an answer: it completed, or it was cut off.
+    let completed = json!({"type": "response.completed", "response": report});
+    let incomplete = json!({"type": "response.incomplete", "response": {"model": "gpt-6-luna", "reasoning": {"effort": "high"}, "incomplete_details": {"reason": "max_output_tokens"}}});
+    for end in [completed, incomplete] {
+        let mut c = listing(real_list(), vec![Reply::sse(&[started.clone(), message("Hi."), end.clone()])]);
+        c.ask("Hello");
+        assert_eq!(model_line(&c), Some(("GPT-6-Luna".to_string(), Some("high".to_string()), false)), "{end}");
+    }
+}
+
+/// `unsupported_value` on the effort, as the Responses API says it.
+fn effort_refused() -> Reply {
+    Reply::json(
+        400,
+        &json!({"error": {"type": "invalid_request_error", "code": "unsupported_value", "param": "reasoning.effort",
+        "message": "Unsupported value: 'medium' is not supported with this model."}}),
+    )
+}
+
+#[test]
+fn a_refused_effort_is_retried_once_without_it_keeps_the_summary_and_says_so() {
+    let mut c = listing(real_list(), vec![effort_refused(), says_it_ran("gpt-6-luna", None)]);
+    c.ask("Hello");
+    let bodies = c.bodies();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0]["reasoning"]["effort"], "medium");
+    assert_eq!(bodies[1]["reasoning"], json!({"summary": "auto"}));
+    assert_eq!(c.answer().as_deref(), Some("Hi."));
+    assert!(notes(&c).iter().any(|n| n.contains("medium") && n.contains("wasn't applied")), "{:?}", notes(&c));
+    assert_eq!(model_line(&c), Some(("GPT-6-Luna".to_string(), None, false)));
+    // Refused again without it: said, not looped.
+    let mut c = listing(real_list(), vec![effort_refused(), effort_refused()]);
+    c.ask("Hello");
+    assert_eq!(c.bodies().len(), 2);
+    assert!(c.error().unwrap().contains("Unsupported value"), "{:?}", c.error());
+}
+
+#[test]
+fn an_effort_refused_in_the_stream_corrects_the_line_already_shown() {
+    let failed = json!({"type": "response.failed", "response": {"status": "failed", "error": {"code": "unsupported_value", "param": "reasoning.effort", "message": "no"}}});
+    let first = Reply::sse(&[json!({"type": "response.created", "response": {"model": "gpt-6-luna"}}), failed]);
+    let mut c = listing(real_list(), vec![first, says_it_ran("gpt-6-luna", None)]);
+    c.ask("Hello");
+    assert_eq!(c.bodies().len(), 2);
+    assert_eq!(model_line(&c), Some(("GPT-6-Luna".to_string(), None, false)));
+    let lines = c.assistant.transcript().entries().filter(|e| matches!(e, Entry::Model { .. })).count();
+    assert_eq!(lines, 1, "the line is replaced, not added to");
+}
+
+#[test]
+fn an_effort_refused_in_the_stream_corrects_the_line_even_if_the_retry_fails() {
+    let failed = json!({"type": "response.failed", "response": {"status": "failed", "error": {"code": "unsupported_value", "param": "reasoning.effort", "message": "no"}}});
+    let first = Reply::sse(&[json!({"type": "response.created", "response": {"model": "gpt-6-luna"}}), failed]);
+    let mut c = listing(real_list(), vec![first, refusal(400, "bad_request", "No.")]);
+    c.ask("Hello");
+    assert_eq!(c.bodies().len(), 2);
+    assert!(c.error().is_some());
+    assert_eq!(model_line(&c), Some(("GPT-6-Luna".to_string(), None, false)));
+}
+
+#[test]
+fn a_list_with_nothing_usable_is_read_again_next_turn() {
+    let mut c = listing(Reply::json(200, &json!({})), vec![says("Hi.")]);
+    c.ask("Hello");
+    assert!(c.error().unwrap().contains("offers no model"), "{:?}", c.error());
+    *c.script.models.lock().unwrap() = Some(real_list());
+    c.ask("Again");
+    assert_eq!(c.error(), None);
+    assert_eq!(c.bodies()[0]["model"], "gpt-6-luna");
+    assert_eq!(c.server.to("/v1/models").len(), 2);
+}
+
+#[test]
+fn a_refused_effort_stays_left_out_until_the_model_changes() {
+    let mut c = listing(real_list(), vec![effort_refused(), says("Hi."), says("Again."), says("Other.")]);
+    c.ask("Hello");
+    c.ask("Again");
+    assert_eq!(c.bodies()[2]["reasoning"], json!({"summary": "auto"}), "the next turn doesn't ask again");
+    assert_eq!(notes(&c), Vec::<String>::new());
+    assert_eq!(model_line(&c).map(|l| l.1), Some(None), "and doesn't show what it didn't ask for");
+    c.assistant.choose(Some("gpt-6.1-sol".into()), None);
+    c.ask("Other");
+    assert_eq!(c.bodies()[3]["reasoning"]["effort"], "medium", "another model may take it");
+}
+
+#[test]
+fn a_chosen_model_that_left_the_list_falls_back_and_the_pane_says_so() {
+    let mut c = listing(real_list(), vec![says("Hi.")]);
+    c.assistant.choose(Some("gpt-gone".into()), None);
+    c.ask("Hello");
+    assert_eq!(c.bodies()[0]["model"], "gpt-6-luna");
+    assert!(notes(&c).iter().any(|n| n.contains("gpt-gone") && n.contains("GPT-6-Luna")), "{:?}", notes(&c));
+}
+
+#[test]
+fn a_chosen_model_the_conversations_list_lacks_reads_the_list_again() {
+    let mut c = listing(real_list(), vec![says("Hi."), says("Again."), says("Third.")]);
+    c.ask("Hello");
+    // Another account signed in, or the plan changed: the pane's list has what this one doesn't.
+    *c.script.models.lock().unwrap() = Some(Reply::json(200, &json!({"models": [{"slug": "gpt-new", "supported_reasoning_levels": ["max"]}]})));
+    c.assistant.choose(Some("gpt-new".into()), Some("max".into()));
+    c.ask("Again");
+    assert_eq!((&c.bodies()[1]["model"], &c.bodies()[1]["reasoning"]["effort"]), (&json!("gpt-new"), &json!("max")));
+    assert_eq!(notes(&c), Vec::<String>::new());
+    assert_eq!(c.server.to("/v1/models").len(), 2);
+    c.ask("Third");
+    assert_eq!(c.server.to("/v1/models").len(), 2, "not while it has the model");
+}
+
+#[test]
+fn a_chosen_effort_the_model_lacks_falls_back_and_the_pane_says_so() {
+    let mut c = listing(real_list(), vec![says("Hi.")]);
+    c.assistant.choose(None, Some("ultra".into()));
+    c.ask("Hello");
+    assert_eq!(c.bodies()[0]["reasoning"]["effort"], "medium");
+    assert!(notes(&c).iter().any(|n| n.contains("ultra") && n.contains("medium")), "{:?}", notes(&c));
+}
+
+#[test]
+fn a_chosen_model_and_effort_reach_the_next_request_with_the_history_intact() {
+    let mut c = listing(real_list(), vec![says("First."), says("Second."), says("Third.")]);
+    c.ask("One");
+    assert_eq!((&c.bodies()[0]["model"], &c.bodies()[0]["reasoning"]["effort"]), (&json!("gpt-6-luna"), &json!("medium")));
+    c.assistant.choose(Some("gpt-6.1-sol".into()), Some("ultra".into()));
+    c.ask("Two");
+    let second = &c.bodies()[1];
+    assert_eq!((&second["model"], &second["reasoning"]["effort"]), (&json!("gpt-6.1-sol"), &json!("ultra")));
+    assert_eq!(second["input"], json!([user("One"), assistant("First."), user("Two")]));
+    // Back to the default: the same conversation goes on.
+    c.assistant.choose(None, None);
+    c.ask("Three");
+    let third = &c.bodies()[2];
+    assert_eq!((&third["model"], &third["reasoning"]["effort"]), (&json!("gpt-6-luna"), &json!("medium")));
+    assert_eq!(third["input"], json!([user("One"), assistant("First."), user("Two"), assistant("Second."), user("Three")]));
+    assert_eq!(c.server.to("/v1/models").len(), 1, "the list is read once a conversation");
+}
+
+#[test]
+fn a_list_that_cant_be_read_doesnt_stop_a_turn_with_a_choice() {
+    let mut c = listing(Reply::json(500, &json!({"error": "down"})), vec![says_it_ran("gpt-saved", None)]);
+    c.ask("Nothing chosen");
+    assert!(c.error().unwrap().contains("couldn't be listed"), "{:?}", c.error());
+    c.assistant.choose(Some("gpt-saved".into()), Some("high".into()));
+    c.ask("Hello");
+    assert_eq!(c.error(), None);
+    assert_eq!(c.bodies()[0]["model"], "gpt-saved");
+    assert_eq!(c.bodies()[0]["reasoning"]["effort"], "high");
+    // With no choice of level, the level the pane says will run.
+    c.assistant.choose(Some("gpt-saved".into()), None);
+    c.ask("Again");
+    assert_eq!(c.bodies()[1]["reasoning"]["effort"], "medium");
+    assert_eq!(model_line(&c).map(|l| l.0), Some("gpt-saved".to_string()));
 }

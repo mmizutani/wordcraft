@@ -21,7 +21,9 @@
 //! permission request: the pane asks it in a turn the person asked for, such as one started with
 //! `{"run": "assist.ask", "params": {"prompt": …}}`, and answers it per `assist.allowUnattended`
 //! in a program's: one from `engine.execute`, or typed with `ui.text` and sent with `ui.key`,
-//! which the window doesn't take as the person's). `{"run": id, "params": {…}}` runs command `id`
+//! which the window doesn't take as the person's), or `{"emit": event}` (a
+//! `wordcraft_assist::Event` as it is, such as `{"event": "model", "name": …, "effort": …, "asked": false}`).
+//! `{"run": id, "params": {…}}` runs command `id`
 //! as the person's own click does (`WordApp::run`), for what a script may not do, such as
 //! signing in to ChatGPT (`assist.chatgpt.signIn`, #19; no browser opens here).
 //! `{"settingsDir": "/abs/dir"}` gives the window a settings folder (the agents' settings in
@@ -255,8 +257,10 @@ fn scripted_assistant(turns: &[serde_json::Value]) -> Result<wordcraft_assist::F
             Step::Emit(wordcraft_assist::Event::Usage(usage))
         } else if s.get("hold").is_some() {
             Step::Hold
+        } else if let Some(event) = s.get("emit") {
+            Step::Emit(serde_json::from_value(event.clone()).map_err(|e| format!("an emit step: {e}"))?)
         } else {
-            return Err(format!("an assistScript step is say, think, tool, plan, ask or hold: {s}"));
+            return Err(format!("an assistScript step is say, think, tool, plan, ask, hold or emit: {s}"));
         })
     };
     turns.iter().try_fold(wordcraft_assist::Fake::new(), |fake, turn| {
