@@ -1410,6 +1410,15 @@ mod final_text {
     }
 
     #[test]
+    fn a_tab_reads_as_the_space_the_model_was_given() {
+        let s = Session::new(Document::from_text("one\ttwo\nthird"));
+        assert!(final_text(&s.doc).contains("one two"), "{}", final_text(&s.doc));
+        let (a, b) = find_in_final(&s.doc, "one two").expect("found");
+        assert_eq!((a.off, b.off), (0, 7));
+        assert!(find_in_final(&s.doc, "one\ttwo").is_some(), "as the document has it too");
+    }
+
+    #[test]
     fn a_citation_of_a_field_s_result_finds_what_it_verified() {
         let mut s = Session::new(Document::from_text("Before after"));
         let field = wordcraft_doc::para::InlineObject::Field {

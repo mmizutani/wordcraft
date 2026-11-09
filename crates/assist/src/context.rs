@@ -245,13 +245,18 @@ struct Focus {
     selection_cut: bool,
 }
 
+/// `words` as [`final_text`] reads: a model is given a tab or a line break in a paragraph as a space.
+pub fn flat(words: &str) -> String {
+    words.chars().map(flat_char).collect()
+}
+
 /// `doc`'s body as it reads with tracked deletions left out, a line for each paragraph: what a turn
 /// gives the model, and so what its citations can quote.
 pub fn final_text(doc: &Document) -> String {
     let mut text = String::new();
     for path in doc.para_paths(StoryRef::Body) {
         if let Some(p) = doc.para(StoryRef::Body, &path) {
-            text.extend(final_chars(p, 0, p.text.len()));
+            text.extend(final_chars(p, 0, p.text.len()).map(flat_char));
         }
         text.push('\n');
     }
@@ -261,9 +266,10 @@ pub fn final_text(doc: &Document) -> String {
 /// Where `words` are in the body as it reads with tracked deletions left out: from where the first
 /// of them is to where the last ends, across anything deleted between them.
 pub fn find_in_final(doc: &Document, words: &str) -> Option<(Pos, Pos)> {
-    if words.is_empty() || words.contains('\n') {
+    if words.is_empty() {
         return None;
     }
+    let words = flat(words);
     for path in doc.para_paths(StoryRef::Body) {
         let Some(p) = doc.para(StoryRef::Body, &path) else { continue };
         let mut text = String::new();
@@ -280,20 +286,15 @@ pub fn find_in_final(doc: &Document, words: &str) -> Option<(Pos, Pos)> {
                 if props.del.is_some() {
                     continue;
                 }
-                let bytes = match &result {
-                    Some(result) => {
-                        text.push_str(result);
-                        result.len()
-                    }
-                    None => {
-                        text.push(c);
-                        c.len_utf8()
-                    }
-                };
-                from.extend(std::iter::repeat_n(at, bytes));
+                let before = text.len();
+                match &result {
+                    Some(result) => text.extend(result.chars().map(flat_char)),
+                    None => text.push(flat_char(c)),
+                }
+                from.extend(std::iter::repeat_n(at, text.len().saturating_sub(before)));
             }
         }
-        let Some(at) = text.find(words) else { continue };
+        let Some(at) = text.find(&words) else { continue };
         let last = at.saturating_add(words.len()).saturating_sub(1);
         let (Some(&start), Some(&end)) = (from.get(at), from.get(last)) else { continue };
         let end_char = p.text.get(end..).and_then(|t| t.chars().next()).map_or(1, char::len_utf8);

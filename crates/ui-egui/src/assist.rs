@@ -380,7 +380,8 @@ pub(crate) fn cited(app: &mut WordApp, words: &str) -> Cited {
     if let Some(found) = app.assist.cited.as_ref().and_then(|held| held.found.get(words)) {
         return found.clone();
     }
-    let in_document = !words.contains('\n') && app.assist.cited.as_ref().is_some_and(|held| held.text.contains(words));
+    let flat = wordcraft_assist::context::flat(words);
+    let in_document = app.assist.cited.as_ref().is_some_and(|held| held.text.contains(&flat));
     let found = if in_document {
         Cited::Document
     } else {
