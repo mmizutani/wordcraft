@@ -226,6 +226,11 @@ impl Assistant {
         self.ended
     }
 
+    /// The preferences the conversation's answers marked since the last call.
+    pub fn take_used(&mut self) -> Vec<String> {
+        self.transcript.take_used()
+    }
+
     /// What the next turns carry of what the person kept ([`crate::memory::Memory::for_model`]).
     pub fn set_memory(&mut self, memory: Option<String>) {
         self.memory = memory;

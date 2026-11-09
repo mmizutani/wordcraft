@@ -468,6 +468,8 @@ fn the_memory_commands_check_what_they_are_given() {
     let mut s = in_window();
     s.run("assist.memory.add", &json!({"text": "  Use numbered lists. "})).unwrap();
     assert_eq!(requests(&mut s), [json!({"assist": "memory.add", "text": "Use numbered lists."})]);
+    s.run("assist.memory.keep", &json!({"id": "m1"})).unwrap();
+    assert_eq!(requests(&mut s), [json!({"assist": "memory.keep", "id": "m1"})]);
     s.run("assist.memory.edit", &json!({"id": "m1", "off": true})).unwrap();
     assert_eq!(requests(&mut s), [json!({"assist": "memory.edit", "id": "m1", "text": null, "off": true})]);
     for (id, bad) in [
@@ -482,6 +484,8 @@ fn the_memory_commands_check_what_they_are_given() {
         ("assist.memory.enabled", json!({"value": "on"})),
         ("assist.memory.keep", json!({})),
         ("assist.memory.keep", json!({"proposal": 0})),
+        ("assist.memory.keep", json!({"id": 5})),
+        ("assist.memory.keep", json!({"id": "x".repeat(21)})),
         ("assist.memory.keep", json!({"proposal": 1, "text": "x".repeat(281)})),
         ("assist.memory.dismiss", json!({"proposal": "one"})),
     ] {

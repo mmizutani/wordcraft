@@ -186,7 +186,8 @@ fn a_control_click_on_add_stores_nothing() {
     use egui_kittest::kittest::Queryable;
     let folder = Folder::new();
     let mut a = window(&folder);
-    a.run("file.options", json!({"pane": "assistant"})).unwrap();
+    a.session.view.assistant_pane = true;
+    a.assist.view = crate::assist::PaneView::Details;
     a.assist.memory.new = "Planted.".into();
     let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 1600.0)).build_ui_state(
         |ui, app: &mut WordApp| {
@@ -412,4 +413,222 @@ fn editing_one_of_two_cards_stays_open() {
         assert_eq!(h.state().assist.memory.editing_proposal, Some((editing, "Mine.".to_string())), "editing {editing}");
         assert!(h.query_by_label("Cancel").is_some(), "editing {editing}");
     }
+}
+
+/// A window whose conversation's first turn marks preference `m1`, kept beforehand, and rewrites
+/// "two" as a tracked change.
+fn marked_turn(folder: &Folder, marks: bool) -> WordApp {
+    Memory::update(&folder.0, |m| m.add("Use digits.", "2026-11-09T10:00:00Z")).unwrap();
+    let mut a = window(folder);
+    let id = Memory::load(&folder.0).items.iter().find(|i| i.text == "Use digits.").unwrap().id.clone();
+    let say = if marks { format!("Rewriting[[used: {id}]].") } else { "Rewriting.".to_string() };
+    let steps = vec![Step::say(&say), Step::tool("select_text", json!({"text": "two"})), Step::tool("type_text", json!({"text": "2"}))];
+    a.assist_with(Box::new(Fake::new().then(steps)));
+    a.run("assist.ask", json!({"prompt": "Use digits"})).unwrap();
+    settle(&mut a);
+    a
+}
+
+#[test]
+fn a_marked_turn_s_changes_count_when_the_person_resolves_them() {
+    let folder = Folder::new();
+    let mut a = marked_turn(&folder, true);
+    let item = &Memory::load(&folder.0).items[0];
+    assert_eq!(item.used, 1);
+    assert!(item.last_used.is_some());
+    assert_eq!((item.accepted, item.rejected), (0, 0), "nothing is resolved yet");
+
+    a.run("select.text", json!({"text": "2"})).unwrap();
+    a.run("review.accept", json!({"author": "Test Assistant", "kind": "insert"})).unwrap();
+    settle(&mut a);
+    assert_eq!(Memory::load(&folder.0).items[0].accepted, 1);
+    a.run("review.rejectAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    let item = &Memory::load(&folder.0).items[0];
+    assert_eq!((item.used, item.accepted, item.rejected), (1, 1, 1));
+}
+
+#[test]
+fn a_turn_that_marks_nothing_counts_nothing() {
+    let folder = Folder::new();
+    let mut a = marked_turn(&folder, false);
+    a.run("review.rejectAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    let item = &Memory::load(&folder.0).items[0];
+    assert_eq!((item.used, item.accepted, item.rejected), (0, 0, 0));
+}
+
+/// Another participant's decisions and a script's aren't the person's.
+#[test]
+fn only_the_person_s_decisions_count() {
+    let folder = Folder::new();
+    let mut a = marked_turn(&folder, true);
+    a.execute("review.rejectAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    assert_eq!(Memory::load(&folder.0).items[0].rejected, 0, "a script's");
+
+    let folder = Folder::new();
+    let mut a = marked_turn(&folder, true);
+    let room = a.shared_room().unwrap();
+    let (_, key) = room.invite_numbered("Colleague", wordcraft_engine::room::Role::Editor).unwrap();
+    let mut colleague = room.join_with(&key).unwrap();
+    colleague.run("review.rejectAll", &json!({"author": "Test Assistant"})).unwrap();
+    colleague.send();
+    settle(&mut a);
+    assert_eq!(Memory::load(&folder.0).items[0].rejected, 0, "another participant's");
+}
+
+#[test]
+fn what_a_turn_sent_is_in_its_details_with_what_a_chip_marked() {
+    let folder = Folder::new();
+    Memory::update(&folder.0, |m| m.add("Keep it short.", "2026-11-09T09:00:00Z")).unwrap();
+    let a = marked_turn(&folder, true);
+    let details = a.conversation().unwrap().details();
+    let turn = details.turns.last().unwrap();
+    let marked = Memory::load(&folder.0).items.iter().find(|i| i.text == "Use digits.").unwrap().id.clone();
+    assert_eq!(marked, "m2", "kept second");
+    assert_eq!(turn.used, [marked]);
+    let sent = turn.context.as_ref().unwrap();
+    assert_eq!(sent.memory.len(), 2);
+    assert_eq!(sent.memory_left_out, 0);
+    assert!(!sent.at.is_empty());
+}
+
+#[test]
+fn what_didn_t_fit_is_counted_in_a_turn_s_details() {
+    let folder = Folder::new();
+    Memory::update(&folder.0, |m| {
+        for n in 0..40 {
+            m.add(&format!("{n} {}", "x".repeat(270)), "2026-11-09T09:00:00Z")?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let mut a = window(&folder);
+    a.assist_with(Box::new(Fake::new()));
+    a.run("assist.ask", json!({"prompt": "Hello"})).unwrap();
+    settle(&mut a);
+    let details = a.conversation().unwrap().details();
+    let sent = details.turns.last().unwrap().context.clone().unwrap();
+    assert!(sent.memory_left_out > 0 && !sent.memory.is_empty(), "{sent:?}");
+    assert_eq!(sent.memory.len() as u32 + sent.memory_left_out, 40);
+}
+
+/// A window with one preference waiting for an answer.
+#[cfg(not(target_arch = "wasm32"))]
+fn asking(folder: &Folder) -> egui_kittest::Harness<'static, WordApp> {
+    Memory::update(&folder.0, |m| {
+        m.add("Use digits.", "2026-11-09T10:00:00Z")?;
+        m.items[0].rejected = 3;
+        m.items[0].accepted = 2;
+        Ok(())
+    })
+    .unwrap();
+    let mut a = window(folder);
+    a.session.view.assistant_pane = true;
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 1200.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    h
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_pane_asks_and_keep_starts_the_counts_again() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let mut h = asking(&folder);
+    assert!(h.query_by_label_contains("You rejected 3 changes").is_some(), "after a restart, with no conversation");
+
+    control_click(&mut h, "Keep");
+    assert_eq!(Memory::load(&folder.0).items[0].rejected, 3, "the control channel's click");
+    assert_eq!(h.state_mut().execute("assist.memory.keep", json!({"id": "m1"})), Err(YOURS.to_string()));
+    h.state_mut().assist.by_person = true;
+    h.state_mut().handle_request(&json!({"assist": "memory.keep", "id": "m1"}));
+    h.state_mut().assist.by_person = false;
+    assert_eq!(Memory::load(&folder.0).items[0].rejected, 3, "a macro's step");
+
+    h.get_by_label("Keep").click();
+    h.run_steps(3);
+    let item = &Memory::load(&folder.0).items[0];
+    assert_eq!((item.text.as_str(), item.accepted, item.rejected), ("Use digits.", 0, 0));
+    assert!(h.query_by_label_contains("You rejected").is_none(), "answered");
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_pane_asks_and_remove_takes_it_out() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let mut h = asking(&folder);
+    control_click(&mut h, "Remove");
+    assert_eq!(Memory::load(&folder.0).items.len(), 1, "the control channel's click");
+    h.get_by_label("Remove").click();
+    h.run_steps(3);
+    assert!(Memory::load(&folder.0).items.is_empty());
+    assert!(h.query_by_label_contains("You rejected").is_none(), "answered");
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn nothing_changes_until_the_person_answers() {
+    let folder = Folder::new();
+    let mut h = asking(&folder);
+    h.run_steps(10);
+    let m = Memory::load(&folder.0);
+    assert!(!m.items[0].off && m.items[0].asks());
+    assert_eq!(m.for_model().sent, ["m1"], "it stays in force");
+}
+
+/// The chip is in the answer, and goes to the list in Details.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_chip_shows_in_the_answer_and_goes_to_details() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let mut a = marked_turn(&folder, true);
+    a.session.view.assistant_pane = true;
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 1200.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    assert!(h.query_by_label_contains("[[used").is_none());
+    h.get_by_label("M1").click();
+    h.run_steps(3);
+    assert_eq!(h.state().assist.view, crate::assist::PaneView::Details);
+    assert!(h.query_by_label("M1").is_some(), "its row in Memory");
+    assert!(h.query_all_by_label("Use digits.").next().is_some());
+    assert!(h.query_by_label("Add").is_some(), "the list came with it");
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_options_page_says_where_the_list_went() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    Memory::update(&folder.0, |m| m.add("Use digits.", "2026-11-09T10:00:00Z")).unwrap();
+    let mut a = window(&folder);
+    a.run("file.options", json!({"pane": "assistant"})).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 1600.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    assert!(h.query_by_label_contains("under Details › Memory").is_some());
+    assert!(h.query_by_label("Use digits.").is_none());
 }

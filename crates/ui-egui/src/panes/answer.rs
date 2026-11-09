@@ -3,13 +3,14 @@
 //! of its own in the flow of the text, reachable by keyboard and named by its words, and says
 //! where it goes: words can say anything. A citation is a numbered chip that selects the words it
 //! cites, and shows only when those words are really in the document or an attached source, so a
-//! made-up one can't look real.
+//! made-up one can't look real. A preference's chip says which of the person's preferences shaped
+//! what it follows ([`wordcraft_assist::memory`]), and goes to the list in Details.
 
 use std::sync::Arc;
 
 use egui::cache::{ComputerMut, FrameCache};
 use egui::{RichText, Stroke, Ui};
-use wordcraft_assist::answer::{Block, Formatted, Span, format, opens};
+use wordcraft_assist::answer::{Block, Formatted, Span, UsedChip, format, opens};
 
 use super::{Tokens, WordApp, semibold};
 use crate::assist::{Cited, cited};
@@ -85,6 +86,7 @@ fn inline(app: &mut WordApp, ui: &mut Ui, t: &Tokens, spans: &[Span], size: f32,
     if let [only] = spans
         && only.link.is_none()
         && only.cite.is_none()
+        && only.used.is_none()
     {
         ui.add(egui::Label::new(rich(only, t, size)).wrap());
         return;
@@ -94,6 +96,10 @@ fn inline(app: &mut WordApp, ui: &mut Ui, t: &Tokens, spans: &[Span], size: f32,
         for (i, span) in spans.iter().enumerate() {
             if let Some(cite) = span.cite {
                 chips.draw(app, ui, cite);
+                continue;
+            }
+            if let Some(used) = &span.used {
+                used_chip(app, ui, t, used);
                 continue;
             }
             match &span.link {
@@ -147,6 +153,21 @@ impl Chips<'_> {
                 _ => select_cited(app, words),
             }
         }
+    }
+}
+
+/// A preference's chip: its words on hover, and a click shows it in Details › Memory.
+fn used_chip(app: &mut WordApp, ui: &mut Ui, t: &Tokens, used: &UsedChip) {
+    let words = RichText::new(crate::assist::memory::chip_label(used.number)).small().color(t.accent);
+    let mut chip = ui.small_button(words);
+    if chip.hovered()
+        && let Some(said) = app.conversation().and_then(|a| a.transcript().sent_preference(&used.id).map(str::to_string))
+    {
+        chip = chip.on_hover_text(said);
+    }
+    if chip.clicked() {
+        app.assist.view = crate::assist::PaneView::Details;
+        app.assist.memory.show_list = true;
     }
 }
 

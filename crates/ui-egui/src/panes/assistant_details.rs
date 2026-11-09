@@ -24,6 +24,13 @@ pub(super) fn details(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
         section(ui, "Sources", |ui| sources(app, ui, t, &details));
         section(ui, "Output", |ui| output(app, ui, t, &details));
         section(ui, "Properties", |ui| properties(app, ui, t, &details));
+        if crate::assist::desktop(app) {
+            // A chip's click comes here.
+            if std::mem::take(&mut app.assist.memory.show_list) {
+                ui.scroll_to_cursor(Some(egui::Align::TOP));
+            }
+            section(ui, "Memory", |ui| memory(app, ui, t, &details));
+        }
     });
 }
 
@@ -292,6 +299,20 @@ fn show(app: &mut WordApp, range: &serde_json::Value, review: bool) {
     if select(app, range) && review {
         let _ = app.run("ui.tab", json!({"tab": "Review"}));
     }
+}
+
+/// What each turn sent of what the person kept, newest first, and the list itself.
+fn memory(app: &mut WordApp, ui: &mut Ui, t: &Tokens, details: &Details) {
+    let turns =
+        details.turns.iter().rev().filter_map(|turn| Some((turn, turn.context.as_ref().filter(|s| !s.memory.is_empty() || s.memory_left_out > 0)?)));
+    for (n, (turn, sent)) in turns.enumerate() {
+        if let Some(asked) = &turn.asked {
+            wrapped(ui, RichText::new(asked).small().color(t.text_dim));
+        }
+        ui.push_id(("memory turn", n), |ui| crate::assist::memory::turn(ui, t, sent, &turn.used, n == 0));
+        ui.add_space(4.0);
+    }
+    crate::assist::memory::page(app, ui, t);
 }
 
 fn row(ui: &mut Ui, t: &Tokens, step: &DetailStep) {
