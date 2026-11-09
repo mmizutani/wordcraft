@@ -316,6 +316,24 @@ fn a_long_comment_is_read_only_as_far_as_its_row_shows() {
 }
 
 #[test]
+fn a_change_whose_paragraph_joined_another_says_only_that_it_was_resolved() {
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Join");
+    s.run("caret.docEnd", &json!({})).unwrap();
+    s.run("text.insert", &json!({"text": " extra"})).unwrap();
+    let end = |path: usize, off: usize| json!({"story": "body", "path": [path], "off": off});
+    s.run("select.range", &json!({"anchor": end(0, 13), "focus": end(1, 0)})).unwrap();
+    s.run("text.delete", &json!({})).unwrap();
+    note(&mut t, &s);
+    s.run("review.acceptAll", &json!({"author": AUTHOR})).unwrap();
+    note(&mut t, &s);
+    assert_eq!(s.doc.plain_text(wordcraft_doc::StoryRef::Body), "one two threefour five six extra");
+    let row = listed(&t).into_iter().find(|r| r.1 == " extra");
+    assert_eq!(row.map(|r| r.2), Some(OutputState::Resolved), "{:?}", listed(&t));
+}
+
+#[test]
 fn a_change_across_paragraphs_says_only_that_it_was_resolved() {
     let mut s = session();
     let mut t = Transcript::default();

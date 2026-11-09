@@ -431,9 +431,13 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool, which: Which) -> CmdRe
         let to = if path == b.path { b.off } else { len };
         // A paragraph's mark is in the selection when the selection goes on past it.
         let mark = path != b.path || caret_mark.as_ref() == Some(&path);
-        let props = (ranged && (path != b.path || to > from)) || caret_props.as_ref() == Some(&path);
+        // One reviewer's row is the text it names: a paragraph's own change only when that is all
+        // of it, and a table's, a row's or a cell's has a row of its own at the caret.
+        let all = matches!(which, Which::All);
+        let touched = if all { path != b.path || to > from } else { from == 0 && to == len && len > 0 };
+        let props = (ranged && touched) || caret_props.as_ref() == Some(&path);
         resolve_para(s, a.story, &path, (from, to), (mark, props), accept, which)?;
-        if ranged {
+        if ranged && all {
             resolve_cell(s, a.story, &path, accept, which)?;
         }
     }
@@ -699,15 +703,15 @@ pub fn change_rows(s: &Session, author: &str, most: usize) -> (Vec<ChangeRow>, u
             // `changes_in` joins a formatting change's own pieces: neighbours are others.
             let joins = before.as_ref().is_some_and(|(kind, r, start, end)| {
                 *kind == c.kind
-                    && *end == c.a
                     && if c.kind == "format" {
-                        // A table's, a row's and a cell's changes share a caret, and Accept or
-                        // Reject there takes them all, so they are one row.
-                        *start == c.a && c.a == c.b
+                        // Accept or Reject over one place takes all its changes, so they are one row:
+                        // a table's, a row's and a cell's at a caret, or a paragraph's and all its text.
+                        *start == c.a && *end == c.b
                     } else {
-                        *r == rev
+                        *r == rev && *end == c.a
                     }
             });
+            let same_words = joins && c.kind == "format";
             before = Some((c.kind, rev, c.a.clone(), c.b.clone()));
             if !joins {
                 omitted = rows.len() >= most;
@@ -722,7 +726,7 @@ pub fn change_rows(s: &Session, author: &str, most: usize) -> (Vec<ChangeRow>, u
             }
             let Some(row) = rows.last_mut() else { continue };
             row.b = c.b.clone();
-            if c.a.path == c.b.path {
+            if c.a.path == c.b.path && !same_words {
                 let piece = s.doc.para(c.a.story, &c.a.path).and_then(|p| p.text.get(c.a.off..c.b.off)).unwrap_or_default();
                 let room = ROW_TEXT_CHARS.saturating_sub(row.text.chars().count());
                 row.text.extend(piece.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(room));
