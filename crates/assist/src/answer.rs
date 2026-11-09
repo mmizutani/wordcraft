@@ -108,22 +108,18 @@ pub fn citations(text: &str) -> Vec<String> {
 /// `text` with each citation's marker, `[[cite: "the exact words"]]`, as an index between two
 /// [`CITE`]s, and the words. A marker not closed yet is held back while the answer is `streaming`,
 /// and stays as text once it isn't: it was no marker. So does one too long to be a citation. Each
-/// marker is looked at only as far as the longest it can be, and a text of markers that are none
-/// stops being looked through: an answer is read over again as it arrives.
+/// marker is looked at only as far as the longest it can be: answers are read over again as they
+/// arrive, and a text of false markers mustn't cost its length for each of them.
 fn with_cites(text: &str, streaming: bool) -> (Cow<'_, str>, Vec<String>) {
     const OPEN: &str = "[[cite:";
     const CLOSE: &str = "\"]]";
-    /// Markers that are none before the rest is taken for plain text.
-    const MOST_FALSE: usize = 256;
     if !text.contains(OPEN) {
         return (Cow::Borrowed(text), Vec::new());
     }
     let mut out = String::with_capacity(text.len());
     let mut words = Vec::new();
     let mut rest = text;
-    let mut false_markers = 0usize;
-    while false_markers < MOST_FALSE {
-        let Some(at) = rest.find(OPEN) else { break };
+    while let Some(at) = rest.find(OPEN) {
         let after = rest.get(at.saturating_add(OPEN.len())..).unwrap_or_default();
         out.push_str(rest.get(..at).unwrap_or_default());
         let quoted = after.trim_start_matches(' ').strip_prefix('"');
@@ -150,7 +146,6 @@ fn with_cites(text: &str, streaming: bool) -> (Cow<'_, str>, Vec<String>) {
             _ => {
                 out.push_str(OPEN);
                 rest = after;
-                false_markers = false_markers.saturating_add(1);
             }
         }
     }

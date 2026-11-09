@@ -2033,6 +2033,8 @@ fn a_source_replaced_by_another_leaves_no_chip_for_words_it_alone_had() {
     h.run_steps(2);
     assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "1").is_some());
     h.state_mut().execute("assist.knowledge", json!({"remove": 0})).unwrap();
+    h.run_steps(2);
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "1").is_none(), "its source is gone");
     h.state_mut().execute("assist.knowledge", json!({"add": new.to_string_lossy()})).unwrap();
     sources_read(h.state_mut());
     h.run_steps(2);

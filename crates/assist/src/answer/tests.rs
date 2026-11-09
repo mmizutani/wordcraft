@@ -362,6 +362,7 @@ fn a_marker_past_the_read_limit_or_across_it_is_still_a_marker() {
 
 #[test]
 fn markers_that_are_none_can_t_cost_more_than_a_frame() {
+    // Each marker is looked at only as far as the longest it can be.
     let many = "[[cite:\"".repeat(32 << 10);
     let at = Instant::now();
     let f = format(&many, false);
