@@ -191,6 +191,11 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
             if wordcraft_engine::cmd::assist::person_only(id) {
                 return err(if id.starts_with("assist.memory.") { crate::assist::memory::YOURS } else { crate::assist::chatgpt::YOURS });
             }
+            // The choice is the window's assistant's, not a document's: the window answers it, and
+            // queued for a window showing this document it would report a change it hadn't made.
+            if matches!(id, "assist.model" | "assist.effort") {
+                return err(format!("`{id}` is for the window's assistant, not a document: send it without `doc`"));
+            }
             // Close, with the same guard as the window's: unsaved changes need `force`. Closing
             // the shared document stops sharing first, and checks what the room took last.
             if id == "file.close" {

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::room::Role;
@@ -93,11 +95,38 @@ pub struct AssistantPrefs {
     /// requests are refused, and each answer is logged.
     #[serde(deserialize_with = "lenient_flag")]
     pub allow_unattended: bool,
+    /// The model and reasoning effort the person chose, one choice per backend id
+    /// (`assist.model`, `assist.effort`). The window copies the entry into each turn. An entry
+    /// that no longer resolves stays: the pane says what ran instead.
+    #[serde(deserialize_with = "lenient_models", skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, ModelChoice>,
 }
+
+/// The model and reasoning effort a person chose for one backend; `None`: its default.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelChoice {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+impl ModelChoice {
+    /// Most backends a saved file keeps a choice for.
+    const MAX_SAVED: usize = 64;
+
+    /// Whether `value` can name a backend, a model or a level: not empty, at most
+    /// [`MAX_CHOICE_CHARS`] characters, no control characters.
+    pub fn valid(value: &str) -> bool {
+        !value.trim().is_empty() && value.chars().count() <= MAX_CHOICE_CHARS && !value.chars().any(char::is_control)
+    }
+}
+
+/// Longest id of a backend, a model or a level taken, in characters.
+pub const MAX_CHOICE_CHARS: usize = 128;
 
 impl Default for AssistantPrefs {
     fn default() -> Self {
-        AssistantPrefs { default_role: Role::Suggester, allow_unattended: false }
+        AssistantPrefs { default_role: Role::Suggester, allow_unattended: false, models: BTreeMap::new() }
     }
 }
 
@@ -128,6 +157,20 @@ impl AssistantPrefs {
 fn lenient_assistant<'de, D: serde::Deserializer<'de>>(d: D) -> Result<AssistantPrefs, D::Error> {
     let value = serde_json::Value::deserialize(d)?;
     Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// The saved choices, junk left out: a value that is damaged reads as no choice, and an entry
+/// that isn't a choice is dropped, without discarding the rest.
+fn lenient_models<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, ModelChoice>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let entries = value.as_object().into_iter().flatten();
+    let saved =
+        |v: &serde_json::Value, key: &str| v.get(key).and_then(serde_json::Value::as_str).filter(|s| ModelChoice::valid(s)).map(str::to_string);
+    Ok(entries
+        .filter(|(id, v)| ModelChoice::valid(id) && v.is_object())
+        .map(|(id, v)| (id.clone(), ModelChoice { model: saved(v, "model"), effort: saved(v, "effort") }))
+        .take(ModelChoice::MAX_SAVED)
+        .collect())
 }
 
 /// A saved switch, or off for junk.
@@ -215,6 +258,7 @@ fn lenient_read_page_color<'de, D: serde::Deserializer<'de>>(d: D) -> Result<cra
 #[cfg(test)]
 mod tests {
     use super::{AssistantPrefs, Prefs};
+    use super::{MAX_CHOICE_CHARS, ModelChoice};
     use crate::agent_files::{AgentFiles, AgentFolder};
     use crate::cmd::view::ReadPageColor;
     use crate::room::Role;
@@ -261,6 +305,33 @@ mod tests {
 
     /// Assistants join as suggesters unless the person chose another role; a saved owner, an
     /// unknown role or junk reads as suggester, and keeps the other preferences.
+    #[test]
+    fn the_model_choices_survive_a_save_and_junk_reads_as_no_choice() {
+        let saved: Prefs =
+            serde_json::from_str(r#"{"assistant":{"models":{"chatgpt":{"model":"gpt-x","effort":"high"},"acp:a":{"effort":"low"}}}}"#).unwrap();
+        let again: Prefs = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(again.assistant.models, saved.assistant.models);
+        assert_eq!(saved.assistant.models["chatgpt"], ModelChoice { model: Some("gpt-x".into()), effort: Some("high".into()) });
+        assert_eq!(saved.assistant.models["acp:a"], ModelChoice { model: None, effort: Some("low".into()) });
+        // Damaged: the rest of the preferences stay, and so do the good choices.
+        let long = "m".repeat(MAX_CHOICE_CHARS + 1);
+        let damaged = format!(
+            r#"{{"assistant":{{"defaultRole":"editor","models":{{"chatgpt":{{"model":7,"effort":"two\nlines"}},"junk":3,"":{{"model":"x"}},"good":{{"model":"gpt-y"}},"long":{{"model":"{long}"}}}}}},"checkSpelling":false}}"#
+        );
+        let read: Prefs = serde_json::from_str(&damaged).unwrap();
+        assert_eq!(read.assistant.default_role, Role::Editor);
+        assert!(!read.check_spelling);
+        assert_eq!(read.assistant.models["chatgpt"], ModelChoice::default());
+        assert_eq!(read.assistant.models["good"].model.as_deref(), Some("gpt-y"));
+        assert_eq!(read.assistant.models["long"], ModelChoice::default());
+        assert_eq!(read.assistant.models.len(), 3);
+        let not_a_map: Prefs = serde_json::from_str(r#"{"assistant":{"models":[1,2]}}"#).unwrap();
+        assert!(not_a_map.assistant.models.is_empty());
+        let many: serde_json::Map<String, serde_json::Value> = (0..1000).map(|i| (format!("b{i}"), serde_json::json!({}))).collect();
+        let huge: Prefs = serde_json::from_value(serde_json::json!({"assistant": {"models": many}})).unwrap();
+        assert_eq!(huge.assistant.models.len(), 64);
+    }
+
     #[test]
     fn the_assistant_role_is_suggester_unless_chosen_and_never_owner() {
         assert_eq!(Prefs::default().assistant.default_role(), Role::Suggester);

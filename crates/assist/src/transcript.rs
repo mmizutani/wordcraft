@@ -49,8 +49,10 @@ pub enum Entry {
     /// The model proposes that the person keep a preference ([`crate::memory`]). It carries no
     /// authority: only the person's click on the card stores anything.
     Proposal { id: u64, text: String, answer: Option<ProposalAnswer> },
-    /// Which model answered.
-    Model { name: String },
+    /// Which model answers and at what level ([`Event::Model`]), as it last said.
+    Model { name: String, effort: Option<String>, asked: bool },
+    /// Something the person should know about the turn ([`Event::Note`]).
+    Note { text: String },
     /// The turn stopped other than by finishing its answer.
     Stopped { stop: StopReason },
     /// The turn failed.
@@ -63,9 +65,10 @@ impl Entry {
             Entry::Asked { text }
             | Entry::Answer { text }
             | Entry::Thought { text }
+            | Entry::Note { text }
             | Entry::Proposal { text, .. }
-            | Entry::Model { name: text }
             | Entry::Error { message: text } => text.len(),
+            Entry::Model { name, effort, .. } => name.len() + effort.as_ref().map_or(0, String::len),
             Entry::Tool(t) => t.title.len() + t.detail.len() + t.id.len(),
             Entry::Plan { entries } => entries.iter().map(|e| e.content.len()).sum(),
             Entry::Permission { request, .. } => request.title.len() + request.options.iter().map(|o| o.name.len() + o.id.len()).sum::<usize>(),
@@ -176,11 +179,17 @@ impl Transcript {
                     self.replace(i, Entry::Permission { request, answer: Some(answer.clone()) });
                 }
             }
-            Event::Model { name } => {
-                if !self.in_turn().any(|(_, e)| matches!(e, Entry::Model { name: n } if n == name)) {
-                    self.push(Entry::Model { name: name.clone() });
+            Event::Model { name, effort, asked } => {
+                let line = Entry::Model { name: name.clone(), effort: effort.clone(), asked: *asked };
+                let i = self.in_turn().find(|(_, e)| matches!(e, Entry::Model { .. })).map(|(i, _)| i);
+                match i {
+                    Some(i) => self.replace(i, line),
+                    None => self.push(line),
                 }
             }
+            Event::Note { text } => self.push(Entry::Note { text: text.clone() }),
+            // What is offered isn't part of the conversation: [`crate::Assistant::offered`].
+            Event::Options(_) => {}
             Event::Done { stop } => {
                 if *stop != StopReason::EndTurn {
                     self.push(Entry::Stopped { stop: *stop });
