@@ -713,8 +713,9 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
             wordcraft_assist::offers::make(&id, &host(app))?
         }
     };
-    // Sources belong to their conversation: those attached before the first go with it.
-    if app.assist.conversation.is_some() {
+    // Sources belong to their conversation: those attached since it, for another document, or before
+    // the first, go with the new one.
+    if app.assist.conversation.as_ref().is_some_and(|c| Some(c.document) == app.assist.knowledge_for) {
         app.assist.knowledge.clear();
         app.assist.knowledge_rev = app.assist.knowledge_rev.wrapping_add(1);
         // One still being read would land in this conversation.

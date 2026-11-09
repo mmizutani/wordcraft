@@ -2067,3 +2067,24 @@ fn a_chip_selects_in_the_body_from_wherever_the_caret_is_and_past_a_deletion() {
     let s = &h.state().session;
     assert_eq!((s.sel.anchor.off, s.sel.focus.off), (0, "one obsolete two".len()));
 }
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_source_attached_for_another_document_s_first_turn_reaches_it() {
+    let (dir, path) = source_file("for-b.txt", "words");
+    let mut a = window("document A");
+    a.assist_with(Box::new(Fake::new()));
+    ask(&mut a, "In A", None);
+    settle(&mut a);
+    a.execute("file.new", json!({})).unwrap();
+    a.execute("assist.useDocument", json!({})).unwrap();
+    a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    sources_read(&mut a);
+    let fake = Fake::new();
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "In B", None);
+    settle(&mut a);
+    assert_eq!(seen.lock().unwrap().turns[0].knowledge.first().map(|s| s.name.as_str()), Some("for-b.txt"));
+    let _ = std::fs::remove_dir_all(dir);
+}

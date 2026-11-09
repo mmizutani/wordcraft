@@ -272,18 +272,30 @@ pub(super) fn resolve_all_then(s: &mut Session, v: &Value, accept: bool) -> CmdR
 }
 
 /// Accept or Reject at the selection; with `next`, the next change is selected afterwards; with
-/// `author`, only that reviewer's changes in the selection are resolved.
+/// `author`, only that reviewer's changes in the selection are resolved, and with `kind` too, only
+/// their insertions, deletions or formatting: one text can carry a change of each.
 pub(super) fn resolve_sel_then(s: &mut Session, v: &Value, accept: bool) -> CmdResult {
+    use wordcraft_doc::RevisionKind;
     let next = p::bool(v, "next") == Some(true);
+    let kind = match v.get("kind") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(k)) if k == "insert" => Some(RevisionKind::Insert),
+        Some(Value::String(k)) if k == "delete" => Some(RevisionKind::Delete),
+        Some(Value::String(k)) if k == "format" => Some(RevisionKind::Format),
+        Some(_) => return Err(CmdError::Params("`kind`: insert, delete or format".into())),
+    };
     match v.get("author") {
-        None | Some(Value::Null) => resolve_sel(s, accept, next, Which::All),
+        None | Some(Value::Null) if kind.is_none() => resolve_sel(s, accept, next, Which::All),
         Some(Value::String(author)) if !author.trim().is_empty() => {
             let author = author.trim();
-            let theirs: BTreeSet<u32> =
-                s.doc.revisions.iter().enumerate().filter(|(_, r)| r.author == author).filter_map(|(i, _)| u32::try_from(i).ok()).collect();
+            let revisions = s.doc.revisions.iter().enumerate();
+            let theirs: BTreeSet<u32> = revisions
+                .filter(|(_, r)| r.author == author && kind.is_none_or(|k| r.kind == k))
+                .filter_map(|(i, _)| u32::try_from(i).ok())
+                .collect();
             resolve_sel(s, accept, next, Which::Revisions(&theirs))
         }
-        Some(_) => Err(CmdError::Params("`author` is the name of the reviewer whose changes to resolve".into())),
+        _ => Err(CmdError::Params("`author` is the name of the reviewer whose changes to resolve, and `kind` goes with it".into())),
     }
 }
 
