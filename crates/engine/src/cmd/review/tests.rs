@@ -1396,6 +1396,28 @@ fn an_author_s_table_and_cell_changes_are_one_row_as_one_click_takes_both() {
 }
 
 #[test]
+fn an_author_s_row_for_a_paragraph_mark_takes_the_mark_and_not_the_text_before_it() {
+    use wordcraft_doc::{Path, StoryRef};
+    let mut s = Session::new(wordcraft_doc::Document::from_text("one"));
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    s.author = "Assistant".into();
+    s.run("select.text", &json!({"text": "one"})).unwrap();
+    s.run("format.bold", &json!({})).unwrap();
+    let path = Path::top(0);
+    let change = |s: &Session| s.doc.para(StoryRef::Body, &path).unwrap().run_ranges().find_map(|(_, c)| c.fmt_change.clone());
+    let rev = change(&s).expect("the text's change").rev;
+    s.doc.para_mut(StoryRef::Body, &path).unwrap().mark.fmt_change =
+        Some(Box::new(wordcraft_doc::props::PropChange { rev, old: Default::default() }));
+
+    let rows = super::change_rows(&s, "Assistant", 8).0;
+    assert_eq!(rows.iter().map(|r| (r.a.off, r.b.off)).collect::<Vec<_>>(), [(0, 3), (3, 3)], "{rows:?}");
+    s.run("select.range", &json!({"anchor": super::pos_json(&rows[1].a), "focus": super::pos_json(&rows[1].b)})).unwrap();
+    s.run("review.reject", &json!({"author": "Assistant", "kind": "format"})).unwrap();
+    assert!(s.doc.para(StoryRef::Body, &path).unwrap().mark.fmt_change.is_none(), "the row's mark resolves");
+    assert!(change(&s).is_some(), "the text's change waits still");
+}
+
+#[test]
 fn an_author_s_row_resolves_their_page_setup_change() {
     use wordcraft_doc::{Revision, RevisionKind, StoryRef};
     let mut s = Session::new(wordcraft_doc::Document::from_text("one"));
