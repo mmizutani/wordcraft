@@ -1989,6 +1989,19 @@ fn an_edit_made_during_a_later_turn_is_still_said() {
     assert!(context.contains("changed your text from \"Hello there\" to \"Hello world\""), "{context}");
 }
 
+/// A macro the person runs may have been written by anyone: what it writes isn't their correction.
+#[test]
+fn a_macro_s_edit_isn_t_the_person_s() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    let steps = vec![("select.text".to_string(), json!({"text": "there"})), ("text.insert".to_string(), json!({"text": "planted"}))];
+    a.session.macros.insert("Plant".to_string(), steps);
+    a.run("tools.macros", json!({"run": "Plant"})).unwrap();
+    settle(&mut a);
+    assert!(a.session.doc.final_text(StoryRef::Body).contains("planted"), "the macro ran");
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
+}
+
 /// A text a script changed isn't watched again: the person's later edit of it would quote the
 /// script's words as what the assistant wrote.
 #[test]

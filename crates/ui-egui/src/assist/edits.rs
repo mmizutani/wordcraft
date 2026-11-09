@@ -94,14 +94,15 @@ pub(super) fn review_ended(app: &mut WordApp) {
     read_again(app, false);
 }
 
-/// A command of the window's starts or ended: one that isn't the person's and changed the document
-/// is a script's or an agent's.
+/// A command of the window's is about to run.
 pub(super) fn command_starts(app: &mut WordApp) {
     app.assist.edits.rev_before = app.session.rev();
 }
 
-pub(super) fn command_ended(app: &mut WordApp) {
-    if !app.assist.by_person && app.session.rev() != app.assist.edits.rev_before {
+/// Command `id` ended. One that changed the document counts as a script's unless the person ran it
+/// themselves: a macro the person ran counts too, since anyone may have written it.
+pub(super) fn command_ended(app: &mut WordApp, id: &str) {
+    if (!app.assist.by_person || id == "tools.macros") && app.session.rev() != app.assist.edits.rev_before {
         app.assist.edits.script_changed = true;
     }
 }

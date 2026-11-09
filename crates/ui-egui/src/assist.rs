@@ -240,7 +240,7 @@ pub(crate) fn after_command(app: &mut WordApp, id: &str, r: Result<Value, String
     if decision(id).is_some() {
         edits::review_ended(app);
     } else {
-        edits::command_ended(app);
+        edits::command_ended(app, id);
     }
     if !id.starts_with("assist.") {
         return r;
