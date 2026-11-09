@@ -361,13 +361,12 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool, which: Which) -> CmdRe
     // Moves with an end in the range: their other ends go with them.
     let mut moves = crate::cmd::moves::names_in(s, &a, &b, caret_mark.as_ref());
     if !matches!(which, Which::All) {
-        // An author's own moves: both ends of anyone else's stay as they are.
+        // An author's own moves only, every end of them: a move with an end of anyone else's stays.
         let revisions = &s.doc.revisions;
+        let theirs = |i: usize| u32::try_from(i).is_ok_and(|i| which.has(Some(i)));
         moves.retain(|name| {
-            revisions
-                .iter()
-                .enumerate()
-                .any(|(i, r)| r.move_name.as_deref() == Some(name.as_str()) && u32::try_from(i).is_ok_and(|i| which.has(Some(i))))
+            let mut ends = revisions.iter().enumerate().filter(|(_, r)| r.move_name.as_deref() == Some(name.as_str())).peekable();
+            ends.peek().is_some() && ends.all(|(i, _)| theirs(i))
         });
     }
     for path in s.doc.paths_between(&a, &b).into_iter().rev() {
