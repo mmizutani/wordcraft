@@ -371,8 +371,8 @@ fn markers_that_are_none_can_t_cost_more_than_a_frame() {
     let far = format!("[[cite:\"{}\"]]", "x".repeat(200 << 10));
     assert!(citations(&far).is_empty());
     // Nor as much as a transcript holds, which Details reads each frame.
-    let transcript = format!("{}\"]]", "[[cite:\" ".repeat(400 << 10));
+    let transcript = format!("{}{}\"]]", "[[cite:\" ".repeat(400 << 10), "x".repeat(4 << 10));
     let at = Instant::now();
-    assert!(citations(&transcript).is_empty());
+    assert!(citations(&transcript).is_empty(), "the one close is too far from every marker");
     assert!(at.elapsed() < Duration::from_millis(1500), "{:?}", at.elapsed());
 }
