@@ -70,6 +70,10 @@ pub(super) fn tick(app: &mut WordApp) {
     let seen = room.version();
     let edits = &mut app.assist.edits;
     for call in calls.into_iter().rev() {
+        // Its text is what the assistant wrote only if no one else has changed anything since.
+        if !room.changed_since(call.last).is_some_and(|names| names.iter().all(|who| *who == name)) {
+            continue;
+        }
         let Some(text) = room.text_where_changed(call.first..=call.last, Some(&name), MAX_TEXT) else { continue };
         edits.watched.push_back(Written { first: call.first, last: call.last, text, seen });
         if edits.watched.len() > MAX_WATCHED {

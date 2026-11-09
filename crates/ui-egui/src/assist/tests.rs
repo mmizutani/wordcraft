@@ -1701,6 +1701,38 @@ fn a_script_s_edit_beside_the_person_s_says_nothing() {
     assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
 }
 
+/// What someone else changes before the turn ends isn't what the assistant wrote: that text isn't
+/// watched at all.
+#[test]
+fn a_text_someone_else_changed_during_the_turn_isn_t_watched() {
+    let mut a = window("old");
+    let fake = Fake::new().then(vec![Step::tool("type_text", json!({"text": "Hello there "})), Step::Hold]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.execute("assist.ask", json!({"prompt": "Write"})).unwrap();
+    let room = a.shared_room().unwrap();
+    let ctx = egui::Context::default();
+    for _ in 0..4000 {
+        a.sync_share(&ctx);
+        super::tick(&mut a);
+        if room.document().1.final_text(StoryRef::Body).contains("there") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Editor).unwrap();
+    helper.run("select.text", &json!({"text": "there"})).unwrap();
+    helper.run("text.insert", &json!({"text": "folks"})).unwrap();
+    helper.send();
+    a.execute("assist.cancel", json!({})).unwrap();
+    settle(&mut a);
+    a.run("select.text", json!({"text": "Hello"})).unwrap();
+    a.run("text.insert", json!({"text": "Howdy"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Mine", None);
+    assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
+}
+
 /// A text a script changed isn't watched again: the person's later edit of it would quote the
 /// script's words as what the assistant wrote.
 #[test]
