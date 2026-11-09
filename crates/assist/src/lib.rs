@@ -24,6 +24,8 @@
 //!   turn, which the next turn's context starts with. Nothing of it is stored.
 //! - [`memory`]: what the person keeps for every later conversation with every backend, which
 //!   only their own click writes.
+//! - [`cases`]: typed records of past contract cases and the ranker that recalls their notes for
+//!   a similar one, in English and Japanese (#107). Pure for now: no files, no window.
 //! - [`offers`]: the backends the pane offers on this host, and how one is made by its id.
 //! - `acp` (desktop only): ACP agents (Claude Code, Codex, Pi…) as backends, each a process
 //!   WordCraft starts and speaks the Agent Client Protocol with.
@@ -37,6 +39,7 @@ pub mod acp;
 pub mod answer;
 mod assistant;
 pub mod backend;
+pub mod cases;
 /// Sign in with ChatGPT and the ChatGPT backend: desktop only (HTTPS and a loopback port).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod chatgpt;
