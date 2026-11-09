@@ -247,6 +247,17 @@ fn a_bullet_list_ends_the_ordered_list_before_it() {
 }
 
 #[test]
+fn a_heading_in_a_list_keeps_its_place_in_the_list() {
+    let f = format("1. # First\n2. Second", false);
+    let items: Vec<(&str, &str, bool)> = f
+        .blocks
+        .iter()
+        .filter_map(|b| if let Block::Item { marker, spans, .. } = b { Some((marker.as_str(), spans[0].text.as_str(), spans[0].bold)) } else { None })
+        .collect();
+    assert_eq!(items, [("1.", "First", true), ("2.", "Second", false)], "{:?}", f.blocks);
+}
+
+#[test]
 fn a_table_ends_the_ordered_list_before_it() {
     let f = format("1. first\n\n| a | b |\n|---|---|\n| c | d |\n\n1. again", false);
     let markers: Vec<&str> = f.blocks.iter().filter_map(|b| if let Block::Item { marker, .. } = b { Some(marker.as_str()) } else { None }).collect();
