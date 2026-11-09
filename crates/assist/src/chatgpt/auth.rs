@@ -515,7 +515,7 @@ fn client_id(p: &Pending, issued: Option<&str>) -> Result<String, AuthError> {
 }
 
 /// Forget the issued client id `dead`, which ChatGPT no longer knows (`invalid_client`): the
-/// host id and the chosen model stay, and the next sign-in registers WordCraft again. The caller holds the lock.
+/// host id stays, and the next sign-in registers WordCraft again. The caller holds the lock.
 fn forget_client(settings: &Path, dead: &str) -> Result<(), String> {
     let client = store::client(settings)?;
     if client.client_id.as_deref() != Some(dead) {
@@ -947,92 +947,4 @@ impl SignOut {
         }
         self.result.as_ref()
     }
-}
-
-/// A model ChatGPT offers the signed-in account.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Model {
-    /// What a request names it (`model`).
-    pub slug: String,
-    /// Its name in the picker.
-    pub name: String,
-}
-
-/// Most models read from the list.
-const MAX_MODELS: usize = 64;
-
-/// The models the signed-in account may use, from OpenAI's API: [`models_with`] with OpenAI's
-/// endpoints. It waits for the network: call it off the window's thread.
-pub fn models(settings: &Path) -> Result<Vec<Model>, AuthError> {
-    models_with(settings, &Endpoints::default())
-}
-
-/// The models the signed-in account may use, in ChatGPT's order (the first is the default). It
-/// waits for the network (and a refresh, when the token is old or turned away).
-pub fn models_with(settings: &Path, endpoints: &Endpoints) -> Result<Vec<Model>, AuthError> {
-    endpoints.check().map_err(AuthError::Failed)?;
-    let agent = http::agent(endpoints.is_local(), false);
-    let url = format!("{}/models", endpoints.api.trim_end_matches('/'));
-    let ask = |refused: Option<&str>| -> Result<(String, Reply), AuthError> {
-        let c = access_token(settings, endpoints, refused)?;
-        if !c.plan_usage() {
-            return Err(AuthError::Denied);
-        }
-        let reply = http::get_json(&agent, &url, Some(&c.access_token)).map_err(AuthError::Network)?;
-        Ok((c.access_token, reply))
-    };
-    let (token, mut reply) = ask(None)?;
-    if reply.status == 401 {
-        // Turned away though it looks fresh here: refreshed once (the sign-in ends only when
-        // the refresh says so), as a turn's token is.
-        log::info!("ChatGPT: the models list turned the token away; refreshing it once");
-        reply = ask(Some(&token))?.1;
-        if reply.status == 401 {
-            return Err(AuthError::Failed(
-                "ChatGPT didn't accept your sign-in: try again, or sign out and sign in again in Options › Account".into(),
-            ));
-        }
-    }
-    if !reply.ok() {
-        return Err(AuthError::Failed(format!("ChatGPT's models couldn't be listed (HTTP {})", reply.status)));
-    }
-    Ok(models_in(&reply.json()))
-}
-
-/// The models a models list names: `models` (`slug`, `display_name`, shown when `visibility`
-/// is `list` or absent), or the API's usual `data` (`id`).
-pub(crate) fn models_in(json: &Value) -> Vec<Model> {
-    let list = json.get("models").or_else(|| json.get("data")).and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-    list.iter()
-        .filter(|m| m.get("visibility").and_then(Value::as_str).is_none_or(|v| v == "list"))
-        .filter_map(|m| {
-            let slug = m.get("slug").or_else(|| m.get("id")).and_then(Value::as_str)?;
-            let ok = valid_model(slug);
-            let name = m.get("display_name").and_then(Value::as_str).unwrap_or(slug);
-            ok.then(|| Model { slug: slug.to_string(), name: crate::backend::label(name).chars().take(80).collect() })
-        })
-        .take(MAX_MODELS)
-        .collect()
-}
-
-/// The model the person chose, if they chose one (else the list's first is used).
-pub fn chosen_model(settings: &Path) -> Option<String> {
-    store::client(settings).ok().and_then(|c| c.model).filter(|m| valid_model(m))
-}
-
-/// Whether `slug` can name a model: 1 to 128 printable ASCII characters, no spaces.
-fn valid_model(slug: &str) -> bool {
-    !slug.is_empty() && slug.len() <= 128 && slug.chars().all(|c| c.is_ascii_graphic())
-}
-
-/// Choose the model (None: the list's first).
-pub fn choose_model(settings: &Path, slug: Option<&str>) -> Result<(), AuthError> {
-    let slug = slug.map(str::trim).filter(|s| !s.is_empty());
-    if slug.is_some_and(|s| !valid_model(s)) {
-        return Err(AuthError::Failed("that isn't a model's name".into()));
-    }
-    let _lock = Lock::take(settings).map_err(AuthError::Storage)?;
-    let client = store::client(settings).map_err(AuthError::Storage)?;
-    store::save_client(settings, &Client { model: slug.map(str::to_string), ..client }).map_err(AuthError::Storage)
 }

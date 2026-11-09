@@ -23,6 +23,7 @@ use wordcraft_engine::AssistantPrefs;
 use wordcraft_engine::room::Role;
 
 use super::{Tokens, WordApp, regular, semibold};
+use crate::assist::models::{Menus, Row};
 use crate::assist::{PaneView, chosen, role_label, role_note};
 use crate::i18n::fmt;
 
@@ -265,9 +266,8 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
             }
         }
         Entry::Permission { request, answer } => permission(app, ui, t, request, answer.as_ref(), waiting == Some(request.id)),
-        Entry::Model { name } => {
-            ui.label(RichText::new(fmt(tl!("Model: {name}"), &[("name", name)])).small().color(t.text_dim));
-        }
+        Entry::Model { name, effort, asked } => model_line(ui, t, name, effort.as_deref(), *asked),
+        Entry::Note { text } => wrapped(ui, RichText::new(text).small().italics().color(t.orange)),
         Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) => {}
         Entry::Stopped { stop } => {
             if let Some(says) = stop.says() {
@@ -278,6 +278,19 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
         }
         // A failed turn says why; the turn itself ends with its own event.
         Entry::Error { message } => wrapped(ui, RichText::new(message).color(t.red)),
+    }
+}
+
+/// Which model answers and at what reasoning level. A level the backend didn't confirm says so.
+fn model_line(ui: &mut Ui, t: &Tokens, name: &str, effort: Option<&str>, asked: bool) {
+    let line = match effort.map(crate::assist::effort_word) {
+        Some(effort) if asked => fmt(tl!("{name} · {effort} (requested)"), &[("name", name), ("effort", effort)]),
+        Some(effort) => fmt(tl!("{name} · {effort}"), &[("name", name), ("effort", effort)]),
+        None => name.to_string(),
+    };
+    let shown = ui.label(RichText::new(line).small().color(t.text_dim));
+    if asked {
+        shown.on_hover_text(tl!("This is the effort WordCraft asked for: the answer didn't say which one ran."));
     }
 }
 
@@ -527,7 +540,8 @@ fn prompt(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     let enter = r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.is_none());
     let id = if drafting { "assist.draft" } else { "assist.ask" };
     let can_send = !busy && !app.assist.prompt.trim().is_empty() && crate::widgets::enabled(app, id);
-    ui.horizontal(|ui| {
+    let menus = crate::assist::models::menus(app);
+    ui.horizontal_wrapped(|ui| {
         let send_button = ui.add_enabled(can_send, egui::Button::new(if drafting { tl!("Write") } else { tl!("Send") }));
         let send_button = match app.session.why_disabled(id) {
             Some(why) if !busy => send_button.on_disabled_hover_text(tl!(why)),
@@ -541,8 +555,80 @@ fn prompt(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
         if ui.add_enabled(busy, egui::Button::new(tl!("Stop"))).clicked() {
             let _ = app.run("assist.cancel", json!({}));
         }
+        if let Some(menus) = &menus {
+            model_menus(app, ui, t, menus, busy);
+        }
         if !busy && let Some(a) = app.conversation().filter(|a| !a.has_ended() && !a.tracked() && a.role() >= Role::Editor) {
             ui.label(RichText::new(fmt(tl!("{name}'s edits aren't tracked"), &[("name", a.name())])).small().color(t.orange));
         }
     });
+    if let Some(why) = menus.as_ref().and_then(|m| m.failed.as_deref()) {
+        wrapped(ui, RichText::new(fmt(tl!("The models couldn't be read: {why}"), &[("why", why)])).small().color(t.orange));
+    }
+}
+
+/// The widest the Model and Effort menus' buttons get.
+const MENU_WIDTH: f32 = 130.0;
+
+/// The Model and Effort menus. Each takes one click and applies from the next turn; during a turn
+/// they are greyed out, saying why.
+fn model_menus(app: &mut WordApp, ui: &mut Ui, t: &Tokens, menus: &Menus, busy: bool) {
+    const WAIT: &str = "The assistant is answering: stop it or wait for it to change this.";
+    // Not a nested layout, which would wrap inside itself: nothing enabled follows on this row
+    // during a turn.
+    if busy {
+        ui.disable();
+    }
+    if menus.has_models() {
+        let label = ui.label(RichText::new(tl!("Model:")).small().color(t.text_dim));
+        let shown = menus.running_model.clone().unwrap_or_else(|| tl!("Default").to_string());
+        let combo = craft_ui::ComboBox::from_id_salt("assistant_model").selected_text(shown).width(MENU_WIDTH).truncate().show_ui(ui, |ui| {
+            let default = match &menus.default_model {
+                Some(model) => fmt(tl!("Default ({model})"), &[("model", model)]),
+                None => tl!("Default").to_string(),
+            };
+            if ui.selectable_label(menus.chosen_model.is_none(), default).clicked() {
+                let _ = app.run("assist.model", json!({"id": null}));
+            }
+            for row in &menus.models {
+                let name = row.name.as_deref().unwrap_or(&row.id);
+                let mut item = ui.selectable_label(menus.chosen_model.as_deref() == Some(row.id.as_str()), name);
+                if let Some(about) = &row.description {
+                    item = item.on_hover_text(about);
+                }
+                if item.clicked() {
+                    let _ = app.run("assist.model", json!({"id": row.id}));
+                }
+            }
+        });
+        let button = combo.response.labelled_by(label.id).on_disabled_hover_text(tl!(WAIT));
+        if let Some(why) = &menus.unknown_because {
+            button.on_hover_text(tl!(why));
+        }
+    }
+    if !menus.efforts.is_empty() {
+        let label = ui.label(RichText::new(tl!("Effort:")).small().color(t.text_dim));
+        let shown = menus.efforts.iter().find(|e| menus.effort.as_deref() == Some(e.id.as_str()));
+        let shown = shown.map_or_else(|| tl!("Default").to_string(), |row| effort_name(row).to_string());
+        let combo = craft_ui::ComboBox::from_id_salt("assistant_effort").selected_text(shown).width(MENU_WIDTH).truncate().show_ui(ui, |ui| {
+            // With no level to tag as the default, a row of its own goes back to it.
+            if !menus.efforts.iter().any(|e| e.is_default) && ui.selectable_label(menus.effort.is_none(), tl!("Default")).clicked() {
+                let _ = app.run("assist.effort", json!({"level": null}));
+            }
+            for row in &menus.efforts {
+                let text =
+                    if row.is_default { fmt(tl!("{effort} (default)"), &[("effort", effort_name(row))]) } else { effort_name(row).to_string() };
+                if ui.selectable_label(menus.effort.as_deref() == Some(row.id.as_str()), text).clicked() {
+                    let level = if row.is_default { json!(null) } else { json!(row.id) };
+                    let _ = app.run("assist.effort", json!({"level": level}));
+                }
+            }
+        });
+        combo.response.labelled_by(label.id).on_disabled_hover_text(tl!(WAIT));
+    }
+}
+
+/// A level's name: what the backend calls it, else the pane's word for its id.
+fn effort_name(row: &Row) -> &str {
+    row.name.as_deref().unwrap_or_else(|| crate::assist::effort_word(&row.id))
 }
