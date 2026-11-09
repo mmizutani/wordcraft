@@ -104,8 +104,8 @@ pub fn format(text: &str, streaming: bool) -> Formatted {
 /// The words of the citations in `text`, whole markers only, at most [`MAX_CITES`]: those that show,
 /// so not a fenced code block's. Details asks for every answer each frame, so this reads fences
 /// without reading the Markdown.
-// ponytail: a marker in code by indentation alone is listed though it shows no chip; read that too
-// if models cite inside such code.
+// ponytail: a marker in inline code, or in code by indentation alone, is listed though it shows no
+// chip; read those too if models cite inside such code.
 pub fn citations(text: &str) -> Vec<String> {
     let mut fences = Fences::default();
     let mut prose = String::with_capacity(text.len());
@@ -292,6 +292,14 @@ impl Builder {
         }
         let mut out = Vec::new();
         for span in spans {
+            // A marker in code is an example of one.
+            if span.code {
+                let text = strip_cites(&span.text);
+                if !text.is_empty() {
+                    out.push(Span { text, ..span });
+                }
+                continue;
+            }
             for (n, piece) in span.text.split(CITE).enumerate() {
                 if n % 2 == 1 {
                     // Past ones code ate, whose markers show nowhere.

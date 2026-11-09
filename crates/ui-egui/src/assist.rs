@@ -116,6 +116,22 @@ struct CitedHeld {
     at: (u64, u64, u64),
     text: String,
     found: HashMap<String, Cited>,
+    /// [`Self::found`] from before it last filled: what is still cited moves back from here
+    /// without being looked for again, and the rest goes when it fills next.
+    before: HashMap<String, Cited>,
+    /// Bytes of words in `found`.
+    bytes: usize,
+}
+
+impl CitedHeld {
+    fn hold(&mut self, words: &str, found: Cited) {
+        if self.found.len() >= MOST_CITED_HELD || self.bytes >= wordcraft_assist::transcript::MAX_BYTES {
+            self.before = std::mem::take(&mut self.found);
+            self.bytes = 0;
+        }
+        self.bytes = self.bytes.saturating_add(words.len());
+        self.found.insert(words.to_string(), found);
+    }
 }
 
 /// Where a citation's words are.
@@ -378,8 +394,10 @@ fn details(app: &mut WordApp) -> Result<Value, String> {
     serde_json::to_value(details_for(app)).map_err(|e| e.to_string())
 }
 
-/// Most citations whose place [`CitedHeld`] keeps.
-pub(crate) const MOST_CITED_HELD: usize = 4096;
+/// Most citations [`CitedHeld`] keeps in each of its maps: as many as a transcript can hold, so what
+/// is still cited never fills one, and Details doesn't look for it again each frame. It is the same
+/// for the words' bytes, which are the text of the answers they came from.
+pub(crate) const MOST_CITED_HELD: usize = wordcraft_assist::transcript::MAX_ENTRIES.saturating_mul(wordcraft_assist::answer::MAX_CITES);
 
 /// Where `words` are: in the document as it reads, or in an attached source. The document's text is
 /// read once a revision, and only when an answer cites anything.
@@ -387,10 +405,16 @@ pub(crate) fn cited(app: &mut WordApp, words: &str) -> Cited {
     let at = (app.session.document_id(), app.session.rev(), app.assist.knowledge_rev);
     if app.assist.cited.as_ref().is_none_or(|held| held.at != at) {
         let text = wordcraft_assist::context::final_text(&app.session.doc);
-        app.assist.cited = Some(CitedHeld { at, text, found: HashMap::new() });
+        app.assist.cited = Some(CitedHeld { at, text, found: HashMap::new(), before: HashMap::new(), bytes: 0 });
     }
-    if let Some(found) = app.assist.cited.as_ref().and_then(|held| held.found.get(words)) {
-        return found.clone();
+    if let Some(held) = app.assist.cited.as_mut() {
+        if let Some(found) = held.found.get(words) {
+            return found.clone();
+        }
+        if let Some(found) = held.before.remove(words) {
+            held.hold(words, found.clone());
+            return found;
+        }
     }
     let flat = wordcraft_assist::context::flat(words);
     let in_document = app.assist.cited.as_ref().is_some_and(|held| held.text.contains(&flat));
@@ -400,12 +424,7 @@ pub(crate) fn cited(app: &mut WordApp, words: &str) -> Cited {
         sources(app).iter().find(|s| s.text.contains(words)).map_or(Cited::Nowhere, |s| Cited::Source(s.name.clone()))
     };
     if let Some(held) = app.assist.cited.as_mut() {
-        // What answers no longer in the transcript cited stays until the document changes, so a
-        // long conversation fills this. A lookup can always be made again.
-        if held.found.len() >= MOST_CITED_HELD {
-            held.found.clear();
-        }
-        held.found.insert(words.to_string(), found.clone());
+        held.hold(words, found.clone());
     }
     found
 }

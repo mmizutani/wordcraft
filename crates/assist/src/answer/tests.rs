@@ -339,6 +339,14 @@ fn a_marker_not_closed_is_held_back_while_arriving_and_text_afterwards() {
 }
 
 #[test]
+fn a_marker_in_inline_code_is_no_chip() {
+    let f = format("Write `[[cite: \"two three\"]]` then [[cite: \"real\"]].", false);
+    assert_eq!(f.citations, ["real"], "{:?}", f.blocks);
+    let spans: Vec<&Span> = f.blocks.iter().flat_map(|b| if let Block::Para(s) = b { s.as_slice() } else { &[] }).collect();
+    assert_eq!(spans.iter().filter_map(|s| s.cite).collect::<Vec<_>>(), [0], "{spans:?}");
+}
+
+#[test]
 fn markers_in_code_leave_the_limit_to_the_citations_that_show() {
     let code = r#"[[cite: "example"]] "#.repeat(MAX_CITES);
     let text = format!("```\n{code}\n```\n\nIt says [[cite: \"the words\"]].");

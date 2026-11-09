@@ -2305,13 +2305,27 @@ fn a_citation_with_real_words_selects_them_and_one_with_invented_words_shows_no_
 }
 
 #[test]
-fn what_citations_looked_for_is_held_to_a_size_and_still_answers() {
+fn what_citations_looked_for_is_held_to_a_size_and_keeps_what_is_still_cited() {
+    use crate::assist::{Cited, MOST_CITED_HELD, cited};
     let mut app = window("one two three");
-    for n in 0..crate::assist::MOST_CITED_HELD.saturating_add(10) {
-        assert_eq!(crate::assist::cited(&mut app, &format!("invented {n}")), crate::assist::Cited::Nowhere);
+    assert_eq!(cited(&mut app, "two three"), Cited::Document);
+    // Looked for again, these would no longer be found: what comes back was held.
+    app.assist.cited.as_mut().unwrap().text.clear();
+    for n in 0..MOST_CITED_HELD.saturating_mul(2).saturating_add(10) {
+        cited(&mut app, &format!("invented {n}"));
+        if n % MOST_CITED_HELD == MOST_CITED_HELD - 1 {
+            assert_eq!(cited(&mut app, "two three"), Cited::Document, "it is still cited at {n}");
+        }
     }
-    assert!(app.assist.cited.as_ref().is_some_and(|held| held.found.len() <= crate::assist::MOST_CITED_HELD));
-    assert_eq!(crate::assist::cited(&mut app, "two three"), crate::assist::Cited::Document);
+    let held = app.assist.cited.as_ref().unwrap();
+    assert!(held.found.len() <= MOST_CITED_HELD && held.before.len() <= MOST_CITED_HELD);
+
+    // Long words fill it sooner.
+    for n in 0..8 {
+        cited(&mut app, &format!("{n}{}", "w".repeat(1 << 20)));
+    }
+    let bytes: usize = app.assist.cited.as_ref().unwrap().found.keys().map(String::len).sum();
+    assert!(bytes <= wordcraft_assist::transcript::MAX_BYTES + (2 << 20), "{bytes}");
 }
 
 #[test]
