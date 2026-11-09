@@ -422,12 +422,10 @@ const PLAIN_TEXT: &[&str] = &["txt", "text", "md", "markdown", "csv", "tsv", "lo
 /// `path` as a source, read as far as the limit from the file as it is now: through the importers
 /// documents open with, or as it is when it is plain text.
 fn read_source(path: &std::path::Path) -> Result<Knowledge, String> {
-    use std::io::Read as _;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let fail = |why: String| format!("{name} couldn't be read as a source: {why}");
-    let file = std::fs::File::open(path).map_err(|e| fail(e.to_string()))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_SOURCE_FILE.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| fail(e.to_string()))?;
+    // A file only: a named pipe would never answer, and the turn waits for what is being read.
+    let bytes = wordcraft_engine::io::read_regular_file(path, MAX_SOURCE_FILE).ok_or_else(|| fail("it isn't a file that can be read".to_string()))?;
     if u64::try_from(bytes.len()).is_ok_and(|n| n > MAX_SOURCE_FILE) {
         return Err(fail(format!("it is larger than {} MB", MAX_SOURCE_FILE >> 20)));
     }
