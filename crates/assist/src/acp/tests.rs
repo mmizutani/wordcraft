@@ -315,6 +315,61 @@ fn the_prompt_carries_the_note_then_the_context_then_the_prompt() {
     assert_eq!(c.report()["prompt"], json!(["And this"]));
 }
 
+/// A session keeps what it read: what the person kept goes in its first prompt and again only when
+/// it changes, including when none applies any more.
+#[test]
+fn what_the_person_kept_reaches_a_new_session_and_again_when_it_changes() {
+    let mut c = Chat::with(&turns(vec![vec![Step::Report], vec![Step::Report], vec![Step::Report], vec![Step::Report], vec![Step::Report]]));
+    let blocks = |c: &Chat| c.report()["prompt"].as_array().unwrap().iter().map(|b| b.as_str().unwrap().to_string()).collect::<Vec<_>>();
+    c.a.set_memory(Some("Saved: one.".into()));
+    c.ask("First");
+    let first = blocks(&c);
+    assert!(first[0].contains("You are Fake Agent"), "{first:?}");
+    assert_eq!(first[1..], ["Saved: one.", "First"]);
+    c.ask("Same");
+    assert_eq!(blocks(&c), ["Same"]);
+    c.a.set_memory(Some("Saved: two.".into()));
+    c.ask("Changed");
+    assert_eq!(blocks(&c), ["Saved: two.", "Changed"]);
+    c.a.set_memory(None);
+    c.ask("Gone");
+    assert_eq!(blocks(&c), [crate::memory::NONE_APPLY, "Gone"]);
+    c.ask("Still gone");
+    assert_eq!(blocks(&c), ["Still gone"]);
+}
+
+/// A prompt the agent refused may never have reached its model: the next turn says it again.
+#[test]
+fn what_the_person_kept_is_said_again_after_a_failed_prompt() {
+    let fail = Step::Fail { code: -32000, message: "not now".into() };
+    let mut c = Chat::with(&turns(vec![vec![Step::Report], vec![fail], vec![Step::Report]]));
+    c.ask("First");
+    c.a.set_memory(Some("Saved: one.".into()));
+    c.ask("Fails");
+    assert!(c.a.transcript().entries().any(|e| matches!(e, Entry::Error { .. })), "the prompt failed");
+    c.ask("Again");
+    assert_eq!(c.report()["prompt"], json!(["Saved: one.", "Again"]));
+}
+
+/// A new session has read nothing, whatever the last one was told: its first prompt failing, the
+/// next one says it again.
+#[test]
+fn a_new_session_s_failed_first_prompt_is_said_again() {
+    let mut script = Script::default();
+    script.replies.insert("Report".into(), vec![Step::Report]);
+    script.replies.insert("Crash".into(), vec![Step::Crash { code: 3, stderr: "gone".into() }]);
+    script.replies.insert("Fails".into(), vec![Step::Fail { code: -32000, message: "not now".into() }]);
+    let mut c = Chat::with(&script);
+    c.a.set_memory(Some("Saved: one.".into()));
+    c.ask("Report");
+    assert!(c.report()["prompt"].as_array().unwrap().iter().any(|b| b == "Saved: one."));
+    c.ask("Crash");
+    c.ask("Fails");
+    assert!(c.error().is_some(), "the new session's first prompt failed");
+    c.ask("Report");
+    assert_eq!(c.report()["prompt"], json!(["Saved: one.", "Report"]));
+}
+
 #[cfg(unix)]
 #[test]
 fn an_agent_folder_rejects_a_world_writable_parent() {

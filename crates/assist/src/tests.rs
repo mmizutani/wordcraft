@@ -1193,6 +1193,134 @@ fn the_digest_is_newest_first_cut_and_within_its_budget() {
     assert_eq!(newest.chars().filter(|c| *c == 'é').count(), crate::feedback::MAX_TEXT - 4);
 }
 
+/// What a stream of answer pieces leaves in the transcript: the answers joined, and the proposals.
+fn streamed(pieces: &[&str]) -> (String, Vec<String>) {
+    let mut t = Transcript::default();
+    t.asked("Go");
+    for piece in pieces {
+        t.record(&Event::Text { text: (*piece).to_string() });
+    }
+    t.record(&Event::Done { stop: StopReason::EndTurn });
+    let answer = t.entries().filter_map(|e| if let Entry::Answer { text } = e { Some(text.as_str()) } else { None }).collect();
+    let proposals = t.entries().filter_map(|e| if let Entry::Proposal { text, .. } = e { Some(text.clone()) } else { None }).collect();
+    (answer, proposals)
+}
+
+#[test]
+fn a_marker_split_across_pieces_is_taken_out_of_the_answer() {
+    let whole = "Done. [[remember: Use numbered lists.]] Anything else?";
+    for at in 0..whole.len() {
+        let (a, b) = whole.split_at(at);
+        let (answer, proposals) = streamed(&[a, b]);
+        assert_eq!(answer.split_whitespace().collect::<Vec<_>>().join(" "), "Done. Anything else?", "split at {at}");
+        assert_eq!(proposals, ["Use numbered lists."], "split at {at}");
+    }
+    // A character at a time, as a stream may.
+    let chars: Vec<String> = whole.chars().map(String::from).collect();
+    let pieces: Vec<&str> = chars.iter().map(String::as_str).collect();
+    assert_eq!(streamed(&pieces).1, ["Use numbered lists."]);
+    // Nothing of it shows while it is under way.
+    let mut t = Transcript::default();
+    t.asked("Go");
+    t.record(&Event::Text { text: "Done. [[remember: Use num".into() });
+    assert_eq!(t.last_answer().as_deref(), Some("Done."));
+}
+
+/// What only Details shows can come between two pieces of an answer, and ends neither its marker
+/// nor the white space after a proposal.
+#[test]
+fn a_marker_goes_on_around_what_only_details_shows() {
+    let mut t = Transcript::default();
+    t.asked("Go");
+    t.record(&Event::Text { text: "Done. [[remem".into() });
+    t.record(&Event::Agent { name: "Some Agent".into() });
+    t.record(&Event::Text { text: "ber: Use lists.]]".into() });
+    t.record(&Event::Usage(Default::default()));
+    t.record(&Event::Text { text: "\n".into() });
+    t.record(&Event::Done { stop: StopReason::EndTurn });
+    assert_eq!(t.pending_proposal(1), Some("Use lists."));
+    let answers: Vec<&str> = t.entries().filter_map(|e| if let Entry::Answer { text } = e { Some(text.as_str()) } else { None }).collect();
+    assert_eq!(answers, ["Done. "]);
+}
+
+/// A citation is the pane's to read: the markers of memory leave it in the answer's text, whole.
+#[test]
+fn a_citation_stays_in_the_answer_beside_a_proposal() {
+    let whole = "It says so [[cite: \"the words\"]]. [[remember: Use lists.]] Done [[used: m1]].";
+    for at in 0..whole.len() {
+        let (a, b) = whole.split_at(at);
+        let (answer, proposals) = streamed(&[a, b]);
+        assert!(answer.contains("[[cite: \"the words\"]]"), "split at {at}: {answer}");
+        assert!(!answer.contains("remember") && !answer.contains("used"), "split at {at}: {answer}");
+        assert_eq!(proposals, ["Use lists."], "split at {at}");
+    }
+}
+
+#[test]
+fn what_only_looks_like_a_marker_stays_text() {
+    for text in ["[[link]] and [x] and [", "a [[rem", "[[remember: never closed", "[[used: m1", "[[", "]]"] {
+        assert_eq!(streamed(&[text]), (text.to_string(), vec![]), "{text}");
+    }
+    let long = format!("[[remember: {}]] after", "x".repeat(5000));
+    assert_eq!(streamed(&[&long]), (long.clone(), vec![]), "too long to be one");
+    assert_eq!(streamed(&[&"[".repeat(60_000)]).0.len(), 60_000);
+}
+
+#[test]
+fn a_marker_in_a_thought_is_ignored() {
+    let mut t = Transcript::default();
+    t.asked("Go");
+    t.record(&Event::Thought { text: "[[remember: From a thought.]]".into() });
+    assert!(!t.entries().any(|e| matches!(e, Entry::Proposal { .. })));
+    assert!(t.entries().any(|e| matches!(e, Entry::Thought { text } if text.contains("[[remember"))));
+}
+
+#[test]
+fn a_turn_shows_at_most_three_proposals_and_the_next_turn_three_more() {
+    let text = "[[remember: One.]][[remember: Two.]][[remember: One.]][[remember: Three.]][[remember: Four.]][[remember:  ]]";
+    let (answer, proposals) = streamed(&[text]);
+    assert_eq!(proposals, ["One.", "Two.", "Three."], "the same twice and a fourth dropped");
+    assert_eq!(answer, "");
+    let mut t = Transcript::default();
+    t.asked("Go");
+    t.record(&Event::Text { text: text.into() });
+    t.record(&Event::Done { stop: StopReason::EndTurn });
+    t.asked("Again");
+    t.record(&Event::Text { text: "[[remember: Five.]]".into() });
+    let ids: Vec<u64> = t.entries().filter_map(|e| if let Entry::Proposal { id, .. } = e { Some(*id) } else { None }).collect();
+    assert_eq!(ids, [1, 2, 3, 4], "numbered through the conversation");
+}
+
+#[test]
+fn a_used_marker_is_taken_out_and_proposes_nothing() {
+    assert_eq!(streamed(&["Numbered: [[used: m999]]one."]), ("Numbered: one.".to_string(), vec![]));
+}
+
+#[test]
+fn a_proposal_s_text_is_cleaned_and_answered_once() {
+    let mut t = Transcript::default();
+    t.asked("Go");
+    t.record(&Event::Text { text: format!("[[remember: \u{202E}Use\nlists. {}]]", "y".repeat(1000)) });
+    t.record(&Event::Done { stop: StopReason::EndTurn });
+    let text = t.pending_proposal(1).unwrap().to_string();
+    assert!(text.starts_with("Use lists. y"), "{text}");
+    assert_eq!(text.chars().count(), crate::memory::MAX_TEXT);
+    t.answer_proposal(1, crate::ProposalAnswer::Dismissed, None);
+    assert_eq!(t.pending_proposal(1), None);
+}
+
+#[test]
+fn an_edit_shows_where_it_differs_within_the_cut() {
+    let mut f = Feedback::default();
+    let start = "word ".repeat(100);
+    f.record_edit(&format!("{start}old\nend"), &format!("{start}new\nend"));
+    let digest = f.digest().unwrap();
+    let line = digest.lines().nth(1).unwrap();
+    assert!(line.starts_with("- changed your text from \""), "{line}");
+    assert!(line.contains("old end\" to ") && line.contains("new end\""), "{line}");
+    assert!(line.chars().count() < 300, "{line}");
+}
+
 mod details {
     use crate::backend::{Event, PlanEntry, PlanStatus, Priority, ToolCall, ToolStatus, Usage};
     use crate::transcript::{MAX_ENTRIES, StepState, Transcript};

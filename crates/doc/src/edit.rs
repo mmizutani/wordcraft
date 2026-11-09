@@ -974,6 +974,40 @@ impl Document {
         Ok(())
     }
 
+    /// The text of `a..b` as it reads with every change accepted, at most `max` bytes and without
+    /// its inline objects, read from the paragraphs without copying them: a line break for each
+    /// paragraph mark it crosses, as [`Document::final_text`] gives one for a deleted mark too.
+    pub fn final_text_in(&self, a: &Pos, b: &Pos, max: usize) -> String {
+        let (a, b) = order(a, b);
+        let mut out = String::new();
+        // ponytail: the budget bounds the text, not this list of the range's paragraphs, which is
+        // what formatting them allocates too. Make `walk_between` stop early if a profile shows it.
+        for path in self.para_paths_in(&a, &b) {
+            let Some(p) = self.para(a.story, &path) else { continue };
+            let from = if path == a.path { a.off } else { 0 };
+            let to = if path == b.path { b.off } else { p.len() };
+            for (range, props) in p.run_ranges() {
+                let (start, end) = (range.start.max(from), range.end.min(to));
+                if props.del.is_some() || start >= end {
+                    continue;
+                }
+                for c in p.text.get(start..end).unwrap_or_default().chars().filter(|c| *c != crate::para::OBJ) {
+                    if out.len().saturating_add(c.len_utf8()) > max {
+                        return out;
+                    }
+                    out.push(c);
+                }
+            }
+            if path != b.path {
+                if out.len() >= max {
+                    return out;
+                }
+                out.push('\n');
+            }
+        }
+        out
+    }
+
     /// Copy `a..b` into a fragment (with copies of the text boxes in it).
     pub fn copy_range(&self, a: &Pos, b: &Pos) -> Fragment {
         let mut blocks = self.copy_blocks(a, b);

@@ -1,9 +1,10 @@
-//! What the person did with the assistant's changes since its last turn (#86, AS7.1): the next
-//! turn's context starts with it, so the assistant adjusts within the conversation. Nothing of it
+//! What the person did with the assistant's changes since its last turn (#86, AS7.1, AS7.5): the
+//! next turn's context starts with it, so the assistant adjusts within the conversation. Nothing of it
 //! is stored, and it stays with its conversation.
 //!
-//! Only the window records here, for the person's own Accept and Reject: a change's text is the
-//! assistant's own writing, quoted, and the digest says it is never an instruction.
+//! Only the window records here, for the person's own Accept, Reject and edits: a change's text is
+//! the assistant's own writing or the person's, quoted, and the digest says it is never an
+//! instruction.
 
 use std::collections::VecDeque;
 
@@ -14,6 +15,9 @@ pub(crate) const MAX_DIGEST: usize = 2 << 10;
 
 /// Most characters of a change's text in a digest.
 pub(crate) const MAX_TEXT: usize = 120;
+
+/// Characters of the text the same in both shown before an edit's first difference.
+const LEAD_IN: usize = 20;
 
 /// Most decisions kept: more than fit a digest of the shortest lines.
 const MAX_DECISIONS: usize = 128;
@@ -55,7 +59,24 @@ impl Feedback {
             return;
         }
         let quoted = serde_json::to_string(text).unwrap_or_default();
-        self.lines.push_back(format!("- {what} your {change}: {quoted}"));
+        self.push(format!("- {what} your {change}: {quoted}"));
+    }
+
+    /// The person changed the assistant's text: `before` is what it wrote, `after` what it reads
+    /// now. Each is shown from a little before where they start to differ, so a long text still
+    /// shows the correction.
+    pub fn record_edit(&mut self, before: &str, after: &str) {
+        let same = before.chars().zip(after.chars()).take_while(|(a, b)| a == b).count();
+        let shown = |text: &str| {
+            let cut: String = text.chars().skip(same.saturating_sub(LEAD_IN)).take(MAX_TEXT).collect();
+            let cut = label(&cut.replace(['\n', '\r', '\t'], " "));
+            serde_json::to_string(cut.trim()).unwrap_or_default()
+        };
+        self.push(format!("- changed your text from {} to {}", shown(before), shown(after)));
+    }
+
+    fn push(&mut self, line: String) {
+        self.lines.push_back(line);
         if self.lines.len() > MAX_DECISIONS {
             self.lines.pop_front();
         }

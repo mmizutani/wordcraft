@@ -198,13 +198,13 @@ pub fn page(app: &mut WordApp, ui: &mut Ui) {
     };
 }
 
-fn section(ui: &mut Ui, title: &str) {
+pub(crate) fn section(ui: &mut Ui, title: &str) {
     ui.add_space(6.0);
     ui.label(RichText::new(tl!(title)).font(semibold(15.0)));
     ui.add_space(2.0);
 }
 
-fn note(ui: &mut Ui, text: &str) {
+pub(crate) fn note(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(tl!(text)).small().weak());
 }
 
@@ -881,6 +881,8 @@ fn assistant(app: &mut WordApp, ui: &mut Ui) {
         ui,
         "When you ask, the Assistant pane asks you before an agent goes ahead. A script or another app that asks the assistant (the control channel, MCP) has no one to ask: its agent's requests are refused unless this is on. Each answer is logged.",
     );
+    ui.add_space(8.0);
+    crate::assist::memory::page(app, ui);
     ui.add_space(8.0);
     // The agents and what each starts with (#24): desktop only, as agents are programs (#26).
     #[cfg(not(target_arch = "wasm32"))]

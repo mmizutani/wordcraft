@@ -911,3 +911,25 @@ fn an_adopted_notes_text_box_gets_a_story_of_its_own() {
     assert_eq!(part.kind, PartKind::TextBox);
     assert!(matches!(part.blocks.first().map(|b| &**b), Some(Block::Para(p)) if p.text == "their box"));
 }
+
+/// A range's accepted text: tracked deletions left out, line breaks kept, held to the budget at a
+/// character's end, without reading past it.
+#[test]
+fn final_text_in_a_range_leaves_deletions_out_and_keeps_to_its_budget() {
+    let mut d = Document::from_text("keep gone here\nsecond\nthird");
+    d.revisions.push(crate::Revision { kind: crate::RevisionKind::Delete, ..crate::Revision::default() });
+    let top = Path::top(0);
+    let p = d.para_mut(StoryRef::Body, &top).unwrap();
+    let props = p.runs[0].props.clone();
+    p.runs = vec![Run { len: 5, props: props.clone() }, Run { len: 5, props: CharProps { del: Some(0), ..props.clone() } }, Run { len: 4, props }];
+    let at = |block: usize, off: usize| Pos { story: StoryRef::Body, path: Path::top(block), off };
+    assert_eq!(d.final_text_in(&at(0, 0), &at(0, 14), 100), "keep here");
+    assert_eq!(d.final_text_in(&at(0, 7), &at(1, 3), 100), "here\nsec");
+    assert_eq!(d.final_text_in(&at(1, 3), &at(0, 7), 100), "here\nsec", "either way round");
+    assert_eq!(d.final_text_in(&at(0, 0), &at(2, 5), 7), "keep he");
+    assert_eq!(d.final_text_in(&at(0, 0), &at(0, 999), 100), "keep here", "an end past the text is its end");
+    let long = Document::from_text(&"é".repeat(5000));
+    let end = long.end_of(StoryRef::Body);
+    let cut = long.final_text_in(&at(0, 0), &end, 11);
+    assert_eq!(cut, "é".repeat(5), "at a character's end");
+}

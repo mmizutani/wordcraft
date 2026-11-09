@@ -5,8 +5,8 @@
 //! conversation. Then the conversation: the prompts, the answers as formatted text
 //! ([`super::answer`]), thoughts folded away, a row per
 //! tool call folded to how it went (open: what it said, and the way to the change it made, #23),
-//! the plan as a checklist, permission requests with their options while they wait, errors, and
-//! why a turn stopped, said plainly. At the bottom, Accept all and Reject all of this assistant's
+//! the plan as a checklist, permission requests with their options while they wait, what the
+//! model proposes to keep (#86), errors, and why a turn stopped, said plainly. At the bottom, Accept all and Reject all of this assistant's
 //! changes, the writing actions (#18), and the prompt box with Send and Stop; Draft turns the box
 //! into what to write at the caret. Everything it does goes through the `assist.*` and `review.*`
 //! commands, but for the answer to a permission request: that is the person's click alone, which
@@ -267,6 +267,7 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
             }
         }
         Entry::Permission { request, answer } => permission(app, ui, t, request, answer.as_ref(), waiting == Some(request.id)),
+        Entry::Proposal { id, text, answer } => crate::assist::memory::proposal_card(app, ui, t, *id, text, *answer),
         Entry::Model { name, effort, asked } => model_line(ui, t, name, effort.as_deref(), *asked),
         Entry::Note { text } => wrapped(ui, RichText::new(text).small().italics().color(t.orange)),
         Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) | Entry::Output(_) => {}

@@ -554,6 +554,34 @@ fn stopping_the_agent_mid_turn_never_makes_the_window_wait() {
     e.end();
 }
 
+/// What one conversation keeps reaches a later one on another backend: ChatGPT proposes a
+/// preference, the person keeps it, and an ACP agent started afterwards is told it. Nothing is kept
+/// by the proposal alone.
+#[test]
+fn what_is_kept_with_chatgpt_reaches_an_agent_in_a_later_conversation() {
+    use wordcraft_assist::memory::Memory;
+    const KEPT: &str = "Use numbered lists in summaries.";
+    let openai = OpenAi::start(vec![says(&format!("Summarized. [[remember: {KEPT}]]"))]);
+    let mut e = Editors::new(&openai, &script(&[(READ, vec![Step::Report])]));
+    let settings = openai.folder.path();
+    e.ask_chatgpt("Summarize this, as a numbered list from now on");
+    e.settle();
+    assert_eq!(answer(&e.chatgpt), "Summarized.");
+    let proposed = e.chatgpt.transcript().entries().find_map(|p| if let Entry::Proposal { text, .. } = p { Some(text.clone()) } else { None });
+    assert_eq!(proposed.as_deref(), Some(KEPT));
+    assert!(Memory::load(settings).items.is_empty(), "the proposal alone keeps nothing");
+
+    // The person's click, as the window's `assist.memory.keep` does it.
+    Memory::update(settings, |m| m.add(KEPT, "2026-11-09T00:00:00Z")).unwrap();
+
+    e.agent.set_memory(Memory::load(settings).for_model().text);
+    e.ask_agent(READ);
+    e.settle();
+    // The report quotes the prompt, whose instructions name the marker, which is taken out of it.
+    assert!(answer(&e.agent).contains(KEPT), "{}", answer(&e.agent));
+    e.end();
+}
+
 /// Each change another participant makes is a frame their change came in at, a later one in the
 /// same second too, which reuses its author's revision record and adds none.
 #[test]

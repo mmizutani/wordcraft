@@ -308,6 +308,7 @@ mod tests {
         forced.removed.insert("Mod+S".into());
         assert!(forced.resolve(&reg, "Mod+S").is_none(), "a key given to Sign Out runs nothing");
         assert!(crate::cmd::assist::person_only("assist.chatgpt.signIn"));
+        assert!(crate::cmd::assist::person_only("assist.memory.add"));
         assert!(!crate::cmd::assist::person_only("assist.ask"));
     }
 }

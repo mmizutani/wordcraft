@@ -30,6 +30,12 @@
 //! from a script or an agent ([`AssistantStatus::chatgpt`] says where the sign-in stands), and
 //! they take no key, go on no ribbon or toolbar and run as no macro's step ([`person_only`]).
 //!
+//! What the assistant remembers across conversations (#86) is a file only the person writes:
+//! `assist.memory` reads it, for the window's key holder, and `assist.memory.add`, `.edit`,
+//! `.remove`, `.clear` and `.enabled` change it from File › Options › Assistant, and `.keep` and
+//! `.dismiss` answer what the model proposes in the Assistant pane. Documents are untrusted and a
+//! kept preference outlasts them, so these writes are [`person_only`] too.
+//!
 //! A writing action is a prompt of ours ([`prompts`]) asked like any other, so its edits are the
 //! assistant's: tracked changes in its name while it is a suggester. The window gives the
 //! assistant's copy the person's selection, or the caret at its end (`"at": "end"`) for what is
@@ -99,6 +105,15 @@ const NOT_ANSWERING: &str = "the assistant isn't answering";
 const SELECT_FIRST: &str = "select the text first";
 /// Why the assistant cannot use a block selection.
 const CONTINUOUS_SELECTION: &str = "select one continuous range of text before asking the assistant";
+
+/// Why the memory is the desktop app's.
+const NO_MEMORY_HERE: &str = "the assistant's memory is kept by the WordCraft desktop app";
+
+/// Most characters of a preference; the assistant's memory keeps no more.
+pub const MAX_MEMORY_TEXT: usize = 280;
+
+/// Longest preference id taken, in characters.
+const MAX_MEMORY_ID: usize = 20;
 
 /// Longest path `assist.knowledge` takes, in characters.
 const MAX_PATH_CHARS: usize = 4096;
@@ -182,6 +197,44 @@ pub fn specs() -> Vec<CommandSpec> {
         .params(r#"{} → WordCraft deletes your ChatGPT sign-in and asks ChatGPT to end it. Yours alone, as signing in is"#)
         .when(can_sign_out)
         .pure(),
+        CommandSpec::new("assist.memory", "What the Assistant Remembers", "File › Options › Assistant", |s, _| {
+            s.push_ui_request(json!({"assist": "memory"}));
+            Ok(json!({}))
+        })
+        .params(r#"{} → whether the assistant's memory is on, what it holds, and what the next turn sends and leaves out"#)
+        .when(memory_here)
+        .pure(),
+        CommandSpec::new("assist.memory.add", "Remember This", "File › Options › Assistant", memory_add)
+            .params(r#"{"text": string (at most 280 characters)} → a preference every later turn of every assistant gets. Yours alone: from a script or an agent (control channel, MCP), as a macro's step or from a key it is an error, and it takes no key and goes on no ribbon or toolbar"#)
+            .when(memory_here)
+            .pure(),
+        CommandSpec::new("assist.memory.edit", "Edit a Preference", "File › Options › Assistant", memory_edit)
+            .params(r#"{"id": string, "text"?: string (at most 280 characters), "off"?: bool (kept, but not sent)}. Yours alone, as `assist.memory.add` is"#)
+            .when(memory_here)
+            .pure(),
+        CommandSpec::new("assist.memory.remove", "Remove a Preference", "File › Options › Assistant", memory_remove)
+            .params(r#"{"id": string}. Yours alone, as `assist.memory.add` is"#)
+            .when(memory_here)
+            .pure(),
+        CommandSpec::new("assist.memory.clear", "Clear What the Assistant Remembers", "File › Options › Assistant", |s, _| {
+            s.push_ui_request(json!({"assist": "memory.clear"}));
+            Ok(json!({"cleared": true}))
+        })
+        .params(r#"{}. Yours alone, as `assist.memory.add` is"#)
+        .when(memory_here)
+        .pure(),
+        CommandSpec::new("assist.memory.enabled", "Use What the Assistant Remembers", "File › Options › Assistant", memory_enabled)
+            .params(r#"{"value": bool} → off, nothing is sent and items stay until cleared. Yours alone, as `assist.memory.add` is"#)
+            .when(memory_here)
+            .pure(),
+        CommandSpec::new("assist.memory.keep", "Keep This Preference", "Home › Assistant", memory_keep)
+            .params(r#"{"proposal": number, "text"?: string (at most 280 characters, in place of what it proposed)} → the conversation's proposal becomes a preference. Yours alone, as `assist.memory.add` is"#)
+            .when(memory_here)
+            .pure(),
+        CommandSpec::new("assist.memory.dismiss", "Not This Preference", "Home › Assistant", memory_dismiss)
+            .params(r#"{"proposal": number} → the conversation's proposal goes, and the assistant's proposing it again shows nothing. Yours alone, as `assist.memory.add` is"#)
+            .when(memory_here)
+            .pure(),
         CommandSpec::new("assist.draft", "Draft with the Assistant", "Home › Assistant", draft)
             .params(r#"{"about": string (what to write)} → the assistant writes it at the caret (after the selection, if there is one)"#)
             .when(can_ask)
@@ -228,12 +281,102 @@ pub fn can_ask(s: &Session) -> Option<&'static str> {
 }
 
 /// Whether command `id` is the person's alone, run from its own button (or Search), never by
-/// someone else's arrangement: signing in to ChatGPT or out of it (#19). It takes no key and goes
+/// someone else's arrangement: signing in to ChatGPT or out of it (#19), and changing what the
+/// assistant remembers (#86), which a document could otherwise plant. It takes no key and goes
 /// on no ribbon or Quick Access Toolbar (an agent could put it where the person presses or clicks
 /// for something else: [`crate::RibbonLayout`]), and the window refuses it as a macro's step
 /// (anyone may have written the macro) and addressed to another document.
 pub fn person_only(id: &str) -> bool {
-    id.starts_with("assist.chatgpt.")
+    id.starts_with("assist.chatgpt.") || id.starts_with("assist.memory.")
+}
+
+/// The memory is the window's, on the desktop.
+fn memory_here(s: &Session) -> Option<&'static str> {
+    if !s.assistant.window {
+        Some(NO_WINDOW)
+    } else if s.assistant.desktop_only {
+        Some(NO_MEMORY_HERE)
+    } else {
+        None
+    }
+}
+
+/// The text in `v["text"]`: trimmed, not empty, at most [`MAX_MEMORY_TEXT`] characters.
+fn memory_text(v: &Value) -> Result<String, CmdError> {
+    let text = match v.get("text") {
+        Some(Value::String(t)) => t.trim(),
+        None | Some(Value::Null) => return Err(CmdError::Params("missing `text`: what the assistant should remember".into())),
+        Some(_) => return Err(CmdError::Params("`text` must be text".into())),
+    };
+    if text.is_empty() || text.chars().count() > MAX_MEMORY_TEXT {
+        return Err(CmdError::Params(format!("`text`: what the assistant should remember, at most {MAX_MEMORY_TEXT} characters")));
+    }
+    Ok(text.to_string())
+}
+
+/// The preference in `v["id"]`, as `assist.memory` names it.
+fn memory_id(v: &Value) -> Result<String, CmdError> {
+    v.get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.chars().count() <= MAX_MEMORY_ID)
+        .map(str::to_string)
+        .ok_or_else(|| CmdError::Params("`id`: a preference's, as `assist.memory` lists them".into()))
+}
+
+fn memory_add(s: &mut Session, v: &Value) -> CmdResult {
+    let text = memory_text(v)?;
+    s.push_ui_request(json!({"assist": "memory.add", "text": text}));
+    Ok(json!({"added": true}))
+}
+
+fn memory_edit(s: &mut Session, v: &Value) -> CmdResult {
+    let id = memory_id(v)?;
+    let text = if v.get("text").is_some_and(|t| !t.is_null()) { Some(memory_text(v)?) } else { None };
+    let off = match v.get("off") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Err(CmdError::Params("`off` must be true or false".into())),
+    };
+    if text.is_none() && off.is_none() {
+        return Err(CmdError::Params("say what changes: `text`, `off` or both".into()));
+    }
+    s.push_ui_request(json!({"assist": "memory.edit", "id": id, "text": text, "off": off}));
+    Ok(json!({"edited": true}))
+}
+
+fn memory_remove(s: &mut Session, v: &Value) -> CmdResult {
+    let id = memory_id(v)?;
+    s.push_ui_request(json!({"assist": "memory.remove", "id": id}));
+    Ok(json!({"removed": true}))
+}
+
+/// The proposal in `v["proposal"]`: a number from 1, as the conversation gives it.
+fn memory_proposal(v: &Value) -> Result<u64, CmdError> {
+    v.get("proposal")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+        .ok_or_else(|| CmdError::Params("`proposal`: the conversation's, a whole number from 1".into()))
+}
+
+fn memory_keep(s: &mut Session, v: &Value) -> CmdResult {
+    let proposal = memory_proposal(v)?;
+    let text = if v.get("text").is_some_and(|t| !t.is_null()) { Some(memory_text(v)?) } else { None };
+    s.push_ui_request(json!({"assist": "memory.keep", "proposal": proposal, "text": text}));
+    Ok(json!({"kept": true}))
+}
+
+fn memory_dismiss(s: &mut Session, v: &Value) -> CmdResult {
+    let proposal = memory_proposal(v)?;
+    s.push_ui_request(json!({"assist": "memory.dismiss", "proposal": proposal}));
+    Ok(json!({"dismissed": true}))
+}
+
+fn memory_enabled(s: &mut Session, v: &Value) -> CmdResult {
+    let Some(value) = v.get("value").and_then(Value::as_bool) else {
+        return Err(CmdError::Params("`value` must be true or false".into()));
+    };
+    s.push_ui_request(json!({"assist": "memory.enabled", "value": value}));
+    Ok(json!({"value": value}))
 }
 
 /// The ChatGPT sign-in is the window's, on the desktop.
