@@ -1158,6 +1158,8 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "assist.chatgpt.cancelSignIn"
             | "assist.chatgpt.signOut"
     ) || id.starts_with("help.")
+        || id == "assist.memory"
+        || id.starts_with("assist.memory.")
 }
 
 /// Commands that save, export, print, send or replace the document: comment text still being
