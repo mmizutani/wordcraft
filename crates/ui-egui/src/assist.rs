@@ -424,7 +424,7 @@ fn read_source(path: &std::path::Path) -> Result<Knowledge, String> {
     }
     let extension = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     if PLAIN_TEXT.contains(&extension.as_str()) {
-        return Ok(Knowledge::new(&name, &String::from_utf8_lossy(&bytes)));
+        return Ok(Knowledge::new(&name, &wordcraft_engine::io::decode_text(&bytes)));
     }
     let doc = wordcraft_engine::io::open_bytes(&name, &bytes).map_err(fail)?;
     Ok(Knowledge::new(&name, &doc.plain_text(wordcraft_doc::StoryRef::Body)))
