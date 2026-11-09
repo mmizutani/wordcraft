@@ -1418,6 +1418,78 @@ fn an_author_s_row_for_a_paragraph_mark_takes_the_mark_and_not_the_text_before_i
 }
 
 #[test]
+fn an_author_s_text_row_leaves_their_table_s_change() {
+    use wordcraft_doc::{Path, StoryRef};
+    let mut s = Session::new(wordcraft_doc::Document::from_text("one"));
+    s.run("insert.table", &json!({"rows": 1, "cols": 1})).unwrap();
+    let table = Path::top(s.doc.body.iter().position(|b| matches!(&**b, wordcraft_doc::Block::Table(_))).unwrap());
+    let cell = table.last();
+    s.run("caret.set", &json!({"pos": {"story": "body", "path": [cell, 0, 0, 0], "off": 0}})).unwrap();
+    s.run("text.insert", &json!({"text": "cell"})).unwrap();
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    s.author = "Assistant".into();
+    let text = |off| json!({"story": "body", "path": [cell, 0, 0, 0], "off": off});
+    s.run("select.range", &json!({"anchor": text(0), "focus": text(4)})).unwrap();
+    s.run("format.bold", &json!({})).unwrap();
+    let rev = s.doc.revisions.iter().position(|r| r.author == "Assistant").unwrap() as u32;
+    s.doc.table_mut(StoryRef::Body, &table).unwrap().props.fmt_change =
+        Some(Box::new(wordcraft_doc::props::PropChange { rev, old: Default::default() }));
+
+    let rows = super::change_rows(&s, "Assistant", 8).0;
+    // The table's, the text's and the paragraph mark's: the command took the mark along.
+    assert_eq!(rows.iter().map(|r| (r.a.off, r.b.off)).collect::<Vec<_>>(), [(0, 0), (0, 4), (4, 4)], "{rows:?}");
+    s.run("select.range", &json!({"anchor": super::pos_json(&rows[1].a), "focus": super::pos_json(&rows[1].b)})).unwrap();
+    s.run("review.reject", &json!({"author": "Assistant", "kind": "format"})).unwrap();
+    assert!(s.doc.table(StoryRef::Body, &table).unwrap().props.fmt_change.is_some(), "the table's change waits still");
+    assert_eq!(super::change_rows(&s, "Assistant", 8).0.iter().map(|r| r.b.off).collect::<Vec<_>>(), [0, 4]);
+}
+
+#[test]
+fn an_author_s_row_for_some_of_a_paragraph_leaves_the_paragraph_s_own_change() {
+    use wordcraft_doc::{Path, StoryRef};
+    let mut s = Session::new(wordcraft_doc::Document::from_text("one two"));
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    s.author = "Assistant".into();
+    s.run("select.text", &json!({"text": "two"})).unwrap();
+    s.run("format.bold", &json!({})).unwrap();
+    let path = Path::top(0);
+    let rev = s.doc.revisions.iter().position(|r| r.author == "Assistant").unwrap() as u32;
+    s.doc.para_mut(StoryRef::Body, &path).unwrap().props.fmt_change =
+        Some(Box::new(wordcraft_doc::props::PropChange { rev, old: Default::default() }));
+
+    let rows = super::change_rows(&s, "Assistant", 8).0;
+    assert_eq!(rows.iter().map(|r| (r.a.off, r.b.off)).collect::<Vec<_>>(), [(0, 7), (4, 7)], "{rows:?}");
+    s.run("select.range", &json!({"anchor": super::pos_json(&rows[1].a), "focus": super::pos_json(&rows[1].b)})).unwrap();
+    s.run("review.reject", &json!({"author": "Assistant", "kind": "format"})).unwrap();
+    assert!(s.doc.para(StoryRef::Body, &path).unwrap().props.fmt_change.is_some(), "the paragraph's change waits still");
+    let rows = super::change_rows(&s, "Assistant", 8).0;
+    assert_eq!(rows.iter().map(|r| (r.a.off, r.b.off)).collect::<Vec<_>>(), [(0, 7)], "{rows:?}");
+    s.run("select.range", &json!({"anchor": super::pos_json(&rows[0].a), "focus": super::pos_json(&rows[0].b)})).unwrap();
+    s.run("review.reject", &json!({"author": "Assistant", "kind": "format"})).unwrap();
+    assert!(super::change_rows(&s, "Assistant", 8).0.is_empty());
+}
+
+#[test]
+fn an_author_s_changes_over_the_same_words_are_one_row_as_one_click_takes_both() {
+    use wordcraft_doc::{Path, StoryRef};
+    let mut s = Session::new(wordcraft_doc::Document::from_text("one"));
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    s.author = "Assistant".into();
+    s.run("select.text", &json!({"text": "one"})).unwrap();
+    s.run("format.bold", &json!({})).unwrap();
+    let rev = s.doc.revisions.iter().position(|r| r.author == "Assistant").unwrap() as u32;
+    s.doc.para_mut(StoryRef::Body, &Path::top(0)).unwrap().props.fmt_change =
+        Some(Box::new(wordcraft_doc::props::PropChange { rev, old: Default::default() }));
+
+    let rows = super::change_rows(&s, "Assistant", 8).0;
+    // The words', once, and the paragraph mark's.
+    assert_eq!(rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["one", ""], "{rows:?}");
+    s.run("select.range", &json!({"anchor": super::pos_json(&rows[0].a), "focus": super::pos_json(&rows[0].b)})).unwrap();
+    s.run("review.reject", &json!({"author": "Assistant", "kind": "format"})).unwrap();
+    assert_eq!(super::change_rows(&s, "Assistant", 8).0.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), [""]);
+}
+
+#[test]
 fn an_author_s_row_resolves_their_page_setup_change() {
     use wordcraft_doc::{Revision, RevisionKind, StoryRef};
     let mut s = Session::new(wordcraft_doc::Document::from_text("one"));
