@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use serde_json::{Value, json};
 use wordcraft_doc::change::Anchor;
-use wordcraft_doc::{Path, Pos, StoryRef};
+use wordcraft_doc::{Path, Pos};
 use wordcraft_engine::room::{Replica, Room, RoomError, hosted};
 use wordcraft_mcp::tools::{ToolResult, call_tool, tool_definitions};
 
@@ -147,19 +147,14 @@ impl ToolHost for CopyTools {
             self.batch(&args)
         } else {
             let result = call_tool(&mut Hosted(&mut self.copy), name, &args);
-            output(&result)
+            let out = output(&result);
+            // The call caught the copy up first, so a path means here what it meant to the read.
+            let sources = if out.ok { self.read_by(name, &args) } else { Vec::new() };
+            ToolOutput { sources, ..out }
         };
         let changed = self.copy.stats().sent > sent;
         let changes = changed.then(|| Versions { first: had.saturating_add(1), last: self.copy.received() });
         ToolOutput { changes, ..out }
-    }
-
-    fn read_at(&self, args: &Value) -> Option<String> {
-        let path = serde_json::from_value::<Path>(args.pointer("/params/path")?.clone()).ok()?;
-        let story = args.pointer("/params/story").map_or(Some(StoryRef::Body), |s| serde_json::from_value(s.clone()).ok())?;
-        let doc = &self.copy.session().doc;
-        doc.para(story, &path)?;
-        Some(doc.anchor_at(&Pos::new(story, path, 0))?.block.to_string())
     }
 
     fn select(&mut self, anchor: Anchor, focus: Anchor) -> bool {
@@ -179,6 +174,25 @@ impl CopyTools {
     /// `keepGoing`) and once the turn is stopped, and holds what it gives back to about
     /// [`MAX_OUTPUT`] as it goes, so a batch of big results never piles up in memory. Every
     /// command gets an entry; the results get what the entries leave of the budget, in order.
+    /// What call `name` with `args`, which just worked, read: the paragraph it names, if it does.
+    fn read_by(&self, name: &str, args: &Value) -> Vec<Source> {
+        let mut read = sources(name, args);
+        if let Some(source) = read.first_mut() {
+            source.target = self.read_at(args);
+        }
+        read
+    }
+
+    /// The id of the paragraph the arguments of a read name, in the story the command reads.
+    fn read_at(&self, args: &Value) -> Option<String> {
+        let params = args.get("params")?;
+        let path = serde_json::from_value::<Path>(params.get("path")?.clone()).ok()?;
+        let session = self.copy.session();
+        let story = wordcraft_engine::cmd::story_param(session, params);
+        session.doc.para(story, &path)?;
+        Some(session.doc.anchor_at(&Pos::new(story, path, 0))?.block.to_string())
+    }
+
     fn batch(&mut self, args: &Value) -> ToolOutput {
         /// The most an entry without its result takes, with its command id cut to 48 characters.
         const ENTRY: usize = 80;
@@ -191,6 +205,7 @@ impl CopyTools {
         let keep_going = args.get("keepGoing").and_then(Value::as_bool).unwrap_or(false);
         let mut room = MAX_OUTPUT.saturating_sub(ENTRY.saturating_mul(commands.len().saturating_add(1)));
         let mut out = Vec::new();
+        let mut read = Vec::new();
         let mut ok = true;
         for c in commands {
             if self.cancel.as_ref().is_some_and(Cancel::is_set) {
@@ -200,7 +215,11 @@ impl CopyTools {
             }
             let id = c.get("command").and_then(Value::as_str).unwrap_or_default();
             let params = c.get("params").cloned().unwrap_or_else(|| json!({}));
-            let result = call_tool(&mut Hosted(&mut self.copy), "execute", &json!({"command": id, "params": params}));
+            let command = json!({"command": id, "params": params});
+            let result = call_tool(&mut Hosted(&mut self.copy), "execute", &command);
+            if !result.is_error && read.len() < crate::backend::MAX_SOURCES {
+                read.extend(self.read_by("execute", &command));
+            }
             let detail = fitted(output(&result).text, room);
             room = room.saturating_sub(detail.as_ref().map_or(0, |d| d.to_string().len()));
             let shown: String = crate::backend::label(id).chars().take(48).collect();
@@ -216,7 +235,7 @@ impl CopyTools {
                 break;
             }
         }
-        ToolOutput { ok, text: Value::Array(out).to_string(), changes: None }
+        ToolOutput { ok, text: Value::Array(out).to_string(), changes: None, sources: read }
     }
 }
 
@@ -271,7 +290,7 @@ fn output(result: &ToolResult) -> ToolOutput {
         let left = total.saturating_sub(text.len());
         text.push_str(&format!("\n…[cut: {left} more bytes; ask for less, e.g. get_text, document.paragraph or a narrower list_commands query]"));
     }
-    ToolOutput { ok: !result.is_error, text, changes: None }
+    ToolOutput { ok: !result.is_error, text, changes: None, sources: Vec::new() }
 }
 
 /// What a call does, for its row in the pane: the tool, and the command it runs.
@@ -297,10 +316,15 @@ pub fn kind(name: &str) -> &'static str {
 }
 
 /// What a call of WordCraft's own tools reads, for the pane's Sources: the shared document. A call
-/// that changes the document reads nothing here. [`ToolHost::read_at`] adds the paragraph.
+/// that changes the document reads nothing here. [`CopyTools`] adds the paragraph.
 pub fn sources(name: &str, args: &Value) -> Vec<Source> {
+    if name == "batch" {
+        let commands = args.get("commands").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+        return commands.iter().flat_map(|c| sources("execute", c)).take(crate::backend::MAX_SOURCES).collect();
+    }
     let command = args.get("command").and_then(Value::as_str).unwrap_or_default();
-    if !matches!(kind(name), "read" | "search") && !command.starts_with("document.") {
+    let reads = command.starts_with("document.") && command != "document.setText";
+    if !matches!(kind(name), "read" | "search") && !reads {
         return Vec::new();
     }
     vec![Source { kind: SourceKind::Document, title: title(name, args), target: None }]
