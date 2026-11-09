@@ -1267,3 +1267,46 @@ fn accept_or_reject_by_author_leaves_others_changes_in_the_selection() {
     assert_eq!(s.doc.plain_text(wordcraft_doc::StoryRef::Body), "one");
     assert!(s.run("review.accept", &json!({"author": 7})).is_err());
 }
+
+#[test]
+fn an_author_s_accept_leaves_someone_else_s_move() {
+    let mut s = Session::new(wordcraft_doc::Document::from_text("x"));
+    s.run("document.setText", &json!({"text": "First one.\nSecond one.\nThird one."})).unwrap();
+    s.run("file.setAuthor", &json!({"name": "Colleague"})).unwrap();
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    s.run("select.range", &json!({"anchor": {"block": 1, "off": 0}, "focus": {"block": 2, "off": 0}})).unwrap();
+    s.run("edit.cut", &json!({})).unwrap();
+    s.run("caret.set", &json!({"pos": {"block": 0, "off": 0}})).unwrap();
+    s.run("edit.paste", &json!({})).unwrap();
+    assert!(s.doc.revisions.iter().any(|r| r.move_name.is_some()), "{:?}", s.doc.revisions);
+    let before = super::changes_by(&s, "Colleague");
+
+    s.run("file.setAuthor", &json!({"name": "Assistant"})).unwrap();
+    s.run("select.all", &json!({})).unwrap();
+    s.run("format.bold", &json!({})).unwrap();
+    let formatted = super::changes_by(&s, "Assistant");
+    assert!(formatted > 0);
+    s.run("select.all", &json!({})).unwrap();
+    s.run("review.accept", &json!({"author": "Assistant"})).unwrap();
+    assert!(super::changes_by(&s, "Assistant") < formatted, "the assistant's went");
+    assert_eq!(super::changes_by(&s, "Colleague"), before, "both ends of the move stay");
+}
+
+#[test]
+fn an_author_s_row_takes_their_table_change_and_not_someone_else_s() {
+    use wordcraft_doc::{Path, Revision, RevisionKind, StoryRef};
+    let mut s = Session::new(wordcraft_doc::Document::from_text("one"));
+    s.run("insert.table", &json!({"rows": 1, "cols": 1})).unwrap();
+    let table = Path::top(s.doc.body.iter().position(|b| matches!(&**b, wordcraft_doc::Block::Table(_))).unwrap());
+    s.doc.revisions.push(Revision::new(RevisionKind::Format, "Assistant", ""));
+    s.doc.revisions.push(Revision::new(RevisionKind::Format, "Colleague", ""));
+    let t = s.doc.table_mut(StoryRef::Body, &table).unwrap();
+    t.props.fmt_change = Some(Box::new(wordcraft_doc::props::PropChange { rev: 1, old: Default::default() }));
+    t.rows[0].cells[0].props.fmt_change = Some(Box::new(wordcraft_doc::props::PropChange { rev: 0, old: Default::default() }));
+    s.run("caret.set", &json!({"pos": {"story": "body", "path": [table.last(), 0, 0, 0], "off": 0}})).unwrap();
+
+    s.run("review.accept", &json!({"author": "Assistant"})).unwrap();
+    let t = s.doc.table(StoryRef::Body, &table).unwrap();
+    assert!(t.rows[0].cells[0].props.fmt_change.is_none(), "the row's own change resolves");
+    assert!(t.props.fmt_change.is_some(), "the colleague's on the table stays");
+}

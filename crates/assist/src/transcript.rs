@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::backend::{Answer, Event, PermissionRequest, PlanEntry, PlanStatus, Source, SourceKind, StopReason, ToolCall, ToolStatus, Usage, label};
 use crate::context::Sent;
-use crate::output::OutputRow;
+use crate::output::{Action, OutputRow};
 
 /// Most entries a transcript keeps.
 pub const MAX_ENTRIES: usize = 2048;
@@ -312,19 +312,37 @@ impl Transcript {
         self.more_output = more;
         let rows: Vec<(usize, OutputRow)> =
             self.entries.iter().enumerate().filter_map(|(i, e)| if let Entry::Output(row) = e { Some((i, row.clone())) } else { None }).collect();
-        // Rows are brought up to date before anything is added: what is added can trim the oldest
-        // entries, which moves the indexes.
-        let (known, new): (Vec<_>, Vec<_>) = crate::output::reconcile(&rows, seen, more, ended).into_iter().partition(|(i, _)| i.is_some());
-        for (i, row) in known {
-            if let Some(i) = i {
-                self.overwrite(i, Entry::Output(row));
+        // Rows are brought up to date before anything moves them: taking one away moves those after
+        // it, and what is added can trim the oldest entries.
+        let actions = crate::output::reconcile(&rows, seen, more, ended);
+        let mut dropped = Vec::new();
+        let mut new = Vec::new();
+        for action in actions {
+            match action {
+                Action::Write(i, row) => self.overwrite(i, Entry::Output(row)),
+                Action::Drop(i) => dropped.push(i),
+                Action::New(row) => new.push(row),
             }
         }
+        dropped.sort_unstable();
+        for i in dropped.into_iter().rev() {
+            self.remove_at(i);
+        }
         self.trim();
-        for (_, row) in new {
+        for row in new {
             self.push(Entry::Output(row));
         }
         self.prune_output();
+    }
+
+    /// Take the entry at `i` away.
+    fn remove_at(&mut self, i: usize) {
+        if let Some(e) = self.entries.remove(i) {
+            self.bytes = self.bytes.saturating_sub(e.bytes());
+            if i < self.turn_start {
+                self.turn_start = self.turn_start.saturating_sub(1);
+            }
+        }
     }
 
     /// Hold the list of what the conversation changed to [`crate::output::MAX_ROWS`]: the oldest
@@ -335,11 +353,8 @@ impl Transcript {
         let mut i = 0;
         while extra > 0 && i < self.entries.len() {
             let ended = matches!(self.entries.get(i), Some(Entry::Output(row)) if row.state != crate::output::OutputState::Open);
-            if ended && let Some(e) = self.entries.remove(i) {
-                self.bytes = self.bytes.saturating_sub(e.bytes());
-                if i < self.turn_start {
-                    self.turn_start = self.turn_start.saturating_sub(1);
-                }
+            if ended {
+                self.remove_at(i);
                 extra = extra.saturating_sub(1);
             } else {
                 i = i.saturating_add(1);

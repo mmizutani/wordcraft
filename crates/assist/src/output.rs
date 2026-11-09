@@ -135,17 +135,24 @@ pub(crate) fn ended(doc: &Document, row: &OutputRow) -> OutputState {
     if went == (row.kind == OutputKind::Delete) { OutputState::Accepted } else { OutputState::Rejected }
 }
 
+/// What to do with a row of the transcript's list.
+pub(crate) enum Action {
+    /// Put this at that index.
+    Write(usize, OutputRow),
+    /// Add this.
+    New(OutputRow),
+    /// Take away the row at that index.
+    Drop(usize),
+}
+
 /// What to do with the transcript's `known` rows (with their indexes) given the rows `seen` in the
-/// document now: each row to write, at its index, or new. A change has no id, so the same change is
-/// the same kind and words in the same paragraph, the nearest such; then, if it is still open, one
-/// whose words hold the other's or are held by them, as a change grows while its turn types; then
-/// the same words in another paragraph, where a new paragraph mark took them.
-pub(crate) fn reconcile(
-    known: &[(usize, OutputRow)],
-    seen: Vec<OutputRow>,
-    more: usize,
-    ended: impl Fn(&OutputRow) -> OutputState,
-) -> Vec<(Option<usize>, OutputRow)> {
+/// document now. A change has no id, so the same change is the same kind and words in the same
+/// paragraph, the nearest such; then, if it is still open, one whose words hold the other's or are
+/// held by them, as a change grows while its turn types; then the same words in another paragraph,
+/// where a new paragraph mark took them. With rows past the limit, a row missing from `seen` may
+/// only have moved past it: it goes from the list and counts with them, and comes back when the
+/// list has room.
+pub(crate) fn reconcile(known: &[(usize, OutputRow)], seen: Vec<OutputRow>, more: usize, ended: impl Fn(&OutputRow) -> OutputState) -> Vec<Action> {
     let mut taken = vec![false; known.len()];
     let mut out = Vec::new();
     let mut left = seen;
@@ -159,18 +166,20 @@ pub(crate) fn reconcile(
         }
         left = unmatched;
     }
-    out.extend(left.into_iter().map(|row| (None, row)));
+    out.extend(left.into_iter().map(Action::New));
     for (n, (i, k)) in known.iter().enumerate() {
-        if taken.get(n).copied().unwrap_or(true) || more > 0 {
+        if taken.get(n).copied().unwrap_or(true) {
             continue;
         }
-        let state = match (k.kind, k.state) {
-            (OutputKind::Comment, OutputState::Deleted) => continue,
-            (OutputKind::Comment, _) => OutputState::Deleted,
-            (_, OutputState::Open) => ended(k),
-            _ => continue,
-        };
-        out.push((Some(*i), OutputRow { state, ..k.clone() }));
+        match (k.kind, k.state) {
+            (OutputKind::Comment, OutputState::Deleted) => {}
+            (_, OutputState::Open | OutputState::Resolved) if more > 0 && (k.kind == OutputKind::Comment || k.state == OutputState::Open) => {
+                out.push(Action::Drop(*i));
+            }
+            (OutputKind::Comment, _) => out.push(Action::Write(*i, OutputRow { state: OutputState::Deleted, ..k.clone() })),
+            (_, OutputState::Open) => out.push(Action::Write(*i, OutputRow { state: ended(k), ..k.clone() })),
+            _ => {}
+        }
     }
     out
 }
@@ -195,14 +204,14 @@ fn nearest(known: &[(usize, OutputRow)], taken: &[bool], row: &OutputRow, matche
 }
 
 /// Row `n` of `known` is `row` now: write it if it changed.
-fn take(n: usize, known: &[(usize, OutputRow)], taken: &mut [bool], row: OutputRow, out: &mut Vec<(Option<usize>, OutputRow)>) {
+fn take(n: usize, known: &[(usize, OutputRow)], taken: &mut [bool], row: OutputRow, out: &mut Vec<Action>) {
     if let Some(flag) = taken.get_mut(n) {
         *flag = true;
     }
     if let Some((i, k)) = known.get(n)
         && *k != row
     {
-        out.push((Some(*i), row));
+        out.push(Action::Write(*i, row));
     }
 }
 
