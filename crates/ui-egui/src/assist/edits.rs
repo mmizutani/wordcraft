@@ -70,8 +70,9 @@ pub(super) fn tick(app: &mut WordApp) {
     let seen = room.version();
     let edits = &mut app.assist.edits;
     for call in calls.into_iter().rev() {
-        // Its text is what the assistant wrote only if no one else has changed anything since.
-        if !room.changed_since(call.last).is_some_and(|names| names.iter().all(|who| *who == name)) {
+        // Its text is what the assistant wrote only if no one else has changed anything since the
+        // call began: others' changes may be among its versions.
+        if !room.changed_since(call.first.saturating_sub(1)).is_some_and(|names| names.iter().all(|who| *who == name)) {
             continue;
         }
         let Some(text) = room.text_where_changed(call.first..=call.last, Some(&name), MAX_TEXT) else { continue };
