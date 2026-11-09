@@ -163,11 +163,9 @@ pub struct Turn {
     /// copy before the turn. `None` leaves that copy's selection where it is.
     pub selection: Option<(Anchor, Anchor)>,
     /// The sources the person attached, for the model to refer to. It is data. What the turn
-    /// recalls from the person's cases joins it on the conversation's thread, as data too.
+    /// recalls from the person's cases ([`crate::Assistant::set_recall`]) joins it on the
+    /// conversation's thread, as data too.
     pub knowledge: Vec<crate::knowledge::TurnSource>,
-    /// What to recall from the person's cases for this turn, run on the conversation's thread
-    /// just before the backend's turn ([`crate::cases::recall::RecallAsk`]); `None`: nothing.
-    pub recall: Option<crate::cases::recall::RecallAsk>,
     /// The model the person chose for this backend; `None`: its default.
     pub model: Option<String>,
     /// The reasoning effort the person chose for this backend; `None`: its default.

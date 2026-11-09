@@ -91,9 +91,10 @@ pub struct Options {
 
 /// What the conversation's thread is asked to do.
 enum Job {
-    /// A turn, and how its permission requests are answered when not as the conversation's
-    /// ([`Assistant::ask_with_policy`]).
-    Turn(Box<Turn>, Option<PermissionPolicy>),
+    /// A turn, how its permission requests are answered when not as the conversation's
+    /// ([`Assistant::ask_with_policy`]), and what it recalls from the person's cases
+    /// ([`Assistant::set_recall`]), which rides beside the turn because a proof is used once.
+    Turn(Box<Turn>, Option<PermissionPolicy>, Option<RecallAsk>),
     End,
 }
 
@@ -320,14 +321,14 @@ impl Assistant {
             memory: self.memory.clone(),
             selection,
             knowledge: self.knowledge.clone(),
-            recall: self.recall.take(),
             model,
             effort,
         };
         // Cleared before the turn is sent: a Stop from now on ends this turn, even one the
         // thread hasn't started yet.
         self.cancel.clear();
-        if self.jobs.send(Job::Turn(Box::new(turn), policy)).is_err() {
+        let recall = self.recall.take();
+        if self.jobs.send(Job::Turn(Box::new(turn), policy, recall)).is_err() {
             self.ended = true;
             return Err(AssistError::Ended);
         }
@@ -526,14 +527,14 @@ impl Work {
             return;
         }
         while let Ok(job) = self.jobs.recv() {
-            let (mut turn, policy) = match job {
-                Job::Turn(t, policy) => (*t, policy.unwrap_or(self.policy)),
+            let (mut turn, policy, recall) = match job {
+                Job::Turn(t, policy, recall) => (*t, policy.unwrap_or(self.policy), recall),
                 Job::End => break,
             };
             // Reading the person's cases is file work, so it runs here, off the frame; what it
             // finds joins the turn's sources, as data, on every backend alike. A case that can't
             // be read makes it find nothing and say so: a memory failure never stops a turn.
-            if let Some(ask) = turn.recall.take() {
+            if let Some(ask) = recall {
                 let recalled = ask.run(&mut self.told, self.backend.retains());
                 self.events.send(Event::Recalled(recalled.sent()));
                 turn.knowledge.extend(recalled.into_sources());

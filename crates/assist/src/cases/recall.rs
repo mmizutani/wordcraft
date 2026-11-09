@@ -11,6 +11,7 @@
 //! [`crate::memory::Instructions`].
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -236,10 +237,21 @@ pub const MAX_ABOUT: usize = 4 << 10;
 const MAX_TOLD: usize = 4096;
 
 /// Proof that no one but the person and this conversation's assistant can read the document. Its
-/// field is private: the only way to get one is [`Alone::check`], and [`RecallAsk::new`] takes one,
-/// so recalled text can't reach a room the other side is in.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Alone(());
+/// fields are private: the only way to get one is [`Alone::check`], and [`RecallAsk::new`] takes
+/// one, so recalled text can't reach a room the other side is in. Not `Clone`: a proof is used once.
+/// It keeps what the check needs, because the window checks on the frame and the conversation's
+/// thread runs the recall later: someone who joins in between is found by [`Alone::recheck`].
+pub struct Alone {
+    room: Arc<Room>,
+    me: ParticipantId,
+    seat: String,
+}
+
+impl std::fmt::Debug for Alone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Alone").field("me", &self.me).field("seat", &self.seat).finish_non_exhaustive()
+    }
+}
 
 /// Who else can read the document: their names, for Details.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -251,24 +263,35 @@ impl Alone {
     /// `room` holds no participant but `me` (the window's own copy) and `seat` (this conversation's
     /// assistant), and no invite but `seat`'s, joined or not. A room refuses a second invite or
     /// participant under a name it has, so the seat's name is sound to compare.
-    pub fn check(room: &Room, me: ParticipantId, seat: &str) -> Result<Alone, Others> {
-        let mut names: Vec<String> = room.participants().into_iter().filter(|p| p.id != me && p.name != seat).map(|p| label(&p.name)).collect();
-        names.extend(room.invites().into_iter().filter(|i| i.name != seat).map(|i| label(&i.name)));
-        names.sort();
-        names.dedup();
-        if names.is_empty() { Ok(Alone(())) } else { Err(Others { names }) }
+    pub fn check(room: &Arc<Room>, me: ParticipantId, seat: &str) -> Result<Alone, Others> {
+        let names = others(room, me, seat);
+        if names.is_empty() { Ok(Alone { room: room.clone(), me, seat: seat.to_string() }) } else { Err(Others { names }) }
+    }
+
+    /// The same check, where the recall runs.
+    fn recheck(&self) -> Result<(), Others> {
+        let names = others(&self.room, self.me, &self.seat);
+        if names.is_empty() { Ok(()) } else { Err(Others { names }) }
     }
 }
 
+/// Who is in `room`, or invited to it, besides `me` and `seat`.
+fn others(room: &Room, me: ParticipantId, seat: &str) -> Vec<String> {
+    let mut names: Vec<String> = room.participants().into_iter().filter(|p| p.id != me && p.name != seat).map(|p| label(&p.name)).collect();
+    names.extend(room.invites().into_iter().filter(|i| i.name != seat).map(|i| label(&i.name)));
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// What one turn asks to recall: from which shelf and case, about what, as of which day, and the
-/// proof it may. Built on the frame, run on the conversation's thread ([`RecallAsk::run`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// proof it may. Built on the frame, run once on the conversation's thread ([`RecallAsk::run`]).
+#[derive(Debug)]
 pub struct RecallAsk {
     shelf: Shelf,
     at: CaseRef,
     about: String,
     today: Day,
-    #[allow(dead_code)]
     alone: Alone,
 }
 
@@ -277,9 +300,13 @@ impl RecallAsk {
         RecallAsk { shelf, at, about: cut(shown(about.to_string()), MAX_ABOUT), today, alone }
     }
 
-    /// Read the case and its wall's other cases, rank, compose. A case that can't be read makes
-    /// it return nothing and say so: a memory failure never stops a turn.
+    /// Check again that no one else reads the document, then read the case and its wall's other
+    /// cases, rank, compose. A case that can't be read makes it return nothing and say so: a
+    /// memory failure never stops a turn.
     pub(crate) fn run(self, told: &mut Told, retains: Option<u64>) -> Recalled {
+        if let Err(others) = self.alone.recheck() {
+            return Recalled::nothing(format!("{} can read this document", others.names.join(", ")));
+        }
         let pool = match Pool::load(&self.shelf, &self.at) {
             Ok(pool) => pool,
             Err(e) => return Recalled::nothing(format!("the case couldn't be read: {e}")),
@@ -703,6 +730,43 @@ mod tests {
     fn a_neighbors_unconfirmed_notes_and_balances_are_not_in_the_pool() {
         let nb = Neighbor::of(id(1), case("case", 4, Standing::Unconfirmed));
         assert!(nb.case.notes.is_empty() && nb.case.balance.is_empty());
+    }
+
+    /// `Alone` was true on the frame, and someone joined before the conversation's thread ran the
+    /// recall: it checks again there, sends nothing, and says who.
+    #[test]
+    fn someone_joining_between_the_frame_and_the_turn_gets_no_recalled_text() {
+        use crate::cases::record::{Click, NoteDraft, PersonOp};
+        use crate::{Fake, Options};
+        use wordcraft_engine::room::{Role, Room};
+        let dir = std::env::temp_dir().join(format!("wordcraft-recall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Acme", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Acme MSA", "2026-11-10", 2).unwrap();
+        let draft = NoteDraft {
+            body: Body::Pattern { rule: Quoted::parse("Cap liability at twelve months."), traps: None },
+            how: None,
+            topics: Topics::default(),
+        };
+        shelf.person(click, &at, PersonOp::AddNote(draft), day("2026-11-10")).unwrap();
+        let mut session = wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("one"));
+        let (room, own) = Room::host(&mut session, "Minoru").unwrap();
+        let fake = Fake::new();
+        let seen = fake.seen();
+        let mut a = crate::Assistant::start(&room, Box::new(fake), Options::default()).unwrap();
+        let alone = Alone::check(&room, own.id(), a.name()).unwrap();
+        a.set_recall(Some(RecallAsk::new(shelf, at, "the liability cap", day("2026-11-10"), alone)));
+        let _key = room.invite("Bob", Role::Viewer).unwrap();
+        a.ask("What about the liability cap?", None).unwrap();
+        assert!(a.wait_idle(std::time::Duration::from_secs(30)));
+        let turns = seen.lock().unwrap().turns.clone();
+        assert!(turns[0].knowledge.is_empty(), "{:?}", turns[0].knowledge);
+        let problem = a.transcript().entries().find_map(|e| if let crate::Entry::Recalled(sent) = e { sent.problem.clone() } else { None });
+        assert_eq!(problem.as_deref(), Some("Bob can read this document"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -633,15 +633,19 @@ fn what_is_recalled_reaches_chatgpt_as_input_once_and_an_agent_once_per_session(
     spec.reach = Reach::Mcp { cli: PathBuf::from(env!("CARGO_BIN_EXE_wordcraft-cli")), room: window.port.addr() };
     spec.start_timeout = WAIT;
     let mut agent = timed("starting the agent", || Assistant::start(&window.room, Box::new(Acp::new(spec)), options())).unwrap();
-    let alone = Alone::check(&window.room, window.own.id(), agent.name()).expect("ChatGPT's invite was taken back");
-    let ask = RecallAsk::new(shelf.clone(), at.clone(), "the liability cap", today, alone);
-    agent.set_recall(Some(ask.clone()));
+    let ask = |window: &Window, agent: &Assistant| {
+        let alone = Alone::check(&window.room, window.own.id(), agent.name()).expect("ChatGPT's invite was taken back");
+        RecallAsk::new(shelf.clone(), at.clone(), "the liability cap", today, alone)
+    };
+    let first_ask = ask(&window, &agent);
+    agent.set_recall(Some(first_ask));
     timed("asking the agent", || agent.ask("Report", None)).unwrap();
     settle(&mut window, &mut agent);
     assert_eq!(error(&agent), None);
     let first: Value = serde_json::from_str(&answer(&agent)).unwrap();
     assert!(first.to_string().contains(NOTE), "the agent's first prompt has it: {first}");
-    agent.set_recall(Some(ask));
+    let second_ask = ask(&window, &agent);
+    agent.set_recall(Some(second_ask));
     timed("asking the agent again", || agent.ask("Report", None)).unwrap();
     settle(&mut window, &mut agent);
     assert_eq!(error(&agent), None);

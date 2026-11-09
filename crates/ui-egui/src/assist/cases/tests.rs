@@ -108,33 +108,32 @@ fn confirmed_notes_of_this_case_and_the_same_client_reach_the_turn_as_data_and_c
     assert_eq!(details.turns[0].context.as_ref().unwrap().recall_withheld, None);
 }
 
+/// A conversation that hasn't read case notes yet runs its turn without recall while someone else
+/// can read the document, and Details says who. (One that has read them is refused instead.)
 #[test]
 fn a_second_participant_or_an_invite_not_yet_used_withholds_recall_and_details_says_who() {
     let folder = Folder::new();
     let c = cases(&folder);
     let mut a = window(&folder);
     a.bind_case(Some(c.here.clone()));
-    let seen = ask(&mut a, Fake::new(), "Review the liability cap");
-    assert_eq!(recalled_json(&seen.lock().unwrap().turns[0]).len(), 3, "alone, it recalls");
-
+    a.share_document(None).unwrap();
     let room = a.shared_room().unwrap();
     let key = room.invite("Bob", Role::Viewer).unwrap();
-    a.execute("assist.ask", json!({"prompt": "Review the liability cap again"})).unwrap();
-    settle(&mut a);
+    let seen = ask(&mut a, Fake::new(), "Review the liability cap");
     let turns = seen.lock().unwrap().turns.clone();
-    assert_eq!(turns.len(), 2);
-    assert!(turns[1].knowledge.is_empty(), "an invite not yet used withholds recall: {:?}", turns[1].knowledge);
+    assert!(turns[0].knowledge.is_empty(), "an invite not yet used withholds recall: {:?}", turns[0].knowledge);
     let details = crate::assist::details_for(&mut a);
-    assert_eq!(details.turns[1].context.as_ref().unwrap().recall_withheld.as_deref(), Some("Bob can read this document"));
-    assert!(details.turns[1].recalled.is_none());
+    assert_eq!(details.turns[0].context.as_ref().unwrap().recall_withheld.as_deref(), Some("Bob can read this document"));
+    assert!(details.turns[0].recalled.is_none());
 
     let _bob = room.join_with(&key).unwrap();
     a.execute("assist.ask", json!({"prompt": "Review the liability cap once more"})).unwrap();
     settle(&mut a);
     let turns = seen.lock().unwrap().turns.clone();
-    assert!(turns[2].knowledge.is_empty(), "a participant withholds recall");
+    assert_eq!(turns.len(), 2);
+    assert!(turns[1].knowledge.is_empty(), "a participant withholds recall");
     let details = crate::assist::details_for(&mut a);
-    assert_eq!(details.turns[2].context.as_ref().unwrap().recall_withheld.as_deref(), Some("Bob can read this document"));
+    assert_eq!(details.turns[1].context.as_ref().unwrap().recall_withheld.as_deref(), Some("Bob can read this document"));
 }
 
 #[test]
@@ -188,4 +187,33 @@ fn a_used_marker_for_a_recalled_item_becomes_a_chip_and_one_the_turn_didnt_send_
     assert!(answer.contains("[[used: 1 n1]]") && !answer.contains("n99"), "{answer}");
     let entry = transcript.entries().position(|e| matches!(e, Entry::Answer { .. })).unwrap();
     assert_eq!(transcript.sent_preference(entry, "n1"), Some(HERE), "the chip's words");
+}
+
+/// Once a conversation has read case notes, the model holds them, so someone joining the document
+/// doesn't just turn recall off: the next turn is refused and nothing reaches the backend.
+fn refused_once_someone_can_read(join: bool) {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    let seen = ask(&mut a, Fake::new(), "Review the liability cap");
+    assert_eq!(recalled_json(&seen.lock().unwrap().turns[0]).len(), 3, "alone, it recalls");
+    let room = a.shared_room().unwrap();
+    let key = room.invite("Bob", Role::Viewer).unwrap();
+    let _bob = join.then(|| room.join_with(&key).unwrap());
+    let refused = a.execute("assist.ask", json!({"prompt": "Review the liability cap again"})).unwrap_err();
+    assert!(refused.contains("Bob can now read this document") && refused.contains("Start a new conversation"), "{refused}");
+    settle(&mut a);
+    assert_eq!(seen.lock().unwrap().turns.len(), 1, "nothing reached the backend");
+    assert!(!a.conversation().unwrap().is_busy());
+}
+
+#[test]
+fn a_conversation_that_recalled_is_refused_a_turn_once_an_invite_is_out() {
+    refused_once_someone_can_read(false);
+}
+
+#[test]
+fn a_conversation_that_recalled_is_refused_a_turn_once_someone_joined() {
+    refused_once_someone_can_read(true);
 }

@@ -51,6 +51,16 @@ impl WordApp {
     }
 }
 
+/// Why the shown document's conversation can't take a turn: it has read case notes, and someone
+/// else can read the document now. Stopping recall alone wouldn't do: the model still holds what it
+/// read, and a document could ask it to write that into a comment the newcomer reads.
+pub(crate) fn refuses(app: &WordApp) -> Option<String> {
+    let c = app.assist.conversation.as_ref().filter(|c| c.recalled && !c.assistant.has_ended() && c.document == app.session.document_id())?;
+    let (room, me) = (app.shared_room()?, app.own_participant()?);
+    let others = Alone::check(&room, me, c.assistant.name()).err()?;
+    Some(format!("This conversation has read your case notes and {} can now read this document. Start a new conversation.", others.names.join(", ")))
+}
+
 /// What the next turn asks to recall: nothing without a bound case, a settings folder, a
 /// conversation, or the proof that no one else reads the document, and `sent` then says which.
 pub(crate) fn for_turn(app: &WordApp, prompt: &str, ctx: &Context, sent: &mut Sent) -> Option<RecallAsk> {

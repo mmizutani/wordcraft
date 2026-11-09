@@ -38,7 +38,9 @@ use serde_json::{Value, json};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use wordcraft_assist::knowledge::{self, MAX_SOURCES};
-use wordcraft_assist::{Answer, Assistant, Backend, Caps, Context, Decision, Feedback, Host, Knowledge, Offer, Options, PermissionPolicy, Readiness};
+use wordcraft_assist::{
+    Answer, Assistant, Backend, Caps, Context, Decision, Entry, Feedback, Host, Knowledge, Offer, Options, PermissionPolicy, Readiness,
+};
 use wordcraft_engine::cmd::assist::AssistantStatus;
 use wordcraft_engine::cmd::review::{AuthoredChange, changes_of};
 use wordcraft_engine::room::Role;
@@ -177,6 +179,9 @@ pub(crate) struct Conversation {
     /// keeps what it read and ChatGPT's history holds answers that may quote it, so a document
     /// bound to another case gets a new conversation, never this one.
     pub(crate) case: Option<wordcraft_assist::cases::CaseRef>,
+    /// Whether any turn recalled anything: from then on the model holds case text, and a turn
+    /// while someone else can read the document is refused ([`cases::refuses`]).
+    pub(crate) recalled: bool,
 }
 
 impl WordApp {
@@ -267,7 +272,10 @@ fn status(app: &WordApp) -> AssistantStatus {
 pub(crate) fn tick(app: &mut WordApp) {
     sync_unattended(app);
     if let Some(c) = app.assist.conversation.as_mut() {
-        c.assistant.poll();
+        let came = c.assistant.poll();
+        if !c.recalled && came > 0 {
+            c.recalled = c.assistant.transcript().entries().rev().take(came).any(|e| matches!(e, Entry::Recalled(sent) if !sent.items.is_empty()));
+        }
         if c.assistant.room().is_closed() {
             c.assistant.end();
         }
@@ -777,6 +785,9 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     if sources_being_read(app) {
         return Err(READING_SOURCE.into());
     }
+    if let Some(why) = cases::refuses(app) {
+        return Err(why);
+    }
     let role = wanted(app, role);
     let chosen_id = chosen(app).map(|o| o.id.clone());
     let bound = cases::bound_for(app);
@@ -884,7 +895,7 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
     };
     let assistant = Assistant::start(&room, backend, options).map_err(|e| e.to_string())?;
     let case = cases::bound_for(app);
-    app.assist.conversation = Some(Conversation { assistant, document: app.session.document_id(), case });
+    app.assist.conversation = Some(Conversation { assistant, document: app.session.document_id(), case, recalled: false });
     // Its requests are numbered from 1: the pane opens for each of them.
     app.assist.opened_for = None;
     // It may be about another document, whose turn shouldn't quote this one's text.
