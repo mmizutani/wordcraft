@@ -16,6 +16,7 @@ Blank0 == 0
 
 VARIABLES
     text, rev, dirty, protected, active, \* Session: document, revision, dirty, password, shown
+    shared,                              \* Session::is_shared: a room that is still open shares it
     savedTexts,                          \* texts that reached the document's own file (file.save)
     slotId, slotRev, copyRefused,        \* Slot.id, Slot.revision, a permanent failure was reported
     job, ready, listed, held,            \* Recovery: job under way, ready, documents, held
@@ -23,10 +24,12 @@ VARIABLES
     disk,                                \* id -> the snapshot-*.json files [gen, text, synced]
     confirmed,                           \* id -> newest generation whose sync_dir returned Ok
     replacedWork,                        \* a restore overwrote a document that held text
+    replacedShared,                      \* a restore overwrote a document a room shares
     edits, faults, crashes
 
-vars == << text, rev, dirty, protected, active, savedTexts, slotId, slotRev, copyRefused, job,
-           ready, listed, held, entries, disk, confirmed, replacedWork, edits, faults, crashes >>
+vars == << text, rev, dirty, protected, active, shared, savedTexts, slotId, slotRev, copyRefused,
+           job, ready, listed, held, entries, disk, confirmed, replacedWork, replacedShared,
+           edits, faults, crashes >>
 
 NoHeld == [id |-> None, rev |-> 0, text |-> 0]
 Job(kind, id, txt, step, gen, prev, why, reqRev) ==
@@ -42,11 +45,12 @@ Inventory == {i \in Ids : entries[i] # 0}
 Fresh == {i \in Ids \ {"earlier"} : disk[i] = {} /\ entries[i] = 0 /\ i \notin listed}
 \* Session::recovery_documents: listed copies, without the one this document keeps.
 Visible == listed \ {slotId, held.id}
-\* Session::is_untouched_blank, with no password.
-Blank == text = Blank0 /\ ~dirty /\ rev = 0 /\ ~protected
+\* Session::is_untouched_blank, with no password. A document a room shares counts as used.
+Blank == text = Blank0 /\ ~dirty /\ rev = 0 /\ ~protected /\ ~shared
 
 Init ==
     /\ text = Blank0 /\ rev = 0 /\ dirty = FALSE /\ protected = FALSE /\ active = TRUE
+    /\ shared = FALSE
     /\ savedTexts = {}
     /\ slotId = None /\ slotRev = -1 /\ copyRefused = FALSE
     /\ job = ScanJob /\ ready = FALSE /\ listed = {} /\ held = NoHeld
@@ -54,7 +58,7 @@ Init ==
     /\ disk = [i \in Ids |-> IF i = "earlier"
                              THEN {[gen |-> 1, text |-> OldText, synced |-> TRUE]} ELSE {}]
     /\ confirmed = [i \in Ids |-> IF i = "earlier" THEN 1 ELSE 0]
-    /\ replacedWork = FALSE
+    /\ replacedWork = FALSE /\ replacedShared = FALSE
     /\ edits = 0 /\ faults = 0 /\ crashes = 0
 
 ----
@@ -65,28 +69,29 @@ Edit ==
     /\ active /\ edits < MaxEdits
     /\ edits' = edits + 1 /\ text' = edits + 1 /\ rev' = rev + 1 /\ dirty' = TRUE
     /\ copyRefused' = FALSE
-    /\ UNCHANGED << protected, active, savedTexts, slotId, slotRev, job, ready, listed, held,
-                    entries, disk, confirmed, replacedWork, faults, crashes >>
+    /\ UNCHANGED << protected, active, shared, savedTexts, slotId, slotRev, job, ready, listed,
+                    held, entries, disk, confirmed, replacedWork, replacedShared, faults, crashes >>
 
 \* cmd/file.rs save: dirty clears only after the file is written. A failed save changes nothing.
 SaveDocument ==
     /\ active /\ dirty
     /\ dirty' = FALSE /\ savedTexts' = savedTexts \cup {text}
-    /\ UNCHANGED << text, rev, protected, active, slotId, slotRev, copyRefused, job, ready, listed,
-                    held, entries, disk, confirmed, replacedWork, edits, faults, crashes >>
+    /\ UNCHANGED << text, rev, protected, active, shared, slotId, slotRev, copyRefused, job, ready,
+                    listed, held, entries, disk, confirmed, replacedWork, replacedShared, edits,
+                    faults, crashes >>
 
 \* Another document is shown, or this one again: Session::activate. The other is not modelled.
 SwitchDocument ==
     /\ active' = ~active
-    /\ UNCHANGED << text, rev, dirty, protected, savedTexts, slotId, slotRev, copyRefused, job,
-                    ready, listed, held, entries, disk, confirmed, replacedWork, edits, faults,
-                    crashes >>
+    /\ UNCHANGED << text, rev, dirty, protected, shared, savedTexts, slotId, slotRev, copyRefused,
+                    job, ready, listed, held, entries, disk, confirmed, replacedWork,
+                    replacedShared, edits, faults, crashes >>
 
 \* cmd/file.rs encrypt -> Session::clear_recovery_before_password -> purge_recovery. It blocks
 \* until the worker is idle, so the action needs an idle worker. encrypt is a pure command: it
 \* sets dirty itself and the revision stays.
-Unchanged4Password == UNCHANGED << text, rev, active, savedTexts, copyRefused, job, ready, listed,
-                                   held, replacedWork, edits, crashes >>
+Unchanged4Password == UNCHANGED << text, rev, active, shared, savedTexts, copyRefused, job, ready,
+                                   listed, held, replacedWork, replacedShared, edits, crashes >>
 EncryptDocument ==
     /\ active /\ ~protected /\ job.kind = "none"
     /\ Unchanged4Password
@@ -121,25 +126,60 @@ EncryptDocument ==
 RemoveEncryption ==
     /\ active /\ protected
     /\ protected' = FALSE /\ dirty' = TRUE
-    /\ UNCHANGED << text, rev, active, savedTexts, slotId, slotRev, copyRefused, job, ready, listed,
-                    held, entries, disk, confirmed, replacedWork, edits, faults, crashes >>
+    /\ UNCHANGED << text, rev, active, shared, savedTexts, slotId, slotRev, copyRefused, job, ready,
+                    listed, held, entries, disk, confirmed, replacedWork, replacedShared, edits,
+                    faults, crashes >>
 
 \* Session::recover { restore } from an untouched blank document (Request.replace). A restore
 \* from a used document opens as another document, which this model leaves out.
 RequestRestore ==
     /\ active /\ job.kind = "none" /\ held.id = None /\ Blank
     /\ \E i \in Visible : job' = Job("load", i, 0, "run", 0, 0, "", rev)
-    /\ UNCHANGED << text, rev, dirty, protected, active, savedTexts, slotId, slotRev, copyRefused,
-                    ready, listed, held, entries, disk, confirmed, replacedWork, edits, faults,
-                    crashes >>
+    /\ UNCHANGED << text, rev, dirty, protected, active, shared, savedTexts, slotId, slotRev,
+                    copyRefused, ready, listed, held, entries, disk, confirmed, replacedWork,
+                    replacedShared, edits, faults, crashes >>
 
 \* Session::recover { discard }: the user throws away a copy that the list shows.
 RequestDiscard ==
     /\ job.kind = "none"
     /\ \E i \in Visible : job' = Job("discard", i, 0, "run", 0, 0, "", 0)
+    /\ UNCHANGED << text, rev, dirty, protected, active, shared, savedTexts, slotId, slotRev,
+                    copyRefused, ready, listed, held, entries, disk, confirmed, replacedWork,
+                    replacedShared, edits, faults, crashes >>
+
+----
+\* A room shares the document (crates/engine/src/room.rs, room/replica.rs, session/shared.rs).
+
+\* Room::host: the active document is shared until the room closes. When blocks need ids first,
+\* Session::reset_shared touches the document: a new revision and dirty, with the same text. The
+\* touch spends an edit like every other touch(): sharing can stop and start again, and an
+\* unbudgeted touch would make the revision grow without end.
+ShareDocument ==
+    /\ active /\ ~shared
+    /\ shared' = TRUE
+    /\ \/ UNCHANGED << rev, dirty, copyRefused, edits >>
+       \/ /\ edits < MaxEdits /\ edits' = edits + 1
+          /\ rev' = rev + 1 /\ dirty' = TRUE /\ copyRefused' = FALSE
+    /\ UNCHANGED << text, protected, active, savedTexts, slotId, slotRev, job, ready, listed, held,
+                    entries, disk, confirmed, replacedWork, replacedShared, faults, crashes >>
+
+\* Room::close, or the window's stop_sharing: Session::is_shared turns false.
+StopSharing ==
+    /\ shared
+    /\ shared' = FALSE
     /\ UNCHANGED << text, rev, dirty, protected, active, savedTexts, slotId, slotRev, copyRefused,
-                    ready, listed, held, entries, disk, confirmed, replacedWork, edits, faults,
-                    crashes >>
+                    job, ready, listed, held, entries, disk, confirmed, replacedWork,
+                    replacedShared, edits, faults, crashes >>
+
+\* Another participant's change reaches the window: Replica::receive, through
+\* Replica::lend_document when another document is shown, so it comes whichever document is shown.
+\* Session::apply_theirs or reset_shared, then touch() in follow_shared.
+TheirEdit ==
+    /\ shared /\ edits < MaxEdits
+    /\ edits' = edits + 1 /\ text' = edits + 1 /\ rev' = rev + 1 /\ dirty' = TRUE
+    /\ copyRefused' = FALSE
+    /\ UNCHANGED << protected, active, shared, savedTexts, slotId, slotRev, job, ready, listed,
+                    held, entries, disk, confirmed, replacedWork, replacedShared, faults, crashes >>
 
 ----
 \* The frame loop: Session::recovery_tick.
@@ -161,19 +201,29 @@ Tick ==
        ELSE /\ slotId # None
             /\ job' = Job("discard", slotId, 0, "run", 0, 0, "own", 0)
             /\ UNCHANGED << slotId, slotRev >>
-    /\ UNCHANGED << text, rev, dirty, protected, active, savedTexts, copyRefused, ready, listed,
-                    held, entries, disk, confirmed, replacedWork, edits, faults, crashes >>
+    /\ UNCHANGED << text, rev, dirty, protected, active, shared, savedTexts, copyRefused, ready,
+                    listed, held, entries, disk, confirmed, replacedWork, replacedShared, edits,
+                    faults, crashes >>
 
 \* Session::open_held_restore, Request.replace.
 Open(h) ==
     /\ held' = NoHeld
-    /\ IF rev = h.rev /\ ~protected
+    /\ IF shared
+       THEN \* Shared since it asked: add_document. The copy opens beside this document and is
+            \* shown instead. That other document is not modelled.
+            /\ active' = FALSE
+            /\ UNCHANGED << replacedWork, replacedShared, text, rev, dirty, slotId, slotRev,
+                            copyRefused >>
+       ELSE IF rev = h.rev /\ ~protected
        THEN \* set_document, dirty = true, Slot::adopt(id, rev).
             /\ replacedWork' = (replacedWork \/ text # Blank0)
+            /\ replacedShared' = (replacedShared \/ shared)
             /\ text' = h.text /\ rev' = rev + 1 /\ dirty' = TRUE
             /\ slotId' = h.id /\ slotRev' = rev + 1 /\ copyRefused' = FALSE
+            /\ UNCHANGED active
        ELSE \* "Recovery cancelled: the document changed while the copy was loading."
-            UNCHANGED << replacedWork, text, rev, dirty, slotId, slotRev, copyRefused >>
+            UNCHANGED << active, replacedWork, replacedShared, text, rev, dirty, slotId, slotRev,
+                         copyRefused >>
 
 Loaded == job.kind = "load" /\ job.why = "ok"
 LoadedCopy == [id |-> job.id, rev |-> job.reqRev, text |-> job.text]
@@ -189,28 +239,29 @@ Receive ==
     /\ copyRefused' = (copyRefused \/ (job.kind = "save" /\ job.why = "permanent"))
     /\ slotId' = IF job.kind = "discard" /\ job.why = "ok" /\ slotId = job.id THEN None ELSE slotId
     /\ held' = IF Loaded THEN LoadedCopy ELSE held
-    /\ UNCHANGED << text, rev, dirty, protected, active, savedTexts, entries, disk, confirmed,
-                    replacedWork, edits, faults, crashes >>
+    /\ UNCHANGED << text, rev, dirty, protected, active, shared, savedTexts, entries, disk,
+                    confirmed, replacedWork, replacedShared, edits, faults, crashes >>
 
 \* The same Session::recovery_tick: a copy loaded for the shown document opens in that frame.
 ReceiveAndOpen ==
     /\ job.step = "answered" /\ Loaded /\ active
     /\ job' = NoJob /\ ready' = TRUE /\ listed' = Inventory
     /\ Open(LoadedCopy)
-    /\ UNCHANGED << protected, active, savedTexts, entries, disk, confirmed, edits, faults, crashes >>
+    /\ UNCHANGED << protected, shared, savedTexts, entries, disk, confirmed, edits, faults, crashes >>
 
 \* A later Session::recovery_tick, once the document that asked is shown again.
 OpenHeld ==
     /\ held.id # None /\ active
     /\ Open(held)
-    /\ UNCHANGED << protected, active, savedTexts, job, ready, listed, entries, disk, confirmed,
+    /\ UNCHANGED << protected, shared, savedTexts, job, ready, listed, entries, disk, confirmed,
                     edits, faults, crashes >>
 
 ----
 \* The worker thread: one job at a time, Store.
 
-UnchangedWorkerUI == UNCHANGED << text, rev, dirty, protected, active, savedTexts, slotId, slotRev,
-                                  copyRefused, ready, listed, held, replacedWork, edits, crashes >>
+UnchangedWorkerUI == UNCHANGED << text, rev, dirty, protected, active, shared, savedTexts, slotId,
+                                  slotRev, copyRefused, ready, listed, held, replacedWork,
+                                  replacedShared, edits, crashes >>
 
 \* Store::scan: each record's newest readable generation.
 WorkerScan ==
@@ -285,17 +336,19 @@ WorkerDiscard ==
     /\ UnchangedWorkerUI
 
 ----
-\* The machine. Memory is gone. A process crash keeps every renamed file; a power loss can lose
-\* the renames sync_dir has not made durable. The next run starts blank and scans.
+\* The machine. Memory is gone, and a room with it. A process crash keeps every renamed file; a
+\* power loss can lose the renames sync_dir has not made durable. The next run starts blank and
+\* scans.
 Crash ==
     /\ crashes < MaxCrashes /\ crashes' = crashes + 1
     /\ \/ disk' = disk
        \/ disk' = [i \in Ids |-> {g \in disk[i] : g.synced}]
     /\ text' = Blank0 /\ rev' = 0 /\ dirty' = FALSE /\ protected' = FALSE /\ active' = TRUE
+    /\ shared' = FALSE
     /\ slotId' = None /\ slotRev' = -1 /\ copyRefused' = FALSE
     /\ job' = ScanJob /\ ready' = FALSE /\ listed' = {} /\ held' = NoHeld
     /\ entries' = [i \in Ids |-> 0]
-    /\ UNCHANGED << savedTexts, confirmed, replacedWork, edits, faults >>
+    /\ UNCHANGED << savedTexts, confirmed, replacedWork, replacedShared, edits, faults >>
 
 \* Nothing left to do: only the deadlock check needs it, and a stuck worker still deadlocks.
 Idle == job.kind = "none" /\ UNCHANGED vars
@@ -303,6 +356,7 @@ Idle == job.kind = "none" /\ UNCHANGED vars
 Next ==
     \/ Edit \/ SaveDocument \/ SwitchDocument \/ EncryptDocument \/ RemoveEncryption
     \/ RequestRestore \/ RequestDiscard
+    \/ ShareDocument \/ StopSharing \/ TheirEdit
     \/ Tick \/ Receive \/ ReceiveAndOpen \/ OpenHeld
     \/ WorkerScan \/ WorkerWriteTemp \/ WorkerRename \/ WorkerSyncDir \/ WorkerPrune
     \/ WorkerLoad \/ WorkerDiscard
@@ -330,5 +384,14 @@ NoPlaintextOfProtected ==
 
 \* A restore replaces only a document that holds no text.
 RestoreOnlyReplacesBlank == ~replacedWork
+
+\* A restore never replaces a document a room shares: the copy opens beside it.
+RestoreNeverReplacesShared == ~replacedShared
+
+\* Not a promise of the code: it keeps the model finite. Every touch spends an edit, and a run
+\* opens at most one copy, from revision 0. An action that bumps rev without a budget breaks this
+\* within a few steps. Without it TLC keeps finding new states and writes them to disk until the
+\* disk is full.
+RevisionBounded == rev <= MaxEdits + 1
 
 ====

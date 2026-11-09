@@ -42,6 +42,9 @@ tlc() { # config module
   (cd "$here" && "$java_bin" -XX:+UseParallelGC "-Djava.io.tmpdir=$tmp" -cp "$jar" tlc2.TLC \
     -nowarning -workers auto -metadir "$tmp/states-$1" -config "$1.cfg" "$2.tla") \
     >"$tmp/$1.out" 2>&1
+  # The state files are never read after TLC stops, and a model that grows without end leaves
+  # hundreds of gigabytes of them, which every exit path below would otherwise keep.
+  rm -rf "$tmp/states-$1"
   # Out of memory, a model that doesn't parse: nothing was checked, so it says nothing about a rule.
   grep -Eq 'Model checking completed\. No error has been found\.|^Error: Invariant .* is violated|^Error: Deadlock reached' "$tmp/$1.out" \
     || { echo "TLC gave no result for $1.cfg. Full output: $tmp/$1.out" >&2; exit 4; }
