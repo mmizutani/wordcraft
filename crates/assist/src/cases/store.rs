@@ -13,8 +13,9 @@
 //! delete can't leave a shadow in one. Every write locks, reads fresh, applies one typed op and
 //! replaces the file in a rename, and never creates a folder: a case deleted in another window
 //! returns [`CaseError::Gone`] and stays deleted. A symlink where a wall or case folder should be
-//! is never followed: a listing skips it and a write finds it `Gone`, so nothing here can touch a
-//! folder outside `assistant-cases/`.
+//! is never followed: a listing skips it and a write finds it `Gone`; one where `case.json` should
+//! be reads as damaged. So nothing here can touch, or recall from, a file outside the case's own
+//! folder.
 
 use std::fs;
 use std::io::Read;
@@ -232,7 +233,7 @@ impl Shelf {
             let name = entry.file_name();
             let Some(id) = name.to_str().and_then(CaseId::parse).filter(|id| *id != at.case && is_real_dir(&entry)) else { continue };
             let file = entry.path().join(CASE_FILE);
-            let Ok(meta) = fs::metadata(&file) else { continue };
+            let Ok(meta) = fs::symlink_metadata(&file) else { continue };
             found.push((meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), meta.len(), id, file));
         }
         found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
@@ -406,8 +407,13 @@ fn is_real_dir(entry: &fs::DirEntry) -> bool {
     entry.file_type().is_ok_and(|t| t.is_dir())
 }
 
-/// At most [`MAX_FILE`] bytes of `path`; `None` when there are more or it can't be read.
+/// At most [`MAX_FILE`] bytes of `path`; `None` when there are more, it can't be read, or it
+/// isn't a plain file. A link is refused rather than followed: one left in a case folder could
+/// point at another wall's case, and the folder is the ethical wall.
 fn read_whole(path: &Path) -> Option<Vec<u8>> {
+    if !fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
     let file = fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
     file.take(MAX_FILE.saturating_add(1)).read_to_end(&mut bytes).ok()?;
