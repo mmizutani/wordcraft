@@ -1,0 +1,32 @@
+[package]
+name = "wordcraft-sites-worker"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+probe = ["worker/d1"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worker = "0.8.7"
+
+[workspace]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+cognitive_complexity = "deny"
+wildcard_imports = "deny"
+too_many_arguments = "deny"
+
+[lints]
+workspace = true
+
+[profile.release]
+lto = true
+codegen-units = 1
