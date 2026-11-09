@@ -286,26 +286,43 @@ fn others(room: &Room, me: ParticipantId, seat: &str) -> Vec<String> {
 
 /// What one turn asks to recall: from which shelf and case, about what, as of which day, and the
 /// proof it may. Built on the frame, run once on the conversation's thread ([`RecallAsk::run`]).
-#[derive(Debug)]
 pub struct RecallAsk {
     shelf: Shelf,
     at: CaseRef,
     about: String,
     today: Day,
     alone: Alone,
+    /// Run once the files are read, before the proof is checked again ([`RecallAsk::after_reading`]).
+    after_reading: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl std::fmt::Debug for RecallAsk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecallAsk").field("at", &self.at).field("today", &self.today).field("alone", &self.alone).finish_non_exhaustive()
+    }
 }
 
 impl RecallAsk {
     pub fn new(shelf: Shelf, at: CaseRef, about: &str, today: Day, alone: Alone) -> RecallAsk {
-        RecallAsk { shelf, at, about: cut(shown(about.to_string()), MAX_ABOUT), today, alone }
+        RecallAsk { shelf, at, about: cut(shown(about.to_string()), MAX_ABOUT), today, alone, after_reading: None }
+    }
+
+    /// For tests: `f` runs between reading the files and the second check of the proof, where
+    /// someone can join.
+    #[doc(hidden)]
+    pub fn after_reading(mut self, f: impl FnOnce() + Send + 'static) -> RecallAsk {
+        self.after_reading = Some(Box::new(f));
+        self
     }
 
     /// Check again that no one else reads the document, then read the case and its wall's other
-    /// cases, rank, compose. A case that can't be read makes it return nothing and say so: a
-    /// memory failure never stops a turn.
+    /// cases, rank, compose, and check once more before anything read leaves: reading takes
+    /// long enough for someone to join. A case that can't be read makes it return nothing and
+    /// say so: a memory failure never stops a turn.
     pub(crate) fn run(self, told: &mut Told, retains: Option<u64>) -> Recalled {
-        if let Err(others) = self.alone.recheck() {
-            return Recalled::nothing(format!("{} can read this document", others.names.join(", ")));
+        let others = |o: Others| Recalled::nothing(format!("{} can read this document", o.names.join(", ")));
+        if let Err(o) = self.alone.recheck() {
+            return others(o);
         }
         let pool = match Pool::load(&self.shelf, &self.at) {
             Ok(pool) => pool,
@@ -317,6 +334,12 @@ impl RecallAsk {
             recalled.sent.problem = Some("this case's file is damaged, so nothing of it was recalled".into());
         } else if pool.skipped > 0 {
             recalled.sent.problem = Some(format!("{} of this client's cases couldn't be read", pool.skipped));
+        }
+        if let Some(f) = self.after_reading {
+            f();
+        }
+        if let Err(o) = self.alone.recheck() {
+            return others(o);
         }
         told.filter(&mut recalled, retains);
         recalled
@@ -760,6 +783,46 @@ mod tests {
         let alone = Alone::check(&room, own.id(), a.name()).unwrap();
         a.set_recall(Some(RecallAsk::new(shelf, at, "the liability cap", day("2026-11-10"), alone)));
         let _key = room.invite("Bob", Role::Viewer).unwrap();
+        a.ask("What about the liability cap?", None).unwrap();
+        assert!(a.wait_idle(std::time::Duration::from_secs(30)));
+        let turns = seen.lock().unwrap().turns.clone();
+        assert!(turns[0].knowledge.is_empty(), "{:?}", turns[0].knowledge);
+        let problem = a.transcript().entries().find_map(|e| if let crate::Entry::Recalled(sent) = e { sent.problem.clone() } else { None });
+        assert_eq!(problem.as_deref(), Some("Bob can read this document"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Someone joins while the recall reads its files: the proof is checked again after reading,
+    /// so nothing of what was read reaches the turn.
+    #[test]
+    fn someone_joining_while_the_recall_reads_its_files_gets_no_recalled_text() {
+        use crate::cases::record::{Click, NoteDraft, PersonOp};
+        use crate::{Fake, Options};
+        use wordcraft_engine::room::{Role, Room};
+        let dir = std::env::temp_dir().join(format!("wordcraft-recall-reading-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Acme", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Acme MSA", "2026-11-10", 2).unwrap();
+        let draft = NoteDraft {
+            body: Body::Pattern { rule: Quoted::parse("Cap liability at twelve months."), traps: None },
+            how: None,
+            topics: Topics::default(),
+        };
+        shelf.person(click, &at, PersonOp::AddNote(draft), day("2026-11-10")).unwrap();
+        let mut session = wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("one"));
+        let (room, own) = Room::host(&mut session, "Minoru").unwrap();
+        let fake = Fake::new();
+        let seen = fake.seen();
+        let mut a = crate::Assistant::start(&room, Box::new(fake), Options::default()).unwrap();
+        let alone = Alone::check(&room, own.id(), a.name()).unwrap();
+        let joining = room.clone();
+        let ask = RecallAsk::new(shelf, at, "the liability cap", day("2026-11-10"), alone).after_reading(move || {
+            joining.invite("Bob", Role::Viewer).unwrap();
+        });
+        a.set_recall(Some(ask));
         a.ask("What about the liability cap?", None).unwrap();
         assert!(a.wait_idle(std::time::Duration::from_secs(30)));
         let turns = seen.lock().unwrap().turns.clone();

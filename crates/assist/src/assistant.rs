@@ -122,8 +122,8 @@ pub struct Assistant {
     choice: (Option<String>, Option<String>),
     /// What the backend last said it offers, once it has.
     offered: Option<Offered>,
-    /// Whether any turn recalled anything from the person's cases: from then on the model holds
-    /// case text, whoever can read the document later.
+    /// Whether any turn was sent with something to recall, or recalled anything: from then on
+    /// the model may hold case text, whoever can read the document later.
     recalled: bool,
     ended: bool,
 }
@@ -237,8 +237,9 @@ impl Assistant {
         self.ended
     }
 
-    /// Whether any turn recalled anything from the person's cases ([`Assistant::set_recall`]).
-    /// Set from the event itself as it is polled, so it can't miss one.
+    /// Whether any turn was sent with something to recall from the person's cases
+    /// ([`Assistant::set_recall`]), or recalled anything: set as the turn is sent and again from
+    /// the event as it is polled, so it can't miss one and never lags the thread.
     pub fn recalled(&self) -> bool {
         self.recalled
     }
@@ -338,6 +339,9 @@ impl Assistant {
         // thread hasn't started yet.
         self.cancel.clear();
         let recall = self.recall.take();
+        // From here the thread may read case notes at any moment, so the conversation counts as
+        // having recalled before the event says what it found: the guard fails closed.
+        self.recalled |= recall.is_some();
         if self.jobs.send(Job::Turn(Box::new(turn), policy, recall)).is_err() {
             self.ended = true;
             return Err(AssistError::Ended);

@@ -62,6 +62,19 @@ fn ask(a: &mut WordApp, fake: Fake, prompt: &str) -> std::sync::Arc<std::sync::M
     seen
 }
 
+/// Frames until `done`, within a generous deadline: a loaded machine schedules the conversation's
+/// thread late, so no wait here is a fixed number of ticks.
+fn frames_until(a: &mut WordApp, what: &str, mut done: impl FnMut(&mut WordApp) -> bool) {
+    let ctx = egui::Context::default();
+    let started = std::time::Instant::now();
+    while !done(a) {
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "{what}");
+        a.sync_share(&ctx);
+        crate::assist::tick(a);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 fn recalled_json(turn: &Turn) -> Vec<Value> {
     let recalled: Vec<&wordcraft_assist::TurnSource> = turn.knowledge.iter().filter(|s| s.origin == SourceOrigin::Recalled).collect();
     assert_eq!(recalled.len(), 1, "one recalled source: {:?}", turn.knowledge);
@@ -106,6 +119,34 @@ fn confirmed_notes_of_this_case_and_the_same_client_reach_the_turn_as_data_and_c
     assert_eq!(recalled.items[0].id, ItemId::Here { note: wordcraft_assist::cases::NoteId::parse("n1").unwrap() });
     assert_eq!(recalled.items[1].title.as_deref(), Some("Acme SaaS renewal"));
     assert_eq!(details.turns[0].context.as_ref().unwrap().recall_withheld, None);
+}
+
+/// A neighbour whose `case.json` is a link to another wall's case is read as damaged, not followed:
+/// the folder is the ethical wall, and a link would carry another client's text across it.
+#[cfg(unix)]
+#[test]
+fn a_neighbour_whose_case_file_links_to_another_wall_contributes_nothing() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let shelf = Shelf::at(&folder.0);
+    let listing = shelf.list();
+    let other = listing.walls.iter().find(|w| w.id != c.here.wall).unwrap();
+    let other_file = folder.0.join("assistant-cases").join(other.id.as_str()).join(other.cases[0].id.as_str()).join("case.json");
+    assert!(std::fs::read_to_string(&other_file).unwrap().contains(OTHER_WALL_CANARY));
+    let linked = shelf.new_case(click(), &c.here.wall, "Acme linked", TODAY, 9).unwrap();
+    let linked_file = folder.0.join("assistant-cases").join(linked.wall.as_str()).join(linked.case.as_str()).join("case.json");
+    std::fs::remove_file(&linked_file).unwrap();
+    std::os::unix::fs::symlink(&other_file, &linked_file).unwrap();
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    let seen = ask(&mut a, Fake::new(), "Review the liability cap and the indemnity clause");
+    let turn = seen.lock().unwrap().turns[0].clone();
+    let everything = format!("{turn:?}");
+    assert!(!everything.contains(OTHER_WALL_CANARY), "the link was followed: {everything}");
+    assert_eq!(recalled_json(&turn).len(), 3, "this case and the real neighbour still recall");
+    let details = crate::assist::details_for(&mut a);
+    let recalled = details.turns[0].recalled.as_ref().unwrap();
+    assert_eq!(recalled.problem.as_deref(), Some("1 of this client's cases couldn't be read"));
 }
 
 /// A conversation that hasn't read case notes yet runs its turn without recall while someone else
@@ -258,14 +299,9 @@ fn someone_joining_mid_turn_ends_a_conversation_that_recalled_and_the_pane_says_
     let seen = fake.seen();
     a.assist_with(Box::new(fake));
     a.execute("assist.ask", json!({"prompt": "Review the liability cap"})).unwrap();
-    let ctx = egui::Context::default();
-    let started = std::time::Instant::now();
-    while !a.conversation().unwrap().recalled() {
-        assert!(started.elapsed() < std::time::Duration::from_secs(20), "the turn never recalled");
-        a.sync_share(&ctx);
-        crate::assist::tick(&mut a);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    // The Recalled event comes before the backend's turn starts, so the turn is waited for too.
+    frames_until(&mut a, "the turn never recalled", |a| a.conversation().unwrap().recalled());
+    frames_until(&mut a, "the backend never got the turn", |_| !seen.lock().unwrap().turns.is_empty());
     assert!(a.conversation().unwrap().is_busy(), "the fake holds its turn");
     assert_eq!(recalled_json(&seen.lock().unwrap().turns[0]).len(), 3);
     let room = a.shared_room().unwrap();
@@ -277,7 +313,8 @@ fn someone_joining_mid_turn_ends_a_conversation_that_recalled_and_the_pane_says_
     assert!(notice.contains("Bob can now read this document") && notice.contains("case notes"), "{notice}");
     settle(&mut a);
     assert!(!a.conversation().unwrap().is_busy());
-    assert!(seen.lock().unwrap().ended, "the backend was told to stop");
+    // Ending never waits for the conversation's thread, which tells the backend.
+    frames_until(&mut a, "the backend was never told to stop", |_| seen.lock().unwrap().ended);
 }
 
 #[test]
@@ -290,14 +327,8 @@ fn someone_joining_while_another_document_is_shown_still_ends_a_conversation_tha
     let seen = fake.seen();
     a.assist_with(Box::new(fake));
     a.execute("assist.ask", json!({"prompt": "Review the liability cap"})).unwrap();
-    let ctx = egui::Context::default();
-    let started = std::time::Instant::now();
-    while !a.assist.conversation.as_ref().unwrap().assistant.recalled() {
-        assert!(started.elapsed() < std::time::Duration::from_secs(20), "the turn never recalled");
-        a.sync_share(&ctx);
-        crate::assist::tick(&mut a);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    frames_until(&mut a, "the turn never recalled", |a| a.assist.conversation.as_ref().unwrap().assistant.recalled());
+    frames_until(&mut a, "the backend never got the turn", |_| !seen.lock().unwrap().turns.is_empty());
     let room = a.shared_room().unwrap();
     a.execute("file.new", json!({})).unwrap();
     let key = room.invite("Bob", Role::Viewer).unwrap();
@@ -305,5 +336,48 @@ fn someone_joining_while_another_document_is_shown_still_ends_a_conversation_tha
     crate::assist::tick(&mut a);
     assert!(a.assist.conversation.as_ref().unwrap().assistant.has_ended(), "the conversation ended though its document isn't shown");
     settle(&mut a);
-    assert!(seen.lock().unwrap().ended, "the backend was told to stop");
+    frames_until(&mut a, "the backend was never told to stop", |_| seen.lock().unwrap().ended);
+}
+
+/// The conversation counts as having recalled from the moment it sends a turn with a recall ask,
+/// not from the frame that polls the `Recalled` event: the thread may be reading the files when
+/// someone joins, and the guard must already cover it.
+#[test]
+fn someone_joining_before_the_recalled_event_is_polled_ends_a_conversation_that_asked_to_recall() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    let fake = Fake::new().then(vec![Step::say("Working on it."), Step::Hold]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.execute("assist.ask", json!({"prompt": "Review the liability cap"})).unwrap();
+    assert!(a.conversation().unwrap().recalled(), "a turn sent with a recall ask counts, before any event is polled");
+    let room = a.shared_room().unwrap();
+    room.invite("Bob", Role::Viewer).unwrap();
+    crate::assist::tick(&mut a);
+    assert!(a.conversation().unwrap().has_ended(), "the conversation ended on the frame");
+    let notice = a.assist.notice.clone().unwrap_or_default();
+    assert!(notice.contains("Bob can now read this document"), "{notice}");
+    frames_until(&mut a, "the backend was never told to stop", |_| seen.lock().unwrap().ended);
+}
+
+/// Binding the document to another case ends the conversation bound to the first: a running
+/// turn holds the first case's notes, and the next ask would only replace the conversation.
+#[test]
+fn rebinding_the_document_ends_the_conversation_bound_to_the_other_case_and_stops_its_turn() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    let fake = Fake::new().then(vec![Step::say("Working on it."), Step::Hold]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.execute("assist.ask", json!({"prompt": "Review the liability cap"})).unwrap();
+    frames_until(&mut a, "the backend never got the turn", |_| !seen.lock().unwrap().turns.is_empty());
+    assert!(a.conversation().unwrap().is_busy(), "the fake holds its turn");
+    a.bind_case(Some(c.neighbor.clone()));
+    assert!(a.conversation().unwrap().has_ended(), "the conversation bound to the other case ended");
+    frames_until(&mut a, "the backend was never told to stop", |_| seen.lock().unwrap().ended);
+    assert!(!a.conversation().unwrap().is_busy());
 }
