@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{Block, Formatted, MAX_BLOCKS, MAX_PARSED, MAX_SPANS, Span, format, opens};
+use super::{Block, Formatted, MAX_BLOCKS, MAX_CITE_CHARS, MAX_CITES, MAX_PARSED, MAX_SPANS, Span, citations, format, opens};
 
 fn words(f: &Formatted) -> String {
     let span = |s: &[Span]| s.iter().map(|s| s.text.as_str()).collect::<String>();
@@ -277,4 +277,57 @@ fn a_fence_four_spaces_in_doesn_t_close_or_open_one() {
     let f = format("```\na\n    ```\n```\nNext", true);
     let next = Block::Para(vec![Span { text: "Next".into(), ..Span::default() }]);
     assert_eq!(f.blocks, [Block::Code("a\n    ```".into()), next]);
+}
+
+#[test]
+fn a_citation_becomes_a_chip_of_its_own_and_its_words_leave_the_text() {
+    let f = format(r#"It **rained** [[cite: "the rain fell"]] that day [[cite:"all day"]]."#, false);
+    assert_eq!(f.citations, ["the rain fell", "all day"]);
+    let Block::Para(spans) = &f.blocks[0] else { panic!("{f:?}") };
+    let chips: Vec<usize> = spans.iter().filter_map(|s| s.cite).collect();
+    assert_eq!(chips, [0, 1]);
+    let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+    assert_eq!(text, "It rained  that day .");
+    assert!(spans.iter().any(|s| s.bold && s.text == "rained"), "the words around it keep their format: {spans:?}");
+}
+
+#[test]
+fn a_marker_not_closed_is_held_back_while_arriving_and_text_afterwards() {
+    let open = r#"Said [[cite: "the ra"#;
+    assert_eq!(words(&format(open, true)).trim_end(), "Said", "held back");
+    assert!(format(open, true).citations.is_empty());
+    assert!(words(&format(open, false)).contains("[[cite:"), "{:?}", format(open, false));
+    let whole = r#"Said [[cite: "the rain"]]"#;
+    assert_eq!(words(&format(whole, true)).trim_end(), "Said");
+    assert_eq!(format(whole, true).citations, ["the rain"]);
+}
+
+#[test]
+fn a_citation_holds_to_its_limits() {
+    let long = format!(r#"a [[cite: "{}"]] b"#, "w".repeat(MAX_CITE_CHARS + 1));
+    let f = format(&long, false);
+    assert!(f.citations.is_empty() && words(&f).contains("[[cite:"), "a marker too long stays as text");
+    let at_limit = format!(r#"[[cite: "{}"]]"#, "é".repeat(MAX_CITE_CHARS));
+    assert_eq!(citations(&at_limit).len(), 1);
+
+    let many = r#"x [[cite: "w"]] "#.repeat(MAX_CITES + 10);
+    let f = format(&many, false);
+    assert_eq!(f.citations.len(), MAX_CITES);
+    assert!(!words(&f).contains("cite"), "past the limit a marker goes without a chip");
+    assert_eq!(citations(r#"[[cite: "  "]]"#), Vec::<String>::new());
+}
+
+#[test]
+fn what_an_answer_can_t_forge_or_lose() {
+    // Its own use of the characters this reads with goes.
+    let f = format("a\u{F8FD}0\u{F8FD} b", false);
+    assert!(f.citations.is_empty() && !words(&f).contains('\u{F8FD}'), "{f:?}");
+    // A citation's words can't hide or reorder anything.
+    assert_eq!(citations("[[cite: \"x\u{202E}y\"]]"), ["xy"]);
+    // In code it shows no chip, and leaves no trace.
+    let f = format("```\ncode [[cite: \"w\"]] here\n```", false);
+    assert_eq!(f.blocks, [Block::Code("code  here".into())]);
+    // Past the limits the markers go too.
+    let f = format(&format!("{}\nend [[cite: \"w\"]] of it", "word ".repeat(30_000)), false);
+    assert!(f.rest.ends_with("end  of it"), "{}", f.rest.chars().rev().take(20).collect::<String>());
 }

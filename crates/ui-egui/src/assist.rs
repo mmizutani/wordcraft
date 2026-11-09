@@ -25,6 +25,7 @@
 //! Signing in to ChatGPT (#19) is [`chatgpt`]'s: File › Options › Account and the pane start it,
 //! and [`tick`] takes how it ended, so ChatGPT is offered ready at once.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -72,6 +73,9 @@ pub(crate) struct AssistState {
     adding: Vec<Receiver<Result<Knowledge, String>>>,
     /// Sources' Add shows what to add.
     pub(crate) add_open: bool,
+    /// Where citations' words were found, for the document and revision and sources it was looked
+    /// at with.
+    cited: Option<((u64, u64, usize), HashMap<String, Cited>)>,
     /// The document and its revision the conversation's record of what it changed last read.
     output_at: Option<(u64, u64)>,
     /// What the pane shows: the conversation, or what the assistant is doing and what runs it.
@@ -103,6 +107,14 @@ pub(crate) struct AssistState {
 }
 
 /// What the Assistant pane shows under its role.
+/// Where a citation's words are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Cited {
+    Document,
+    Source(String),
+    Nowhere,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PaneView {
     #[default]
@@ -343,9 +355,53 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
 }
 
 /// The conversation in summary, as the pane's Details shows it. Empty without a conversation.
-fn details(app: &WordApp) -> Result<Value, String> {
-    let details = app.conversation().map(Assistant::details).unwrap_or_default();
-    serde_json::to_value(details).map_err(|e| e.to_string())
+fn details(app: &mut WordApp) -> Result<Value, String> {
+    serde_json::to_value(details_for(app)).map_err(|e| e.to_string())
+}
+
+/// Where `words` are: in the document, as `select.text` finds them, or in an attached source. Looked
+/// for once a revision: answers are drawn each frame.
+// ponytail: each word's look goes through the document; an index of its text if citations multiply.
+pub(crate) fn cited(app: &mut WordApp, words: &str) -> Cited {
+    use wordcraft_doc::StoryRef::Body;
+    let at = (app.session.document_id(), app.session.rev(), sources(app).len());
+    let held = app.assist.cited.get_or_insert_with(|| (at, HashMap::new()));
+    if held.0 != at {
+        *held = (at, HashMap::new());
+    }
+    if let Some(found) = held.1.get(words) {
+        return found.clone();
+    }
+    let doc = &app.session.doc;
+    let in_document = doc.para_paths(Body).iter().any(|path| doc.para(Body, path).is_some_and(|p| p.text.contains(words)));
+    let found = if in_document {
+        Cited::Document
+    } else {
+        sources(app).iter().find(|s| s.text.contains(words)).map_or(Cited::Nowhere, |s| Cited::Source(s.name.clone()))
+    };
+    if let Some(held) = app.assist.cited.as_mut() {
+        held.1.insert(words.to_string(), found.clone());
+    }
+    found
+}
+
+/// The conversation in summary, with its citations looked for: a made-up one is only counted.
+pub(crate) fn details_for(app: &mut WordApp) -> wordcraft_assist::Details {
+    let mut details = app.conversation().map(Assistant::details).unwrap_or_default();
+    for turn in &mut details.turns {
+        let citations = std::mem::take(&mut turn.citations);
+        for mut citation in citations {
+            match cited(app, &citation.words) {
+                Cited::Document => turn.citations.push(citation),
+                Cited::Source(name) => {
+                    citation.source = Some(name);
+                    turn.citations.push(citation);
+                }
+                Cited::Nowhere => turn.unfound = turn.unfound.saturating_add(1),
+            }
+        }
+    }
+    details
 }
 
 /// What `assist.knowledge` answers.

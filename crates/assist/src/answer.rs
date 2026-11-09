@@ -21,6 +21,12 @@ pub const MAX_PARSED: usize = 64 << 10;
 pub const MAX_BLOCKS: usize = 512;
 pub const MAX_SPANS: usize = 4096;
 
+/// Most characters of the words a citation holds; a longer marker stays as text.
+pub const MAX_CITE_CHARS: usize = 200;
+
+/// Most citations of an answer that show; markers past them go without a chip.
+pub const MAX_CITES: usize = 64;
+
 /// A run of text in one format.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Span {
@@ -32,6 +38,8 @@ pub struct Span {
     /// The address it links to, as the model wrote it: the window shows it and opens it only
     /// when [`opens`] says so, on the person's click.
     pub link: Option<String>,
+    /// It stands for this citation of [`Formatted::citations`], and has no text of its own.
+    pub cite: Option<usize>,
 }
 
 /// One block of an answer.
@@ -59,6 +67,8 @@ pub struct Formatted {
     pub blocks: Vec<Block>,
     /// What is past the limits, as plain text.
     pub rest: String,
+    /// The words of its citations, in order. Nothing says they are real: the window looks.
+    pub citations: Vec<String>,
 }
 
 /// Whether the window may open `address` on the person's click: a web address only, so a model
@@ -71,20 +81,85 @@ pub fn opens(address: &str) -> bool {
 /// Read `text` (an answer's) as Markdown. While it is `streaming`, what its last paragraph hasn't
 /// finished is closed or held back ([`settled`]), so no `**` shows and then goes away.
 pub fn format(text: &str, streaming: bool) -> Formatted {
-    let (read, past) = split_at_line(text, MAX_PARSED);
-    let read = if streaming { settled(read) } else { Cow::Borrowed(read) };
+    let text: Cow<'_, str> = if text.contains(OURS) { Cow::Owned(text.replace(OURS, "")) } else { Cow::Borrowed(text) };
+    let (read, past) = split_at_line(&text, MAX_PARSED);
+    let (read, citations) = with_cites(read, streaming);
+    let read = if streaming { settled(&read) } else { read };
     let (flow, cut) = parsed(read);
     // The parser reads documents, which hold tables to limits. An answer's words all stay.
     if cut {
-        return Formatted { blocks: Vec::new(), rest: text.to_string() };
+        return Formatted { blocks: Vec::new(), rest: strip_cites(&with_cites(&text, false).0), citations: Vec::new() };
     }
     let mut out = Builder::default();
     for block in &flow.blocks {
         out.block(block);
     }
     let mut formatted = out.done();
-    formatted.rest.push_str(past);
+    formatted.rest.push_str(&strip_cites(&with_cites(past, false).0));
+    formatted.citations = citations;
     formatted
+}
+
+/// The words of the citations in `text`, whole markers only, at most [`MAX_CITES`].
+pub fn citations(text: &str) -> Vec<String> {
+    with_cites(text, false).1
+}
+
+/// `text` with each citation's marker, `[[cite: "the exact words"]]`, as an index between two
+/// [`CITE`]s, and the words. A marker not closed yet is held back while the answer is `streaming`,
+/// and stays as text once it isn't: it was no marker. So does one too long to be a citation.
+fn with_cites(text: &str, streaming: bool) -> (Cow<'_, str>, Vec<String>) {
+    const OPEN: &str = "[[cite:";
+    const CLOSE: &str = "\"]]";
+    if !text.contains(OPEN) {
+        return (Cow::Borrowed(text), Vec::new());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut words = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(OPEN) {
+        let after = rest.get(at.saturating_add(OPEN.len())..).unwrap_or_default();
+        out.push_str(rest.get(..at).unwrap_or_default());
+        let quoted = after.trim_start_matches(' ').strip_prefix('"');
+        let marker = quoted
+            .and_then(|q| q.find(CLOSE).map(|end| (q.get(..end).unwrap_or_default(), q.get(end.saturating_add(CLOSE.len())..).unwrap_or_default())));
+        match marker {
+            Some((cited, tail)) if cited.chars().count() <= MAX_CITE_CHARS => {
+                if !cited.trim().is_empty() && words.len() < MAX_CITES {
+                    out.push(CITE);
+                    out.push_str(&words.len().to_string());
+                    out.push(CITE);
+                    words.push(shown(cited.to_string()));
+                }
+                rest = tail;
+            }
+            None if streaming => return (Cow::Owned(out), words),
+            _ => {
+                out.push_str(OPEN);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    (Cow::Owned(out), words)
+}
+
+/// `spans` with the citations in their text, as [`with_cites`] left them, as spans of their own.
+fn cited(spans: Vec<Span>) -> Vec<Span> {
+    if !spans.iter().any(|s| s.text.contains(CITE)) {
+        return spans;
+    }
+    let mut out = Vec::new();
+    for span in spans {
+        for (n, piece) in span.text.split(CITE).enumerate() {
+            if n % 2 == 1 {
+                out.push(Span { cite: piece.parse().ok(), ..Span::default() });
+            } else if !piece.is_empty() {
+                out.push(Span { text: piece.to_string(), ..span.clone() });
+            }
+        }
+    }
+    out
 }
 
 /// `text` as the parser reads it for an answer, and whether a table lost words.
@@ -95,6 +170,12 @@ fn parsed(text: Cow<'_, str>) -> (wordcraft_formats::model::Flow, bool) {
 
 /// Stands for the `:` of a `data:` address while the parser reads an answer.
 const NOT_DATA: &str = "\u{F8FE}";
+
+/// Stands either side of a citation's index while the parser reads an answer.
+const CITE: char = '\u{F8FD}';
+
+/// The characters this reads an answer with, which an answer's own text gives up.
+const OURS: &[char] = &['\u{F8FD}', '\u{F8FE}', '\u{F8FF}'];
 
 /// `text` with no `data:` address the parser would decode, which [`shown_again`] undoes. An answer
 /// draws a picture's description only, and a reference repeated thousands of times to one long
@@ -219,7 +300,7 @@ impl Builder {
         }
         let block = match (&p.kind, &p.list) {
             (Kind::Code, _) => {
-                let line = shown_again(&p.inlines.iter().map(inline_text).collect::<String>());
+                let line = strip_cites(&shown_again(&p.inlines.iter().map(inline_text).collect::<String>()));
                 // Once something has gone to the plain text, what follows goes after it.
                 if self.formatted.rest.is_empty()
                     && !self.code_ended
@@ -311,14 +392,22 @@ fn spans(p: &Para, bold: bool) -> Vec<Span> {
             _ => out.push(span),
         }
     }
-    out
+    cited(out)
+}
+
+/// `text` without the citations [`with_cites`] left in it: code shows no chip.
+fn strip_cites(text: &str) -> String {
+    if !text.contains(CITE) {
+        return text.to_string();
+    }
+    text.split(CITE).step_by(2).collect()
 }
 
 fn span_of(text: String, fmt: Option<&Fmt>, bold: bool) -> Span {
     let Some(f) = fmt else { return Span { text, bold, ..Span::default() } };
     // An address too long to show whole isn't a link: cut, it could go somewhere else.
     let link = f.link.as_deref().map(shown_again).filter(|l| l.chars().count() <= MAX_LABEL).map(|l| label(&l));
-    Span { text, bold: bold || f.bold, italic: f.italic, strike: f.strike, code: f.code, link }
+    Span { text, bold: bold || f.bold, italic: f.italic, strike: f.strike, code: f.code, link, cite: None }
 }
 
 /// The words of an inline: a picture's description, never the picture.

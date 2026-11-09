@@ -1935,3 +1935,77 @@ fn another_open_document_can_be_a_source() {
     assert!(text.len() < (64 << 10) + 64, "{}", text.len());
     assert!(wordcraft_assist::Knowledge::new("Long", &text).cut);
 }
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_citation_with_real_words_selects_them_and_one_with_invented_words_shows_no_chip() {
+    use egui_kittest::kittest::Queryable;
+    let answer = r#"It says two [[cite: "two three"]]. It also says [[cite: "made up words"]] nothing."#;
+    let mut h = answered(answer);
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "1").is_some(), "one chip");
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "2").is_none(), "an invented citation shows no chip");
+    assert!(h.query_by_label_contains("cite").is_none(), "the markers don't show");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "1").click();
+    h.run_steps(2);
+    let s = &h.state().session;
+    assert_eq!(s.doc.copy_range(&s.sel.anchor, &s.sel.focus).plain_text(), "two three", "the chip selects the words");
+
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    h.get_by_label("Steps").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("“two three”").is_some(), "Sources lists what was found");
+    assert!(h.query_by_label("One citation couldn't be found.").is_some(), "and says what wasn't");
+    assert!(h.query_by_label_contains("made up words").is_none());
+
+    let details = h.state_mut().execute("assist.details", json!({})).unwrap();
+    assert_eq!(details["turns"][0]["unfound"], 1);
+    assert_eq!(details["turns"][0]["citations"][0]["words"], "two three");
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_citation_of_an_attached_source_has_a_chip_that_says_which() {
+    let (dir, path) = source_file("notes.txt", "The source says this.");
+    let mut app = window("one two three");
+    app.assist_with(Box::new(Fake::new().then(vec![Step::say(r#"Yes [[cite: "says this"]]."#)])));
+    app.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    sources_read(&mut app);
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Go"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if !h.state().conversation().is_some_and(|c| c.is_busy()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(2);
+    use egui_kittest::kittest::Queryable;
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "1").click();
+    h.run_steps(2);
+    assert!(h.state().assist.notice.as_deref().is_some_and(|n| n.contains("notes.txt")), "{:?}", h.state().assist.notice);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_citation_in_a_thought_isn_t_read() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = window("one two three");
+    app.assist_with(Box::new(Fake::new().then(vec![Step::Think(r#"Maybe [[cite: "two three"]]"#.into()), Step::say("Done.")])));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Go"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if !h.state().conversation().is_some_and(|c| c.is_busy()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(2);
+    h.get_by_label("Thinking").click();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("[[cite:").is_some(), "a thought shows as it came");
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "1").is_none(), "no chip");
+}

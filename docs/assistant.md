@@ -64,6 +64,14 @@ leaves it closed and the pane says so. At most 64 KiB of an answer, 512 blocks a
 text are formatted, and the rest shows as plain text, as does a whole answer whose table would lose
 words to the limits a document's tables have.
 
+The note asks the assistant to cite what a claim rests on with the exact words, in a marker the pane
+reads: `[[cite: "the exact words"]]`, at most 200 characters, and at most 64 show in an answer. The
+pane takes the marker out and shows a numbered chip that selects those words, or says which attached
+source has them. A marker whose words are in neither the document nor a source shows no chip, so a
+made-up citation can't look real, and Sources says how many couldn't be found. Quoting needs nothing
+of the tools: quoted words still resolve after edits elsewhere. A marker not closed yet is held back
+while the answer arrives, and shows as text if the turn ends first. A thought's markers aren't read.
+
 Once there is a conversation, tabs under the role switch it with its **Details**, which keeps
 updating during a turn and reads only the conversation's own record, so the two can't disagree.
 Each section folds. **Steps** lists each turn under what you asked: the agent's plan when it gave
@@ -74,7 +82,7 @@ with a note when the selection was cut. That comes from the pass that wrote the 
 so it can't disagree with it. Under it come the turn's reads and searches, each once: WordCraft's
 own tools by name, where a row for a paragraph selects it, and says so if it has gone; a file an agent read by its path and
 line; an address an agent fetched, which opens only on your own click. An agent's read that doesn't
-say where it looked is listed by its title. **Add a source…** there attaches a file, from the system's
+say where it looked is listed by its title, and under them what the turn's answers cite. **Add a source…** there attaches a file, from the system's
 file dialog, or another open document, for the assistant to refer to, and it can be attached before
 the conversation starts. The list says each one's name and size and whether it was cut: a
 conversation holds at most 8, of 64 KiB of text each, and a turn carries at most 128 KiB, which each

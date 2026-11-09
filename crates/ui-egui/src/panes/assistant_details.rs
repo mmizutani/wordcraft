@@ -5,7 +5,7 @@
 use egui::{RichText, Ui};
 use serde_json::json;
 use wordcraft_assist::answer::opens;
-use wordcraft_assist::{DetailStep, Details, OutputKind, OutputRow, OutputState, Sent, Source, SourceKind, StepState, Usage};
+use wordcraft_assist::{Citation, DetailStep, Details, OutputKind, OutputRow, OutputState, Sent, Source, SourceKind, StepState, Usage};
 use wordcraft_engine::room::Role;
 
 use super::assistant::{Mark, wrapped};
@@ -16,7 +16,7 @@ use crate::i18n::fmt;
 
 /// Details, in `height` points.
 pub(super) fn details(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
-    let details = app.conversation().map(wordcraft_assist::Assistant::details).unwrap_or_default();
+    let details = crate::assist::details_for(app);
     let area = egui::ScrollArea::vertical().id_salt("assistant_details").max_height(height).auto_shrink([false, false]);
     area.show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -56,7 +56,7 @@ fn steps(ui: &mut Ui, t: &Tokens, details: &Details) {
 fn sources(app: &mut WordApp, ui: &mut Ui, t: &Tokens, details: &Details) {
     attached(app, ui, t);
     for (i, turn) in details.turns.iter().enumerate() {
-        if turn.context.is_none() && turn.sources.is_empty() {
+        if turn.context.is_none() && turn.sources.is_empty() && turn.citations.is_empty() && turn.unfound == 0 {
             continue;
         }
         if let Some(asked) = &turn.asked {
@@ -71,6 +71,18 @@ fn sources(app: &mut WordApp, ui: &mut Ui, t: &Tokens, details: &Details) {
         if turn.more_sources > 0 {
             let more = turn.more_sources.to_string();
             ui.label(RichText::new(fmt(tl!("and {count} more"), &[("count", &more)])).small().color(t.text_dim));
+        }
+        for (n, citation) in turn.citations.iter().enumerate() {
+            ui.push_id((i, "cite", n), |ui| citation_row(app, ui, t, citation));
+        }
+        if turn.unfound > 0 {
+            let count = turn.unfound.to_string();
+            let says = if turn.unfound == 1 {
+                tl!("One citation couldn't be found.").to_string()
+            } else {
+                fmt(tl!("{count} citations couldn't be found."), &[("count", &count)])
+            };
+            wrapped(ui, RichText::new(says).small().color(t.orange));
         }
         ui.add_space(4.0);
     }
@@ -127,6 +139,19 @@ fn attached(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
 /// `bytes` for a person to read.
 fn size(bytes: usize) -> String {
     if bytes < 1024 { format!("{bytes} B") } else { format!("{:.1} KiB", bytes as f64 / 1024.0) }
+}
+
+/// What an answer cites: the document's words select, and a source's say which source has them.
+fn citation_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, citation: &Citation) {
+    let words = format!("“{}”", citation.words);
+    match &citation.source {
+        None => {
+            if ui.link(RichText::new(words).small()).on_hover_text(tl!("Select these words")).clicked() {
+                super::answer::select_cited(app, &citation.words);
+            }
+        }
+        Some(source) => wrapped(ui, RichText::new(fmt(tl!("{words} from {source}"), &[("words", &words), ("source", source)])).small().color(t.text)),
+    }
 }
 
 /// What a turn gave the model, in one row, and a note when the selection was cut.

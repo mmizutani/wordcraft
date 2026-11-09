@@ -123,6 +123,20 @@ pub struct TurnDetails {
     pub more_sources: u32,
     /// The changes and comments that first showed during it, oldest first.
     pub output: Vec<OutputRow>,
+    /// What its answers cite, each once, at most [`crate::answer::MAX_CITES`].
+    pub citations: Vec<Citation>,
+    /// How many citations' words the document and the sources don't have
+    /// ([`crate::Assistant::details`] can't tell: the window looks, and leaves those out).
+    pub unfound: u32,
+}
+
+/// What an answer cites.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Citation {
+    pub words: String,
+    /// The attached source that has them; `None`: the document, if anything.
+    pub source: Option<String>,
 }
 
 /// What runs a conversation, which its transcript doesn't hold ([`crate::Assistant::details`]).
@@ -167,6 +181,7 @@ struct TurnBuilder<'a> {
     sources: Vec<Source>,
     more_sources: u32,
     output: Vec<OutputRow>,
+    citations: Vec<Citation>,
     /// The sources seen, listed or not, so each counts once.
     seen: HashSet<(SourceKind, &'a str, Option<&'a str>)>,
 }
@@ -174,10 +189,19 @@ struct TurnBuilder<'a> {
 impl<'a> TurnBuilder<'a> {
     /// Add the turn to `turns`, if it has anything to show, and start another.
     fn finish(&mut self, turns: &mut Vec<TurnDetails>) {
-        let TurnBuilder { asked, plan, calls, context, sources, more_sources, output, .. } = std::mem::take(self);
+        let TurnBuilder { asked, plan, calls, context, sources, more_sources, output, citations, .. } = std::mem::take(self);
         let steps = plan.unwrap_or(calls);
-        if asked.is_some() || !steps.is_empty() || context.is_some() || !sources.is_empty() || !output.is_empty() {
-            turns.push(TurnDetails { asked, steps, context, sources, more_sources, output });
+        if asked.is_some() || !steps.is_empty() || context.is_some() || !sources.is_empty() || !output.is_empty() || !citations.is_empty() {
+            turns.push(TurnDetails { asked, steps, context, sources, more_sources, output, citations, unfound: 0 });
+        }
+    }
+
+    /// What answer `text` cites.
+    fn cite(&mut self, text: &str) {
+        for words in crate::answer::citations(text) {
+            if self.citations.len() < crate::answer::MAX_CITES && !self.citations.iter().any(|c| c.words == words) {
+                self.citations.push(Citation { words, source: None });
+            }
         }
     }
 
@@ -292,7 +316,8 @@ impl Transcript {
                 Entry::Usage(usage) => out.usage = Some(usage.clone()),
                 Entry::Context(sent) => turn.context = Some(sent.clone()),
                 Entry::Output(row) => turn.output.push(row.clone()),
-                Entry::Answer { .. } | Entry::Thought { .. } | Entry::Permission { .. } | Entry::Stopped { .. } | Entry::Error { .. } => {}
+                Entry::Answer { text } => turn.cite(text),
+                Entry::Thought { .. } | Entry::Permission { .. } | Entry::Stopped { .. } | Entry::Error { .. } => {}
             }
         }
         turn.finish(&mut out.turns);

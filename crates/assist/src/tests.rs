@@ -1359,3 +1359,27 @@ mod sources {
         assert_eq!(call.sources[0].target.as_deref(), Some("/evil"));
     }
 }
+
+mod citations {
+    use crate::backend::Event;
+    use crate::transcript::Transcript;
+
+    #[test]
+    fn details_lists_what_a_turn_s_answers_cite_each_once_and_not_a_thought_s() {
+        let mut t = Transcript::default();
+        t.asked("First");
+        t.record(&Event::Thought { text: r#"[[cite: "thought"]]"#.into() });
+        t.record(&Event::Text { text: r#"Yes [[cite: "one"]] and [[cite: "one"]] and [[cite: "two"]]"#.into() });
+        let turn = t.details().turns.remove(0);
+        let words: Vec<&str> = turn.citations.iter().map(|c| c.words.as_str()).collect();
+        assert_eq!(words, ["one", "two"]);
+    }
+
+    #[test]
+    fn the_note_asks_for_citations_in_the_form_the_pane_reads() {
+        let seat = crate::Seat { name: "A".into(), role: wordcraft_engine::room::Role::Suggester, key: String::new(), document: String::new() };
+        let note = crate::note(&seat, true);
+        let marker = note.split_once("[[cite:").map(|(_, m)| format!("[[cite:{m}")).unwrap_or_default();
+        assert_eq!(crate::answer::citations(&marker), ["the exact words"], "{note}");
+    }
+}
