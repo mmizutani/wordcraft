@@ -1932,6 +1932,19 @@ fn another_open_document_can_be_a_source() {
     assert_eq!(a.assist.knowledge[0].name, "First");
     assert_eq!(a.assist.knowledge[0].text.trim_end(), "first document");
 
+    // A field reads as its result, as the document does opened from a file.
+    let mut with_field = window("Before after");
+    let field = wordcraft_doc::para::InlineObject::Field {
+        instr: "PAGE".into(),
+        result: "SEVEN".into(),
+        locked: false,
+        dirty: false,
+        code: false,
+        form: String::new(),
+    };
+    with_field.session.doc.para_mut(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().insert_object(7, field, &Default::default()).unwrap();
+    assert!(super::text_for_source(&with_field.session.doc).contains("Before SEVEN"));
+
     // A long one is read only as far as it takes to say it was cut.
     let long = window(&"long words\n".repeat(64 << 10));
     let text = super::text_for_source(&long.session.doc);

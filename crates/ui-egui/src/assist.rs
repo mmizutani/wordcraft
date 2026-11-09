@@ -439,7 +439,9 @@ fn text_for_source(doc: &wordcraft_doc::Document) -> String {
         if text.len() > knowledge::MAX_SOURCE_BYTES {
             break;
         }
-        text.extend(doc.para(Body, &path).map_or("", |p| p.text.as_str()).chars().filter(|c| *c != wordcraft_doc::para::OBJ));
+        if let Some(p) = doc.para(Body, &path) {
+            text.push_str(&p.plain_text());
+        }
         text.push('\n');
     }
     text
