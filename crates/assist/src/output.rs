@@ -66,6 +66,18 @@ pub struct OutputRow {
 }
 
 impl OutputRow {
+    /// What `review.accept` and `review.reject` take for it alone, `name`'s: one text can carry a
+    /// change of each kind, and a move's two ends go together.
+    pub fn resolve_params(&self, name: &str) -> Value {
+        let kind = match self.kind {
+            OutputKind::Insert => Some("insert"),
+            OutputKind::Delete => Some("delete"),
+            OutputKind::Format => Some("format"),
+            OutputKind::Move | OutputKind::Comment => None,
+        };
+        json!({"author": name, "kind": kind})
+    }
+
     /// `select.range`'s parameters for it.
     pub fn range(&self) -> Option<Value> {
         let (start, end) = (self.start?, self.end?);
@@ -78,7 +90,8 @@ pub(crate) fn rows(session: &Session, name: &str) -> (Vec<OutputRow>, usize) {
     let doc = &session.doc;
     let (changes, more) = change_rows(session, name, MAX_ROWS);
     let changes = changes.into_iter().map(|c| OutputRow {
-        in_paragraph: occurrences(doc, doc.anchor_at(&c.a), &c.text),
+        // None when it isn't in one paragraph: a change across paragraphs can't be counted in one.
+        in_paragraph: occurrences(doc, doc.anchor_at(&c.a), &c.text).filter(|n| *n > 0),
         kind: match c.kind {
             "insert" => OutputKind::Insert,
             "delete" => OutputKind::Delete,

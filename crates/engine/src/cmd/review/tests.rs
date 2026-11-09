@@ -1318,3 +1318,20 @@ fn an_author_s_row_takes_their_table_change_and_not_someone_else_s() {
     assert!(t.rows[0].cells[0].props.fmt_change.is_none(), "the row's own change resolves");
     assert!(t.props.fmt_change.is_some(), "the colleague's on the table stays");
 }
+
+#[test]
+fn a_kind_keeps_an_author_s_other_change_on_the_same_text() {
+    let mut s = Session::new(wordcraft_doc::Document::from_text("one two"));
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    s.author = "Assistant".into();
+    s.run("select.text", &json!({"text": "two"})).unwrap();
+    s.run("format.bold", &json!({})).unwrap();
+    s.run("select.text", &json!({"text": "two"})).unwrap();
+    s.run("text.delete", &json!({})).unwrap();
+    s.run("select.text", &json!({"text": "two"})).unwrap();
+    s.run("review.accept", &json!({"author": "Assistant", "kind": "format"})).unwrap();
+    assert_eq!(s.doc.plain_text(wordcraft_doc::StoryRef::Body), "one two", "the deletion waits still");
+    assert!(super::changes_by(&s, "Assistant") > 0);
+    assert!(s.run("review.accept", &json!({"kind": "format"})).is_err(), "a kind goes with an author");
+    assert!(s.run("review.accept", &json!({"author": "Assistant", "kind": "other"})).is_err());
+}
