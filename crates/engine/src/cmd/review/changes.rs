@@ -364,6 +364,11 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool, which: Which) -> CmdRe
     // A caret in a paragraph whose own formatting changed (and no tracked text around it).
     let mut caret_props = None;
     let ranged = a != b;
+    // One reviewer's row with no text of its own: someone else's run around the caret mustn't stand
+    // in for the table's or the section's change it lists.
+    if a == b && !matches!(which, Which::All) && (resolve_cell(s, a.story, &a.path, accept, which)? || resolve_section_at(s, &a, accept, which)?) {
+        return if next { select_next_unresolved(s) } else { sel_result(s) };
+    }
     let (a, b) = if a == b {
         // The change at the caret: the run around it, else the paragraph mark right after it,
         // else the paragraph's formatting, else the table cell's.

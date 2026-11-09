@@ -1371,3 +1371,40 @@ fn an_author_s_row_resolves_their_page_setup_change() {
     assert!(s.doc.last_section.fmt_change.is_none());
     assert_eq!(s.doc.plain_text(StoryRef::Body), "one");
 }
+
+#[test]
+fn someone_s_insertion_at_the_caret_doesn_t_stand_in_for_an_author_s_page_setup_change() {
+    use wordcraft_doc::{Revision, RevisionKind};
+    let mut s = Session::new(wordcraft_doc::Document::from_text("one"));
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    s.author = "Colleague".into();
+    s.run("caret.docEnd", &json!({})).unwrap();
+    s.run("text.insert", &json!({"text": " two"})).unwrap();
+    s.doc.revisions.push(Revision::new(RevisionKind::Format, "Assistant", ""));
+    let rev = (s.doc.revisions.len() - 1) as u32;
+    s.doc.last_section.fmt_change = Some(Box::new(wordcraft_doc::props::PropChange { rev, old: Default::default() }));
+    let rows = super::change_rows(&s, "Assistant", 8).0;
+    s.run("select.range", &json!({"anchor": super::pos_json(&rows[0].a), "focus": super::pos_json(&rows[0].b)})).unwrap();
+    s.run("review.accept", &json!({"author": "Assistant", "kind": "format"})).unwrap();
+    assert!(s.doc.last_section.fmt_change.is_none());
+    assert!(super::changes_by(&s, "Colleague") > 0, "the insertion waits still");
+}
+
+#[test]
+fn a_reply_s_row_has_its_thread_s_place() {
+    let mut s = Session::new(wordcraft_doc::Document::from_text("one two"));
+    s.author = "Colleague".into();
+    s.run("select.text", &json!({"text": "two"})).unwrap();
+    let parent = s.run("review.newComment", &json!({"text": "Why?"})).unwrap()["id"].as_u64().unwrap();
+    s.author = "Assistant".into();
+    s.run("review.reply", &json!({"id": parent, "text": "Because."})).unwrap();
+    let (rows, _) = super::comment_rows(&s, "Assistant", 8);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].text, "Because.");
+    assert!(rows[0].at.is_some(), "{rows:?}");
+
+    // A loop in an imported thread ends, with no place.
+    let id = rows[0].id;
+    s.doc.comments.get_mut(&id).unwrap().parent = Some(id);
+    assert!(super::comment_rows(&s, "Assistant", 8).0[0].at.is_none());
+}
