@@ -54,6 +54,11 @@ stopped other than by finishing says why, plainly: the answer was cut off at the
 writes at once, the assistant stopped after the most steps one request may take, or it declined
 to go on.
 
+Each turn has a line saying which model answers and at what reasoning effort, such as
+`GPT-6-Luna · Medium`. `(requested)` after the effort means ChatGPT didn't say which one ran, so
+the line shows what WordCraft asked for. The same place has a short note when the turn runs
+something other than what was chosen, or when an effort wasn't applied.
+
 What you accept and reject of the assistant's changes reaches its next turn. The turn's context
 starts with a short list, newest first, of what you decided since its last turn, each change's
 text cut to 120 characters and the list to 2 KiB, so the assistant adjusts within the
@@ -140,6 +145,48 @@ opens may carry your last sign-in as a hint, so no command's answer holds it, an
 out the browser opener's command line. Cancel stops a sign-in unless it is already finishing
 what the browser sent: then you are signed in, and the page says so at once; until it has, Sign
 Out and a new sign-in ask you to try again in a moment.
+
+### Which model and effort run
+
+With nothing chosen, ChatGPT runs `gpt-6-luna` at `medium`: the account's list ranks a more
+expensive model first, and a plan's usage is the person's. What a turn runs comes from the list
+and the choice, in this order:
+
+| | Model | Effort |
+|---|---|---|
+| 1 | The choice, when the list has it | The choice, when this model offers it |
+| 2 | `gpt-6-luna`, when the list has it | `medium`, when this model offers it |
+| 3 | The list's first | This model's default |
+| 4 | | Nothing sent |
+
+A model whose list entry names no levels takes any level. If ChatGPT refuses an effort, the
+request goes again once without it, keeping the reasoning summary, and the pane says the effort
+wasn't applied. It stays left out until the model or the effort changes. A list that can't be read
+stops a turn only when nothing was chosen. A choice that no longer resolves stays saved, and the
+pane says what ran instead.
+
+**The menus.** Beside Send and Stop are a Model menu and an Effort menu, wrapping under them when
+the pane is narrow. The Model menu starts with a Default row that names what it resolves to, and
+that row clears the choice. The Effort menu lists this model's levels, ticks the current one and
+tags what runs with nothing chosen, and choosing the tagged row clears the choice. With no level to
+tag it has a Default row that does. With no levels listed it offers Low, Medium and High, and a
+script may choose any other, which the turn sends. Choosing takes one click. During a turn both are greyed out and say why. The web app has no backend, so it
+shows neither.
+
+WordCraft reads the list on a thread of its own when the pane opens with someone signed in and no
+list held, and again after a sign-in, so no frame waits for it. While it reads, the Model menu has
+the Default row and says so on hover. A read that fails shows the reason under the menus, doesn't
+stop a turn that has a saved choice, and is tried again the next time the pane opens. A conversation
+reads the list once, and again if the person chooses a model its copy doesn't have.
+
+**The commands.** `assist.model {"id"?: string | null}` and `assist.effort {"level"?: string | null}`
+choose for the assistant in use: leave the param out to read, and `null` goes back to the default.
+Each answers with the backend, what is chosen, what the last turn says ran and what the menus
+offer. Once the offer is known, a value outside it is refused and names what is offered. A change
+applies from the next turn and keeps the conversation, since each request sends the earlier turns
+as words and answers. The choice is kept per backend in the preferences (`assistant.models`). A
+person invited to the document can't run either command, at any role, and neither can be addressed
+to a document with `doc`.
 
 ### Setting up an agent
 
@@ -417,7 +464,13 @@ own account the way it documents.
    `chatgpt-credentials.json`, which on Unix only you may read.
 2. In the assistant pane pick ChatGPT and ask it to rewrite the first sentence in a friendlier
    tone: the answer streams in, the rewrite is a tracked change by "ChatGPT", and its tool rows
-   open to the change.
+   open to the change. The turn's line reads `GPT-6-Luna · Medium`. If it says `(requested)`, the
+   stream doesn't report the effort: note that in #84.
+   Open the Model menu: it lists your account's models with Default (GPT-6-Luna) on top, and if it
+   has only that row, or the Effort menu offers only Low, Medium and High for every model, note
+   which in #84, since the list then lacks those fields. Note too whether `gpt-6-luna` is listed
+   and on which plan. Choose another model and effort, and send another prompt: the line shows
+   them, and the conversation goes on.
 3. Ask for something long, and press Stop while it answers: it stops at once and says so. Ask
    again: it answers.
 4. Sign Out on the same page: `chatgpt-credentials.json` is gone, and the pane says to sign in,
