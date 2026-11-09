@@ -297,6 +297,8 @@ fn a_marker_not_closed_is_held_back_while_arriving_and_text_afterwards() {
     assert_eq!(words(&format(open, true)).trim_end(), "Said", "held back");
     assert!(format(open, true).citations.is_empty());
     assert!(words(&format(open, false)).contains("[[cite:"), "{:?}", format(open, false));
+    // Though its words run over a line, where a `[` alone isn't held back.
+    assert_eq!(words(&format("Said [[cite: \"the\nrain", true)).trim_end(), "Said");
     let whole = r#"Said [[cite: "the rain"]]"#;
     assert_eq!(words(&format(whole, true)).trim_end(), "Said");
     assert_eq!(format(whole, true).citations, ["the rain"]);
@@ -322,6 +324,8 @@ fn what_an_answer_can_t_forge_or_lose() {
     // Its own use of the characters this reads with goes.
     let f = format("a\u{F8FD}0\u{F8FD} b", false);
     assert!(f.citations.is_empty() && !words(&f).contains('\u{F8FD}'), "{f:?}");
+    let Block::Para(spans) = &f.blocks[0] else { panic!("{f:?}") };
+    assert!(spans.iter().all(|s| s.cite.is_none()), "it can't make a chip of its own: {spans:?}");
     // A citation's words can't hide or reorder anything.
     assert_eq!(citations("[[cite: \"x\u{202E}y\"]]"), ["xy"]);
     // In code it shows no chip, and leaves no trace.
