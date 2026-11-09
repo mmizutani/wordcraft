@@ -132,7 +132,7 @@ fn corpus() -> Vec<Case> {
                 pitfall("2023-05-10", "Indemnity clause covered third-party claims and first-party losses alike."),
                 pattern("2023-06-01", "New York enterprises want uncapped indemnity for IP infringement."),
                 position("2023-07-01", Topic::Indemnity, "Indemnity narrowed to third-party IP claims only."),
-                lesson("2023-08-01", "Hold harmless language without a cap is a liability cap by another name."),
+                lesson("2023-08-01", "Hold harmless language without a cap is uncapped liability under another name."),
                 leverage("2023-05-05", "We were the only vendor certified for their platform."),
             ],
         ),
@@ -336,15 +336,66 @@ fn every_topic_has_an_english_and_a_japanese_term() {
 fn hostile_text_tokenizes_within_a_bound() {
     for c in ['契', '['] {
         let text: String = std::iter::repeat_n(c, 1 << 20).collect();
-        assert!(tokens(&text).count() <= super::text::MAX_TOKENS);
+        assert!(tokens(&text).len() <= super::text::MAX_TOKENS);
     }
 }
 
 #[test]
 fn full_width_and_mixed_text_tokenize_as_the_design_says() {
-    let got: Vec<String> = tokens("ＳaaＳ契約 第１条").map(|t| t.for_test()).collect();
+    let got = token_texts("ＳaaＳ契約 第１条");
     assert_eq!(got, ["saas", "契約", "第", "1", "条"]);
-    assert!(tokens("この").next().is_none());
+    assert!(token_texts("この").is_empty());
+}
+
+fn token_texts(text: &str) -> Vec<String> {
+    tokens(text).into_iter().map(|t| t.for_test()).collect()
+}
+
+#[test]
+fn a_long_word_becomes_one_short_token() {
+    let got = token_texts(&"a".repeat(1 << 20));
+    assert_eq!(got.len(), 1);
+    assert!(got.iter().all(|t| t.len() <= 64));
+}
+
+#[test]
+fn a_long_hiragana_run_keeps_the_words_after_it() {
+    let got = token_texts(&format!("{}契約", "あ".repeat(5000)));
+    assert!(got.iter().any(|t| t == "契約"));
+}
+
+#[test]
+fn one_hiragana_alone_is_no_word() {
+    assert!(token_texts("の").is_empty());
+}
+
+#[test]
+fn every_term_finds_its_own_topic() {
+    for (topic, terms) in TERMS {
+        for term in *terms {
+            let term = term.trim_end_matches('*');
+            assert!(topics_in(term).contains(*topic), "{term} doesn't find {topic:?}");
+        }
+    }
+}
+
+#[test]
+fn a_short_term_matches_whole_words_only() {
+    assert!(!topics_in("Please review this draft and give feedback").contains(Topic::Payment));
+    assert!(!topics_in("a slash in the heading").contains(Topic::Sla));
+    assert!(topics_in("the fees are due").contains(Topic::Payment));
+    assert!(topics_in("indemnification").contains(Topic::Indemnity));
+}
+
+#[test]
+fn an_english_term_inside_japanese_text_is_found() {
+    assert!(topics_in("本ＮＤＡの条件").contains(Topic::Confidentiality));
+    assert!(topics_in("相手のSLA条項").contains(Topic::Sla));
+}
+
+#[test]
+fn a_lease_deposit_is_not_a_warranty() {
+    assert!(!topics_in("保証金は３か月分").contains(Topic::Warranties));
 }
 
 #[test]

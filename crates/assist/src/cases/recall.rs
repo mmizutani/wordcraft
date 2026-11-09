@@ -32,7 +32,7 @@ pub struct Query {
 
 impl Query {
     pub fn new(about: &str, applies: Applies, today: Day) -> Query {
-        Query { topics: topics_in(about), tokens: tokens(about).collect(), applies, today }
+        Query { topics: topics_in(about), tokens: tokens(about), applies, today }
     }
 }
 
