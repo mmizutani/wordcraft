@@ -38,6 +38,7 @@
 pub mod acp;
 pub mod answer;
 mod assistant;
+mod atomic;
 pub mod backend;
 pub mod cases;
 /// Sign in with ChatGPT and the ChatGPT backend: desktop only (HTTPS and a loopback port).

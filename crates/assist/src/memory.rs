@@ -12,14 +12,14 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::io::Read;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::atomic::{self, Lock};
 use crate::backend::label;
 
 /// The file, in the settings folder.
@@ -51,9 +51,6 @@ const MAX_FILE: u64 = 1 << 20;
 
 /// The highest number an id is read with, so adding to it can't overflow or collide.
 const MAX_ID_NUMBER: u64 = 1 << 53;
-
-/// Longest a write waits for another WordCraft's: a window's frame is waiting.
-const LOCK_WAIT: Duration = Duration::from_millis(500);
 
 /// What the model is asked to do, whenever the person's memory is on. A proposal is only a card
 /// the person answers, so a document that gets one written gains nothing without their click, but
@@ -235,12 +232,7 @@ impl Memory {
         let mut m = Memory::load(dir);
         let r = change(&mut m)?;
         if m.damaged {
-            let (from, to) = (dir.join(FILE), dir.join(format!("{FILE}{DAMAGED_SUFFIX}")));
-            match fs::rename(&from, &to) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("{} can't be moved aside: {e}", from.display())),
-            }
+            atomic::rename_if_there(&dir.join(FILE), &dir.join(format!("{FILE}{DAMAGED_SUFFIX}")))?;
             m.damaged = false;
         }
         m.write(&dir.join(FILE))?;
@@ -259,32 +251,10 @@ impl Memory {
         m.write(&dir.join(FILE))
     }
 
-    /// A new file beside `path`, only its owner able to read it, renamed over it: a failed write
-    /// leaves the old one as it was. The lock makes the temporary name this writer's alone.
     fn write(&self, path: &Path) -> Result<(), String> {
         let v = json!({"version": VERSION, "enabled": self.enabled, "lastId": self.last_id.max(self.highest_id()), "items": self.items, "dismissed": self.dismissed});
         let bytes = serde_json::to_vec_pretty(&v).map_err(|e| e.to_string())?;
-        let temp: PathBuf = path.with_extension("json.tmp");
-        let written = (|| {
-            match fs::remove_file(&temp) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-            let mut open = fs::OpenOptions::new();
-            open.write(true).create_new(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
-            let mut f = open.open(&temp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-            drop(f);
-            fs::rename(&temp, path)
-        })();
-        written.map_err(|e| {
-            let _ = fs::remove_file(&temp);
-            format!("{} can't be written: {e}", path.display())
-        })
+        atomic::write(path, &bytes)
     }
 
     /// Keep `text`: the item it makes, or the one that already says it. `now` is its time.
@@ -422,39 +392,6 @@ impl Memory {
     }
 }
 
-/// The lock file, held by the operating system until this is dropped, so a WordCraft that crashed
-/// holds nothing.
-struct Lock(fs::File);
-
-impl Lock {
-    fn take(path: &Path) -> Result<Lock, String> {
-        let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let until = Instant::now().checked_add(LOCK_WAIT);
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(Lock(file)),
-                Err(fs::TryLockError::WouldBlock) => {
-                    if until.is_none_or(|until| Instant::now() >= until) {
-                        return Err("another WordCraft is saving what the assistant remembers: try again".into());
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                // A file system without locks: the fresh read before the write still narrows the race.
-                Err(fs::TryLockError::Error(e)) => {
-                    log::warn!("{} can't be locked: {e}", path.display());
-                    return Ok(Lock(file));
-                }
-            }
-        }
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
 /// `text` as an item holds it: one line, without what hides or reorders text, at most [`MAX_TEXT`]
 /// characters. `None` when nothing is left.
 pub(crate) fn clean(text: &str) -> Option<String> {
@@ -465,12 +402,12 @@ pub(crate) fn clean(text: &str) -> Option<String> {
 }
 
 /// `text` as two that say the same thing compare: case and spaces don't count.
-fn normalized(text: &str) -> String {
+pub(crate) fn normalized(text: &str) -> String {
     text.split_whitespace().map(str::to_lowercase).collect::<Vec<_>>().join(" ")
 }
 
 /// What the file keeps of a dismissed text: enough to recognise it, not the text.
-fn key_of(text: &str) -> String {
+pub(crate) fn key_of(text: &str) -> String {
     let mut out = String::with_capacity(64);
     for byte in Sha256::digest(normalized(text).as_bytes()) {
         let _ = write!(out, "{byte:02x}");
@@ -478,7 +415,7 @@ fn key_of(text: &str) -> String {
     out
 }
 
-fn is_key(key: &str) -> bool {
+pub(crate) fn is_key(key: &str) -> bool {
     key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
