@@ -391,6 +391,21 @@ fn what_an_answer_can_t_forge_or_lose() {
 }
 
 #[test]
+fn a_placeholder_a_character_entity_makes_can_t_take_a_citation_s_place() {
+    for forged in ["&#xF8FD;999&#xF8FD;", "&#xF8FD;0&#xF8FD;", "&#63741;0&#63741;", "&#XF8FD;0&#xf8fd;", "&#x&#xF8FD;F8FD;0&#x&#xF8FD;F8FD;"] {
+        let f = format(&format!("{forged} Says [[cite: \"real\"]] that."), false);
+        assert_eq!(f.citations, ["real"], "{forged}");
+        let Block::Para(spans) = &f.blocks[0] else { panic!("{f:?}") };
+        let chip = spans.iter().position(|s| s.cite == Some(0));
+        let says = spans.iter().position(|s| s.text.contains("Says"));
+        assert!(chip.is_some() && says < chip, "{forged}: {spans:?}");
+        assert_eq!(spans.iter().filter(|s| s.cite.is_some()).count(), 1, "{forged}: {spans:?}");
+    }
+    // Any other reference still reads as itself.
+    assert_eq!(words(&format("a &#x41; b &amp; c", false)).trim_end(), "a A b & c");
+}
+
+#[test]
 fn a_placeholder_a_character_entity_makes_can_t_add_a_chip() {
     let forged = format!("[[cite:\"w\"]] {}", "&#xF8FD;0&#xF8FD; ".repeat(70));
     let f = format(&forged, false);

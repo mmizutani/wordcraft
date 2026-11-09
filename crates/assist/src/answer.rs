@@ -82,6 +82,7 @@ pub fn opens(address: &str) -> bool {
 /// finished is closed or held back ([`settled`]), so no `**` shows and then goes away.
 pub fn format(text: &str, streaming: bool) -> Formatted {
     let text: Cow<'_, str> = if text.contains(OURS) { Cow::Owned(text.replace(OURS, "")) } else { Cow::Borrowed(text) };
+    let text = without_our_references(&text);
     let (text, words) = with_cites(&text, streaming, usize::MAX);
     let (read, past) = split_at_line(&text, MAX_PARSED);
     let read = if streaming { settled(read) } else { Cow::Borrowed(read) };
@@ -117,6 +118,35 @@ pub fn citations(text: &str) -> Vec<String> {
         }
     }
     with_cites(&prose, false, MAX_CITES).1
+}
+
+/// `text` with each character reference to one of [`OURS`] replaced: the parser decodes them after
+/// [`format`] took ours out, and one made to read as a citation would take a real one's place.
+/// Replaced, not removed, as the text around one could make another once it has gone.
+fn without_our_references(text: &str) -> Cow<'_, str> {
+    if !text.contains("&#") {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("&#") {
+        let name = rest.get(at.saturating_add(1)..).unwrap_or_default();
+        let end = name.char_indices().take(33).find(|(_, c)| *c == ';').map(|(i, _)| i);
+        let ours = end.filter(|e| name.get(..*e).and_then(wordcraft_formats::html::decode_entity).is_some_and(|d| d.contains(OURS)));
+        out.push_str(rest.get(..at).unwrap_or_default());
+        match ours {
+            Some(e) => {
+                out.push('\u{FFFD}');
+                rest = name.get(e.saturating_add(1)..).unwrap_or_default();
+            }
+            None => {
+                out.push('&');
+                rest = name;
+            }
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
 }
 
 /// `text` with each citation's marker, `[[cite: "the exact words"]]`, as an index between two
@@ -283,8 +313,7 @@ impl Builder {
     }
 
     /// A paragraph's text as spans, with its citations as spans of their own. Chips come in the
-    /// order of their markers, each once, so what a character entity in an answer makes of our
-    /// placeholder can't add one past the limit.
+    /// order of their markers, each once.
     fn spans_of(&mut self, p: &Para, bold: bool) -> Vec<Span> {
         let spans = spans(p, bold);
         if !spans.iter().any(|s| s.text.contains(CITE)) {
