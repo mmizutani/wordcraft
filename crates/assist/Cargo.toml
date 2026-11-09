@@ -11,6 +11,8 @@ workspace = true
 [dependencies]
 wordcraft-doc = { workspace = true }
 wordcraft-engine = { workspace = true }
+# Answers are read as Markdown with the parser the file formats use (`answer`).
+wordcraft-formats = { workspace = true }
 # The tools an assistant's model calls are the MCP server's (one list, one implementation).
 wordcraft-mcp = { workspace = true }
 serde = { workspace = true }

@@ -231,6 +231,50 @@ pub fn comment_list(s: &Session) -> Vec<(u32, Option<Pos>)> {
     found
 }
 
+/// Most steps from a reply up to the comment that has its place.
+const MOST_THREAD_DEPTH: usize = 32;
+
+/// One of an author's comments in the document, for a list of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommentRow {
+    pub id: u32,
+    /// Where it is, when it has a place in the text.
+    pub at: Option<Pos>,
+    /// Its text, at most [`super::changes::ROW_TEXT_CHARS`] characters.
+    pub text: String,
+    pub resolved: bool,
+}
+
+/// The first `most` comments and replies `author` made, in the order of the document, and how
+/// many more there are. Each one's text is its first paragraph's, read without copying the rest.
+pub fn comment_rows(s: &Session, author: &str, most: usize) -> (Vec<CommentRow>, usize) {
+    let all = comment_list(s);
+    // A reply has no place of its own: its place is its thread's. Imported threads can hold a loop.
+    let place = |id: u32| {
+        let mut at = id;
+        for _ in 0..MOST_THREAD_DEPTH {
+            if let Some(found) = all.iter().find(|(c, _)| *c == at).and_then(|(_, pos)| pos.clone()) {
+                return Some(found);
+            }
+            at = s.doc.comments.get(&at)?.parent?;
+        }
+        None
+    };
+    let theirs: Vec<u32> = all.iter().map(|(id, _)| *id).filter(|id| s.doc.comments.get(id).is_some_and(|c| c.author == author)).collect();
+    let more = theirs.len().saturating_sub(most);
+    let rows = theirs
+        .into_iter()
+        .take(most)
+        .filter_map(|id| {
+            let c = s.doc.comments.get(&id)?;
+            let first = s.doc.para(StoryRef::Part(c.part), &wordcraft_doc::Path::top(0)).map(|p| p.text.as_str()).unwrap_or_default();
+            let text = first.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(super::changes::ROW_TEXT_CHARS).collect();
+            Some(CommentRow { id, at: place(id), text, resolved: c.resolved })
+        })
+        .collect();
+    (rows, more)
+}
+
 pub(super) fn list_comments(s: &mut Session, _: &Value) -> CmdResult {
     let list = comment_list(s);
     Ok(Value::Array(

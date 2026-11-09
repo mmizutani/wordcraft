@@ -101,18 +101,28 @@ impl Paragraph {
     /// The text with objects removed or replaced by their text (fields → result).
     pub fn plain_text(&self) -> String {
         let mut out = String::with_capacity(self.text.len());
+        self.plain_text_up_to(&mut out, usize::MAX);
+        out
+    }
+
+    /// Add [`Self::plain_text`] to `out` until `out` holds `most` bytes or a little past it, a long
+    /// paragraph or field left uncopied beyond that.
+    pub fn plain_text_up_to(&self, out: &mut String, most: usize) {
         let mut k = 0;
         for c in self.text.chars() {
+            let room = most.saturating_sub(out.len());
+            if room == 0 {
+                return;
+            }
             if c == OBJ {
                 if let Some(o) = self.objects.get(k) {
-                    out.push_str(o.plain_text());
+                    out.extend(o.plain_text().chars().take(room));
                 }
                 k += 1;
             } else {
                 out.push(c);
             }
         }
-        out
     }
     /// [`Self::plain_text`] as it reads on screen: characters in runs set in a symbol font
     /// (Symbol, Wingdings…) become their standard Unicode equivalents
