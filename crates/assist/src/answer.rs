@@ -74,6 +74,7 @@ pub fn format(text: &str, streaming: bool) -> Formatted {
     let (read, past) = split_at_line(text, MAX_PARSED);
     let read = if streaming { settled(read) } else { Cow::Borrowed(read) };
     let read = separate_fences(read);
+    let read = without_embedded(&read);
     let (flow, cut) = markdown::parse_reporting_cuts(&read);
     // The parser reads documents, which hold tables to limits. An answer's words all stay.
     if cut {
@@ -86,6 +87,34 @@ pub fn format(text: &str, streaming: bool) -> Formatted {
     let mut formatted = out.done();
     formatted.rest.push_str(past);
     formatted
+}
+
+/// Stands for the `:` of a `data:` address while the parser reads an answer.
+const NOT_DATA: &str = "\u{F8FE}";
+
+/// `text` with no `data:` address the parser would decode, which [`shown_again`] undoes. An answer
+/// draws a picture's description only, and a reference repeated thousands of times to one long
+/// address would decode it each time: hundreds of megabytes from a few kilobytes of answer.
+fn without_embedded(text: &str) -> Cow<'_, str> {
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains("data:") {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0usize;
+    for (at, _) in lower.match_indices("data:") {
+        let colon = at.saturating_add(4);
+        out.push_str(text.get(from..colon).unwrap_or_default());
+        out.push_str(NOT_DATA);
+        from = colon;
+    }
+    out.push_str(text.get(from..).unwrap_or_default());
+    Cow::Owned(out)
+}
+
+/// What [`without_embedded`] did, undone.
+fn shown_again(text: &str) -> String {
+    text.replace(NOT_DATA, "")
 }
 
 /// A paragraph of this alone says two code blocks are two: the parser gives each line of code as a
@@ -186,7 +215,7 @@ impl Builder {
         }
         let block = match (&p.kind, &p.list) {
             (Kind::Code, _) => {
-                let line = p.inlines.iter().map(inline_text).collect::<String>();
+                let line = shown_again(&p.inlines.iter().map(inline_text).collect::<String>());
                 // Once something has gone to the plain text, what follows goes after it.
                 if self.formatted.rest.is_empty()
                     && !self.code_ended
@@ -266,7 +295,7 @@ fn spans(p: &Para, bold: bool) -> Vec<Span> {
             other => (Cow::Owned(inline_text(other)), None),
         };
         // The parser decodes `&#x202E;` and the like, which the event's own filter never saw.
-        let text = shown(text.into_owned());
+        let text = shown(shown_again(&text));
         if text.is_empty() {
             continue;
         }
@@ -284,7 +313,7 @@ fn spans(p: &Para, bold: bool) -> Vec<Span> {
 fn span_of(text: String, fmt: Option<&Fmt>, bold: bool) -> Span {
     let Some(f) = fmt else { return Span { text, bold, ..Span::default() } };
     // An address too long to show whole isn't a link: cut, it could go somewhere else.
-    let link = f.link.as_deref().filter(|l| l.chars().count() <= MAX_LABEL).map(label);
+    let link = f.link.as_deref().map(shown_again).filter(|l| l.chars().count() <= MAX_LABEL).map(|l| label(&l));
     Span { text, bold: bold || f.bold, italic: f.italic, strike: f.strike, code: f.code, link }
 }
 
@@ -339,6 +368,11 @@ struct Fences {
 
 impl Fences {
     fn line(&mut self, line: &str) {
+        // Four spaces in is code, or a line of it, as the parser reads it.
+        let indent = line.chars().take_while(|c| *c == ' ').count();
+        if indent >= 4 || line.starts_with('\t') {
+            return;
+        }
         let t = line.trim();
         let Some(c) = t.chars().next().filter(|c| matches!(c, '`' | '~')) else { return };
         let n = t.chars().take_while(|x| *x == c).count();
