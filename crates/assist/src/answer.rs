@@ -82,7 +82,7 @@ pub fn opens(address: &str) -> bool {
 /// finished is closed or held back ([`settled`]), so no `**` shows and then goes away.
 pub fn format(text: &str, streaming: bool) -> Formatted {
     let text: Cow<'_, str> = if text.contains(OURS) { Cow::Owned(text.replace(OURS, "")) } else { Cow::Borrowed(text) };
-    let (text, citations) = with_cites(&text, streaming);
+    let (text, words) = with_cites(&text, streaming, usize::MAX);
     let (read, past) = split_at_line(&text, MAX_PARSED);
     let read = if streaming { settled(read) } else { Cow::Borrowed(read) };
     let (flow, cut) = parsed(read);
@@ -94,9 +94,10 @@ pub fn format(text: &str, streaming: bool) -> Formatted {
     for block in &flow.blocks {
         out.block(block);
     }
+    let cited = std::mem::take(&mut out.cited);
     let mut formatted = out.done();
     formatted.rest.push_str(&strip_cites(past));
-    formatted.citations = citations;
+    formatted.citations = cited.iter().filter_map(|i| words.get(*i).cloned()).collect();
     formatted
 }
 
@@ -115,15 +116,16 @@ pub fn citations(text: &str) -> Vec<String> {
             prose.push_str(line);
         }
     }
-    with_cites(&prose, false).1
+    with_cites(&prose, false, MAX_CITES).1
 }
 
 /// `text` with each citation's marker, `[[cite: "the exact words"]]`, as an index between two
 /// [`CITE`]s, and the words. A marker not closed yet is held back while the answer is `streaming`,
 /// and stays as text once it isn't: it was no marker. So does one too long to be a citation. The
 /// next close is looked for only once the reading has passed the last one found, so the whole text
-/// costs one pass however many false markers it holds: Details reads every answer each frame.
-fn with_cites(text: &str, streaming: bool) -> (Cow<'_, str>, Vec<String>) {
+/// costs one pass however many false markers it holds: Details reads every answer each frame. It
+/// keeps `most` citations, or marks as many as there are for [`Builder`] to choose those that show.
+fn with_cites(text: &str, streaming: bool, most: usize) -> (Cow<'_, str>, Vec<String>) {
     const OPEN: &str = "[[cite:";
     const CLOSE: &str = "\"]]";
     if !text.contains(OPEN) {
@@ -149,7 +151,7 @@ fn with_cites(text: &str, streaming: bool) -> (Cow<'_, str>, Vec<String>) {
         let cited = close.and_then(|c| q.get(..c.saturating_sub(from))).filter(|c| c.len() <= longest && c.chars().count() <= MAX_CITE_CHARS);
         match cited {
             Some(cited) => {
-                if !cited.trim().is_empty() && words.len() < MAX_CITES {
+                if !cited.trim().is_empty() && words.len() < most {
                     out.push(CITE);
                     out.push_str(&words.len().to_string());
                     out.push(CITE);
@@ -270,6 +272,9 @@ struct Builder {
     code_ended: bool,
     /// The citation the next chip must be.
     next_cite: usize,
+    /// The citations with a chip, at most [`MAX_CITES`]: a marker in code has none. A chip's number
+    /// is its place here.
+    cited: Vec<usize>,
 }
 
 impl Builder {
@@ -290,8 +295,9 @@ impl Builder {
             for (n, piece) in span.text.split(CITE).enumerate() {
                 if n % 2 == 1 {
                     // Past ones code ate, whose markers show nowhere.
-                    if let Some(cite) = piece.parse().ok().filter(|cite| *cite >= self.next_cite) {
-                        out.push(Span { cite: Some(cite), ..Span::default() });
+                    if let Some(cite) = piece.parse().ok().filter(|cite| *cite >= self.next_cite && self.cited.len() < MAX_CITES) {
+                        out.push(Span { cite: Some(self.cited.len()), ..Span::default() });
+                        self.cited.push(cite);
                         self.next_cite = cite.saturating_add(1);
                     }
                 } else if !piece.is_empty() {

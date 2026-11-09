@@ -339,6 +339,18 @@ fn a_marker_not_closed_is_held_back_while_arriving_and_text_afterwards() {
 }
 
 #[test]
+fn markers_in_code_leave_the_limit_to_the_citations_that_show() {
+    let code = r#"[[cite: "example"]] "#.repeat(MAX_CITES);
+    let text = format!("```\n{code}\n```\n\nIt says [[cite: \"the words\"]].");
+    let f = format(&text, false);
+    assert_eq!(f.citations, ["the words"], "{:?}", f.blocks);
+    assert_eq!(f.citations, citations(&text), "Details lists what the conversation shows");
+    let cites: Vec<usize> =
+        f.blocks.iter().flat_map(|b| if let Block::Para(spans) = b { spans.clone() } else { Vec::new() }).filter_map(|s| s.cite).collect();
+    assert_eq!(cites, [0]);
+}
+
+#[test]
 fn a_citation_holds_to_its_limits() {
     let long = format!(r#"a [[cite: "{}"]] b"#, "w".repeat(MAX_CITE_CHARS + 1));
     let f = format(&long, false);
@@ -414,9 +426,9 @@ fn markers_that_are_none_can_t_cost_more_than_a_frame() {
 #[test]
 fn a_marker_in_code_doesn_t_cost_the_chips_after_it() {
     let f = format("```\n[[cite: \"example\"]]\n```\n\nSays [[cite: \"real words\"]] and [[cite: \"more\"]].", false);
-    assert_eq!(f.citations, ["example", "real words", "more"]);
+    assert_eq!(f.citations, ["real words", "more"]);
     let listed = citations("```\n[[cite: \"example\"]]\n```\n\nSays [[cite: \"real words\"]] and [[cite: \"more\"]].");
-    assert_eq!(listed, ["real words", "more"], "what Details lists is what shows");
+    assert_eq!(listed, f.citations, "what Details lists is what shows");
     let chips: Vec<usize> = f.blocks.iter().flat_map(|b| if let Block::Para(s) = b { s.as_slice() } else { &[] }).filter_map(|s| s.cite).collect();
-    assert_eq!(chips, [1, 2]);
+    assert_eq!(chips, [0, 1]);
 }
