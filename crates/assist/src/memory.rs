@@ -147,6 +147,8 @@ impl Memory {
             Some(Value::Bool(b)) => m.enabled = *b,
             Some(_) => m.damaged = true,
         }
+        // A list that isn't one may be what the person meant to keep: moved aside, not lost.
+        m.damaged |= ["items", "dismissed"].iter().any(|name| v.get(*name).is_some_and(|list| !list.is_array()));
         for item in v.get("items").and_then(Value::as_array).into_iter().flatten() {
             if m.items.len() >= MAX_ITEMS {
                 m.damaged = true;

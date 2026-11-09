@@ -86,6 +86,8 @@ fn a_hostile_file_is_read_within_the_limits_and_kept_aside() {
         ("ten megabytes of text", json!({"version": 1, "items": [{"id": "m1", "text": "x".repeat(10 << 20)}]}).to_string().into_bytes(), 0),
         ("a later version", json!({"version": 2, "items": [{"id": "m1", "text": "x"}]}).to_string().into_bytes(), 0),
         ("no version", json!({"items": [{"id": "m1", "text": "x"}]}).to_string().into_bytes(), 0),
+        ("items that aren't a list", json!({"version": 1, "items": {"id": "m1", "text": "Use British English."}}).to_string().into_bytes(), 0),
+        ("dismissed that isn't a list", json!({"version": 1, "items": [], "dismissed": "abc"}).to_string().into_bytes(), 0),
         ("wrong types", json!({"version": 1, "enabled": "yes", "items": [5, {"text": 5}], "dismissed": [1, "abc"]}).to_string().into_bytes(), 0),
     ];
     for (name, bytes, items) in cases {
