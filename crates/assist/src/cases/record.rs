@@ -445,7 +445,8 @@ const _: fn() = || {
 };
 
 /// The variant of [`Body`] with no data. `TRANSFER` and the half-lives are indexed by it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Kind {
     Pitfall,
     Pattern,

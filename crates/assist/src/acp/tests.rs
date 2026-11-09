@@ -321,14 +321,14 @@ fn the_prompt_carries_the_note_then_the_context_then_the_prompt() {
 fn what_the_person_kept_reaches_a_new_session_and_again_when_it_changes() {
     let mut c = Chat::with(&turns(vec![vec![Step::Report], vec![Step::Report], vec![Step::Report], vec![Step::Report], vec![Step::Report]]));
     let blocks = |c: &Chat| c.report()["prompt"].as_array().unwrap().iter().map(|b| b.as_str().unwrap().to_string()).collect::<Vec<_>>();
-    c.a.set_memory(Some("Saved: one.".into()));
+    c.a.set_memory(Some(crate::memory::Instructions::test("Saved: one.")));
     c.ask("First");
     let first = blocks(&c);
     assert!(first[0].contains("You are Fake Agent"), "{first:?}");
     assert_eq!(first[1..], ["Saved: one.", "First"]);
     c.ask("Same");
     assert_eq!(blocks(&c), ["Same"]);
-    c.a.set_memory(Some("Saved: two.".into()));
+    c.a.set_memory(Some(crate::memory::Instructions::test("Saved: two.")));
     c.ask("Changed");
     assert_eq!(blocks(&c), ["Saved: two.", "Changed"]);
     c.a.set_memory(None);
@@ -344,7 +344,7 @@ fn what_the_person_kept_is_said_again_after_a_failed_prompt() {
     let fail = Step::Fail { code: -32000, message: "not now".into() };
     let mut c = Chat::with(&turns(vec![vec![Step::Report], vec![fail], vec![Step::Report]]));
     c.ask("First");
-    c.a.set_memory(Some("Saved: one.".into()));
+    c.a.set_memory(Some(crate::memory::Instructions::test("Saved: one.")));
     c.ask("Fails");
     assert!(c.a.transcript().entries().any(|e| matches!(e, Entry::Error { .. })), "the prompt failed");
     c.ask("Again");
@@ -360,7 +360,7 @@ fn a_new_session_s_failed_first_prompt_is_said_again() {
     script.replies.insert("Crash".into(), vec![Step::Crash { code: 3, stderr: "gone".into() }]);
     script.replies.insert("Fails".into(), vec![Step::Fail { code: -32000, message: "not now".into() }]);
     let mut c = Chat::with(&script);
-    c.a.set_memory(Some("Saved: one.".into()));
+    c.a.set_memory(Some(crate::memory::Instructions::test("Saved: one.")));
     c.ask("Report");
     assert!(c.report()["prompt"].as_array().unwrap().iter().any(|b| b == "Saved: one."));
     c.ask("Crash");
@@ -1092,7 +1092,7 @@ fn what_the_person_kept_reaches_an_agent_whose_choices_are_set_first() {
     let script = Script { set_ms: 300, ..configured(vec![vec![Step::Report], vec![Step::Report]]) };
     let mut c = Chat::with(&script);
     let blocks = |c: &Chat| c.report()["prompt"].as_array().unwrap().iter().map(|b| b.as_str().unwrap().to_string()).collect::<Vec<_>>();
-    c.a.set_memory(Some("Saved: one.".into()));
+    c.a.set_memory(Some(crate::memory::Instructions::test("Saved: one.")));
     c.a.choose(Some("deep".into()), None);
     c.a.ask("Hello", None).unwrap();
     c.until("the agent started", |c| c.tool(START_ROW).is_some_and(|t| t.status == ToolStatus::Completed));
@@ -1104,7 +1104,7 @@ fn what_the_person_kept_reaches_an_agent_whose_choices_are_set_first() {
     let first = blocks(&c);
     assert!(first[0].contains("writing assistant inside WordCraft"), "{first:?}");
     assert_eq!(first[1..], ["Saved: one.", "Again"]);
-    c.a.set_memory(Some("Saved: two.".into()));
+    c.a.set_memory(Some(crate::memory::Instructions::test("Saved: two.")));
     c.a.choose(Some("fast".into()), None);
     c.ask("Changed");
     assert_eq!(blocks(&c), ["Saved: two.", "Changed"]);
@@ -1226,7 +1226,7 @@ fn an_agent_s_locations_and_fetches_reach_sources_and_junk_is_ignored() {
 #[test]
 fn a_source_goes_as_a_resource_when_the_agent_takes_them_else_as_text() {
     use crate::knowledge::TurnSource;
-    let source = || vec![TurnSource { name: "notes one.txt".into(), text: "Source words.".into() }];
+    let source = || vec![TurnSource { name: "notes one.txt".into(), text: "Source words.".into(), ..TurnSource::default() }];
     let report = |embedded: bool| {
         let script = Script { embedded_context: embedded, turns: vec![vec![Step::Report]], ..Script::default() };
         let mut c = Chat::with(&script);

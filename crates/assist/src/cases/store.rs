@@ -221,6 +221,39 @@ impl Shelf {
         real_dir(&dir).then_some(dir).ok_or(CaseError::Gone)
     }
 
+    /// The other cases of `at`'s wall, most recently changed first, at most `max_cases` of them and
+    /// `max_bytes` of their files, and how many were skipped as damaged or unreadable. A scan of one
+    /// wall's folder and nothing else: off the frame. A case whose file is damaged contributes
+    /// nothing, since what it holds may be cut.
+    pub(crate) fn recent_cases(&self, at: &CaseRef, max_cases: usize, max_bytes: u64) -> (Vec<(CaseId, Case)>, u32) {
+        let Ok(dir) = self.real_wall_dir(&at.wall) else { return (Vec::new(), 0) };
+        let mut found: Vec<(std::time::SystemTime, u64, CaseId, PathBuf)> = Vec::new();
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(CaseId::parse).filter(|id| *id != at.case && is_real_dir(&entry)) else { continue };
+            let file = entry.path().join(CASE_FILE);
+            let Ok(meta) = fs::metadata(&file) else { continue };
+            found.push((meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), meta.len(), id, file));
+        }
+        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
+        let mut out = Vec::new();
+        let mut skipped = 0u32;
+        let mut bytes = 0u64;
+        for (_, len, id, file) in found.into_iter().take(max_cases) {
+            bytes = bytes.saturating_add(len);
+            if bytes > max_bytes {
+                break;
+            }
+            let case = read_case(&file);
+            if case.damaged {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+            out.push((id, case));
+        }
+        (out, skipped)
+    }
+
     /// Cheap: one stat. Other windows learn of a delete here.
     pub fn exists(&self, at: &CaseRef) -> bool {
         self.case_dir(at).join(CASE_FILE).is_file()

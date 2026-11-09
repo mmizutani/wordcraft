@@ -157,13 +157,17 @@ pub struct Turn {
     /// whether its edits are tracked, and how to read and follow the document ([`crate::note`]).
     pub note: Option<String>,
     /// What the person kept for every conversation ([`crate::memory`]), as it stands this turn:
-    /// `None` when there is nothing to send.
-    pub memory: Option<String>,
+    /// `None` when there is nothing to send. Instruction-grade, so only [`crate::memory`] makes it.
+    pub memory: Option<crate::memory::Instructions>,
     /// The person's selection, by stable paragraph id: the backend selects it in its document
     /// copy before the turn. `None` leaves that copy's selection where it is.
     pub selection: Option<(Anchor, Anchor)>,
-    /// The sources the person attached, for the model to refer to. It is data.
+    /// The sources the person attached, for the model to refer to. It is data. What the turn
+    /// recalls from the person's cases joins it on the conversation's thread, as data too.
     pub knowledge: Vec<crate::knowledge::TurnSource>,
+    /// What to recall from the person's cases for this turn, run on the conversation's thread
+    /// just before the backend's turn ([`crate::cases::recall::RecallAsk`]); `None`: nothing.
+    pub recall: Option<crate::cases::recall::RecallAsk>,
     /// The model the person chose for this backend; `None`: its default.
     pub model: Option<String>,
     /// The reasoning effort the person chose for this backend; `None`: its default.
@@ -417,6 +421,9 @@ pub enum Event {
     Note { text: String },
     /// What the backend offers to choose from, whole: it replaces what it said before.
     Options(Offered),
+    /// What the turn recalled from the person's cases, and why nothing when nothing
+    /// ([`crate::cases::recall`]). Sent by the conversation, never by a backend.
+    Recalled(crate::cases::recall::RecallSent),
     /// The turn ended.
     Done { stop: StopReason },
     /// The turn failed: why, said plainly. The turn ended.
@@ -463,6 +470,7 @@ impl Event {
             Event::Usage(u) => Event::Usage(Usage { cost: u.cost.map(|c| cut(label(&c), MAX_COST)), ..u }),
             Event::Note { text: t } => Event::Note { text: text(t) },
             Event::Options(offered) => Event::Options(offered.bounded()),
+            Event::Recalled(recalled) => Event::Recalled(recalled.bounded()),
             Event::Error { message } => Event::Error { message: text(message) },
             e @ (Event::Answered { .. } | Event::Done { .. }) => e,
         }
@@ -778,8 +786,10 @@ impl TurnCtx<'_> {
     /// Send `event` to the conversation. [`Event::Done`] is the conversation's own, sent when
     /// [`Backend::turn`] returns: a backend's is dropped (return the stop reason instead).
     pub fn emit(&self, event: Event) {
-        if matches!(event, Event::Done { .. }) {
-            log::debug!("assistant: a backend sent its own Done, which was dropped");
+        // Done ends the turn, and Recalled says what WordCraft read from the person's cases: a
+        // backend saying either would be lying to the pane.
+        if matches!(event, Event::Done { .. } | Event::Recalled(_)) {
+            log::debug!("assistant: a backend sent its own Done or Recalled, which was dropped");
             return;
         }
         self.events.send(event);
@@ -917,6 +927,13 @@ pub trait Backend: Send {
     /// The conversation ended: stop what it started (kill the agent process, close
     /// connections). Called once, on the conversation's thread.
     fn end(&mut self) {}
+
+    /// When this backend's session keeps what it is sent, a number that changes with each new
+    /// session (an ACP agent), so what was sent once needn't be sent again until then. `None`
+    /// when each turn starts without it: ChatGPT, the fake.
+    fn retains(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(test)]

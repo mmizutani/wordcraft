@@ -34,6 +34,7 @@ use super::models::{self, Resolved, valid_model};
 use super::sse;
 use super::{AUTHOR, Endpoints, ID, USAGE_PAGE};
 use crate::backend::{Backend, BackendInfo, Cancel, Event, ModelOption, Seat, StopReason, ToolSpec, Turn, TurnCtx, Usage, cut};
+use crate::memory::Instructions;
 
 /// Most requests (model rounds) one turn makes.
 pub const MAX_ROUNDS: usize = 25;
@@ -108,7 +109,7 @@ pub struct ChatGpt {
     /// What every request's `instructions` say: the note, and how to work.
     instructions: String,
     /// What this turn's requests add to them of what the person kept.
-    memory: Option<String>,
+    memory: Option<Instructions>,
     /// The earlier turns, as input items, and their size.
     earlier: VecDeque<Value>,
     earlier_bytes: usize,
@@ -184,7 +185,7 @@ impl ChatGpt {
     fn body(&self, model: &str, effort: Option<&str>, tools: &[ToolSpec], items: &[Value]) -> Value {
         let input: Vec<Value> = self.earlier.iter().chain(items).cloned().collect();
         let instructions = match &self.memory {
-            Some(memory) => format!("{}\n\n{memory}", self.instructions),
+            Some(memory) => format!("{}\n\n{}", self.instructions, memory.as_str()),
             None => self.instructions.clone(),
         };
         let mut reasoning = json!({"summary": "auto"});

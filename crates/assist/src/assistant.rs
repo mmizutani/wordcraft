@@ -24,7 +24,9 @@ use crate::backend::{
     Answer, Backend, BackendInfo, Cancel, Event, Events, MAX_QUEUED_EVENTS, NoTools, Offered, PermissionPolicy, PermissionRequest, Permissions, Seat,
     StopReason, ToolHost, Turn, TurnCtx, Waker,
 };
+use crate::cases::recall::{RecallAsk, Told};
 use crate::context::Sent;
+use crate::memory::Instructions;
 use crate::tools::CopyTools;
 use crate::transcript::{Details, Entry, Properties, Transcript};
 
@@ -110,7 +112,9 @@ pub struct Assistant {
     /// Whether the next turn is the conversation's first, which carries the note.
     first: bool,
     /// What each turn from now on carries of what the person kept ([`Assistant::set_memory`]).
-    memory: Option<String>,
+    memory: Option<Instructions>,
+    /// What the next turn recalls from the person's cases ([`Assistant::set_recall`]): one turn's.
+    recall: Option<RecallAsk>,
     /// What the next turns carry of the sources the person attached.
     knowledge: Vec<crate::knowledge::TurnSource>,
     /// The model and reasoning effort each turn carries ([`Assistant::choose`]).
@@ -143,6 +147,7 @@ impl Assistant {
             cancel: cancel.clone(),
             permissions: permissions.clone(),
             policy: options.permissions,
+            told: Told::default(),
         };
         // A thread's name can't hold a NUL (spawning would panic): the id, as a short label.
         let thread = format!("assistant {}", info.id.chars().filter(|c| !c.is_control()).take(40).collect::<String>());
@@ -164,6 +169,7 @@ impl Assistant {
             busy: false,
             first: true,
             memory: None,
+            recall: None,
             knowledge: Vec::new(),
             choice: (None, None),
             offered: None,
@@ -232,8 +238,15 @@ impl Assistant {
     }
 
     /// What the next turns carry of what the person kept ([`crate::memory::Memory::for_model`]).
-    pub fn set_memory(&mut self, memory: Option<String>) {
+    pub fn set_memory(&mut self, memory: Option<Instructions>) {
         self.memory = memory;
+    }
+
+    /// What the next turn recalls from the person's cases, run on the conversation's thread just
+    /// before the backend's turn and given to it as data ([`crate::cases::recall`]). One turn's:
+    /// the window builds it for each turn, with the proof that no one else reads the document.
+    pub fn set_recall(&mut self, recall: Option<RecallAsk>) {
+        self.recall = recall;
     }
 
     /// The model and reasoning effort the next turns carry: what the person chose for this
@@ -307,6 +320,7 @@ impl Assistant {
             memory: self.memory.clone(),
             selection,
             knowledge: self.knowledge.clone(),
+            recall: self.recall.take(),
             model,
             effort,
         };
@@ -486,6 +500,8 @@ struct Work {
     cancel: Cancel,
     permissions: Permissions,
     policy: PermissionPolicy,
+    /// What the backend's session has been sent of the person's cases, when it keeps it.
+    told: Told,
 }
 
 impl Work {
@@ -510,10 +526,18 @@ impl Work {
             return;
         }
         while let Ok(job) = self.jobs.recv() {
-            let (turn, policy) = match job {
+            let (mut turn, policy) = match job {
                 Job::Turn(t, policy) => (*t, policy.unwrap_or(self.policy)),
                 Job::End => break,
             };
+            // Reading the person's cases is file work, so it runs here, off the frame; what it
+            // finds joins the turn's sources, as data, on every backend alike. A case that can't
+            // be read makes it find nothing and say so: a memory failure never stops a turn.
+            if let Some(ask) = turn.recall.take() {
+                let recalled = ask.run(&mut self.told, self.backend.retains());
+                self.events.send(Event::Recalled(recalled.sent()));
+                turn.knowledge.extend(recalled.into_sources());
+            }
             // The person's selection, in the assistant's copy: WordCraft's own step, not a call
             // of the model's, so the pane doesn't show it. A copy that can't find it (its
             // paragraph is gone) keeps its own.

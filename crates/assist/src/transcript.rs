@@ -7,6 +7,7 @@ use std::collections::{HashSet, VecDeque};
 use serde::Serialize;
 
 use crate::backend::{Answer, Event, PermissionRequest, PlanEntry, PlanStatus, Source, SourceKind, StopReason, ToolCall, ToolStatus, Usage, label};
+use crate::cases::recall::RecallSent;
 use crate::context::Sent;
 use crate::markers::{Markers, Piece};
 use crate::output::{Action, OutputRow};
@@ -63,6 +64,9 @@ pub enum Entry {
     Usage(Usage),
     /// What the turn gave the model of the document. Details shows it; the conversation doesn't.
     Context(Sent),
+    /// What the turn recalled from the person's cases, as data ([`crate::cases::recall`]), or why
+    /// nothing. Details shows it; the conversation doesn't.
+    Recalled(RecallSent),
     /// A change or a comment the conversation made, as it last stood. Details shows it; the
     /// conversation doesn't.
     Output(OutputRow),
@@ -78,7 +82,7 @@ impl Entry {
     /// Whether only Details shows it: the conversation goes on as if it weren't there, and an
     /// answer that arrives in pieces around it stays one answer.
     pub fn details_only(&self) -> bool {
-        matches!(self, Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) | Entry::Output(_) | Entry::Used { .. })
+        matches!(self, Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) | Entry::Recalled(_) | Entry::Output(_) | Entry::Used { .. })
     }
 
     fn bytes(&self) -> usize {
@@ -104,6 +108,7 @@ impl Entry {
                 sent.document.len() + sent.at.len() + memory + sent.knowledge.iter().map(|s| s.name.len()).sum::<usize>()
             }
             Entry::Output(row) => row.text.len(),
+            Entry::Recalled(sent) => sent.bytes(),
             Entry::Stopped { .. } => 0,
         }
         .saturating_add(16)
@@ -144,6 +149,8 @@ pub struct TurnDetails {
     pub steps: Vec<Step>,
     /// What the turn gave the model of the document.
     pub context: Option<Sent>,
+    /// What it recalled from the person's cases, once the conversation's thread looked.
+    pub recalled: Option<RecallSent>,
     /// What its tool calls read and looked for, in order, each once, at most [`MAX_TURN_SOURCES`].
     pub sources: Vec<Source>,
     /// How many more [`TurnDetails::sources`] leaves out.
@@ -212,6 +219,7 @@ struct TurnBuilder<'a> {
     plan: Option<Vec<Step>>,
     calls: Vec<Step>,
     context: Option<Sent>,
+    recalled: Option<RecallSent>,
     sources: Vec<Source>,
     more_sources: u32,
     output: Vec<OutputRow>,
@@ -224,10 +232,10 @@ struct TurnBuilder<'a> {
 impl<'a> TurnBuilder<'a> {
     /// Add the turn to `turns`, if it has anything to show, and start another.
     fn finish(&mut self, turns: &mut Vec<TurnDetails>) {
-        let TurnBuilder { asked, plan, calls, context, sources, more_sources, output, citations, used, .. } = std::mem::take(self);
+        let TurnBuilder { asked, plan, calls, context, recalled, sources, more_sources, output, citations, used, .. } = std::mem::take(self);
         let steps = plan.unwrap_or(calls);
         if asked.is_some() || !steps.is_empty() || context.is_some() || !sources.is_empty() || !output.is_empty() || !citations.is_empty() {
-            turns.push(TurnDetails { asked, steps, context, sources, more_sources, output, citations, used, unfound: 0 });
+            turns.push(TurnDetails { asked, steps, context, recalled, sources, more_sources, output, citations, used, unfound: 0 });
         }
     }
 
@@ -366,6 +374,7 @@ impl Transcript {
                 Entry::Agent { name } => out.agent = Some(name.clone()),
                 Entry::Usage(usage) => out.usage = Some(usage.clone()),
                 Entry::Context(sent) => turn.context = Some(sent.clone()),
+                Entry::Recalled(sent) => turn.recalled = Some(sent.clone()),
                 Entry::Output(row) => turn.output.push(row.clone()),
                 Entry::Answer { text } => turn.cite(text),
                 Entry::Used { id } => turn.used.push(id.clone()),
@@ -455,7 +464,7 @@ impl Transcript {
     /// Add what `event` says.
     pub fn record(&mut self, event: &Event) {
         // What only Details shows doesn't end an answer, so a marker goes on around it too.
-        if !matches!(event, Event::Text { .. } | Event::Agent { .. } | Event::Usage(_) | Event::Options(_)) {
+        if !matches!(event, Event::Text { .. } | Event::Agent { .. } | Event::Usage(_) | Event::Options(_) | Event::Recalled(_)) {
             self.flush_markers();
         }
         match event {
@@ -515,6 +524,7 @@ impl Transcript {
             Event::Note { text } => self.push(Entry::Note { text: text.clone() }),
             // What is offered isn't part of the conversation: [`crate::Assistant::offered`].
             Event::Options(_) => {}
+            Event::Recalled(sent) => self.push(Entry::Recalled(sent.clone())),
             Event::Done { stop } => {
                 if *stop != StopReason::EndTurn {
                     self.push(Entry::Stopped { stop: *stop });
@@ -569,18 +579,26 @@ impl Transcript {
         marked
     }
 
-    /// What preference `id` said in the turn of the entry at `entry`, if that turn sent it: the
-    /// person may have reworded it since.
+    /// What preference or recalled item `id` said in the turn of the entry at `entry`, if that turn
+    /// sent it: the person may have reworded a preference since.
     pub fn sent_preference(&self, entry: usize, id: &str) -> Option<&str> {
-        let turn =
-            self.entries.iter().take(entry.saturating_add(1)).rev().find_map(|e| if let Entry::Context(sent) = e { Some(sent) } else { None })?;
-        turn.memory.iter().find(|p| p.id == id).map(|p| p.text.as_str())
+        let turn = self.entries.iter().take(entry.saturating_add(1)).rev().take_while(|e| !matches!(e, Entry::Asked { .. }));
+        turn.into_iter().find_map(|e| match e {
+            Entry::Context(sent) => sent.memory.iter().find(|p| p.id == id).map(|p| p.text.as_str()),
+            Entry::Recalled(sent) => sent.items.iter().find(|i| i.id.to_string() == id).map(|i| i.text.as_str()),
+            _ => None,
+        })
     }
 
-    /// The model says preference `id` shaped the answer here: a chip goes in, numbered through the
-    /// turn. One the turn didn't send does nothing, whatever the model writes.
+    /// The model says preference or recalled item `id` shaped the answer here: a chip goes in,
+    /// numbered through the turn. One the turn didn't send does nothing, whatever the model writes.
     fn mark_used(&mut self, id: &str) {
-        if !self.in_turn().any(|(_, e)| matches!(e, Entry::Context(sent) if sent.memory.iter().any(|p| p.id == id))) {
+        let sent = self.in_turn().any(|(_, e)| match e {
+            Entry::Context(sent) => sent.memory.iter().any(|p| p.id == id),
+            Entry::Recalled(sent) => sent.items.iter().any(|i| i.id.to_string() == id),
+            _ => false,
+        });
+        if !sent {
             return;
         }
         let marked: Vec<&str> =
