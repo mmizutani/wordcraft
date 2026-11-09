@@ -14,11 +14,11 @@ mod comments;
 mod proofing;
 
 pub(crate) use changes::reject_all;
-pub use changes::{ChangeRow, ROW_TEXT_CHARS, change_rows};
 pub use changes::{
-    DELETION_TEXT_CHARS, DeletionBalloon, changes_by, deletion_balloons, format_changes, has_deletions, has_format_changes, move_changes,
-    tracking_json,
+    AUTHORED_TEXT_CHARS, AuthoredChange, DELETION_TEXT_CHARS, DeletionBalloon, MOST_AUTHORED_CHANGES, changes_by, changes_of, deletion_balloons,
+    format_changes, has_deletions, has_format_changes, move_changes, tracking_json,
 };
+pub use changes::{ChangeRow, ROW_TEXT_CHARS, change_rows};
 use changes::{list_changes, nav_change, resolve_all_then, resolve_sel_then, tracking_options};
 pub(crate) use comments::comment_at_caret;
 pub use comments::{CommentRow, comment_list, comment_range_at_caret, comment_rows};

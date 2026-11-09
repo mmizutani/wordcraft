@@ -20,6 +20,8 @@
 //!   prompts and reads [`Event`]s each frame, and never waits for it.
 //! - [`Context`]: the selection, the paragraphs around it and the outline, as text, held to hard
 //!   caps on a document of any size.
+//! - [`Feedback`]: what the person accepted and rejected of the assistant's changes since its last
+//!   turn, which the next turn's context starts with. Nothing of it is stored.
 //! - [`offers`]: the backends the pane offers on this host, and how one is made by its id.
 //! - `acp` (desktop only): ACP agents (Claude Code, Codex, Pi…) as backends, each a process
 //!   WordCraft starts and speaks the Agent Client Protocol with.
@@ -38,6 +40,7 @@ pub mod backend;
 pub mod chatgpt;
 pub mod context;
 mod fake;
+mod feedback;
 pub mod knowledge;
 pub mod offers;
 pub mod output;
@@ -52,6 +55,7 @@ pub use backend::{
 };
 pub use context::{Caps, Context, Sent};
 pub use fake::{FAKE_ID, Fake, HOLD, Seen, Step};
+pub use feedback::{Decision, Feedback};
 pub use knowledge::{Knowledge, SentSource, TurnSource};
 pub use offers::{Host, Offer, Readiness};
 pub use output::{OutputKind, OutputRow, OutputState};

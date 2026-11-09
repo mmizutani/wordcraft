@@ -122,6 +122,14 @@ says, its cost as the agent gave it. A row with nothing to say doesn't show. Whe
 waiting on a question for you, the pane goes back to the conversation, where the question is.
 `assist.details` answers a script with the same summary.
 
+What you accept and reject of the assistant's changes reaches its next turn. The turn's context
+starts with a short list, newest first, of what you decided since its last turn, each change's
+text cut to 120 characters and the list to 2 KiB, so the assistant adjusts within the
+conversation. Nothing of it is stored, and a new conversation starts without it. Only your own
+Accept and Reject count: not another participant's, a script's, a macro's, or a click the control
+channel made. A row's Accept and Reject in Output count as yours too, and Sources says when a turn
+was given such a list, and how long it was.
+
 ## Backends
 
 | Id | Backend | What runs it |
@@ -380,7 +388,8 @@ worth proposing to pi-acp (<https://github.com/svkozak/pi-acp>).
 What the agent sends its model, and where, is its business: Claude Code talks to Anthropic,
 Codex to OpenAI and Pi to the providers you set it up with, under your account with them. Each
 turn WordCraft gives it your prompt and the selection with the paragraphs around it and the
-outline, held to 32 KiB in all; the first turn adds a note that says which document it works
+outline, held to 32 KiB in all, and what you accepted and rejected of its changes since its last
+turn, held to 2 KiB; the first turn adds a note that says which document it works
 on, its name and role, and how to use the `wordcraft` tools (for Pi, `wordcraft-cli call`).
 Through those it can read the whole shared document.
 

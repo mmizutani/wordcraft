@@ -2505,3 +2505,258 @@ fn a_file_chosen_for_one_document_doesn_t_land_in_another() {
     assert_eq!(sources_read(&mut a)["sources"].as_array().unwrap().len(), 1);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The context of the turn asked `n`-th (from 0).
+fn context_of(seen: &std::sync::Arc<std::sync::Mutex<wordcraft_assist::Seen>>, n: usize) -> String {
+    seen.lock().unwrap().turns[n].context.clone().unwrap_or_default()
+}
+
+/// What the person rejects of the conversation's changes starts the next turn's context, once.
+/// What someone else or a script resolves, and what the person resolves of someone else's, doesn't.
+#[test]
+fn what_the_person_decides_reaches_the_next_turn_once() {
+    const SAID: &str = "What the person did with your changes";
+    let mut a = window("one two three");
+    let fake = Fake::new().then(rewrite_two()).then(rewrite_two()).then(rewrite_two()).then(rewrite_two());
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Use digits", None);
+    assert!(!context_of(&seen, 0).contains(SAID), "nothing was decided yet");
+
+    // Another participant rejects them, in the room.
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Editor).unwrap();
+    helper.run("review.rejectAll", &json!({})).unwrap();
+    helper.send();
+    settle(&mut a);
+    assert_eq!(wordcraft_engine::cmd::review::changes_by(&a.session, "Test Assistant"), 0);
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains(SAID), "another participant's decision");
+
+    // A script rejects them.
+    a.execute("review.rejectAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 2).contains(SAID), "a script's decision");
+
+    // The person rejects them, and someone else's too.
+    let mut suggester = room.join("Suggester", wordcraft_engine::room::Role::Suggester).unwrap();
+    suggester.run("caret.docStart", &json!({})).unwrap();
+    suggester.run("text.insert", &json!({"text": "theirs "})).unwrap();
+    suggester.send();
+    settle(&mut a);
+    a.run("review.rejectAll", json!({})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 3);
+    assert!(context.starts_with(SAID), "{context}");
+    assert!(context.contains("rejected your insertion: \"2\"") && context.contains("rejected your deletion: \"two\""), "{context}");
+    assert!(!context.contains("theirs"), "someone else's change: {context}");
+
+    // Once: the next turn starts clean.
+    a.run("review.acceptAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Accepted", None);
+    let context = context_of(&seen, 4);
+    assert!(context.contains("accepted your insertion: \"2\""), "{context}");
+    assert!(!context.contains("rejected"), "said once: {context}");
+    ask(&mut a, "Nothing new", None);
+    assert!(!context_of(&seen, 5).contains(SAID));
+}
+
+/// A new conversation may be about another document: what the person decided in the last stays
+/// behind.
+#[test]
+fn feedback_stays_with_its_conversation() {
+    const SAID: &str = "What the person did with your changes";
+    let mut a = window("one two three");
+    let fake = Fake::new().then(rewrite_two());
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Use digits", None);
+    a.run("review.rejectAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    let next = Fake::new();
+    let seen = next.seen();
+    a.assist_with(Box::new(next));
+    ask(&mut a, "Start over", None);
+    assert!(!context_of(&seen, 0).contains(SAID), "{}", context_of(&seen, 0));
+}
+
+/// A click the control channel made on Reject all isn't the person's decision.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_control_click_on_reject_all_tells_the_assistant_nothing() {
+    use egui_kittest::kittest::Queryable;
+    const SAID: &str = "What the person did with your changes";
+    let mut a = window("one two three");
+    let fake = Fake::new().then(rewrite_two());
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.session.view.assistant_pane = true;
+    ask(&mut a, "Use digits", None);
+    let mut h = harness(a);
+    let frame = |h: &mut egui_kittest::Harness<'_, WordApp>| {
+        let ctx = h.ctx.clone();
+        let mut raw = std::mem::take(h.input_mut());
+        h.state_mut().raw_input_hook(&ctx, &mut raw);
+        *h.input_mut() = raw;
+        h.step();
+    };
+    h.run_steps(3);
+    let pos = h.get_by_label("Reject all").rect().center();
+    let (req, _rx) = crate::control::ControlRequest::new("ui.click", json!({"x": pos.x, "y": pos.y}));
+    let ctx = h.ctx.clone();
+    assert!(matches!(crate::control::handle(h.state_mut(), &ctx, &req), crate::control::Outcome::Done(_)));
+    for _ in 0..20 {
+        frame(&mut h);
+    }
+    assert_eq!(wordcraft_engine::cmd::review::changes_by(&h.state().session, "Test Assistant"), 0, "the click went through");
+    ask(h.state_mut(), "Again", None);
+    assert!(!context_of(&seen, 1).contains(SAID), "{}", context_of(&seen, 1));
+}
+
+/// Two runs of the assistant's insertion, "a" and "b", with Helper's insertion "X" between them.
+fn split_by_helper(steps: Vec<Step>) -> (WordApp, std::sync::Arc<std::sync::Mutex<wordcraft_assist::Seen>>) {
+    let mut a = window("one");
+    let fake = Fake::new().then(vec![Step::tool("type_text", json!({"text": "ab"}))]).then(steps);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Write", None);
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Suggester).unwrap();
+    helper.run("select.text", &json!({"text": "a"})).unwrap();
+    helper.run("caret.right", &json!({})).unwrap();
+    helper.run("text.insert", &json!({"text": "X"})).unwrap();
+    helper.send();
+    settle(&mut a);
+    assert_eq!(a.session.doc.final_text(StoryRef::Body), "aXbone");
+    (a, seen)
+}
+
+/// Rejecting someone else's insertion between two runs of the assistant's joins them: the
+/// assistant's change is still there, undecided.
+#[test]
+fn someone_else_s_change_between_the_assistant_s_runs_says_nothing_of_them() {
+    const SAID: &str = "What the person did with your changes";
+    let (mut a, seen) = split_by_helper(vec![]);
+    a.run("review.rejectAll", json!({"author": "Helper"})).unwrap();
+    settle(&mut a);
+    assert_eq!(wordcraft_engine::cmd::review::changes_of(&a.session, "Test Assistant").unwrap().len(), 1, "joined, not resolved");
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains(SAID), "{}", context_of(&seen, 1));
+}
+
+/// Accepting another's deletion inside the assistant's insertion shortens it: not a decision on it.
+#[test]
+fn someone_else_s_deletion_inside_the_assistant_s_insertion_says_nothing_of_it() {
+    const SAID: &str = "What the person did with your changes";
+    let mut a = window("one");
+    let fake = Fake::new().then(vec![Step::tool("type_text", json!({"text": "abcd"}))]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Write", None);
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Suggester).unwrap();
+    helper.run("select.text", &json!({"text": "bc"})).unwrap();
+    helper.run("text.delete", &json!({})).unwrap();
+    helper.send();
+    settle(&mut a);
+    a.run("review.acceptAll", json!({"author": "Helper"})).unwrap();
+    settle(&mut a);
+    assert_eq!(accepted(&a), "adone", "the deletion was accepted");
+    assert!(wordcraft_engine::cmd::review::changes_by(&a.session, "Test Assistant") > 0, "the insertion is still undecided");
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains(SAID), "{}", context_of(&seen, 1));
+}
+
+/// Two changes in one revision: Accept of one says that one, and Accept All says both.
+#[test]
+fn one_of_two_changes_of_a_revision_is_told_apart() {
+    let (mut a, seen) = split_by_helper(vec![Step::say("Noted.")]);
+    let before = wordcraft_engine::cmd::review::changes_of(&a.session, "Test Assistant").unwrap();
+    assert_eq!(before.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    assert_eq!(before[0].rev, before[1].rev, "one revision holds both");
+    a.run("select.text", json!({"text": "a"})).unwrap();
+    a.run("review.accept", json!({})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(context.contains("accepted your insertion: \"a\""), "{context}");
+    assert!(!context.contains("\"b\""), "{context}");
+    a.run("review.acceptAll", json!({})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "And again", None);
+    assert!(context_of(&seen, 2).contains("accepted your insertion: \"b\""), "{}", context_of(&seen, 2));
+}
+
+/// Drafting a new paragraph is the assistant's main edit: accepting one says its text.
+#[test]
+fn accepting_a_whole_paragraph_says_its_text() {
+    let mut a = window("old");
+    let draft = vec![Step::tool("type_text", json!({"text": "Whole"})), Step::tool("execute", json!({"command": "text.newParagraph"}))];
+    let fake = Fake::new().then(draft);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Draft", None);
+    a.run("review.acceptAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    assert_eq!(a.session.doc.final_text(StoryRef::Body), "Whole\nold");
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(context.contains("accepted your insertion: \"Whole\""), "{context}");
+}
+
+/// A change with no text of its own, such as a tracked paragraph mark, isn't worth a line.
+#[test]
+fn a_change_with_no_text_says_nothing() {
+    let mut a = window("old");
+    let draft = vec![Step::tool("execute", json!({"command": "text.newParagraph"}))];
+    let fake = Fake::new().then(draft);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Split", None);
+    a.run("review.acceptAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(!context.contains("What the person did with your changes"), "{context}");
+}
+
+/// A row's Accept in Details is the person's own: the next turn hears of it, and its Sources say so.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn accepting_a_row_of_output_reaches_the_next_turn_and_sources_says_so() {
+    use egui_kittest::kittest::Queryable;
+    let mut a = window("one two three");
+    let fake = Fake::new().then(rewrite_two()).then(vec![Step::say("Noted.")]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Use digits", None);
+    let mut h = harness(a);
+    caught_up(&mut h);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    h.get_by_label("Steps").click();
+    h.run_steps(2);
+    h.get_by_label("Sources").click();
+    h.run_steps(2);
+    h.get_all_by_label("Accept").next().unwrap().click();
+    h.run_steps(3);
+
+    ask(h.state_mut(), "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(context.contains("accepted your"), "{context}");
+    let sent = h
+        .state()
+        .conversation()
+        .unwrap()
+        .transcript()
+        .entries()
+        .rev()
+        .find_map(|e| if let Entry::Context(s) = e { Some(s.clone()) } else { None })
+        .unwrap();
+    assert_eq!((sent.bytes + sent.feedback + 2) as usize, context.len(), "what is given is all accounted for: {context}");
+    h.get_by_label("Sources").click();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("what you did with its changes").is_some());
+}

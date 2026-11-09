@@ -675,6 +675,76 @@ pub fn changes_by(s: &Session, author: &str) -> usize {
         .sum()
 }
 
+/// Most characters of a change's text [`changes_of`] keeps: what feedback to a model quotes.
+pub const AUTHORED_TEXT_CHARS: usize = 120;
+
+/// Most changes [`changes_of`] keeps and the window compares; past this it gives none. This bounds
+/// the snapshot, not the walk that finds them.
+// ponytail: the walk is `changes_in`, as for `changes_by`, proportional to the document's tracked
+// runs. Make `changes_in` stream, for all its callers, if a click shows up in a profile.
+pub const MOST_AUTHORED_CHANGES: usize = 4096;
+
+/// One of an author's tracked changes in the document: what the window compares before and after
+/// the person resolves some (#86). Neighbouring runs of one change are one here. A revision can
+/// hold several changes (an author's in one second share it), so it doesn't name one alone.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AuthoredChange {
+    /// `insert`, `delete`, `format`…, as the Reviewing Pane names it.
+    pub kind: &'static str,
+    pub rev: u32,
+    /// The start of its text, at most [`AUTHORED_TEXT_CHARS`] characters: objects left out, and a
+    /// line break for each paragraph mark.
+    pub text: String,
+}
+
+/// The tracked changes `author` made across the document, in every story, as [`changes_by`] counts
+/// them but for a deletion hidden under someone else's insertion, which the reviewing list doesn't
+/// show either. `None` when there are more than [`MOST_AUTHORED_CHANGES`]. Each change's text is
+/// read from its paragraphs, without copying them, so the work stays bounded by the paragraphs'
+/// runs however long they are.
+pub fn changes_of(s: &Session, author: &str) -> Option<Vec<AuthoredChange>> {
+    let theirs = |rev: u32| s.doc.revisions.get(rev as usize).is_some_and(|r| r.author == author);
+    let stories = std::iter::once(StoryRef::Body).chain(s.doc.parts.keys().map(|id| StoryRef::Part(*id)));
+    let mut out = Vec::new();
+    for story in stories {
+        // Where the last one ends, to join what comes next to it.
+        let mut end: Option<Pos> = None;
+        let first = out.len();
+        for c in changes_in(s, story) {
+            let Some(rev) = c.rev.filter(|r| theirs(*r)) else { continue };
+            let joins = end.as_ref() == Some(&c.a);
+            match out.get_mut(first..).and_then(<[AuthoredChange]>::last_mut).filter(|l| joins && l.kind == c.kind && l.rev == rev) {
+                Some(last) => add_text(s, &c, &mut last.text),
+                None => {
+                    let mut text = String::new();
+                    add_text(s, &c, &mut text);
+                    out.push(AuthoredChange { kind: c.kind, rev, text });
+                }
+            }
+            if out.len() > MOST_AUTHORED_CHANGES {
+                return None;
+            }
+            end = Some(c.b);
+        }
+    }
+    Some(out)
+}
+
+/// Add what piece `c` of a change holds to `text`, up to [`AUTHORED_TEXT_CHARS`] characters: the
+/// text of its range in one paragraph, or a line break for a paragraph mark, whose range ends in
+/// the next one.
+fn add_text(s: &Session, c: &Change, text: &mut String) {
+    let room = AUTHORED_TEXT_CHARS.saturating_sub(text.chars().count());
+    if c.a.path != c.b.path {
+        if room > 0 {
+            text.push('\n');
+        }
+        return;
+    }
+    let piece = s.doc.para(c.a.story, &c.a.path).and_then(|p| p.text.get(c.a.off..c.b.off)).unwrap_or_default();
+    text.extend(piece.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(room));
+}
+
 /// Most characters of a change's or a comment's text [`change_rows`] and [`comment_rows`] keep.
 pub const ROW_TEXT_CHARS: usize = 120;
 
