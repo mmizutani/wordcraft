@@ -19,6 +19,7 @@
 //!
 //! Desktop only: the web build starts no process.
 
+mod config;
 pub mod fake_agent;
 pub mod presets;
 mod room_port;
@@ -36,9 +37,10 @@ use serde_json::{Value, json};
 use wordcraft_mcp::Backend as _;
 
 use crate::backend::{
-    Answer, Backend, BackendInfo, Event, MAX_OPTIONS, MAX_PLAN, MAX_SOURCES, PermissionKind, PermissionOption, PermissionPolicy, PermissionRequest,
-    PlanEntry, PlanStatus, Priority, Seat, Source, SourceKind, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, Usage, label,
+    Answer, Backend, BackendInfo, Event, MAX_OPTIONS, MAX_PLAN, MAX_SOURCES, Offered, PermissionKind, PermissionOption, PermissionPolicy,
+    PermissionRequest, PlanEntry, PlanStatus, Priority, Seat, Source, SourceKind, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, Usage, label,
 };
+use config::{Config, Select};
 pub use room_port::RoomPort;
 pub use rpc::{AUTH_REQUIRED, MAX_LINE, METHOD_NOT_FOUND, STDERR_TAIL};
 use rpc::{Incoming, Message, Process, RpcError, classify};
@@ -237,6 +239,9 @@ pub struct AuthMethod {
     pub description: String,
 }
 
+/// Most messages from the agent read between two turns before the next one goes on.
+const MAX_CATCH_UP: usize = 4096;
+
 /// The agent running for a conversation.
 struct Running {
     process: Process,
@@ -245,6 +250,14 @@ struct Running {
     session: String,
     /// Whether it takes `resource` blocks in a prompt (`embeddedContext`).
     embedded_context: bool,
+    /// The session's config options, as the agent last said them.
+    config: Config,
+    /// What the model and the level were before WordCraft changed them: Default goes back to it.
+    before: (Option<String>, Option<String>),
+    /// Whether a prompt went to this session. A turn can stop before its first one, while a
+    /// choice is set, and the next turn then has what the first would have sent: the note, which
+    /// the agent can't work without, and what it offers, for the menus.
+    prompted: bool,
 }
 
 /// An ACP agent as a backend.
@@ -263,6 +276,13 @@ pub struct Acp {
     /// The shared document's version when each call that is still running was first seen: its
     /// changes are the assistant's after it.
     started: HashMap<String, u64>,
+}
+
+impl Running {
+    /// The config option for the model or the level, and what it was before WordCraft changed it.
+    fn slot(&mut self, is_model: bool) -> (Option<&mut Select>, &mut Option<String>) {
+        if is_model { (self.config.model.as_mut(), &mut self.before.0) } else { (self.config.thought.as_mut(), &mut self.before.1) }
+    }
 }
 
 impl Acp {
@@ -368,7 +388,9 @@ impl Acp {
                 Ok(result) => {
                     let session = result.get("sessionId").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 1024);
                     let session = session.ok_or_else(|| format!("{name} started no session"))?.to_string();
-                    return Ok(Some((Running { process, folder, session, embedded_context }, agent)));
+                    let running =
+                        Running { process, folder, session, embedded_context, config: Config::parse(&result), before: (None, None), prompted: false };
+                    return Ok(Some((running, agent)));
                 }
                 Err(e) if e.code == AUTH_REQUIRED && !signed_in => {
                     if !self.sign_in(&mut process, &methods, ctx)? {
@@ -446,6 +468,134 @@ impl Acp {
         }
         // The next session has read nothing yet.
         self.memory_told = None;
+    }
+
+    /// Set what the person chose for this turn, model first: its answer may change the levels.
+    /// A value it no longer offers is skipped, with a note, and so is one it refuses: neither stops
+    /// the turn. Nothing chosen goes back to what WordCraft changed, once the agent takes it.
+    /// Whether anything changed.
+    fn apply_choice(&mut self, turn: &Turn, ctx: &mut TurnCtx<'_>) -> Result<bool, String> {
+        let mut changed = false;
+        for (is_model, wanted) in [(true, turn.model.as_ref()), (false, turn.effort.as_ref())] {
+            let name = self.name().to_string();
+            let until = Instant::now() + self.spec.start_timeout;
+            let Some(running) = self.running.as_mut() else { break };
+            let session = running.session.clone();
+            let (Some(option), before) = running.slot(is_model) else { continue };
+            let Some(target) = wanted.or(before.as_ref()).cloned() else { continue };
+            if !option.offers(&target) {
+                if wanted.is_some() {
+                    ctx.emit(Event::Note { text: format!("{name} doesn't offer {target} now: it goes on with {}.", option.current) });
+                }
+                continue;
+            }
+            let mut taken = target == option.current;
+            if !taken {
+                if wanted.is_some() && before.is_none() {
+                    *before = Some(option.current.clone());
+                }
+                let params = json!({"sessionId": session, "configId": option.id, "value": target});
+                let asked = running.process.request("session/set_config_option", params)?;
+                let answered = self.answer_to(asked, until, ctx);
+                let Some(running) = self.running.as_mut() else { break };
+                match answered {
+                    Ok(Some(Ok(answer))) => {
+                        if answer.get("configOptions").is_some() {
+                            running.config = Config::parse(&answer);
+                        } else if let (Some(option), _) = running.slot(is_model) {
+                            // The protocol says it answers with all of them; this one didn't.
+                            option.current = target;
+                        }
+                        taken = true;
+                        changed = true;
+                    }
+                    Ok(Some(Err(e))) => ctx.emit(Event::Note { text: format!("{name} didn't change to {target}: {}", e.message) }),
+                    stopped_or_stuck => {
+                        // It may still take the value: what it runs isn't known, so the next turn
+                        // says what it wants whatever was held.
+                        if let (Some(option), _) = running.slot(is_model) {
+                            option.current.clear();
+                        }
+                        return stopped_or_stuck.map(|_| changed);
+                    }
+                }
+            }
+            if taken
+                && wanted.is_none()
+                && let Some(running) = self.running.as_mut()
+            {
+                *running.slot(is_model).1 = None;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Tell the pane what the session's config options offer and which model runs. What is offered
+    /// says what runs with nothing chosen: what Default goes back to, or what the agent has.
+    fn show_config(&self, ctx: &TurnCtx<'_>, offer: bool) {
+        let Some(running) = &self.running else { return };
+        if offer {
+            let offered = running.config.offered();
+            let (model, effort) = running.before.clone();
+            ctx.emit(Event::Options(Offered { model: model.or(offered.model.clone()), effort: effort.or(offered.effort.clone()), ..offered }));
+        }
+        if let Some((name, effort)) = running.config.line() {
+            ctx.emit(Event::Model { name, effort, asked: false });
+        }
+    }
+
+    /// Wait for the answer to request `id`, before `until`, doing what a turn does with what the
+    /// agent sends meanwhile. `None` when the turn was stopped first.
+    fn answer_to(&mut self, id: i64, until: Instant, ctx: &mut TurnCtx<'_>) -> Result<Option<Result<Value, RpcError>>, String> {
+        let name = self.name().to_string();
+        loop {
+            if ctx.is_cancelled() {
+                return Ok(None);
+            }
+            if Instant::now() >= until {
+                return Err(format!("{name} didn't answer in time"));
+            }
+            let Some(running) = self.running.as_mut() else { return Err(format!("{name} isn't running")) };
+            let message = match running.process.next(TICK) {
+                None => continue,
+                Some(Incoming::Closed) => return Err(running.process.why_gone(&name)),
+                Some(Incoming::Junk(why)) => {
+                    log::debug!("assistant: {name} wrote {why}");
+                    continue;
+                }
+                Some(Incoming::Message(m)) => m,
+            };
+            match classify(&message) {
+                Message::Response { id: answered, result } if answered.as_i64() == Some(id) => return Ok(Some(result.cloned())),
+                Message::Notification { method: "session/update", params } => self.update(params, ctx),
+                Message::Request { id: asked, method, params } => self.answer_request(asked, method, params, false, ctx)?,
+                Message::Response { .. } | Message::Notification { .. } | Message::Invalid => {}
+            }
+        }
+    }
+
+    /// Take what the agent sent since the last turn, doing what a turn does with it: its config
+    /// options may have changed, which decides what the next prompt needs set first. At most
+    /// [`MAX_CATCH_UP`] messages, and not past a Stop: an agent that keeps writing would otherwise
+    /// hold the turn here, where nothing else looks at either. What is left is read in the turn.
+    fn catch_up(&mut self, ctx: &mut TurnCtx<'_>) -> Result<(), String> {
+        for _ in 0..MAX_CATCH_UP {
+            if ctx.is_cancelled() {
+                return Ok(());
+            }
+            let Some(running) = self.running.as_mut() else { return Ok(()) };
+            let message = match running.process.next(Duration::ZERO) {
+                None | Some(Incoming::Closed) => return Ok(()),
+                Some(Incoming::Junk(_)) => continue,
+                Some(Incoming::Message(m)) => m,
+            };
+            match classify(&message) {
+                Message::Notification { method: "session/update", params } => self.update(params, ctx),
+                Message::Request { id, method, params } => self.answer_request(id, method, params, false, ctx)?,
+                Message::Response { .. } | Message::Notification { .. } | Message::Invalid => {}
+            }
+        }
+        Ok(())
     }
 
     /// Show tool call `update` (a `tool_call`, a `tool_call_update` or a permission request's
@@ -530,6 +680,12 @@ impl Acp {
             Some("plan") => {
                 let entries = update.get("entries").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
                 ctx.emit(Event::Plan { entries: entries.iter().filter_map(plan_entry).take(MAX_PLAN).collect() });
+            }
+            Some("config_option_update") => {
+                if let Some(running) = self.running.as_mut() {
+                    running.config = Config::parse(update);
+                }
+                self.show_config(ctx, true);
             }
             Some("usage_update") => {
                 if let Some(usage) = usage_update(update) {
@@ -658,12 +814,21 @@ impl Backend for Acp {
         if fresh && !self.start_shown(ctx)? {
             return Ok(StopReason::Cancelled);
         }
+        if !fresh {
+            self.catch_up(ctx)?;
+        }
+        let changed = self.apply_choice(turn, ctx)?;
+        if ctx.is_cancelled() {
+            return Ok(StopReason::Cancelled);
+        }
+        let first = self.running.as_ref().is_some_and(|r| !r.prompted);
+        self.show_config(ctx, first || changed);
         // A new session gets the note, which the agent's model reads first.
-        let note = if fresh { self.note.as_deref() } else { None };
-        let memory = if !fresh && turn.memory != self.memory_told {
-            Some(turn.memory.as_deref().unwrap_or(crate::memory::NONE_APPLY))
-        } else if fresh {
+        let note = if first { self.note.as_deref() } else { None };
+        let memory = if first {
             turn.memory.as_deref()
+        } else if turn.memory != self.memory_told {
+            Some(turn.memory.as_deref().unwrap_or(crate::memory::NONE_APPLY))
         } else {
             None
         };
@@ -684,7 +849,10 @@ impl Backend for Acp {
         let prompt: Vec<Value> = before.chain(sources).chain(asked).collect();
         let session = running.session.clone();
         let ended = match running.process.request("session/prompt", json!({"sessionId": session, "prompt": prompt})) {
-            Ok(id) => self.finish_turn(id, ctx),
+            Ok(id) => {
+                running.prompted = true;
+                self.finish_turn(id, ctx)
+            }
             Err(e) => Err(format!("{}: {e}", self.spec.label)),
         };
         // A prompt that failed may not have reached it: the next turn says it again.
