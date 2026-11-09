@@ -37,8 +37,8 @@ use serde_json::{Value, json};
 use wordcraft_mcp::Backend as _;
 
 use crate::backend::{
-    Answer, Backend, BackendInfo, Event, MAX_OPTIONS, MAX_PLAN, Offered, PermissionKind, PermissionOption, PermissionPolicy, PermissionRequest,
-    PlanEntry, PlanStatus, Priority, Seat, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, label,
+    Answer, Backend, BackendInfo, Event, MAX_OPTIONS, MAX_PLAN, MAX_SOURCES, Offered, PermissionKind, PermissionOption, PermissionPolicy,
+    PermissionRequest, PlanEntry, PlanStatus, Priority, Seat, Source, SourceKind, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, Usage, label,
 };
 use config::{Config, Select};
 pub use room_port::RoomPort;
@@ -248,6 +248,8 @@ struct Running {
     /// Its folder: new and empty, removed when it stops.
     folder: Folder,
     session: String,
+    /// Whether it takes `resource` blocks in a prompt (`embeddedContext`).
+    embedded_context: bool,
     /// The session's config options, as the agent last said them.
     config: Config,
     /// What the model and the level were before WordCraft changed them: Default goes back to it.
@@ -312,6 +314,7 @@ impl Acp {
             status: ToolStatus::InProgress,
             detail: String::new(),
             changes: None,
+            sources: Vec::new(),
         };
         ctx.emit(Event::Tool(row.clone()));
         let started = self.start(ctx);
@@ -321,15 +324,18 @@ impl Acp {
             Err(e) => (ToolStatus::Failed, e.clone()),
         };
         ctx.emit(Event::Tool(ToolCall { status, detail, ..row }));
-        let Some(running) = started? else { return Ok(false) };
+        let Some((running, agent)) = started? else { return Ok(false) };
         self.running = Some(running);
+        if let Some(name) = agent {
+            ctx.emit(Event::Agent { name });
+        }
         Ok(true)
     }
 
     /// Start the agent: its process in a new empty folder, `initialize`, and a session (signing
-    /// in first when it asks for that and the person picks a way). `None` when the turn was
-    /// stopped meanwhile.
-    fn start(&mut self, ctx: &mut TurnCtx<'_>) -> Result<Option<Running>, String> {
+    /// in first when it asks for that and the person picks a way), with what it says it is.
+    /// `None` when the turn was stopped meanwhile.
+    fn start(&mut self, ctx: &mut TurnCtx<'_>) -> Result<Option<(Running, Option<String>)>, String> {
         let name = self.name().to_string();
         let (mcp_servers, reach_env) = self.reach()?;
         if !self.approve_setup(ctx)? || ctx.is_cancelled() {
@@ -367,9 +373,8 @@ impl Acp {
             let theirs = version.map_or_else(|| "an unknown version".to_string(), |v| format!("version {v}"));
             return Err(format!("{name} speaks {theirs} of the Agent Client Protocol, and WordCraft speaks version {PROTOCOL_VERSION}"));
         }
-        if let Some(agent) = agent_info(&init) {
-            log::info!("assistant: {name} says it is {agent}");
-        }
+        let agent = agent_info(&init);
+        let embedded_context = init.pointer("/agentCapabilities/promptCapabilities/embeddedContext").and_then(Value::as_bool).unwrap_or(false);
         let methods = auth_methods(&init);
         let new_session = json!({"cwd": cwd, "mcpServers": mcp_servers});
         let mut signed_in = false;
@@ -380,7 +385,9 @@ impl Acp {
                 Ok(result) => {
                     let session = result.get("sessionId").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 1024);
                     let session = session.ok_or_else(|| format!("{name} started no session"))?.to_string();
-                    return Ok(Some(Running { process, folder, session, config: Config::parse(&result), before: (None, None), prompted: false }));
+                    let running =
+                        Running { process, folder, session, embedded_context, config: Config::parse(&result), before: (None, None), prompted: false };
+                    return Ok(Some((running, agent)));
                 }
                 Err(e) if e.code == AUTH_REQUIRED && !signed_in => {
                     if !self.sign_in(&mut process, &methods, ctx)? {
@@ -597,6 +604,7 @@ impl Acp {
             status: ToolStatus::Pending,
             detail: String::new(),
             changes: None,
+            sources: Vec::new(),
         });
         if let Some(title) = update.get("title").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
             call.title = title.to_string();
@@ -612,6 +620,12 @@ impl Acp {
         }
         if call.title.is_empty() {
             call.title = "Tool call".into();
+        }
+        // An update says only what changed: what it leaves out still stands.
+        for source in call_sources(update, &call.kind) {
+            if !call.sources.contains(&source) && call.sources.len() < MAX_SOURCES {
+                call.sources.push(source);
+            }
         }
         // What the assistant changed in the document while the call ran (through WordCraft's MCP
         // server or `wordcraft-cli call`) is the call's: its row links to it. Kinds that change
@@ -668,7 +682,12 @@ impl Acp {
                 }
                 self.show_config(ctx, true);
             }
-            // The person's prompt echoed, modes, commands, usage…: nothing to show.
+            Some("usage_update") => {
+                if let Some(usage) = usage_update(update) {
+                    ctx.emit(Event::Usage(usage));
+                }
+            }
+            // The person's prompt echoed, modes, commands…: nothing to show.
             _ => {}
         }
     }
@@ -801,13 +820,21 @@ impl Backend for Acp {
         self.show_config(ctx, first || changed);
         // A new session gets the note, which the agent's model reads first.
         let note = if first { self.note.as_deref() } else { None };
-        let prompt: Vec<Value> = [note, turn.context.as_deref(), Some(turn.prompt.as_str())]
-            .into_iter()
-            .flatten()
-            .filter(|t| !t.trim().is_empty())
-            .map(|t| json!({"type": "text", "text": t}))
-            .collect();
+        let text = |t: &str| json!({"type": "text", "text": t});
+        let before = [note, turn.context.as_deref()].into_iter().flatten().filter(|t| !t.trim().is_empty()).map(text);
         let Some(running) = self.running.as_mut() else { return Err(format!("{} isn't running", self.spec.label)) };
+        let embedded = running.embedded_context;
+        let sources = turn.knowledge.iter().enumerate().map(|(n, source)| {
+            if embedded {
+                let name: String = source.name.chars().map(|c| if c.is_alphanumeric() || c == '.' { c } else { '-' }).collect();
+                let framed = source.as_text();
+                json!({"type": "resource", "resource": {"uri": format!("wordcraft:source/{n}/{name}"), "mimeType": "text/plain", "text": framed}})
+            } else {
+                text(&source.as_text())
+            }
+        });
+        let asked = (!turn.prompt.trim().is_empty()).then(|| text(&turn.prompt));
+        let prompt: Vec<Value> = before.chain(sources).chain(asked).collect();
         let session = running.session.clone();
         let ended = match running.process.request("session/prompt", json!({"sessionId": session, "prompt": prompt})) {
             Ok(id) => {
@@ -903,6 +930,46 @@ fn content_text(block: &Value) -> String {
         Some("resource") => "[resource]".into(),
         _ => String::new(),
     }
+}
+
+/// What a `usage_update` says: how much of the session's context is in use and how much it holds,
+/// and what the session has cost, as the agent gave it. `None` when it says nothing usable.
+fn usage_update(update: &Value) -> Option<Usage> {
+    let number = |key: &str| update.get(key).and_then(Value::as_u64);
+    let cost = update.get("cost").and_then(|cost| {
+        let amount = cost.get("amount").filter(|a| a.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0))?;
+        let currency = cost.get("currency").and_then(Value::as_str).map(label).filter(|c| !c.trim().is_empty())?;
+        Some(format!("{amount} {currency}"))
+    });
+    let usage = Usage { context_used: number("used"), context_size: number("size"), cost, ..Usage::default() };
+    (usage != Usage::default()).then_some(usage)
+}
+
+/// What a tool call says it read: its `locations`, and where a fetch went (`rawInput` holds the
+/// address, by convention: no field of the protocol does), or a link in its content. Junk is left
+/// out.
+fn call_sources(update: &Value, kind: &str) -> Vec<Source> {
+    let mut out = Vec::new();
+    let locations = update.get("locations").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    for location in locations.iter().take(MAX_SOURCES) {
+        let Some(path) = location.get("path").and_then(Value::as_str).filter(|p| !p.trim().is_empty()) else { continue };
+        let title = match location.get("line").and_then(Value::as_u64) {
+            Some(line) => format!("{path}:{line}"),
+            None => path.to_string(),
+        };
+        out.push(Source { kind: SourceKind::File, title, target: Some(path.to_string()) });
+    }
+    if kind == "fetch" {
+        let raw = |key: &str| update.pointer(&format!("/rawInput/{key}")).and_then(Value::as_str);
+        let content = update.get("content").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+        let linked = content.iter().take(8).find_map(|c| {
+            let block = c.get("content")?;
+            (block.get("type").and_then(Value::as_str) == Some("resource_link")).then(|| block.get("uri").and_then(Value::as_str)).flatten()
+        });
+        let address = raw("url").or_else(|| raw("uri")).or(linked).filter(|a| crate::answer::opens(a));
+        out.extend(address.map(|a| Source { kind: SourceKind::Web, title: a.to_string(), target: Some(a.to_string()) }));
+    }
+    out
 }
 
 /// Most characters of a tool call's detail.

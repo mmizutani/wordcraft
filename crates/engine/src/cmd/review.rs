@@ -14,13 +14,14 @@ mod comments;
 mod proofing;
 
 pub(crate) use changes::reject_all;
+pub use changes::{ChangeRow, ROW_TEXT_CHARS, change_rows};
 pub use changes::{
     DELETION_TEXT_CHARS, DeletionBalloon, changes_by, deletion_balloons, format_changes, has_deletions, has_format_changes, move_changes,
     tracking_json,
 };
 use changes::{list_changes, nav_change, resolve_all_then, resolve_sel_then, tracking_options};
 pub(crate) use comments::comment_at_caret;
-pub use comments::{comment_list, comment_range_at_caret};
+pub use comments::{CommentRow, comment_list, comment_range_at_caret, comment_rows};
 use comments::{comments_change, delete_comment, edit_comment, list_comments, nav_comment, new_comment, reply, validate_comment_id};
 use proofing::{all_issues, issue_at, next_issue, suggestions, thesaurus, word_count};
 
@@ -56,9 +57,9 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("review.rejectAll", "Reject All Changes", "Review › Changes", |s, v| resolve_all_then(s, v, false))
             .params(r#"{"stopTracking"?: bool (also turn Track Changes off), "author"?: string (only this reviewer's changes)}"#),
         CommandSpec::new("review.accept", "Accept", "Review › Changes", |s, v| resolve_sel_then(s, v, true))
-            .params(r#"{"next"?: bool (then select the next change)}"#),
+            .params(r#"{"next"?: bool (then select the next change), "author"?: string (only this reviewer's changes in the selection: its text, or a table's, row's or cell's own change at a caret), "kind"?: "insert|delete|format|move" (with `author`: only those)}"#),
         CommandSpec::new("review.reject", "Reject", "Review › Changes", |s, v| resolve_sel_then(s, v, false))
-            .params(r#"{"next"?: bool (then select the next change)}"#),
+            .params(r#"{"next"?: bool (then select the next change), "author"?: string (only this reviewer's changes in the selection: its text, or a table's, row's or cell's own change at a caret), "kind"?: "insert|delete|format|move" (with `author`: only those)}"#),
         CommandSpec::new("review.nextChange", "Next Change", "Review › Changes", |s, _| nav_change(s, 1)).pure(),
         CommandSpec::new("review.previousChange", "Previous Change", "Review › Changes", |s, _| nav_change(s, -1)).pure(),
         CommandSpec::new("review.markup", "Display for Review", "Review › Tracking", |s, v| {
