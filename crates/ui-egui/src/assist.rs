@@ -34,7 +34,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use wordcraft_assist::{Answer, Assistant, Backend, Caps, Context, Decision, Feedback, Host, Offer, Options, PermissionPolicy, Readiness};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+
+use wordcraft_assist::knowledge::{self, MAX_SOURCES};
+use wordcraft_assist::{Answer, Assistant, Backend, Caps, Context, Decision, Feedback, Host, Knowledge, Offer, Options, PermissionPolicy, Readiness};
 use wordcraft_engine::cmd::assist::AssistantStatus;
 use wordcraft_engine::cmd::review::{AuthoredChange, changes_of};
 use wordcraft_engine::room::Role;
@@ -70,6 +73,23 @@ pub(crate) struct AssistState {
     /// Frames left in which the prompt box takes the keyboard: a few, as the click that opened
     /// the pane hands the keyboard back to the page.
     pub(crate) focus_prompt: u8,
+    /// The sources attached for the conversation: they carry on until a new one starts.
+    pub(crate) knowledge: Vec<Knowledge>,
+    /// The document they were attached in: no other document's turn gets them.
+    knowledge_for: Option<u64>,
+    /// Sources being read off the frame thread.
+    adding: Vec<Receiver<Result<Knowledge, String>>>,
+    /// Sources' Add shows what to add.
+    pub(crate) add_open: bool,
+    /// Where citations' words were found, for the document and revision and sources it was looked
+    /// at with.
+    cited: Option<CitedHeld>,
+    /// Goes up each time the sources change: what they hold was looked at with it.
+    knowledge_rev: u64,
+    /// The document and its revision the conversation's record of what it changed last read.
+    output_at: Option<(u64, u64)>,
+    /// What the pane shows: the conversation, or what the assistant is doing and what runs it.
+    pub(crate) view: PaneView,
     /// Why the last prompt didn't start, or a change couldn't be shown, for the pane.
     pub(crate) notice: Option<String>,
     /// The command running now is the person's ([`WordApp::run`]: the pane, a menu, a
@@ -99,6 +119,46 @@ pub(crate) struct AssistState {
     pub(crate) chatgpt: chatgpt::ChatGptState,
     /// What the assistant remembers across conversations (#86), as last read.
     pub(crate) memory: memory::MemoryState,
+}
+
+/// What the Assistant pane shows under its role.
+/// The document's text and where citations' words were found, for what it was looked at with: the
+/// document, its revision and the sources' [`AssistState::knowledge_rev`].
+struct CitedHeld {
+    at: (u64, u64, u64),
+    text: String,
+    found: HashMap<String, Cited>,
+    /// [`Self::found`] from before it last filled: what is still cited moves back from here
+    /// without being looked for again, and the rest goes when it fills next.
+    before: HashMap<String, Cited>,
+    /// Bytes of words in `found`.
+    bytes: usize,
+}
+
+impl CitedHeld {
+    fn hold(&mut self, words: &str, found: Cited) {
+        if self.found.len() >= MOST_CITED_HELD || self.bytes >= wordcraft_assist::transcript::MAX_BYTES {
+            self.before = std::mem::take(&mut self.found);
+            self.bytes = 0;
+        }
+        self.bytes = self.bytes.saturating_add(words.len());
+        self.found.insert(words.to_string(), found);
+    }
+}
+
+/// Where a citation's words are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Cited {
+    Document,
+    Source(String),
+    Nowhere,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PaneView {
+    #[default]
+    Conversation,
+    Details,
 }
 
 /// One conversation, and the document it is about.
@@ -208,12 +268,16 @@ pub(crate) fn tick(app: &mut WordApp) {
         if app.assist.opened_for != Some(id) {
             app.assist.opened_for = Some(id);
             app.session.view.assistant_pane = true;
+            // The question is in the conversation.
+            app.assist.view = PaneView::Conversation;
         } else if !app.session.view.assistant_pane
             && let Some(a) = app.conversation_mut()
         {
             a.answer(id, Answer::Cancelled);
         }
     }
+    note_output(app);
+    take_sources(app);
     // A sign-in or a sign-out that ended changes what ChatGPT's offer says: ask again now.
     let account_changed = chatgpt::tick(app);
     #[cfg(not(target_arch = "wasm32"))]
@@ -227,6 +291,21 @@ pub(crate) fn tick(app: &mut WordApp) {
         refresh_offers(app);
     }
     app.session.assistant = status(app);
+}
+
+/// While the pane is open, bring the conversation's record of what it changed up to date, when the
+/// document changed: the Review list forgets a change once it is resolved, and this remembers how
+/// it ended. It costs a walk of the document's tracked changes, as Accept all's count does.
+fn note_output(app: &mut WordApp) {
+    let document = app.session.document_id();
+    let at = (document, app.session.rev());
+    if !app.session.view.assistant_pane || app.assist.output_at == Some(at) {
+        return;
+    }
+    if let Some(c) = app.assist.conversation.as_mut().filter(|c| c.document == document) {
+        c.assistant.note_output(&app.session);
+        app.assist.output_at = Some(at);
+    }
 }
 
 /// After command `id` ran in the window with result `r`: for an `assist.*` command, act on the
@@ -295,6 +374,19 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
             Ok(json!({"switched": switched}))
         }
         "backend" => backend(app, req.get("id").and_then(Value::as_str)),
+        "details" => details(app),
+        "knowledge" => {
+            if let Some(n) = req.get("remove").and_then(Value::as_u64) {
+                remove_source(app, usize::try_from(n).unwrap_or(usize::MAX))?;
+            }
+            if let Some(path) = req.get("add").and_then(Value::as_str) {
+                add_source_file(app, path);
+            }
+            if let Some(id) = req.get("source").and_then(Value::as_u64) {
+                add_source_document(app, id);
+            }
+            Ok(sources_json(app))
+        }
         "choice" => choice(app, req),
         "show" => {
             let last = req.get("version").and_then(Value::as_u64).unwrap_or(0);
@@ -309,6 +401,215 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
     };
     app.session.assistant = status(app);
     r
+}
+
+/// The conversation in summary, as the pane's Details shows it. Empty without a conversation.
+fn details(app: &mut WordApp) -> Result<Value, String> {
+    serde_json::to_value(details_for(app)).map_err(|e| e.to_string())
+}
+
+/// Most citations [`CitedHeld`] keeps in each of its maps: as many as a transcript can hold, so what
+/// is still cited never fills one, and Details doesn't look for it again each frame. It is the same
+/// for the words' bytes, which are the text of the answers they came from.
+pub(crate) const MOST_CITED_HELD: usize = wordcraft_assist::transcript::MAX_ENTRIES.saturating_mul(wordcraft_assist::answer::MAX_CITES);
+
+/// Where `words` are: in the document as it reads, or in an attached source. The document's text is
+/// read once a revision, and only when an answer cites anything.
+pub(crate) fn cited(app: &mut WordApp, words: &str) -> Cited {
+    let at = (app.session.document_id(), app.session.rev(), app.assist.knowledge_rev);
+    if app.assist.cited.as_ref().is_none_or(|held| held.at != at) {
+        let text = wordcraft_assist::context::final_text(&app.session.doc);
+        app.assist.cited = Some(CitedHeld { at, text, found: HashMap::new(), before: HashMap::new(), bytes: 0 });
+    }
+    if let Some(held) = app.assist.cited.as_mut() {
+        if let Some(found) = held.found.get(words) {
+            return found.clone();
+        }
+        if let Some(found) = held.before.remove(words) {
+            held.hold(words, found.clone());
+            return found;
+        }
+    }
+    let flat = wordcraft_assist::context::flat(words);
+    let in_document = app.assist.cited.as_ref().is_some_and(|held| held.text.contains(&flat));
+    let found = if in_document {
+        Cited::Document
+    } else {
+        sources(app).iter().find(|s| s.text.contains(words)).map_or(Cited::Nowhere, |s| Cited::Source(s.name.clone()))
+    };
+    if let Some(held) = app.assist.cited.as_mut() {
+        held.hold(words, found.clone());
+    }
+    found
+}
+
+/// Select `words` in the document, as they read: true when they are there.
+pub(crate) fn select_cited(app: &mut WordApp, words: &str) -> bool {
+    let Some((anchor, focus)) = wordcraft_assist::context::find_in_final(&app.session.doc, words) else { return false };
+    let range = json!({"anchor": wordcraft_engine::cmd::pos_json(&anchor), "focus": wordcraft_engine::cmd::pos_json(&focus)});
+    app.run("select.range", range).is_ok()
+}
+
+/// The conversation in summary, with its citations looked for: a made-up one is only counted.
+pub(crate) fn details_for(app: &mut WordApp) -> wordcraft_assist::Details {
+    let mut details = app.conversation().map(Assistant::details).unwrap_or_default();
+    for turn in &mut details.turns {
+        let citations = std::mem::take(&mut turn.citations);
+        for mut citation in citations {
+            match cited(app, &citation.words) {
+                Cited::Document => turn.citations.push(citation),
+                Cited::Source(name) => {
+                    citation.source = Some(name);
+                    turn.citations.push(citation);
+                }
+                Cited::Nowhere => turn.unfound = turn.unfound.saturating_add(1),
+            }
+        }
+    }
+    details
+}
+
+/// What `assist.knowledge` answers.
+fn sources_json(app: &WordApp) -> Value {
+    let list: Vec<Value> = sources(app).iter().map(|s| json!({"name": s.name, "bytes": s.text.len(), "size": s.size, "cut": s.cut})).collect();
+    json!({"sources": list, "pending": app.assist.adding.len(), "error": app.assist.notice})
+}
+
+/// Why a prompt waits: it would go without the source the person just chose.
+const READING_SOURCE: &str = "a source is still being read: ask again in a moment";
+
+/// Whether a source for this document is still being read.
+pub(crate) fn sources_being_read(app: &WordApp) -> bool {
+    !app.assist.adding.is_empty() && app.assist.knowledge_for == Some(app.session.document_id())
+}
+
+/// The sources attached in the document shown.
+pub(crate) fn sources(app: &WordApp) -> &[Knowledge] {
+    if app.assist.knowledge_for == Some(app.session.document_id()) { &app.assist.knowledge } else { &[] }
+}
+
+/// Whether there is room for one more source. The list is the document shown's from here on.
+fn source_room(app: &mut WordApp) -> bool {
+    let document = app.session.document_id();
+    if app.assist.knowledge_for != Some(document) {
+        app.assist.knowledge_rev = app.assist.knowledge_rev.wrapping_add(1);
+        app.assist.knowledge.clear();
+        app.assist.adding.clear();
+        app.assist.knowledge_for = Some(document);
+    }
+    let room = app.assist.knowledge.len().saturating_add(app.assist.adding.len()) < MAX_SOURCES;
+    if !room {
+        app.assist.notice = Some(format!("a conversation holds at most {MAX_SOURCES} sources: remove one first"));
+    }
+    room
+}
+
+/// Read the file at `path` as a source, off the frame thread: a large one takes time to import.
+/// Whoever asked has had the file rule applied, or chose the file themselves.
+pub(crate) fn add_source_file(app: &mut WordApp, path: &str) {
+    if !source_room(app) {
+        return;
+    }
+    let path = std::path::PathBuf::from(path);
+    let (tx, rx) = channel();
+    let wake = app.ctx.clone();
+    let reading = std::thread::Builder::new().name("assistant source".into()).spawn(move || {
+        let _ = tx.send(read_source(&path));
+        if let Some(ctx) = wake {
+            ctx.request_repaint();
+        }
+    });
+    match reading {
+        Ok(_) => app.assist.adding.push(rx),
+        Err(e) => app.assist.notice = Some(format!("the source couldn't be read: {e}")),
+    }
+}
+
+/// Most bytes of a file read as a source: its text is cut to much less, but only after importing it.
+const MAX_SOURCE_FILE: u64 = 16 << 20;
+
+/// Files that are their text already: read as they are, since a text importer makes a paragraph of
+/// every line, which a file of line breaks would make millions of.
+const PLAIN_TEXT: &[&str] = &["txt", "text", "md", "markdown", "csv", "tsv", "log"];
+
+/// `path` as a source, read as far as the limit from the file as it is now: through the importers
+/// documents open with, or as it is when it is plain text.
+fn read_source(path: &std::path::Path) -> Result<Knowledge, String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let fail = |why: String| format!("{name} couldn't be read as a source: {why}");
+    // A file only: a named pipe would never answer, and the turn waits for what is being read.
+    let bytes = wordcraft_engine::io::read_regular_file(path, MAX_SOURCE_FILE).ok_or_else(|| fail("it isn't a file that can be read".to_string()))?;
+    if u64::try_from(bytes.len()).is_ok_and(|n| n > MAX_SOURCE_FILE) {
+        return Err(fail(format!("it is larger than {} MB", MAX_SOURCE_FILE >> 20)));
+    }
+    let extension = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if PLAIN_TEXT.contains(&extension.as_str()) {
+        return Ok(Knowledge::new(&name, &wordcraft_engine::io::decode_text(&bytes)));
+    }
+    let doc = wordcraft_engine::io::open_bytes(&name, &bytes).map_err(fail)?;
+    Ok(Knowledge::new(&name, &doc.plain_text(wordcraft_doc::StoryRef::Body)))
+}
+
+/// The start of `doc`'s text, past what a source keeps: as much as it takes to say it was cut, read
+/// without copying the rest of a long document.
+fn text_for_source(doc: &wordcraft_doc::Document) -> String {
+    use wordcraft_doc::StoryRef::Body;
+    let mut text = String::new();
+    for path in doc.para_paths(Body) {
+        if text.len() > knowledge::MAX_SOURCE_BYTES {
+            break;
+        }
+        if let Some(p) = doc.para(Body, &path) {
+            p.plain_text_up_to(&mut text, knowledge::MAX_SOURCE_BYTES.saturating_add(1));
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// Attach open document `id`, which the command checked, as a source named by its title.
+fn add_source_document(app: &mut WordApp, id: u64) {
+    let title = app.session.documents().into_iter().find(|d| d.id == id).map(|d| d.title);
+    if let Some(title) = title
+        && source_room(app)
+    {
+        match app.session.with_document(id, |s| text_for_source(&s.doc)) {
+            Ok(text) => {
+                app.assist.knowledge.push(Knowledge::new(&title, &text));
+                app.assist.knowledge_rev = app.assist.knowledge_rev.wrapping_add(1);
+            }
+            Err(e) => app.assist.notice = Some(e.to_string()),
+        }
+    }
+}
+
+/// Remove source `n`.
+pub(crate) fn remove_source(app: &mut WordApp, n: usize) -> Result<(), String> {
+    if n >= sources(app).len() {
+        return Err(format!("`remove`: there are {} sources", sources(app).len()));
+    }
+    app.assist.knowledge.remove(n);
+    app.assist.knowledge_rev = app.assist.knowledge_rev.wrapping_add(1);
+    Ok(())
+}
+
+/// Take the sources that were read.
+fn take_sources(app: &mut WordApp) {
+    let mut adding = std::mem::take(&mut app.assist.adding);
+    adding.retain(|rx| match rx.try_recv() {
+        Ok(Ok(source)) => {
+            app.assist.knowledge.push(source);
+            app.assist.knowledge_rev = app.assist.knowledge_rev.wrapping_add(1);
+            false
+        }
+        Ok(Err(why)) => {
+            app.assist.notice = Some(why);
+            false
+        }
+        Err(TryRecvError::Empty) => true,
+        Err(TryRecvError::Disconnected) => false,
+    });
+    app.assist.adding = adding;
 }
 
 /// The assistants offered, whether each is ready, and the one chosen; with `id`, choose it.
@@ -455,6 +756,9 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     if !app.has_document() {
         return Err("no document is open".into());
     }
+    if sources_being_read(app) {
+        return Err(READING_SOURCE.into());
+    }
     let role = wanted(app, role);
     let chosen_id = chosen(app).map(|o| o.id.clone());
     let keep = app.conversation().is_some_and(|a| {
@@ -464,8 +768,11 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
         start(app, role)?;
     }
     let caps = Caps::default();
-    let mut context = Context::of(&app.session, &caps).to_text(&caps);
+    let (mut context, mut sent) = Context::of(&app.session, &caps).rendered(&caps);
+    let (carried, given) = knowledge::for_turn(sources(app));
+    sent.knowledge = given;
     if let Some(digest) = app.assist.feedback.digest() {
+        sent.feedback = u32::try_from(digest.len()).unwrap_or(u32::MAX);
         context = format!("{digest}\n\n{context}");
     }
     // The person's selection, by paragraph id: the assistant's copy finds it there, though the
@@ -498,8 +805,10 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     let saved = app.conversation().and_then(|a| app.session.prefs.assistant.models.get(&a.info().id)).cloned().unwrap_or_default();
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
     a.set_memory(kept);
+    a.set_knowledge(carried);
     a.choose(saved.model, saved.effort);
     a.ask_with_policy(prompt, Some(context), selection, policy).map_err(|e| e.to_string())?;
+    a.gave(sent);
     let (name, role, tracked) = (a.name().to_string(), a.role(), a.tracked());
     app.assist.feedback.clear();
     Ok(json!({"asked": true, "assistant": name, "role": role.name(), "tracked": tracked}))
@@ -527,6 +836,14 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
             wordcraft_assist::offers::make(&id, &host(app))?
         }
     };
+    // Sources belong to their conversation: those attached since it, for another document, or before
+    // the first, go with the new one.
+    if app.assist.conversation.as_ref().is_some_and(|c| Some(c.document) == app.assist.knowledge_for) {
+        app.assist.knowledge.clear();
+        app.assist.knowledge_rev = app.assist.knowledge_rev.wrapping_add(1);
+        // One still being read would land in this conversation.
+        app.assist.adding.clear();
+    }
     end(app);
     if !app.shows_shared_document() {
         app.share_document(None)?;
@@ -703,12 +1020,20 @@ pub(crate) fn effort_word(level: &str) -> &str {
 pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
     use wordcraft_assist::Entry;
     match e {
-        Entry::Asked { text } | Entry::Answer { text } | Entry::Thought { text } => vec![text.clone()],
-        Entry::Tool(call) => vec![call.title.clone(), call.detail.clone()],
+        Entry::Asked { text } | Entry::Thought { text } => vec![text.clone()],
+        Entry::Answer { text } => crate::panes::answer::shown_texts(text),
+        Entry::Tool(call) => {
+            let sources = call.sources.iter().flat_map(|s| [s.title.clone(), s.target.clone().unwrap_or_default()]);
+            [call.title.clone(), call.detail.clone()].into_iter().chain(sources).collect()
+        }
         Entry::Plan { entries } => entries.iter().map(|p| p.content.clone()).collect(),
         Entry::Permission { request, .. } => std::iter::once(request.title.clone()).chain(request.options.iter().map(|o| o.name.clone())).collect(),
         Entry::Proposal { text, .. } => vec![text.clone()],
         Entry::Model { name, effort, .. } => std::iter::once(name.clone()).chain(effort.clone()).collect(),
+        Entry::Agent { name } => vec![name.clone()],
+        Entry::Usage(u) => u.cost.iter().cloned().collect(),
+        Entry::Context(sent) => std::iter::once(sent.document.clone()).chain(sent.knowledge.iter().map(|s| s.name.clone())).collect(),
+        Entry::Output(row) => vec![row.text.clone()],
         Entry::Note { text } => vec![text.clone()],
         Entry::Stopped { .. } => vec![],
         Entry::Error { message } => vec![message.clone()],

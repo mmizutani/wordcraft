@@ -539,6 +539,7 @@ fn hostile_permission_requests_and_events_are_held_to_the_pane_s_limits() {
             status: ToolStatus::Completed,
             detail: "d".repeat(4000),
             changes: None,
+            sources: Vec::new(),
         }));
     }
     assert!(t.len() <= crate::transcript::MAX_ENTRIES);
@@ -762,6 +763,67 @@ fn the_tools_are_the_mcp_server_s_for_one_document() {
     for gone in ["open_document", "save_document", "new_document", "list_documents", "screenshot", "click", "key", "room", "render_page"] {
         assert!(!names.contains(&gone), "{gone}");
     }
+}
+
+/// The id of a paragraph, as a read's source names it.
+fn paragraph_id(doc: &wordcraft_doc::Document, story: wordcraft_doc::StoryRef, n: usize) -> Option<String> {
+    let at = wordcraft_doc::Pos::new(story, wordcraft_doc::Path::top(n), 0);
+    doc.anchor_at(&at).map(|a| a.block.to_string())
+}
+
+#[test]
+fn a_read_s_source_is_the_paragraph_it_read_though_someone_added_one_before_it() {
+    use wordcraft_doc::StoryRef::Body;
+    let mut w = Window::new("one\ntwo");
+    let key = w.room.invite("Reader", Role::Viewer).unwrap();
+    let mut tools = CopyTools::join(&w.room, &key).unwrap();
+    assert!(tools.call("get_text", &json!({})).ok);
+    w.own
+        .lend(&mut w.session, |copy| {
+            copy.run("caret.docStart", &json!({})).unwrap();
+            copy.run("text.newParagraph", &json!({})).unwrap();
+            copy.send();
+        })
+        .unwrap();
+    w.settle();
+    let out = tools.call("execute", &json!({"command": "document.paragraph", "params": {"path": [1]}}));
+    assert!(out.text.contains("one"), "{}", out.text);
+    assert_eq!(out.sources[0].target, paragraph_id(&w.session.doc, Body, 1));
+}
+
+#[test]
+fn a_read_with_no_story_names_the_paragraph_in_the_story_the_selection_is_in() {
+    let mut w = Window::new("one");
+    let key = w.room.invite("Reader", Role::Editor).unwrap();
+    let mut tools = CopyTools::join(&w.room, &key).unwrap();
+    assert!(tools.call("execute", &json!({"command": "references.footnote"})).ok);
+    w.settle();
+    let note = *w.session.doc.parts.keys().next().expect("the note");
+    let story = wordcraft_doc::StoryRef::Part(note);
+    let at = json!({"story": story, "path": [0], "off": 0});
+    assert!(tools.call("execute", &json!({"command": "caret.set", "params": {"pos": at}})).ok);
+    let out = tools.call("execute", &json!({"command": "document.paragraph", "params": {"path": [0]}}));
+    assert!(out.ok, "{}", out.text);
+    assert_eq!(out.sources[0].target, paragraph_id(&w.session.doc, story, 0));
+}
+
+#[test]
+fn a_batch_s_sources_are_the_reads_that_ran() {
+    use wordcraft_doc::StoryRef::Body;
+    let mut w = Window::new("one\ntwo");
+    let key = w.room.invite("Reader", Role::Editor).unwrap();
+    let mut tools = CopyTools::join(&w.room, &key).unwrap();
+    let read = json!({"command": "document.paragraph", "params": {"path": [1]}});
+    let out = tools.call("batch", &json!({"commands": [read, {"command": "caret.docEnd"}, {"command": "text.insert", "params": {"text": "!"}}]}));
+    assert!(out.ok, "{}", out.text);
+    assert_eq!(out.sources.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), ["execute document.paragraph"]);
+    w.settle();
+    assert_eq!(out.sources[0].target, paragraph_id(&w.session.doc, Body, 1));
+    let out = tools.call("batch", &json!({"commands": [{"command": "nope.nope"}, read]}));
+    assert!(out.sources.is_empty(), "the read after the error didn't run: {:?}", out.sources);
+    let missing = json!({"command": "document.paragraph", "params": {"path": [99]}});
+    let out = tools.call("batch", &json!({"commands": [missing], "keepGoing": true}));
+    assert!(out.sources.is_empty(), "a read that failed read nothing: {:?}", out.sources);
 }
 
 #[test]
@@ -1164,6 +1226,36 @@ fn a_marker_split_across_pieces_is_taken_out_of_the_answer() {
     assert_eq!(t.last_answer().as_deref(), Some("Done."));
 }
 
+/// What only Details shows can come between two pieces of an answer, and ends neither its marker
+/// nor the white space after a proposal.
+#[test]
+fn a_marker_goes_on_around_what_only_details_shows() {
+    let mut t = Transcript::default();
+    t.asked("Go");
+    t.record(&Event::Text { text: "Done. [[remem".into() });
+    t.record(&Event::Usage(Default::default()));
+    t.record(&Event::Text { text: "ber: Use lists.]]".into() });
+    t.record(&Event::Usage(Default::default()));
+    t.record(&Event::Text { text: "\n".into() });
+    t.record(&Event::Done { stop: StopReason::EndTurn });
+    assert_eq!(t.pending_proposal(1), Some("Use lists."));
+    let answers: Vec<&str> = t.entries().filter_map(|e| if let Entry::Answer { text } = e { Some(text.as_str()) } else { None }).collect();
+    assert_eq!(answers, ["Done. "]);
+}
+
+/// A citation is the pane's to read: the markers of memory leave it in the answer's text, whole.
+#[test]
+fn a_citation_stays_in_the_answer_beside_a_proposal() {
+    let whole = "It says so [[cite: \"the words\"]]. [[remember: Use lists.]] Done [[used: m1]].";
+    for at in 0..whole.len() {
+        let (a, b) = whole.split_at(at);
+        let (answer, proposals) = streamed(&[a, b]);
+        assert!(answer.contains("[[cite: \"the words\"]]"), "split at {at}: {answer}");
+        assert!(!answer.contains("remember") && !answer.contains("used"), "split at {at}: {answer}");
+        assert_eq!(proposals, ["Use lists."], "split at {at}");
+    }
+}
+
 #[test]
 fn what_only_looks_like_a_marker_stays_text() {
     for text in ["[[link]] and [x] and [", "a [[rem", "[[remember: never closed", "[[used: m1", "[[", "]]"] {
@@ -1215,4 +1307,342 @@ fn a_proposal_s_text_is_cleaned_and_answered_once() {
     assert_eq!(text.chars().count(), crate::memory::MAX_TEXT);
     t.answer_proposal(1, crate::ProposalAnswer::Dismissed, None);
     assert_eq!(t.pending_proposal(1), None);
+}
+
+mod details {
+    use crate::backend::{Event, PlanEntry, PlanStatus, Priority, ToolCall, ToolStatus, Usage};
+    use crate::transcript::{MAX_ENTRIES, StepState, Transcript};
+
+    fn call(id: &str, status: ToolStatus) -> Event {
+        Event::Tool(ToolCall {
+            id: id.into(),
+            title: format!("Call {id}"),
+            kind: "read".into(),
+            status,
+            detail: String::new(),
+            changes: None,
+            sources: Vec::new(),
+        })
+    }
+
+    fn plan(entries: &[(&str, PlanStatus)]) -> Event {
+        Event::Plan {
+            entries: entries.iter().map(|(c, status)| PlanEntry { content: (*c).into(), priority: Priority::Medium, status: *status }).collect(),
+        }
+    }
+
+    #[test]
+    fn steps_are_the_plan_when_the_agent_gave_one_else_the_tool_calls_by_turn() {
+        let mut t = Transcript::default();
+        t.asked("First");
+        t.record(&call("a", ToolStatus::Completed));
+        t.record(&call("b", ToolStatus::Failed));
+        t.record(&call("c", ToolStatus::InProgress));
+        t.asked("Second");
+        t.record(&call("d", ToolStatus::Completed));
+        t.record(&plan(&[("Read", PlanStatus::Completed), ("Edit", PlanStatus::InProgress), ("Check", PlanStatus::Pending)]));
+        t.asked("Third");
+
+        let details = t.details();
+        let turns: Vec<(Option<&str>, Vec<(&str, StepState)>)> =
+            details.turns.iter().map(|turn| (turn.asked.as_deref(), turn.steps.iter().map(|s| (s.title.as_str(), s.state)).collect())).collect();
+        assert_eq!(
+            turns,
+            [
+                (Some("First"), vec![("Call a", StepState::Done), ("Call b", StepState::Failed), ("Call c", StepState::Running)]),
+                (Some("Second"), vec![("Read", StepState::Done), ("Edit", StepState::Running), ("Check", StepState::Waiting)]),
+                (Some("Third"), vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_turn_names_itself_on_one_short_line() {
+        let mut t = Transcript::default();
+        t.asked(&format!("Line one\nline two {}", "x".repeat(200)));
+        let asked = t.details().turns[0].asked.clone().unwrap();
+        assert!(!asked.contains('\n') && asked.starts_with("Line one") && asked.ends_with('…') && asked.chars().count() <= 81, "{asked}");
+    }
+
+    #[test]
+    fn usage_and_who_ran_it_are_the_last_said() {
+        let mut t = Transcript::default();
+        t.asked("First");
+        t.record(&Event::Agent { name: "Agent 1".into() });
+        t.record(&Event::Model { name: "model-a".into(), effort: Some("high".into()), asked: false });
+        t.record(&Event::Usage(Usage { input_tokens: Some(1), ..Usage::default() }));
+        t.record(&Event::Usage(Usage { input_tokens: Some(2), ..Usage::default() }));
+        assert_eq!(t.entries().filter(|e| matches!(e, crate::Entry::Usage(_))).count(), 1, "a turn's usage is replaced");
+        t.asked("Second");
+        t.record(&Event::Model { name: "model-b".into(), effort: Some("low".into()), asked: true });
+        let details = t.details();
+        assert_eq!(details.agent.as_deref(), Some("Agent 1"));
+        assert_eq!(details.model.as_deref(), Some("model-b"));
+        assert_eq!((details.effort.as_deref(), details.effort_asked), (Some("low"), true));
+        assert_eq!(details.usage.and_then(|u| u.input_tokens), Some(2));
+    }
+
+    #[test]
+    fn what_only_details_shows_doesn_t_split_an_answer() {
+        let mut t = Transcript::default();
+        t.asked("Hi");
+        t.record(&Event::Text { text: "**hel".into() });
+        t.record(&Event::Usage(Usage { context_used: Some(1), ..Usage::default() }));
+        t.record(&Event::Agent { name: "Agent 1".into() });
+        t.record(&Event::Text { text: "lo**".into() });
+        assert_eq!(t.last_answer().as_deref(), Some("**hello**"));
+        assert_eq!(t.entries().filter(|e| matches!(e, crate::Entry::Answer { .. })).count(), 1);
+    }
+
+    #[test]
+    fn a_backend_s_cost_is_held_to_the_pane_s_limits() {
+        let long = Event::Usage(Usage { cost: Some(format!("\u{202E}{}", "9".repeat(500))), ..Usage::default() }).bounded();
+        let Event::Usage(usage) = long else { panic!("{long:?}") };
+        let cost = usage.cost.unwrap_or_default();
+        assert!(!cost.contains('\u{202E}') && cost.len() <= 64, "{cost}");
+    }
+
+    #[test]
+    fn trimming_the_oldest_entries_keeps_details_true_to_what_is_left() {
+        let mut t = Transcript::default();
+        t.asked("Gone soon");
+        t.record(&Event::Usage(Usage { input_tokens: Some(1), ..Usage::default() }));
+        for n in 0..MAX_ENTRIES {
+            t.record(&call(&n.to_string(), ToolStatus::Completed));
+        }
+        let details = t.details();
+        assert_eq!(details.turns.len(), 1);
+        assert_eq!(details.turns[0].asked, None, "the prompt was trimmed");
+        assert_eq!(details.turns[0].steps.len(), t.len(), "every step left is a row, and none that went");
+        assert_eq!(details.usage, None);
+    }
+}
+
+mod sources {
+    use serde_json::json;
+
+    use crate::backend::{Event, Source, SourceKind, ToolCall, ToolStatus};
+    use crate::context::{Caps, Context};
+    use crate::tools;
+    use crate::transcript::{MAX_TURN_SOURCES, Transcript};
+
+    fn context() -> Context {
+        Context {
+            title: "Report".into(),
+            selection: "Selected words.".into(),
+            before: (1..=3).map(|n| format!("Before-{n} text.")).collect(),
+            after: (1..=3).map(|n| format!("After-{n} text.")).collect(),
+            outline: (1..=4).map(|n| (1, format!("Head-{n}"))).collect(),
+            words: 100,
+            ..Context::default()
+        }
+    }
+
+    #[test]
+    fn what_is_said_to_be_sent_is_what_the_text_holds_at_every_cap() {
+        let c = context();
+        for total_bytes in 0..=600 {
+            let caps = Caps { total_bytes, ..Caps::default() };
+            let (text, sent) = c.rendered(&caps);
+            assert_eq!(text.matches("Before-").count() as u32, sent.before, "before, at {total_bytes}: {text}");
+            assert_eq!(text.matches("After-").count() as u32, sent.after, "after, at {total_bytes}: {text}");
+            assert_eq!(text.matches("Head-").count() as u32, sent.headings, "headings, at {total_bytes}: {text}");
+            assert_eq!(sent.bytes as usize, text.len());
+            assert_eq!(sent.cap as usize, total_bytes);
+            assert_eq!(text, c.to_text(&caps));
+            let selected = "Selected words.".get(..sent.selection_bytes as usize).unwrap_or_default();
+            assert!(text.contains(&format!("<<<\n{selected}\n>>>")) || sent.selection_bytes == 0, "at {total_bytes}: {text}");
+            assert_eq!(text.contains("Selected words"), sent.selection_bytes >= 14, "at {total_bytes}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_selection_larger_than_the_cap_says_it_was_cut_and_how_much_went() {
+        let c = Context { selection: "s".repeat(4096), ..context() };
+        let caps = Caps { total_bytes: 1024, ..Caps::default() };
+        let (text, sent) = c.rendered(&caps);
+        assert!(sent.selection_cut);
+        assert!(sent.selection_bytes > 0 && (sent.selection_bytes as usize) < 1024, "{sent:?}");
+        assert!(text.contains(&"s".repeat(sent.selection_bytes as usize)));
+        assert!(!text.contains(&"s".repeat(sent.selection_bytes as usize + 1)), "no more than it says");
+        assert!(sent.bytes <= sent.cap);
+    }
+
+    #[test]
+    fn a_caret_gives_no_selection() {
+        let (_, sent) = Context { selection: String::new(), ..context() }.rendered(&Caps::default());
+        assert_eq!((sent.selection_bytes, sent.selection_cut), (0, false));
+    }
+
+    #[test]
+    fn wordcraft_s_tools_say_what_they_read() {
+        let document = |title: &str| Source { kind: SourceKind::Document, title: title.into(), target: None };
+        assert_eq!(tools::sources("get_text", &json!({})), [document("get_text")]);
+        assert_eq!(tools::sources("list_commands", &json!({"query": "table"})), [document("list_commands")]);
+        assert_eq!(
+            tools::sources("execute", &json!({"command": "document.paragraph", "params": {"path": [2]}})),
+            [document("execute document.paragraph")]
+        );
+        assert_eq!(tools::sources("type_text", &json!({"text": "x"})), []);
+        assert_eq!(tools::sources("execute", &json!({"command": "format.bold"})), []);
+        assert_eq!(tools::sources("execute", &json!({"command": "document.setText"})), [], "it changes the document");
+    }
+
+    #[test]
+    fn details_lists_a_turn_s_reads_once_each_and_holds_to_a_limit() {
+        let call = |id: usize, sources: Vec<Source>, kind: &str| {
+            Event::Tool(ToolCall {
+                id: id.to_string(),
+                title: format!("Call {id}"),
+                kind: kind.into(),
+                status: ToolStatus::Completed,
+                detail: String::new(),
+                changes: None,
+                sources,
+            })
+        };
+        let file = |n: usize| Source { kind: SourceKind::File, title: format!("/f{n}"), target: Some(format!("/f{n}")) };
+        let mut t = Transcript::default();
+        t.asked("Read");
+        t.sent(Default::default());
+        t.record(&call(0, vec![file(0)], "read"));
+        t.record(&call(1, vec![file(0)], "read"));
+        t.record(&call(2, Vec::new(), "search"));
+        t.record(&call(3, Vec::new(), "edit"));
+        let turn = t.details().turns.remove(0);
+        assert!(turn.context.is_some());
+        assert_eq!(turn.sources, [file(0), Source { kind: SourceKind::Other, title: "Call 2".into(), target: None }]);
+
+        t.asked("Read more");
+        for n in 0..MAX_TURN_SOURCES + 5 {
+            t.record(&call(100 + n, vec![file(n)], "read"));
+        }
+        let turn = t.details().turns.remove(1);
+        assert_eq!((turn.sources.len(), turn.more_sources), (MAX_TURN_SOURCES, 5));
+
+        // What isn't listed counts once too.
+        t.record(&call(9000, vec![file(MAX_TURN_SOURCES)], "read"));
+        assert_eq!(t.details().turns[1].more_sources, 5);
+    }
+
+    #[test]
+    fn a_target_too_long_to_show_whole_is_left_out() {
+        let long = format!("https://example.com/{}", "a".repeat(600));
+        let source = Source { kind: SourceKind::Web, title: long.clone(), target: Some(long) };
+        let call = ToolCall {
+            id: "a".into(),
+            title: "t".into(),
+            kind: "fetch".into(),
+            status: ToolStatus::Completed,
+            detail: String::new(),
+            changes: None,
+            sources: vec![source],
+        };
+        let Event::Tool(call) = Event::Tool(call).bounded() else { panic!() };
+        assert_eq!(call.sources[0].target, None, "cut, it could lead somewhere else");
+    }
+
+    #[test]
+    fn a_tool_call_s_sources_are_held_to_the_pane_s_limits() {
+        let hostile = Source { kind: SourceKind::File, title: "/\u{202E}evil\nline".into(), target: Some("/\u{202E}evil".into()) };
+        let call = ToolCall {
+            id: "a".into(),
+            title: "t".into(),
+            kind: "read".into(),
+            status: ToolStatus::Completed,
+            detail: String::new(),
+            changes: None,
+            sources: vec![hostile; 100],
+        };
+        let Event::Tool(call) = Event::Tool(call).bounded() else { panic!() };
+        assert_eq!(call.sources.len(), crate::backend::MAX_SOURCES);
+        assert_eq!(call.sources[0].title, "/evilline");
+        assert_eq!(call.sources[0].target.as_deref(), Some("/evil"));
+    }
+}
+
+mod citations {
+    use crate::backend::Event;
+    use crate::transcript::Transcript;
+
+    #[test]
+    fn details_lists_what_a_turn_s_answers_cite_each_once_and_not_a_thought_s() {
+        let mut t = Transcript::default();
+        t.asked("First");
+        t.record(&Event::Thought { text: r#"[[cite: "thought"]]"#.into() });
+        t.record(&Event::Text { text: r#"Yes [[cite: "one"]] and [[cite: "one"]] and [[cite: "two"]]"#.into() });
+        let turn = t.details().turns.remove(0);
+        let words: Vec<&str> = turn.citations.iter().map(|c| c.words.as_str()).collect();
+        assert_eq!(words, ["one", "two"]);
+    }
+
+    #[test]
+    fn the_note_asks_for_citations_in_the_form_the_pane_reads() {
+        let seat = crate::Seat { name: "A".into(), role: wordcraft_engine::room::Role::Suggester, key: String::new(), document: String::new() };
+        let note = crate::note(&seat, true);
+        let marker = note.split_once("[[cite:").map(|(_, m)| format!("[[cite:{m}")).unwrap_or_default();
+        assert_eq!(crate::answer::citations(&marker), ["the exact words"], "{note}");
+    }
+}
+
+mod final_text {
+    use serde_json::json;
+    use wordcraft_doc::Document;
+    use wordcraft_engine::Session;
+
+    use crate::context::{final_text, find_in_final};
+
+    #[test]
+    fn a_citation_reads_the_document_as_it_will_read() {
+        let mut s = Session::new(Document::from_text("one obsolete two\nthird"));
+        s.run("review.trackChanges", &json!({"value": true})).unwrap();
+        s.run("select.text", &json!({"text": "obsolete "})).unwrap();
+        s.run("text.delete", &json!({})).unwrap();
+        let text = final_text(&s.doc);
+        assert!(!text.contains("obsolete") && text.contains("one two"), "{text}");
+
+        let (a, b) = find_in_final(&s.doc, "one two").expect("found");
+        assert_eq!((a.off, b.off), (0, "one obsolete two".len()), "it spans what was deleted between");
+        let (a, b) = find_in_final(&s.doc, "third").expect("found");
+        assert_eq!((a.path.last(), a.off, b.off), (1, 0, 5));
+        assert_eq!(find_in_final(&s.doc, "obsolete"), None);
+        assert_eq!(find_in_final(&s.doc, "two\nthird"), None);
+        assert_eq!(find_in_final(&s.doc, ""), None);
+    }
+
+    #[test]
+    fn a_citation_s_ends_are_where_its_first_and_last_characters_are() {
+        let s = Session::new(Document::from_text("日本語 words é end"));
+        let (a, b) = find_in_final(&s.doc, "語 words é").expect("found");
+        let text = "日本語 words é end";
+        assert_eq!(text.get(a.off..b.off), Some("語 words é"));
+    }
+
+    #[test]
+    fn a_tab_reads_as_the_space_the_model_was_given() {
+        let s = Session::new(Document::from_text("one\ttwo\nthird"));
+        assert!(final_text(&s.doc).contains("one two"), "{}", final_text(&s.doc));
+        let (a, b) = find_in_final(&s.doc, "one two").expect("found");
+        assert_eq!((a.off, b.off), (0, 7));
+        assert!(find_in_final(&s.doc, "one\ttwo").is_some(), "as the document has it too");
+    }
+
+    #[test]
+    fn a_citation_of_a_field_s_result_finds_what_it_verified() {
+        let mut s = Session::new(Document::from_text("Before after"));
+        let field = wordcraft_doc::para::InlineObject::Field {
+            instr: "PAGE".into(),
+            result: "SEVEN".into(),
+            locked: false,
+            dirty: false,
+            code: false,
+            form: String::new(),
+        };
+        s.doc.para_mut(wordcraft_doc::StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().insert_object(7, field, &Default::default()).unwrap();
+        assert!(final_text(&s.doc).contains("Before SEVEN"), "{}", final_text(&s.doc));
+        let (a, b) = find_in_final(&s.doc, "Before SEVEN").expect("found as verified");
+        let p = s.doc.para(wordcraft_doc::StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
+        let object = p.text.find(wordcraft_doc::para::OBJ).unwrap();
+        assert_eq!((a.off, b.off), (0, object + wordcraft_doc::para::OBJ.len_utf8()), "through the object");
+    }
 }

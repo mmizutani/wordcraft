@@ -36,8 +36,8 @@ use serde_json::{Value, json};
 use wordcraft_mcp::Backend as _;
 
 use crate::backend::{
-    Answer, Backend, BackendInfo, Event, MAX_OPTIONS, MAX_PLAN, PermissionKind, PermissionOption, PermissionPolicy, PermissionRequest, PlanEntry,
-    PlanStatus, Priority, Seat, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, label,
+    Answer, Backend, BackendInfo, Event, MAX_OPTIONS, MAX_PLAN, MAX_SOURCES, PermissionKind, PermissionOption, PermissionPolicy, PermissionRequest,
+    PlanEntry, PlanStatus, Priority, Seat, Source, SourceKind, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, Usage, label,
 };
 pub use room_port::RoomPort;
 pub use rpc::{AUTH_REQUIRED, MAX_LINE, METHOD_NOT_FOUND, STDERR_TAIL};
@@ -243,6 +243,8 @@ struct Running {
     /// Its folder: new and empty, removed when it stops.
     folder: Folder,
     session: String,
+    /// Whether it takes `resource` blocks in a prompt (`embeddedContext`).
+    embedded_context: bool,
 }
 
 /// An ACP agent as a backend.
@@ -295,6 +297,7 @@ impl Acp {
             status: ToolStatus::InProgress,
             detail: String::new(),
             changes: None,
+            sources: Vec::new(),
         };
         ctx.emit(Event::Tool(row.clone()));
         let started = self.start(ctx);
@@ -307,7 +310,7 @@ impl Acp {
         let Some((running, agent)) = started? else { return Ok(false) };
         self.running = Some(running);
         if let Some(name) = agent {
-            ctx.emit(Event::Model { name, effort: None, asked: false });
+            ctx.emit(Event::Agent { name });
         }
         Ok(true)
     }
@@ -354,6 +357,7 @@ impl Acp {
             return Err(format!("{name} speaks {theirs} of the Agent Client Protocol, and WordCraft speaks version {PROTOCOL_VERSION}"));
         }
         let agent = agent_info(&init);
+        let embedded_context = init.pointer("/agentCapabilities/promptCapabilities/embeddedContext").and_then(Value::as_bool).unwrap_or(false);
         let methods = auth_methods(&init);
         let new_session = json!({"cwd": cwd, "mcpServers": mcp_servers});
         let mut signed_in = false;
@@ -364,7 +368,7 @@ impl Acp {
                 Ok(result) => {
                     let session = result.get("sessionId").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 1024);
                     let session = session.ok_or_else(|| format!("{name} started no session"))?.to_string();
-                    return Ok(Some((Running { process, folder, session }, agent)));
+                    return Ok(Some((Running { process, folder, session, embedded_context }, agent)));
                 }
                 Err(e) if e.code == AUTH_REQUIRED && !signed_in => {
                     if !self.sign_in(&mut process, &methods, ctx)? {
@@ -455,6 +459,7 @@ impl Acp {
             status: ToolStatus::Pending,
             detail: String::new(),
             changes: None,
+            sources: Vec::new(),
         });
         if let Some(title) = update.get("title").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
             call.title = title.to_string();
@@ -470,6 +475,12 @@ impl Acp {
         }
         if call.title.is_empty() {
             call.title = "Tool call".into();
+        }
+        // An update says only what changed: what it leaves out still stands.
+        for source in call_sources(update, &call.kind) {
+            if !call.sources.contains(&source) && call.sources.len() < MAX_SOURCES {
+                call.sources.push(source);
+            }
         }
         // What the assistant changed in the document while the call ran (through WordCraft's MCP
         // server or `wordcraft-cli call`) is the call's: its row links to it. Kinds that change
@@ -520,7 +531,12 @@ impl Acp {
                 let entries = update.get("entries").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
                 ctx.emit(Event::Plan { entries: entries.iter().filter_map(plan_entry).take(MAX_PLAN).collect() });
             }
-            // The person's prompt echoed, modes, commands, usage…: nothing to show.
+            Some("usage_update") => {
+                if let Some(usage) = usage_update(update) {
+                    ctx.emit(Event::Usage(usage));
+                }
+            }
+            // The person's prompt echoed, modes, commands…: nothing to show.
             _ => {}
         }
     }
@@ -651,13 +667,21 @@ impl Backend for Acp {
         } else {
             None
         };
-        let prompt: Vec<Value> = [note, memory, turn.context.as_deref(), Some(turn.prompt.as_str())]
-            .into_iter()
-            .flatten()
-            .filter(|t| !t.trim().is_empty())
-            .map(|t| json!({"type": "text", "text": t}))
-            .collect();
+        let text = |t: &str| json!({"type": "text", "text": t});
+        let before = [note, memory, turn.context.as_deref()].into_iter().flatten().filter(|t| !t.trim().is_empty()).map(text);
         let Some(running) = self.running.as_mut() else { return Err(format!("{} isn't running", self.spec.label)) };
+        let embedded = running.embedded_context;
+        let sources = turn.knowledge.iter().enumerate().map(|(n, source)| {
+            if embedded {
+                let name: String = source.name.chars().map(|c| if c.is_alphanumeric() || c == '.' { c } else { '-' }).collect();
+                let framed = source.as_text();
+                json!({"type": "resource", "resource": {"uri": format!("wordcraft:source/{n}/{name}"), "mimeType": "text/plain", "text": framed}})
+            } else {
+                text(&source.as_text())
+            }
+        });
+        let asked = (!turn.prompt.trim().is_empty()).then(|| text(&turn.prompt));
+        let prompt: Vec<Value> = before.chain(sources).chain(asked).collect();
         let session = running.session.clone();
         let ended = match running.process.request("session/prompt", json!({"sessionId": session, "prompt": prompt})) {
             Ok(id) => self.finish_turn(id, ctx),
@@ -754,6 +778,46 @@ fn content_text(block: &Value) -> String {
         Some("resource") => "[resource]".into(),
         _ => String::new(),
     }
+}
+
+/// What a `usage_update` says: how much of the session's context is in use and how much it holds,
+/// and what the session has cost, as the agent gave it. `None` when it says nothing usable.
+fn usage_update(update: &Value) -> Option<Usage> {
+    let number = |key: &str| update.get(key).and_then(Value::as_u64);
+    let cost = update.get("cost").and_then(|cost| {
+        let amount = cost.get("amount").filter(|a| a.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0))?;
+        let currency = cost.get("currency").and_then(Value::as_str).map(label).filter(|c| !c.trim().is_empty())?;
+        Some(format!("{amount} {currency}"))
+    });
+    let usage = Usage { context_used: number("used"), context_size: number("size"), cost, ..Usage::default() };
+    (usage != Usage::default()).then_some(usage)
+}
+
+/// What a tool call says it read: its `locations`, and where a fetch went (`rawInput` holds the
+/// address, by convention: no field of the protocol does), or a link in its content. Junk is left
+/// out.
+fn call_sources(update: &Value, kind: &str) -> Vec<Source> {
+    let mut out = Vec::new();
+    let locations = update.get("locations").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    for location in locations.iter().take(MAX_SOURCES) {
+        let Some(path) = location.get("path").and_then(Value::as_str).filter(|p| !p.trim().is_empty()) else { continue };
+        let title = match location.get("line").and_then(Value::as_u64) {
+            Some(line) => format!("{path}:{line}"),
+            None => path.to_string(),
+        };
+        out.push(Source { kind: SourceKind::File, title, target: Some(path.to_string()) });
+    }
+    if kind == "fetch" {
+        let raw = |key: &str| update.pointer(&format!("/rawInput/{key}")).and_then(Value::as_str);
+        let content = update.get("content").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+        let linked = content.iter().take(8).find_map(|c| {
+            let block = c.get("content")?;
+            (block.get("type").and_then(Value::as_str) == Some("resource_link")).then(|| block.get("uri").and_then(Value::as_str)).flatten()
+        });
+        let address = raw("url").or_else(|| raw("uri")).or(linked).filter(|a| crate::answer::opens(a));
+        out.extend(address.map(|a| Source { kind: SourceKind::Web, title: a.to_string(), target: Some(a.to_string()) }));
+    }
+    out
 }
 
 /// Most characters of a tool call's detail.
