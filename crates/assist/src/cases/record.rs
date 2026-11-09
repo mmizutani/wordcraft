@@ -361,6 +361,7 @@ pub enum Side {
 /// Who stands behind a record. Only [`Case::apply_person`] writes `Confirmed`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub enum Standing {
     Unconfirmed,
     Confirmed { on: Day },
@@ -387,6 +388,7 @@ pub enum FactorKind {
 /// One reason a balance stands where it does.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Factor {
     pub kind: FactorKind,
     pub favors: Side,
@@ -397,6 +399,7 @@ pub struct Factor {
 /// worth depends on the balance on its date.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Balance {
     pub on: Day,
     pub stance: Stance,
@@ -407,7 +410,7 @@ pub struct Balance {
 
 /// What decides similarity. The person's click sets all of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct Facts {
     pub kind: Option<ContractKind>,
     pub side: Option<OurSide>,
@@ -458,6 +461,7 @@ impl Kind {
 /// What a note says, by kind. Each kind has only the fields it needs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub enum Body {
     Pattern {
         rule: Quoted,
@@ -561,6 +565,7 @@ impl From<NoteId> for String {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Note {
     pub id: NoteId,
     pub at: Day,
@@ -611,6 +616,7 @@ impl Note {
 /// model never replaces a person's.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Plan {
     pub goal: Quoted,
     #[serde(default)]
@@ -633,9 +639,11 @@ impl Plan {
 }
 
 /// The record. Only the shelf writes one to disk, and only through [`Case::apply_person`] and
-/// [`Case::apply_model`].
+/// [`Case::apply_model`]. Every persisted type denies unknown fields, so a file from a build that
+/// knows more reads as damaged instead of losing that field on the next write.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Case {
     #[serde(default)]
     version: u32,
@@ -752,7 +760,11 @@ impl Case {
         let before = self.notes.len();
         self.notes.retain(|n| seen.insert(n.id));
         cut |= self.notes.len() != before;
-        self.last_note = self.last_note.min(MAX_ID_NUMBER).max(self.highest_id());
+        if self.last_note > MAX_ID_NUMBER {
+            self.last_note = MAX_ID_NUMBER;
+            cut = true;
+        }
+        self.last_note = self.last_note.max(self.highest_id());
         cut
     }
 
@@ -760,9 +772,14 @@ impl Case {
         self.notes.iter().map(|n| n.id.0).max().unwrap_or(0)
     }
 
-    fn next_id(&mut self) -> NoteId {
-        self.last_note = self.last_note.max(self.highest_id()).saturating_add(1);
-        NoteId(self.last_note)
+    /// An id no note has or has had, or `Full("note ids")` when the next would not parse back.
+    fn next_id(&mut self) -> Result<NoteId, CaseError> {
+        let next = self.last_note.max(self.highest_id()).saturating_add(1);
+        if next > MAX_ID_NUMBER {
+            return Err(CaseError::Full("note ids"));
+        }
+        self.last_note = next;
+        Ok(NoteId(next))
     }
 
     fn note_mut(&mut self, id: NoteId) -> Result<&mut Note, CaseError> {
@@ -824,7 +841,7 @@ impl Case {
                 if self.notes.len() >= MAX_NOTES {
                     return Err(CaseError::Full("notes"));
                 }
-                let note = draft.into_note(self.next_id(), today, confirmed)?;
+                let note = draft.into_note(self.next_id()?, today, confirmed)?;
                 self.notes.push(note);
             }
             PersonOp::EditNote(id, draft) => {
@@ -873,7 +890,7 @@ impl Case {
                 } else {
                     None
                 };
-                let note = draft.into_note(self.next_id(), today, Standing::Unconfirmed)?;
+                let note = draft.into_note(self.next_id()?, today, Standing::Unconfirmed)?;
                 let added = note.id;
                 match evict {
                     Some(i) if i < self.notes.len() => {

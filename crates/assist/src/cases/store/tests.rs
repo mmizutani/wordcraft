@@ -282,3 +282,45 @@ fn a_model_balance_never_evicts_a_confirmed_one() {
     case.apply_person(PersonOp::Balance(draft(Stance::Even)), today()).unwrap();
     assert_eq!(case.balance.len(), MAX_BALANCES);
 }
+
+#[test]
+fn a_field_this_build_does_not_know_is_damage() {
+    let (shelf, at) = shelf_with_case("unknown-field");
+    let path = shelf.case_dir(&at).join("case.json");
+    let aside = shelf.case_dir(&at).join(format!("case.json{DAMAGED_SUFFIX}"));
+    let mut case = Case::new("Acme MSA");
+    case.apply_person(PersonOp::AddNote(pitfall("a trap")), today()).unwrap();
+    let mut v: serde_json::Value = serde_json::from_slice(&case.to_bytes().unwrap()).unwrap();
+    let mut top = v.clone();
+    top["mood"] = serde_json::json!("tense");
+    v["notes"][0]["colour"] = serde_json::json!("red");
+    for (what, file) in [("at the top", top), ("in a note", v)] {
+        let bytes = serde_json::to_vec(&file).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let _ = std::fs::remove_file(&aside);
+        assert!(shelf.open(&at).unwrap().damaged, "a field {what} reads as damaged");
+        assert_eq!(shelf.model(&at, ModelWrite::Note(pitfall("from a model")), today()), Err(CaseError::Damaged), "{what}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "{what}: untouched by the model");
+        shelf.person(click(), &at, PersonOp::Close(crate::cases::Stage::Signed), today()).unwrap();
+        assert_eq!(std::fs::read(&aside).unwrap(), bytes, "{what}: the original is kept aside");
+    }
+}
+
+#[test]
+fn note_ids_that_run_out_stop_the_write() {
+    let (shelf, at) = shelf_with_case("ids");
+    let path = shelf.case_dir(&at).join("case.json");
+    let max = 1u64 << 53;
+    let mut v: serde_json::Value = serde_json::from_slice(&Case::new("Acme MSA").to_bytes().unwrap()).unwrap();
+    v["lastNote"] = serde_json::json!(max);
+    let bytes = serde_json::to_vec(&v).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(!shelf.open(&at).unwrap().damaged, "the maximum itself is a valid last id");
+    assert_eq!(shelf.model(&at, ModelWrite::Note(pitfall("one more")), today()), Err(CaseError::Full("note ids")));
+    assert_eq!(shelf.person(click(), &at, PersonOp::AddNote(pitfall("one more")), today()), Err(CaseError::Full("note ids")));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes, "nothing was written");
+
+    v["lastNote"] = serde_json::json!(max + 1);
+    std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+    assert!(shelf.open(&at).unwrap().damaged, "past the maximum is damage");
+}
