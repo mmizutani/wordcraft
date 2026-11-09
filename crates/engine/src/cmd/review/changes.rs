@@ -127,6 +127,17 @@ fn resolve_cell(s: &mut Session, story: StoryRef, path: &wordcraft_doc::Path, ac
     Ok(true)
 }
 
+/// Resolve the tracked formatting of the paragraph mark at `at`, the caret. Whether there was any.
+fn resolve_mark_at(s: &mut Session, at: &Pos, accept: bool, which: Which) -> Result<bool, CmdError> {
+    let at_mark = s.doc.para(at.story, &at.path).is_some_and(|p| at.off == p.len() && which.has_change(p.mark.fmt_change.as_deref()));
+    if at_mark {
+        let para = s.doc.para_mut(at.story, &at.path)?;
+        fmt_revisions::resolve_char(&mut para.mark, accept);
+        para.touch();
+    }
+    Ok(at_mark)
+}
+
 /// Resolve the section's tracked change at `at`, the caret: the change is listed where the section
 /// ends, at the end of its last paragraph or of the document. Whether there was one.
 fn resolve_section_at(s: &mut Session, at: &Pos, accept: bool, which: Which) -> Result<bool, CmdError> {
@@ -366,8 +377,13 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool, which: Which) -> CmdRe
     let ranged = a != b;
     // One reviewer's row with no text of its own: someone else's run around the caret mustn't stand
     // in for the table's or the section's change it lists.
-    if a == b && !matches!(which, Which::All) && (resolve_cell(s, a.story, &a.path, accept, which)? || resolve_section_at(s, &a, accept, which)?) {
-        return if next { select_next_unresolved(s) } else { sel_result(s) };
+    if a == b && !matches!(which, Which::All) {
+        // One row can list them together, and takes them all. The run before a mark mustn't stand
+        // in for it either.
+        let (cell, section) = (resolve_cell(s, a.story, &a.path, accept, which)?, resolve_section_at(s, &a, accept, which)?);
+        if resolve_mark_at(s, &a, accept, which)? || cell || section {
+            return if next { select_next_unresolved(s) } else { sel_result(s) };
+        }
     }
     let (a, b) = if a == b {
         // The change at the caret: the run around it, else the paragraph mark right after it,
