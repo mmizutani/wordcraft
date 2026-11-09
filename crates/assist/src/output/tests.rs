@@ -334,6 +334,30 @@ fn a_change_whose_paragraph_joined_another_says_only_that_it_was_resolved() {
 }
 
 #[test]
+fn a_move_s_row_takes_the_move_and_leaves_the_formatting_of_where_it_went() {
+    use wordcraft_doc::{Path, Revision, RevisionKind, StoryRef};
+    let mut s = session();
+    s.run("document.setText", &json!({"text": "First one.\nSecond one.\nThird one."})).unwrap();
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    s.run("select.range", &json!({"anchor": {"block": 1, "off": 0}, "focus": {"block": 2, "off": 0}})).unwrap();
+    s.run("edit.cut", &json!({})).unwrap();
+    s.run("caret.set", &json!({"pos": {"block": 0, "off": 0}})).unwrap();
+    s.run("edit.paste", &json!({})).unwrap();
+    let rev = u32::try_from(s.doc.revisions.len()).unwrap();
+    s.doc.revisions.push(Revision::new(RevisionKind::Format, AUTHOR, ""));
+    let change = wordcraft_doc::props::PropChange { rev, old: Default::default() };
+    s.doc.para_mut(StoryRef::Body, &Path::top(0)).unwrap().props.fmt_change = Some(Box::new(change));
+
+    let (seen, _) = rows(&s, AUTHOR);
+    let row = seen.iter().find(|r| r.kind == OutputKind::Move).expect("the move's row");
+    s.run("select.range", &row.range().unwrap()).unwrap();
+    s.run("review.accept", &row.resolve_params(AUTHOR)).unwrap();
+    let left = rows(&s, AUTHOR).0;
+    assert!(left.iter().all(|r| r.kind != OutputKind::Move), "{left:?}");
+    assert!(s.doc.para(StoryRef::Body, &Path::top(0)).unwrap().props.fmt_change.is_some(), "the formatting waits still");
+}
+
+#[test]
 fn a_change_across_paragraphs_says_only_that_it_was_resolved() {
     let mut s = session();
     let mut t = Transcript::default();
