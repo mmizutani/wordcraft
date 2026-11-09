@@ -2053,6 +2053,21 @@ fn sources_hold_to_their_number_and_a_file_that_can_t_be_read_says_why() {
 }
 
 #[test]
+#[cfg(unix)]
+fn a_named_pipe_as_a_source_says_so_and_doesn_t_hold_up_the_turn() {
+    let (dir, _) = source_file("small.txt", "words");
+    let pipe = dir.join("pipe.txt");
+    assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+    let mut a = window("one");
+    a.assist_with(Box::new(Fake::new()));
+    a.execute("assist.knowledge", json!({"add": pipe.to_string_lossy()})).unwrap();
+    let now = sources_read(&mut a);
+    assert!(now["error"].as_str().unwrap_or_default().contains("pipe.txt"), "{now}");
+    assert!(!super::sources_being_read(&a));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn a_script_s_path_is_held_to_the_file_rule() {
     use wordcraft_engine::file_access::{AutomationRoots, confine};
