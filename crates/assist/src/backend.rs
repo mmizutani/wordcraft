@@ -528,12 +528,15 @@ pub struct ToolOutput {
     pub text: String,
     /// The versions of the shared document the call's changes made, when it changed it.
     pub changes: Option<Versions>,
+    /// What it read, resolved against the copy it read from.
+    #[serde(default)]
+    pub sources: Vec<Source>,
 }
 
 impl ToolOutput {
     /// A failed call, with why.
     pub fn error(why: impl Into<String>) -> ToolOutput {
-        ToolOutput { ok: false, text: why.into(), changes: None }
+        ToolOutput { ok: false, text: why.into(), changes: None, sources: Vec::new() }
     }
 }
 
@@ -545,11 +548,6 @@ pub trait ToolHost {
     /// Call tool `name` with `args`. Junk arguments and unknown tools are error outputs, never
     /// panics.
     fn call(&mut self, name: &str, args: &Value) -> ToolOutput;
-    /// The id of the paragraph the arguments of a read name, if they name one that is there.
-    fn read_at(&self, args: &Value) -> Option<String> {
-        let _ = args;
-        None
-    }
     /// Select from `anchor` to `focus` in the host's copy of the document before a turn: the
     /// person's selection in the window, as places in paragraphs named by id, which edits that
     /// moved the paragraphs don't move. Whether it could; a host without a copy of its own
@@ -811,10 +809,6 @@ impl TurnCtx<'_> {
         let id = if id.is_empty() { format!("call-{}", self.calls) } else { id.to_string() };
         let title = crate::tools::title(name, args);
         let kind = crate::tools::kind(name).to_string();
-        let mut sources = crate::tools::sources(name, args);
-        if let Some(source) = sources.first_mut() {
-            source.target = self.tools.read_at(args);
-        }
         if self.is_cancelled() {
             return ToolOutput::error("stopped: the person stopped this turn");
         }
@@ -825,12 +819,13 @@ impl TurnCtx<'_> {
             status: ToolStatus::InProgress,
             detail: String::new(),
             changes: None,
-            sources: sources.clone(),
+            // What it means to read, until it has.
+            sources: crate::tools::sources(name, args),
         }));
         let out = if self.is_cancelled() { ToolOutput::error("stopped: the person stopped this turn") } else { self.tools.call(name, args) };
         let status = if out.ok { ToolStatus::Completed } else { ToolStatus::Failed };
         let detail = crate::tools::summary(&out);
-        self.emit(Event::Tool(ToolCall { id, title, kind, status, detail, changes: out.changes, sources }));
+        self.emit(Event::Tool(ToolCall { id, title, kind, status, detail, changes: out.changes, sources: out.sources.clone() }));
         out
     }
 
@@ -958,7 +953,7 @@ mod cancellation_tests {
             }
             fn call(&mut self, _: &str, _: &Value) -> ToolOutput {
                 self.0 += 1;
-                ToolOutput { ok: true, text: String::new(), changes: None }
+                ToolOutput { ok: true, text: String::new(), changes: None, sources: Vec::new() }
             }
         }
         for name in ["type_text", "execute"] {
