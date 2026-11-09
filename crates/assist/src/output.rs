@@ -67,13 +67,14 @@ pub struct OutputRow {
 
 impl OutputRow {
     /// What `review.accept` and `review.reject` take for it alone, `name`'s: one text can carry a
-    /// change of each kind, and a move's two ends go together.
+    /// change of each kind.
     pub fn resolve_params(&self, name: &str) -> Value {
         let kind = match self.kind {
             OutputKind::Insert => Some("insert"),
             OutputKind::Delete => Some("delete"),
             OutputKind::Format => Some("format"),
-            OutputKind::Move | OutputKind::Comment => None,
+            OutputKind::Move => Some("move"),
+            OutputKind::Comment => None,
         };
         json!({"author": name, "kind": kind})
     }
