@@ -126,7 +126,7 @@ fn attached(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
 
 /// `bytes` for a person to read.
 fn size(bytes: usize) -> String {
-    format!("{:.1} KiB", bytes as f64 / 1024.0)
+    if bytes < 1024 { format!("{bytes} B") } else { format!("{:.1} KiB", bytes as f64 / 1024.0) }
 }
 
 /// What a turn gave the model, in one row, and a note when the selection was cut.
