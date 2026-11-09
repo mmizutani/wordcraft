@@ -304,16 +304,18 @@ pub(super) fn resolve_all_then(s: &mut Session, v: &Value, accept: bool) -> CmdR
 
 /// Accept or Reject at the selection; with `next`, the next change is selected afterwards; with
 /// `author`, only that reviewer's changes in the selection are resolved, and with `kind` too, only
-/// their insertions, deletions or formatting: one text can carry a change of each.
+/// their insertions, deletions, formatting or moves: one text can carry a change of each.
 pub(super) fn resolve_sel_then(s: &mut Session, v: &Value, accept: bool) -> CmdResult {
-    use wordcraft_doc::RevisionKind;
+    use wordcraft_doc::{Revision, RevisionKind};
     let next = p::bool(v, "next") == Some(true);
-    let kind = match v.get("kind") {
+    let kind: Option<fn(&Revision) -> bool> = match v.get("kind") {
         None | Some(Value::Null) => None,
-        Some(Value::String(k)) if k == "insert" => Some(RevisionKind::Insert),
-        Some(Value::String(k)) if k == "delete" => Some(RevisionKind::Delete),
-        Some(Value::String(k)) if k == "format" => Some(RevisionKind::Format),
-        Some(_) => return Err(CmdError::Params("`kind`: insert, delete or format".into())),
+        Some(Value::String(k)) if k == "insert" => Some(|r| r.kind == RevisionKind::Insert),
+        Some(Value::String(k)) if k == "delete" => Some(|r| r.kind == RevisionKind::Delete),
+        Some(Value::String(k)) if k == "format" => Some(|r| r.kind == RevisionKind::Format),
+        // Either end of one, which go together.
+        Some(Value::String(k)) if k == "move" => Some(|r| r.move_name.is_some()),
+        Some(_) => return Err(CmdError::Params("`kind`: insert, delete, format or move".into())),
     };
     match v.get("author") {
         None | Some(Value::Null) if kind.is_none() => resolve_sel(s, accept, next, Which::All),
@@ -321,7 +323,7 @@ pub(super) fn resolve_sel_then(s: &mut Session, v: &Value, accept: bool) -> CmdR
             let author = author.trim();
             let revisions = s.doc.revisions.iter().enumerate();
             let theirs: BTreeSet<u32> = revisions
-                .filter(|(_, r)| r.author == author && kind.is_none_or(|k| r.kind == k))
+                .filter(|(_, r)| r.author == author && kind.is_none_or(|wanted| wanted(r)))
                 .filter_map(|(i, _)| u32::try_from(i).ok())
                 .collect();
             resolve_sel(s, accept, next, Which::Revisions(&theirs))
