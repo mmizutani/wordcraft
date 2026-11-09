@@ -765,6 +765,67 @@ fn the_tools_are_the_mcp_server_s_for_one_document() {
     }
 }
 
+/// The id of a paragraph, as a read's source names it.
+fn paragraph_id(doc: &wordcraft_doc::Document, story: wordcraft_doc::StoryRef, n: usize) -> Option<String> {
+    let at = wordcraft_doc::Pos::new(story, wordcraft_doc::Path::top(n), 0);
+    doc.anchor_at(&at).map(|a| a.block.to_string())
+}
+
+#[test]
+fn a_read_s_source_is_the_paragraph_it_read_though_someone_added_one_before_it() {
+    use wordcraft_doc::StoryRef::Body;
+    let mut w = Window::new("one\ntwo");
+    let key = w.room.invite("Reader", Role::Viewer).unwrap();
+    let mut tools = CopyTools::join(&w.room, &key).unwrap();
+    assert!(tools.call("get_text", &json!({})).ok);
+    w.own
+        .lend(&mut w.session, |copy| {
+            copy.run("caret.docStart", &json!({})).unwrap();
+            copy.run("text.newParagraph", &json!({})).unwrap();
+            copy.send();
+        })
+        .unwrap();
+    w.settle();
+    let out = tools.call("execute", &json!({"command": "document.paragraph", "params": {"path": [1]}}));
+    assert!(out.text.contains("one"), "{}", out.text);
+    assert_eq!(out.sources[0].target, paragraph_id(&w.session.doc, Body, 1));
+}
+
+#[test]
+fn a_read_with_no_story_names_the_paragraph_in_the_story_the_selection_is_in() {
+    let mut w = Window::new("one");
+    let key = w.room.invite("Reader", Role::Editor).unwrap();
+    let mut tools = CopyTools::join(&w.room, &key).unwrap();
+    assert!(tools.call("execute", &json!({"command": "references.footnote"})).ok);
+    w.settle();
+    let note = *w.session.doc.parts.keys().next().expect("the note");
+    let story = wordcraft_doc::StoryRef::Part(note);
+    let at = json!({"story": story, "path": [0], "off": 0});
+    assert!(tools.call("execute", &json!({"command": "caret.set", "params": {"pos": at}})).ok);
+    let out = tools.call("execute", &json!({"command": "document.paragraph", "params": {"path": [0]}}));
+    assert!(out.ok, "{}", out.text);
+    assert_eq!(out.sources[0].target, paragraph_id(&w.session.doc, story, 0));
+}
+
+#[test]
+fn a_batch_s_sources_are_the_reads_that_ran() {
+    use wordcraft_doc::StoryRef::Body;
+    let mut w = Window::new("one\ntwo");
+    let key = w.room.invite("Reader", Role::Editor).unwrap();
+    let mut tools = CopyTools::join(&w.room, &key).unwrap();
+    let read = json!({"command": "document.paragraph", "params": {"path": [1]}});
+    let out = tools.call("batch", &json!({"commands": [read, {"command": "caret.docEnd"}, {"command": "text.insert", "params": {"text": "!"}}]}));
+    assert!(out.ok, "{}", out.text);
+    assert_eq!(out.sources.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), ["execute document.paragraph"]);
+    w.settle();
+    assert_eq!(out.sources[0].target, paragraph_id(&w.session.doc, Body, 1));
+    let out = tools.call("batch", &json!({"commands": [{"command": "nope.nope"}, read]}));
+    assert!(out.sources.is_empty(), "the read after the error didn't run: {:?}", out.sources);
+    let missing = json!({"command": "document.paragraph", "params": {"path": [99]}});
+    let out = tools.call("batch", &json!({"commands": [missing], "keepGoing": true}));
+    assert!(out.sources.is_empty(), "a read that failed read nothing: {:?}", out.sources);
+}
+
 #[test]
 fn oversized_document_reads_are_refused_before_tool_materialization() {
     let mut w = Window::new("small");
@@ -1286,6 +1347,7 @@ mod sources {
         );
         assert_eq!(tools::sources("type_text", &json!({"text": "x"})), []);
         assert_eq!(tools::sources("execute", &json!({"command": "format.bold"})), []);
+        assert_eq!(tools::sources("execute", &json!({"command": "document.setText"})), [], "it changes the document");
     }
 
     #[test]

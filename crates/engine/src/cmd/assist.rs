@@ -411,7 +411,8 @@ fn knowledge(s: &mut Session, v: &Value) -> CmdResult {
             Some(open.ok_or_else(|| CmdError::Params("`document`: the id of another open document".into()))?)
         }
     };
-    s.push_ui_request(json!({"assist": "knowledge", "add": add, "document": document, "remove": remove}));
+    // `document` in a request says which window it is for, so this goes by another name.
+    s.push_ui_request(json!({"assist": "knowledge", "add": add, "source": document, "remove": remove}));
     Ok(json!({}))
 }
 

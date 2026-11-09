@@ -354,7 +354,7 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
             if let Some(path) = req.get("add").and_then(Value::as_str) {
                 add_source_file(app, path);
             }
-            if let Some(id) = req.get("document").and_then(Value::as_u64) {
+            if let Some(id) = req.get("source").and_then(Value::as_u64) {
                 add_source_document(app, id);
             }
             Ok(sources_json(app))
