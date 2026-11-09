@@ -55,6 +55,10 @@ Dependencies and assets use SPDX identifiers. An expression is allowed when ever
 
 House rule 15 (no agent attribution) does not apply to this fork's own pull requests: they say which agent wrote them and who asked for it, by the owner's decision (#65). The rules above are copied unchanged, so the house-rules check still matches craft-contrib.
 
+**Upstream's progress docs are read-only here**, by the owner's decision (2026-11-09). Don't edit `ROADMAP.md`, `docs/gaps.md`, `docs/roadmap.md`, `docs/target-app-parity.md`, `docs/file-format-parity.md`, `docs/layout-parity.md`, `docs/typing-parity.md`, `docs/ui-parity.md`, `docs/hardware-parity.md` or `docs/localization-parity.md`. Every pull request that rewrote their status lines and logs conflicted with every other open one and with upstream. This replaces the instruction to update them in Roadmap below, and the doc half of "Change behaviour, doc and tests together" in Typing. Keep reading them at the start of a session.
+
+A pull request adds one new file under `docs/fork/changes/` instead, as [`docs/fork/README.md`](docs/fork/README.md) describes. In any other doc, edit the body and leave a status line or revision history alone. A merge from upstream takes upstream's text for the read-only docs.
+
 # WordCraft — instructions for agents
 
 WordCraft is a clean-room, open-source, Rust-native word processor targeting Microsoft Word parity — and going further on speed, openness and agent control. It runs natively on macOS, Windows, Linux and BSD, and on the web via WASM. Siblings with the same conventions: `../photocraft` (Photoshop), `../vectorcraft` (Illustrator), `../filmcraft` (Premiere), `../lightcraft` (Lightroom), `../pdfcraft` (Acrobat), `../effectcraft` (After Effects), `../designcraft` (InDesign).
