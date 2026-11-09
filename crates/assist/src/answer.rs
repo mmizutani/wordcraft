@@ -194,6 +194,7 @@ impl Builder {
             // A pane is too narrow for a grid: each row reads as a line, its cells apart.
             // ponytail: a real grid when answers with tables turn out to be common.
             FBlock::Table(t) => {
+                self.numbers.clear();
                 for row in &t.rows {
                     let mut line = Vec::new();
                     for cell in row.iter().filter(|c| !c.covered) {
