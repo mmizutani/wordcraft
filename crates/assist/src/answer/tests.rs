@@ -262,7 +262,7 @@ fn two_code_blocks_stay_two() {
 fn no_embedded_picture_is_decoded_and_the_words_still_read() {
     let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
     let text = format!("[p]: data:image/png;base64,{png}\n\n![x][p] ![y](DATA:image/png;base64,{png})");
-    let flow = wordcraft_formats::markdown::parse(&super::without_embedded(&text));
+    let (flow, _) = super::parsed(text.into());
     let has_picture = flow.blocks.iter().any(|b| matches!(b, wordcraft_formats::model::FBlock::Para(p) if p.inlines.iter().any(|i| matches!(i, wordcraft_formats::model::Inline::Image(_)))));
     assert!(!has_picture, "{:?}", flow.blocks.len());
     // Words that say it read as they were.
@@ -275,7 +275,6 @@ fn no_embedded_picture_is_decoded_and_the_words_still_read() {
 #[test]
 fn a_fence_four_spaces_in_doesn_t_close_or_open_one() {
     let f = format("```\na\n    ```\n```\nNext", true);
-    assert_eq!(f.blocks[0], Block::Code("a\n    ```".into()), "{:?}", f.blocks);
-    assert!(!words(&f).contains('\u{F8FF}'));
-    assert!(words(&f).contains("Next"));
+    let next = Block::Para(vec![Span { text: "Next".into(), ..Span::default() }]);
+    assert_eq!(f.blocks, [Block::Code("a\n    ```".into()), next]);
 }
