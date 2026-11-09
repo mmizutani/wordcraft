@@ -96,8 +96,9 @@ conversation made, newest first and by turn, by the name it joined under, while 
 each with its words cut short, Show, and for a change, Accept and Reject of that change alone. A
 change someone resolved, you or anyone in the room, says how it ended, read from its words in its
 paragraph: gone means an insertion was rejected or a deletion accepted, still there means the other
-way round. A formatting change, a move, words that were there more than once, or a paragraph longer
-than 64 KiB says only that it was resolved. A comment says whether it is open, resolved or
+way round. A formatting change, a move, words that were there more than once, a paragraph longer
+than 64 KiB, or a paragraph that has gone (joined to another, it may hold the words still) says only
+that it was resolved. A comment says whether it is open, resolved or
 deleted. At most 256 changes and 64 comments are listed, and the rest are counted; Review has them
 all, and while some are past the limit no row is said to have ended. Rows that ended go first when
 the list is full. `review.accept` and `review.reject` take an `author`, which leaves anyone else's
