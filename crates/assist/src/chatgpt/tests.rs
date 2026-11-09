@@ -12,9 +12,10 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::auth::{Claims, access_token, check_id_token, models_in, valid_client_id};
+use super::auth::{Claims, access_token, check_id_token, valid_client_id};
 use super::fake_server::{Reply, Request, Server};
 use super::http::{b64url, now, parse_query};
+use super::models::models_in;
 use super::store;
 use super::*;
 
@@ -86,6 +87,8 @@ pub(super) struct Script {
     pub(super) revoke: Mutex<u16>,
     /// Access tokens the models list turns away (401), as a server that no longer takes them.
     pub(super) turned_away: Mutex<Vec<String>>,
+    /// What the models list answers, when not the two test models.
+    pub(super) models: Mutex<Option<Reply>>,
 }
 
 /// The fake sign-in server: the token, discovery, revocation and models endpoints, with
@@ -104,6 +107,7 @@ pub(super) fn server(script: Arc<Script>, api: impl Fn(&Request, usize) -> Reply
         ("GET", "/v1/models") if turned_away(&script, r) => {
             Reply::json(401, &json!({"error": {"code": "subscription_sharing_invalid_user", "message": "who are you"}}))
         }
+        ("GET", "/v1/models") if script.models.lock().unwrap().is_some() => script.models.lock().unwrap().clone().unwrap(),
         ("GET", "/v1/models") => Reply::json(
             200,
             &json!({"models": [
@@ -354,24 +358,6 @@ fn sign_in_without_returned_scopes_keeps_the_requested_scopes() {
     assert!(account.plan_usage);
     assert_eq!(readiness(Some(folder.path())), Readiness::Ready);
     assert_eq!(store::read_credentials(folder.path()).unwrap().scopes, SCOPES.split_whitespace().collect::<Vec<_>>());
-}
-
-#[test]
-fn finishing_registration_preserves_the_model_chosen_while_waiting_for_the_browser() {
-    let folder = Folder::new();
-    let script = Arc::new(Script::default());
-    let server = server(script.clone(), no_api);
-    let endpoints = Endpoints::local(server.base());
-    let mut sign_in = SignIn::start(folder.path(), options(&endpoints)).unwrap();
-    let url = sign_in.url().to_string();
-    *script.nonce.lock().unwrap() = param(&url, "nonce").unwrap();
-    choose_model(folder.path(), Some("gpt-test-mini")).unwrap();
-    let (status, page) = callback(sign_in.redirect_uri(), &format!("code=c&state={}&client_id=oaiapp_issued-1", param(&url, "state").unwrap()));
-    assert_eq!(status, 200, "{page}");
-    sign_in.wait(WAIT).cloned().unwrap().unwrap();
-    let client = store::client(folder.path()).unwrap();
-    assert_eq!(client.model.as_deref(), Some("gpt-test-mini"));
-    assert_eq!(client.client_id.as_deref(), Some("oaiapp_issued-1"));
 }
 
 #[test]
@@ -684,13 +670,12 @@ fn a_spent_or_turned_away_refresh_token_ends_the_sign_in_whatever_shape_the_refu
 fn a_registration_chatgpt_no_longer_knows_is_forgotten_and_signing_in_again_registers_anew() {
     let (folder, script, server, endpoints) = signed_in(no_api);
     let host_id = store::client(folder.path()).unwrap().host_id;
-    choose_model(folder.path(), Some("gpt-test")).unwrap();
     expire(folder.path());
     *script.refuse.lock().unwrap() = Some((401, json!({"error": "invalid_client"})));
     assert_eq!(access_token(folder.path(), &endpoints, None).unwrap_err(), AuthError::SignInAgain);
-    // The refused client id is forgotten, with the sign-in; the host id and the model stay.
+    // The refused client id is forgotten, with the sign-in; the host id stays.
     let client = store::client(folder.path()).unwrap();
-    assert_eq!((client.host_id.as_str(), client.client_id.as_deref(), client.model.as_deref()), (host_id.as_str(), None, Some("gpt-test")));
+    assert_eq!((client.host_id.as_str(), client.client_id.as_deref()), (host_id.as_str(), None));
     assert_eq!(super::account(folder.path()), None);
     // Signing in again, as the error says, registers WordCraft anew (without the last sign-in's
     // hints) and works.
@@ -979,7 +964,7 @@ fn id_tokens_are_checked_for_issuer_audience_expiry_and_nonce() {
 }
 
 #[test]
-fn the_models_list_keeps_listed_models_in_order_and_the_choice_is_kept() {
+fn the_models_list_keeps_listed_models_in_order() {
     let listed = json!({"models": [
         {"slug": "gpt-a", "display_name": "GPT A", "visibility": "list"},
         {"slug": "hidden", "display_name": "Hidden", "visibility": "hide"},
@@ -990,32 +975,18 @@ fn the_models_list_keeps_listed_models_in_order_and_the_choice_is_kept() {
         7,
         {"slug": "gpt-c", "display_name": "C\u{0}\u{7}"},
     ]});
-    let names: Vec<(String, String)> = models_in(&listed).into_iter().map(|m| (m.slug, m.name)).collect();
+    let names: Vec<(String, String)> = models_in(&listed).into_iter().map(|m| (m.id, m.name)).collect();
     assert_eq!(names, [("gpt-a".into(), "GPT A".into()), ("gpt-b".into(), "gpt-b".into()), ("gpt-c".into(), "C".into())]);
-    assert_eq!(models_in(&json!({"data": [{"id": "gpt-x", "object": "model"}]})), [Model { slug: "gpt-x".into(), name: "gpt-x".into() }]);
+    assert_eq!(models_in(&json!({"data": [{"id": "gpt-x", "object": "model"}]})).iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["gpt-x"]);
     assert!(models_in(&json!("junk")).is_empty() && models_in(&json!({"models": {"a": 1}})).is_empty());
     let many: Vec<Value> = (0..1000).map(|i| json!({"slug": format!("m{i}")})).collect();
     assert_eq!(models_in(&json!({"models": many})).len(), 64);
     // From the server, with the account's token.
     let (folder, _script, server, endpoints) = signed_in(no_api);
     let models = models_with(folder.path(), &endpoints).unwrap();
-    assert_eq!(models.iter().map(|m| m.slug.as_str()).collect::<Vec<_>>(), ["gpt-test", "gpt-test-mini"]);
+    assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["gpt-test", "gpt-test-mini"]);
     assert_eq!(server.to("/v1/models")[0].header("authorization"), Some("Bearer access-0"));
     assert!(matches!(models_with(Folder::new().path(), &endpoints), Err(AuthError::NotSignedIn)));
-    // The choice.
-    assert_eq!(chosen_model(folder.path()), None);
-    choose_model(folder.path(), Some(" gpt-test-mini ")).unwrap();
-    assert_eq!(chosen_model(folder.path()).as_deref(), Some("gpt-test-mini"));
-    assert!(choose_model(folder.path(), Some("not a model\n")).is_err());
-    assert!(choose_model(folder.path(), Some(&"m".repeat(200))).is_err());
-    assert_eq!(chosen_model(folder.path()).as_deref(), Some("gpt-test-mini"));
-    choose_model(folder.path(), None).unwrap();
-    assert_eq!(chosen_model(folder.path()), None);
-    // A hand-edited file with junk for a model: none chosen.
-    let client = store::client(folder.path()).unwrap();
-    store::save_client(folder.path(), &store::Client { model: Some("two words\n".into()), ..client }).unwrap();
-    assert_eq!(chosen_model(folder.path()), None);
-    assert_eq!(store::client(folder.path()).unwrap().client_id.as_deref(), Some("oaiapp_issued-1"), "the client id stays");
 }
 
 #[test]
@@ -1023,7 +994,7 @@ fn a_models_list_that_turns_a_fresh_token_away_refreshes_it_once() {
     let (folder, script, server, endpoints) = signed_in(no_api);
     script.turned_away.lock().unwrap().push("access-0".into());
     let models = models_with(folder.path(), &endpoints).unwrap();
-    assert_eq!(models[0].slug, "gpt-test");
+    assert_eq!(models[0].id, "gpt-test");
     let sent: Vec<Option<String>> = server.to("/v1/models").iter().map(|r| r.header("authorization").map(str::to_string)).collect();
     assert_eq!(sent, [Some("Bearer access-0".to_string()), Some("Bearer access-1".to_string())]);
     assert_eq!(server.to("/oauth/token").len(), 2, "the exchange, then one refresh");

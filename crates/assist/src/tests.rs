@@ -113,7 +113,7 @@ fn the_assistant_s_tool_calls_are_tracked_changes_in_its_name_and_the_window_see
     assert_eq!(tool_rows(t), [("select_text".to_string(), ToolStatus::Completed), ("type_text".to_string(), ToolStatus::Completed)]);
     let changed: Vec<Option<crate::Versions>> = t.entries().filter_map(|e| if let Entry::Tool(c) = e { Some(c.changes) } else { None }).collect();
     assert!(changed[0].is_none() && changed[1].is_some(), "the edit says which versions it made: {changed:?}");
-    assert!(t.entries().any(|e| matches!(e, Entry::Model { name } if name == "scripted")));
+    assert!(t.entries().any(|e| matches!(e, Entry::Model { name, .. } if name == "scripted")));
     // The backend began with its seat and got the note on the first turn only.
     let seen = fake_seen.lock().unwrap().clone();
     assert_eq!(seen.seat, Some(("Test Assistant".to_string(), Role::Suggester)));

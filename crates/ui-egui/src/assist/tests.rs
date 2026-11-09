@@ -618,6 +618,248 @@ fn until(h: &mut egui_kittest::Harness<'static, WordApp>, done: impl Fn(&WordApp
     panic!("the window never gets there");
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_transcript_line_shows_the_model_and_effort_and_a_note_says_what_changed() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::Event;
+    let model = |effort: &str, asked| Step::Emit(Event::Model { name: "GPT-6-Luna".into(), effort: Some(effort.into()), asked });
+    let note = Step::Emit(Event::Note { text: "ChatGPT didn't take ultra effort for GPT-6-Luna: it wasn't applied.".into() });
+    let mut app = window("one two three");
+    app.assist_with(Box::new(
+        Fake::new().then(vec![model("medium", false), note, Step::say("Hi.")]).then(vec![model("xhigh", true), Step::say("Again.")]),
+    ));
+    let mut h = harness(app);
+    h.state_mut().execute("assist.ask", json!({"prompt": "Hello"})).unwrap();
+    until(&mut h, idle);
+    assert!(h.query_by_label("GPT-6-Luna · Medium").is_some());
+    assert!(h.query_by_label("scripted").is_none(), "what the backend said last replaces what it said first");
+    assert!(h.query_by_label("ChatGPT didn't take ultra effort for GPT-6-Luna: it wasn't applied.").is_some());
+    h.state_mut().execute("assist.ask", json!({"prompt": "Again"})).unwrap();
+    until(&mut h, idle);
+    assert!(h.query_by_label("GPT-6-Luna · Extra High (requested)").is_some(), "a level no one confirmed says so");
+}
+
+/// A choice is kept per backend and reaches each turn of the conversation, which goes on; null
+/// goes back to the default. It is a preference: saved with the others, not a document change.
+#[test]
+fn a_chosen_model_and_effort_reach_the_next_turn_and_are_saved() {
+    let fake = Fake::new();
+    let seen = fake.seen();
+    let mut a = window("one two three");
+    a.assist_with(Box::new(fake));
+    let answer = a.execute("assist.model", json!({})).unwrap();
+    assert_eq!(answer, json!({"backend": "fake", "chosen": {"model": null, "effort": null}, "running": null, "offered": null}));
+    ask(&mut a, "First", None);
+    let answer = a.execute("assist.effort", json!({"level": "high"})).unwrap();
+    assert_eq!(answer["chosen"], json!({"model": null, "effort": "high"}));
+    assert_eq!(answer["running"], json!({"model": "scripted", "effort": null, "asked": false}));
+    a.execute("assist.model", json!({"id": "gpt-x"})).unwrap();
+    ask(&mut a, "Second", None);
+    let saved = a.prefs();
+    assert_eq!(saved.editing.assistant.models["fake"].model.as_deref(), Some("gpt-x"));
+    a.execute("assist.model", json!({"id": null})).unwrap();
+    a.execute("assist.effort", json!({"level": null})).unwrap();
+    assert!(a.session.prefs.assistant.models.is_empty(), "nothing chosen, nothing kept");
+    ask(&mut a, "Third", None);
+    let turns = seen.lock().unwrap().turns.clone();
+    let choices: Vec<_> = turns.iter().map(|t| (t.model.as_deref(), t.effort.as_deref())).collect();
+    assert_eq!(choices, [(None, None), (Some("gpt-x"), Some("high")), (None, None)]);
+    assert_eq!(a.conversation().unwrap().transcript().entries().filter(|e| matches!(e, Entry::Asked { .. })).count(), 3, "one conversation");
+    assert!(!a.session.can_undo());
+    // Restored in a new window, with what else was saved.
+    let again: crate::UiState = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert_eq!(again.editing.assistant.models["fake"].effort.as_deref(), Some("high"));
+}
+
+/// What the scripted assistant offers in the menus' tests: two models, one with levels of its own,
+/// and levels for the other.
+fn offer() -> wordcraft_assist::Offered {
+    use wordcraft_assist::{Level, ModelOption, Offered};
+    Offered {
+        models: vec![
+            ModelOption { id: "fast".into(), name: "Fast".into(), description: Some("Quick answers".into()), ..ModelOption::default() },
+            ModelOption {
+                id: "deep".into(),
+                name: "Deep".into(),
+                efforts: vec!["low".into(), "max".into()],
+                default_effort: Some("low".into()),
+                ..ModelOption::default()
+            },
+        ],
+        efforts: vec![Level { id: "think".into(), name: "Think hard".into() }, Level { id: "skim".into(), name: "Skim".into() }],
+        model: Some("fast".into()),
+        effort: Some("skim".into()),
+    }
+}
+
+/// A window whose scripted assistant has said it offers `offered`, then played `then`.
+fn offering(offered: wordcraft_assist::Offered, then: Vec<Step>) -> WordApp {
+    let mut steps = vec![Step::Emit(wordcraft_assist::Event::Options(offered))];
+    steps.extend(then);
+    let mut a = window("one two three");
+    a.assist_with(Box::new(Fake::new().then(steps)));
+    a.execute("assist.ask", json!({"prompt": "Hello"})).unwrap();
+    a
+}
+
+#[test]
+fn the_menus_follow_what_the_backend_offers_and_what_is_chosen() {
+    use super::models::menus;
+    let mut a = offering(offer(), vec![]);
+    settle(&mut a);
+    let m = menus(&a).unwrap();
+    let ids = |rows: &[super::models::Row]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&m.models), ["fast", "deep"]);
+    assert_eq!((m.chosen_model.clone(), m.running_model.as_deref()), (None, Some("Fast")), "nothing chosen ticks the Default row");
+    assert_eq!(ids(&m.efforts), ["think", "skim"], "the levels for any model");
+    assert_eq!(m.effort.as_deref(), Some("skim"));
+    // A model with levels of its own has those, its default tagged.
+    a.execute("assist.model", json!({"id": "deep"})).unwrap();
+    let m = menus(&a).unwrap();
+    assert_eq!((m.chosen_model.as_deref(), m.running_model.as_deref()), (Some("deep"), Some("Deep")));
+    assert_eq!(ids(&m.efforts), ["low", "max"]);
+    assert_eq!(m.efforts.iter().filter(|e| e.is_default).map(|e| e.id.as_str()).collect::<Vec<_>>(), ["low"]);
+    assert_eq!(m.effort.as_deref(), Some("low"), "its default, not the session's level, which it doesn't take");
+    // What isn't offered is refused, and what was chosen stays.
+    let e = a.execute("assist.model", json!({"id": "gone"})).unwrap_err();
+    assert!(e.contains("gone") && e.contains("fast, deep"), "{e}");
+    assert!(a.execute("assist.effort", json!({"level": "think"})).unwrap_err().contains("low, max"));
+    assert_eq!(a.session.prefs.assistant.models["fake"].model.as_deref(), Some("deep"));
+    assert_eq!(a.execute("assist.effort", json!({"level": "max"})).unwrap()["offered"]["effort"], "max");
+    // A saved choice no longer offered ticks the Default row again, and stays saved.
+    a.session.prefs.assistant.models.get_mut("fake").unwrap().model = Some("gone".into());
+    let m = menus(&a).unwrap();
+    assert_eq!((m.chosen_model.clone(), m.running_model.as_deref()), (None, Some("Fast")));
+    assert_eq!(a.session.prefs.assistant.models["fake"].model.as_deref(), Some("gone"));
+}
+
+#[test]
+fn a_backend_that_offers_nothing_has_no_menus() {
+    let mut a = offering(wordcraft_assist::Offered::default(), vec![]);
+    settle(&mut a);
+    assert_eq!(super::models::menus(&a), None);
+    // Nor one that never said (the scripted assistant before it runs).
+    let mut a = window("x");
+    a.assist_with(Box::new(Fake::new()));
+    assert_eq!(super::models::menus(&a), None);
+}
+
+#[test]
+fn an_agent_that_only_offers_a_level_has_only_the_effort_menu() {
+    let only = wordcraft_assist::Offered { models: vec![], model: None, ..offer() };
+    let mut a = offering(only, vec![]);
+    settle(&mut a);
+    let m = super::models::menus(&a).unwrap();
+    assert!(!m.has_models());
+    assert_eq!(m.efforts.len(), 2);
+}
+
+#[test]
+fn an_agent_not_started_yet_has_the_default_row_and_says_why() {
+    let mut a = window("x");
+    super::refresh_offers(&mut a);
+    a.assist.offers.push(wordcraft_assist::Offer {
+        id: "acp:custom".into(),
+        label: "An agent".into(),
+        readiness: wordcraft_assist::Readiness::Ready,
+    });
+    a.ui.assistant = "acp:custom".into();
+    let m = super::models::menus(&a).unwrap();
+    assert!(m.has_models() && m.models.is_empty() && !m.known);
+    assert!(m.unknown_because.is_some());
+    // It can't refuse what it doesn't know yet: the choice is saved, for the agent's first turn.
+    a.execute("assist.model", json!({"id": "some-model"})).unwrap();
+    assert_eq!(super::models::menus(&a).unwrap().running_model.as_deref(), Some("some-model"));
+    assert_eq!(a.session.prefs.assistant.models["acp:custom"].model.as_deref(), Some("some-model"));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_web_app_has_no_menus() {
+    let mut a = window("x");
+    a.session.prefs.assistant.models.insert("fake".into(), wordcraft_engine::ModelChoice { model: Some("x".into()), effort: None });
+    a.assist_as_web();
+    assert_eq!(super::models::menus(&a), None);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_menus_show_in_the_prompt_row_and_are_disabled_during_a_turn() {
+    use egui::accesskit::Role;
+    use egui_kittest::kittest::{NodeT, Queryable};
+    let mut h = harness(offering(offer(), vec![Step::Hold]));
+    until(&mut h, |a| super::models::menus(a).is_some());
+    h.run_steps(2);
+    let disabled =
+        |h: &egui_kittest::Harness<'static, WordApp>, label: &str| h.get_by_role_and_label(Role::ComboBox, label).accesskit_node().is_disabled();
+    assert!(disabled(&h, "Model:") && disabled(&h, "Effort:"), "a turn is running");
+    h.state_mut().execute("assist.cancel", json!({})).unwrap();
+    until(&mut h, idle);
+    assert!(!disabled(&h, "Model:") && !disabled(&h, "Effort:"), "the turn ended");
+    let shows = |h: &egui_kittest::Harness<'static, WordApp>, label: &str| {
+        h.get_by_role_and_label(Role::ComboBox, label).accesskit_node().value().map(|v| v.to_string())
+    };
+    assert_eq!((shows(&h, "Model:").as_deref(), shows(&h, "Effort:").as_deref()), (Some("Fast"), Some("Skim")), "each says what runs");
+    // One click chooses, and the turn goes on as the same conversation.
+    h.get_by_role_and_label(Role::ComboBox, "Model:").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Default").is_some() && h.query_by_label("Deep").is_some());
+    h.get_by_label("Deep").click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.prefs.assistant.models["fake"].model.as_deref(), Some("deep"));
+    assert_eq!(shows(&h, "Model:").as_deref(), Some("Deep"), "the button says it now");
+    // A level's row chooses it; the row tagged as the default goes back to no choice.
+    h.get_by_role_and_label(Role::ComboBox, "Effort:").click();
+    h.run_steps(2);
+    h.get_by_label("Max").click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.prefs.assistant.models["fake"].effort.as_deref(), Some("max"));
+    h.get_by_role_and_label(Role::ComboBox, "Effort:").click();
+    h.run_steps(2);
+    h.get_by_label("Low (default)").click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.prefs.assistant.models["fake"].effort, None);
+    assert_eq!(shows(&h, "Effort:").as_deref(), Some("Low"), "the default it went back to is ticked");
+    // With no level tagged, a Default row of its own does the same.
+    h.state_mut().execute("assist.model", json!({"id": "fast"})).unwrap();
+    h.state_mut().execute("assist.effort", json!({"level": "think"})).unwrap();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::ComboBox, "Effort:").click();
+    h.run_steps(2);
+    h.get_by_label("Default").click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.prefs.assistant.models["fake"].effort, None);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_backend_s_offer_is_held_to_the_pane_s_limits() {
+    use wordcraft_assist::{Level, ModelOption, Offered};
+    let junk = "n\u{202E}\u{0}ame";
+    let many = Offered {
+        models: (0..1000)
+            .map(|i| ModelOption {
+                id: format!("m{i}"),
+                name: junk.into(),
+                description: Some(junk.into()),
+                efforts: (0..100).map(|l| format!("l{l}")).collect(),
+                ..ModelOption::default()
+            })
+            .chain([ModelOption { id: " ".into(), ..ModelOption::default() }])
+            .collect(),
+        efforts: (0..100).map(|i| Level { id: format!("e{i}"), name: junk.into() }).collect(),
+        model: Some("two\nlines".into()),
+        effort: None,
+    };
+    let mut a = offering(many, vec![]);
+    settle(&mut a);
+    let offered = a.conversation().unwrap().offered().unwrap();
+    assert_eq!((offered.models.len(), offered.efforts.len(), offered.model.clone()), (64, 16, None));
+    assert_eq!((offered.models[0].efforts.len(), offered.models[0].name.as_str()), (16, "name"));
+    assert_eq!(offered.efforts[0].name, "name");
+}
+
 fn waiting(a: &WordApp) -> bool {
     a.conversation().is_some_and(|c| c.pending_permission().is_some())
 }

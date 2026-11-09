@@ -165,6 +165,29 @@ fn junk_params_never_panic() {
     assert!(!s.prefs.assistant.allow_unattended, "junk never allows what no one answers");
 }
 
+/// `assist.model` and `assist.effort` hand the window what to do, as only it knows which assistant
+/// is in use: omitted reads, null clears, text chooses. Anything else is refused and asks nothing.
+#[test]
+fn choosing_a_model_or_effort_goes_to_the_window() {
+    let mut s = in_window();
+    for (id, key, which) in [("assist.model", "id", "model"), ("assist.effort", "level", "effort")] {
+        s.run(id, &json!({})).unwrap();
+        assert_eq!(requests(&mut s), [json!({"assist": "choice", "which": which, "set": false})], "{id}");
+        s.run(id, &json!({key: " x "})).unwrap();
+        assert_eq!(requests(&mut s), [json!({"assist": "choice", "which": which, "set": true, "value": "x"})], "{id}");
+        s.run(id, &json!({key: null})).unwrap();
+        assert_eq!(requests(&mut s), [json!({"assist": "choice", "which": which, "set": true, "value": null})], "{id}");
+        for bad in [json!(7), json!(""), json!("  "), json!("two\nlines"), json!(["x"]), json!({"a": 1}), json!("m".repeat(129))] {
+            assert!(matches!(s.run(id, &json!({key: bad})), Err(CmdError::Params(_))), "{id} {bad}");
+            assert!(requests(&mut s).is_empty(), "{id} {bad}");
+        }
+        // Without a window there is nothing to choose for.
+        let mut alone = Session::new(Document::from_text("x"));
+        disabled(alone.run(id, &json!({})));
+        assert!(!s.can_undo(), "a preference, not an edit");
+    }
+}
+
 /// A participant's copy of a shared document can't start or drive an assistant: only the
 /// window's owner can. Showing the pane is their own view.
 #[test]
@@ -189,6 +212,10 @@ fn a_participants_copy_cant_run_the_assistant() {
             ("assist.cancel", json!({})),
             ("assist.useDocument", json!({})),
             ("assist.backend", json!({"id": "fake"})),
+            ("assist.model", json!({"id": "gpt-x"})),
+            ("assist.model", json!({})),
+            ("assist.effort", json!({"level": "ultra"})),
+            ("assist.effort", json!({})),
             ("assist.defaultRole", json!({"value": "editor"})),
             ("assist.allowUnattended", json!({"value": true})),
             ("assist.chatgpt.signIn", json!({})),
@@ -199,6 +226,7 @@ fn a_participants_copy_cant_run_the_assistant() {
             assert!(why.contains("application's settings"), "{role} {id}: {why}");
         }
         assert!(copy.run("assist.pane", &json!({"value": true})).is_ok(), "{role}");
+        assert!(copy.session().prefs.assistant.models.is_empty());
         assert_eq!(copy.session().prefs.assistant.default_role, Role::Suggester);
         assert!(!copy.session().prefs.assistant.allow_unattended);
     }
