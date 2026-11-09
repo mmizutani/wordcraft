@@ -657,3 +657,33 @@ fn a_chip_the_turn_didn_t_send_doesn_t_show() {
     assert!(h.query_by_label_contains("two.").is_some(), "the answer shows");
     assert!(h.query_by_label("M1").is_none());
 }
+
+/// An answer's chip says what its own turn sent, though the person reworded it since.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn an_older_chip_keeps_the_words_its_turn_sent() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    Memory::update(&folder.0, |m| m.add("Use digits.", "2026-11-09T10:00:00Z")).unwrap();
+    let mut a = window(&folder);
+    a.assist_with(Box::new(Fake::new().then(vec![Step::say("First[[used: m1]].")]).then(vec![Step::say("Second[[used: m1]].")])));
+    a.session.view.assistant_pane = true;
+    a.run("assist.ask", json!({"prompt": "One"})).unwrap();
+    settle(&mut a);
+    a.run("assist.memory.edit", json!({"id": "m1", "text": "Spell out numbers."})).unwrap();
+    a.run("assist.ask", json!({"prompt": "Two"})).unwrap();
+    settle(&mut a);
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 1200.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    h.get_all_by_label("M1").next().unwrap().hover();
+    h.run_steps(60);
+    assert!(h.query_by_label("Use digits.").is_some(), "the first answer's chip says what its turn sent");
+    assert!(h.query_by_label("Spell out numbers.").is_none());
+}

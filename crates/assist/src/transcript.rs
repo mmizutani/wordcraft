@@ -569,12 +569,12 @@ impl Transcript {
         marked
     }
 
-    /// What preference `id` said when a turn last sent it.
-    pub fn sent_preference(&self, id: &str) -> Option<&str> {
-        self.entries.iter().rev().find_map(|e| match e {
-            Entry::Context(sent) => sent.memory.iter().find(|p| p.id == id).map(|p| p.text.as_str()),
-            _ => None,
-        })
+    /// What preference `id` said in the turn of the entry at `entry`, if that turn sent it: the
+    /// person may have reworded it since.
+    pub fn sent_preference(&self, entry: usize, id: &str) -> Option<&str> {
+        let turn =
+            self.entries.iter().take(entry.saturating_add(1)).rev().find_map(|e| if let Entry::Context(sent) = e { Some(sent) } else { None })?;
+        turn.memory.iter().find(|p| p.id == id).map(|p| p.text.as_str())
     }
 
     /// The model says preference `id` shaped the answer here: a chip goes in, numbered through the

@@ -31,11 +31,12 @@ impl ComputerMut<(&str, bool), Arc<Formatted>> for Reader {
 /// What the answers shown read as: the frames between two pieces of an answer read nothing.
 type Read = FrameCache<Arc<Formatted>, Reader>;
 
-/// Draw the answer `text`; `streaming`: more of it is still coming.
-pub(super) fn answer(app: &mut WordApp, ui: &mut Ui, t: &Tokens, text: &str, streaming: bool) {
+/// Draw the answer `text`, the conversation's entry at `entry`; `streaming`: more of it is still
+/// coming.
+pub(super) fn answer(app: &mut WordApp, ui: &mut Ui, t: &Tokens, entry: usize, text: &str, streaming: bool) {
     let read = ui.ctx().memory_mut(|m| m.caches.cache::<Read>().get((text, streaming)).clone());
     let size = egui::TextStyle::Body.resolve(ui.style()).size;
-    let mut chips = Chips { words: &read.citations, shown: 0 };
+    let mut chips = Chips { entry, words: &read.citations, shown: 0 };
     for (i, block) in read.blocks.iter().enumerate() {
         if i > 0 {
             ui.add_space(4.0);
@@ -99,7 +100,7 @@ fn inline(app: &mut WordApp, ui: &mut Ui, t: &Tokens, spans: &[Span], size: f32,
                 continue;
             }
             if let Some(used) = &span.used {
-                used_chip(app, ui, t, used);
+                used_chip(app, ui, t, chips.entry, used);
                 continue;
             }
             match &span.link {
@@ -131,6 +132,8 @@ fn link(app: &mut WordApp, ui: &mut Ui, t: &Tokens, span: &Span, address: &str, 
 
 /// An answer's citations, and how many have shown so far: the numbers count only those.
 struct Chips<'a> {
+    /// The answer's place in the conversation: a preference's chip reads its turn's words.
+    entry: usize,
     words: &'a [String],
     shown: usize,
 }
@@ -156,10 +159,11 @@ impl Chips<'_> {
     }
 }
 
-/// A preference's chip: its words on hover, and a click shows it in Details › Memory. Only for what
-/// a turn sent: the transcript checks each marker, but text can come to read as one once it is drawn.
-fn used_chip(app: &mut WordApp, ui: &mut Ui, t: &Tokens, used: &UsedChip) {
-    let Some(said) = app.conversation().and_then(|a| a.transcript().sent_preference(&used.id).map(str::to_string)) else { return };
+/// A preference's chip: its words as its turn sent them on hover, and a click shows it in Details ›
+/// Memory. Only for what that turn sent: the transcript checks each marker, but text can come to
+/// read as one once it is drawn.
+fn used_chip(app: &mut WordApp, ui: &mut Ui, t: &Tokens, entry: usize, used: &UsedChip) {
+    let Some(said) = app.conversation().and_then(|a| a.transcript().sent_preference(entry, &used.id).map(str::to_string)) else { return };
     let words = RichText::new(crate::assist::memory::chip_label(used.number)).small().color(t.accent);
     if ui.small_button(words).on_hover_text(said).clicked() {
         app.assist.view = crate::assist::PaneView::Details;

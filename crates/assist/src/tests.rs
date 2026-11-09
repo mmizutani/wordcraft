@@ -1318,7 +1318,24 @@ fn a_marker_of_what_the_turn_sent_is_a_chip_numbered_through_the_turn() {
     assert_eq!(t.take_used(), ["m2", "m1"], "each once");
     assert!(t.take_used().is_empty());
     assert_eq!(t.entries().filter(|e| matches!(e, Entry::Answer { .. })).count(), 1, "one answer around them");
-    assert_eq!(t.sent_preference("m1"), Some("Text of m1."));
+    assert_eq!(t.sent_preference(t.len() - 1, "m1"), Some("Text of m1."));
+}
+
+#[test]
+fn a_chip_s_words_are_what_its_own_turn_sent() {
+    let mut t = Transcript::default();
+    sent_two(&mut t, "2026-11-09T10:00:00Z");
+    t.record(&Event::Text { text: "First[[used: m1]].".into() });
+    let first = t.len() - 1;
+    t.asked("Again");
+    let memory = vec![crate::memory::SentPreference { id: "m1".into(), text: "Reworded.".into() }];
+    t.sent(crate::Sent { at: "2026-11-09T10:01:00Z".into(), memory, ..crate::Sent::default() });
+    t.record(&Event::Text { text: "Second[[used: m1]].".into() });
+    let second = t.len() - 1;
+    assert_eq!(t.sent_preference(first, "m1"), Some("Text of m1."));
+    assert_eq!(t.sent_preference(second, "m1"), Some("Reworded."));
+    assert_eq!(t.sent_preference(first, "m999"), None);
+    assert_eq!(t.sent_preference(second, "m2"), None, "an earlier turn's isn't this one's");
 }
 
 #[test]

@@ -238,7 +238,7 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
                 wrapped(ui, RichText::new(text).color(t.text));
             });
         }
-        Entry::Answer { text } => super::answer::answer(app, ui, t, text, streaming),
+        Entry::Answer { text } => super::answer::answer(app, ui, t, i, text, streaming),
         Entry::Thought { text } => {
             egui::CollapsingHeader::new(RichText::new(tl!("Thinking")).small().color(t.text_dim))
                 .id_salt(("assistant_thought", i))
