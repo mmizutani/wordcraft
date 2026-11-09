@@ -882,7 +882,7 @@ fn assistant(app: &mut WordApp, ui: &mut Ui) {
         "When you ask, the Assistant pane asks you before an agent goes ahead. A script or another app that asks the assistant (the control channel, MCP) has no one to ask: its agent's requests are refused unless this is on. Each answer is logged.",
     );
     ui.add_space(8.0);
-    crate::assist::memory::options_section(ui);
+    crate::assist::memory::options_section(app, ui);
     ui.add_space(8.0);
     // The agents and what each starts with (#24): desktop only, as agents are programs (#26).
     #[cfg(not(target_arch = "wasm32"))]

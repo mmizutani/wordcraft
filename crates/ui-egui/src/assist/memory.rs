@@ -267,10 +267,16 @@ fn read_if_stale(app: &mut WordApp) {
     }
 }
 
-/// What File › Options › Assistant says about it.
-pub(crate) fn options_section(ui: &mut Ui) {
+/// What File › Options › Assistant says about it: where the list is, or the list itself where the
+/// pane can't show it, as turning this off and clearing it mustn't take opening a document.
+pub(crate) fn options_section(app: &mut WordApp, ui: &mut Ui) {
     section(ui, "Memory");
-    note(ui, "What the assistant remembers is in the Assistant pane, under Details › Memory.");
+    if app.has_document() && super::desktop(app) {
+        note(ui, "What the assistant remembers is in the Assistant pane, under Details › Memory.");
+    } else {
+        let t = Tokens::get(ui.ctx());
+        page(app, ui, &t);
+    }
 }
 
 /// The questions the pane asks now, for the end of the conversation: a closed Details asks nothing.

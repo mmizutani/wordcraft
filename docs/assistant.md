@@ -142,9 +142,9 @@ are.
 What you keep reaches every later conversation with every backend. Details › Memory in the
 Assistant pane has the list: add a preference, edit it, turn it off, remove it or clear them all,
 and turn the whole thing off with **Give the assistant what you kept**. Off, nothing is sent and
-what you kept stays until you clear it. File › Options › Assistant says where the list is. The
-commands work with no document open, but the pane needs one. `assist.memory` reads the list for
-whoever holds the window's key.
+what you kept stays until you clear it. The pane needs a document, so with none open File › Options
+› Assistant has the list instead; with one open, it says where the list is. `assist.memory` reads
+the list for whoever holds the window's key.
 
 **Only your own click stores anything.** Documents are untrusted: a shared document, a received
 file or a comment can tell a model to remember something, and a stored preference would act on
