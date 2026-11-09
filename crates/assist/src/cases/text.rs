@@ -121,13 +121,14 @@ pub const TERMS: &[(Topic, &[&str])] = &[
 /// The topics `text` names, by [`TERMS`].
 pub fn topics_in(text: &str) -> Topics {
     // ASCII words separated by single spaces, with a space at each end and wherever ASCII meets
-    // other text, so 本ＮＤＡの reads as " 本 nda の " and a term is found at a word's edges.
+    // other text, so 本ＮＤＡの reads as " 本 nda の " and a term is found at a word's edges. Any
+    // space counts, since pasted contract text carries no-break and ideographic spaces.
     let mut folded = String::with_capacity(text.len().min(MAX_TOPIC_TEXT * 4).saturating_add(2));
     folded.push(' ');
     let mut last_ascii = false;
     for c in text.chars().take(MAX_TOPIC_TEXT).map(fold) {
         let ascii = c.is_ascii_alphanumeric();
-        if c.is_ascii() && !ascii {
+        if c.is_whitespace() || (c.is_ascii() && !ascii) {
             if !folded.ends_with(' ') {
                 folded.push(' ');
             }

@@ -394,6 +394,13 @@ fn an_english_term_inside_japanese_text_is_found() {
 }
 
 #[test]
+fn any_space_separates_words() {
+    for space in ['\u{00A0}', '\u{3000}', '\u{2009}'] {
+        assert!(topics_in(&format!("governing{space}law")).contains(Topic::GoverningLaw), "{space:?}");
+    }
+}
+
+#[test]
 fn a_lease_deposit_is_not_a_warranty() {
     assert!(!topics_in("保証金は３か月分").contains(Topic::Warranties));
 }
