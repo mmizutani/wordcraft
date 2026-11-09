@@ -36,8 +36,8 @@ pub enum Entry {
     Plan { entries: Vec<PlanEntry> },
     /// A permission request, and its answer once given.
     Permission { request: PermissionRequest, answer: Option<Answer> },
-    /// Which model answered.
-    Model { name: String },
+    /// Which model answers and at what level ([`Event::Model`]), as it last said.
+    Model { name: String, effort: Option<String>, asked: bool },
     /// What the agent says it is. Details shows it; the conversation doesn't.
     Agent { name: String },
     /// What the turn used, as it last said. Details shows it; the conversation doesn't.
@@ -47,6 +47,8 @@ pub enum Entry {
     /// A change or a comment the conversation made, as it last stood. Details shows it; the
     /// conversation doesn't.
     Output(OutputRow),
+    /// Something the person should know about the turn ([`Event::Note`]).
+    Note { text: String },
     /// The turn stopped other than by finishing its answer.
     Stopped { stop: StopReason },
     /// The turn failed.
@@ -65,9 +67,10 @@ impl Entry {
             Entry::Asked { text }
             | Entry::Answer { text }
             | Entry::Thought { text }
-            | Entry::Model { name: text }
+            | Entry::Note { text }
             | Entry::Agent { name: text }
             | Entry::Error { message: text } => text.len(),
+            Entry::Model { name, effort, .. } => name.len() + effort.as_ref().map_or(0, String::len),
             Entry::Tool(t) => {
                 let sources = t.sources.iter().map(|s| s.title.len() + s.target.as_ref().map_or(0, String::len));
                 t.title.len() + t.detail.len() + t.id.len() + sources.sum::<usize>()
@@ -165,6 +168,10 @@ pub struct Details {
     pub agent: Option<String>,
     /// The model that answered last.
     pub model: Option<String>,
+    /// The reasoning level it answered at, when one is known.
+    pub effort: Option<String>,
+    /// [`Self::effort`] is what was asked for, as the backend didn't say what ran.
+    pub effort_asked: bool,
     /// What the last turn that said used.
     pub usage: Option<Usage>,
     /// How many more changes there are than the list holds ([`crate::output::MAX_ROWS`]).
@@ -311,13 +318,17 @@ impl Transcript {
                     turn.calls.push(Step { title: call.title.clone(), state });
                     turn.read(call);
                 }
-                Entry::Model { name, .. } => out.model = Some(name.clone()),
+                Entry::Model { name, effort, asked } => {
+                    out.model = Some(name.clone());
+                    out.effort = effort.clone();
+                    out.effort_asked = *asked;
+                }
                 Entry::Agent { name } => out.agent = Some(name.clone()),
                 Entry::Usage(usage) => out.usage = Some(usage.clone()),
                 Entry::Context(sent) => turn.context = Some(sent.clone()),
                 Entry::Output(row) => turn.output.push(row.clone()),
                 Entry::Answer { text } => turn.cite(text),
-                Entry::Thought { .. } | Entry::Permission { .. } | Entry::Stopped { .. } | Entry::Error { .. } => {}
+                Entry::Thought { .. } | Entry::Permission { .. } | Entry::Note { .. } | Entry::Stopped { .. } | Entry::Error { .. } => {}
             }
         }
         turn.finish(&mut out.turns);
@@ -421,9 +432,12 @@ impl Transcript {
                     self.replace(i, Entry::Permission { request, answer: Some(answer.clone()) });
                 }
             }
-            Event::Model { name } => {
-                if !self.in_turn().any(|(_, e)| matches!(e, Entry::Model { name: n } if n == name)) {
-                    self.push(Entry::Model { name: name.clone() });
+            Event::Model { name, effort, asked } => {
+                let line = Entry::Model { name: name.clone(), effort: effort.clone(), asked: *asked };
+                let i = self.in_turn().find(|(_, e)| matches!(e, Entry::Model { .. })).map(|(i, _)| i);
+                match i {
+                    Some(i) => self.replace(i, line),
+                    None => self.push(line),
                 }
             }
             Event::Agent { name } => {
@@ -438,6 +452,9 @@ impl Transcript {
                     None => self.push(Entry::Usage(usage.clone())),
                 }
             }
+            Event::Note { text } => self.push(Entry::Note { text: text.clone() }),
+            // What is offered isn't part of the conversation: [`crate::Assistant::offered`].
+            Event::Options(_) => {}
             Event::Done { stop } => {
                 if *stop != StopReason::EndTurn {
                     self.push(Entry::Stopped { stop: *stop });

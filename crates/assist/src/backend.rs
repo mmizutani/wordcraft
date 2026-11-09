@@ -52,6 +52,71 @@ pub struct BackendInfo {
     pub in_process_tools: bool,
 }
 
+/// One model a backend offers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOption {
+    /// What a request names it.
+    pub id: String,
+    /// What the picker shows.
+    pub name: String,
+    /// Hover text.
+    pub description: Option<String>,
+    /// The reasoning levels it takes, as offered; empty means unknown.
+    pub efforts: Vec<String>,
+    /// The level it runs at unless told otherwise, when the backend says.
+    pub default_effort: Option<String>,
+}
+
+/// A reasoning level a backend offers whatever the model, under a name of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Level {
+    pub id: String,
+    pub name: String,
+}
+
+/// What a backend offers to choose from, and what it is set to now.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Offered {
+    pub models: Vec<ModelOption>,
+    /// The levels for any model. A model that names its own levels takes those.
+    pub efforts: Vec<Level>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// Most models a backend's offer keeps.
+pub const MAX_OFFERED_MODELS: usize = 64;
+
+/// Most reasoning levels a backend's offer keeps, for a model or for any.
+pub const MAX_OFFERED_LEVELS: usize = 16;
+
+/// Whether `id` can name a model or a level: what a request sends back, so it isn't cut.
+fn offered_id(id: &str) -> bool {
+    !id.trim().is_empty() && id.len() <= MAX_LABEL && !id.chars().any(char::is_control)
+}
+
+impl Offered {
+    /// The offer held to the pane's limits: at most [`MAX_OFFERED_MODELS`] models and
+    /// [`MAX_OFFERED_LEVELS`] levels, names as labels, entries without a usable id dropped.
+    fn bounded(self) -> Offered {
+        let models = self.models.into_iter().filter(|m| offered_id(&m.id)).take(MAX_OFFERED_MODELS).map(|m| ModelOption {
+            name: label(&m.name),
+            description: m.description.map(|d| label(&d)),
+            efforts: m.efforts.into_iter().filter(|e| offered_id(e)).take(MAX_OFFERED_LEVELS).collect(),
+            default_effort: m.default_effort.filter(|e| offered_id(e)),
+            id: m.id,
+        });
+        let efforts = self.efforts.into_iter().filter(|l| offered_id(&l.id)).take(MAX_OFFERED_LEVELS);
+        Offered {
+            models: models.collect(),
+            efforts: efforts.map(|l| Level { name: label(&l.name), id: l.id }).collect(),
+            model: self.model.filter(|m| offered_id(m)),
+            effort: self.effort.filter(|e| offered_id(e)),
+        }
+    }
+}
+
 /// The assistant's place in the shared document, which the backend gets when the conversation
 /// starts ([`Backend::begin`]): who it is, and the key of the invite it joined with, which an
 /// agent outside the process connects with (WordCraft's MCP server, `WORDCRAFT_CONTROL_KEY`).
@@ -96,6 +161,10 @@ pub struct Turn {
     pub selection: Option<(Anchor, Anchor)>,
     /// The sources the person attached, for the model to refer to. It is data.
     pub knowledge: Vec<crate::knowledge::TurnSource>,
+    /// The model the person chose for this backend; `None`: its default.
+    pub model: Option<String>,
+    /// The reasoning effort the person chose for this backend; `None`: its default.
+    pub effort: Option<String>,
 }
 
 /// Why a turn stopped (ACP's stop reasons, which the ChatGPT backend maps its own to).
@@ -333,12 +402,18 @@ pub enum Event {
     Permission(PermissionRequest),
     /// A permission request was answered, by the person or by the conversation's policy.
     Answered { id: u64, answer: Answer },
-    /// Which model answered.
-    Model { name: String },
+    /// Which model answers and at what reasoning level, once known. A later one this turn
+    /// replaces it. `asked`: the level is what was asked for, as the backend didn't say what ran.
+    Model { name: String, effort: Option<String>, asked: bool },
     /// What the agent says it is: its name and version.
     Agent { name: String },
     /// What the turn has used so far: it replaces what it said before.
     Usage(Usage),
+    /// Something the person should know about the turn, which goes on: what ran instead of what
+    /// they chose, or a level that wasn't applied.
+    Note { text: String },
+    /// What the backend offers to choose from, whole: it replaces what it said before.
+    Options(Offered),
     /// The turn ended.
     Done { stop: StopReason },
     /// The turn failed: why, said plainly. The turn ended.
@@ -380,9 +455,11 @@ impl Event {
                 Event::Plan { entries: entries.into_iter().take(MAX_PLAN).map(|e| PlanEntry { content: label(&e.content), ..e }).collect() }
             }
             Event::Permission(r) => Event::Permission(PermissionRequest { id: r.id, ..PermissionRequest::bounded(&r.title, r.options) }),
-            Event::Model { name } => Event::Model { name: label(&name) },
+            Event::Model { name, effort, asked } => Event::Model { name: label(&name), effort: effort.map(|e| label(&e)), asked },
             Event::Agent { name } => Event::Agent { name: label(&name) },
             Event::Usage(u) => Event::Usage(Usage { cost: u.cost.map(|c| cut(label(&c), MAX_COST)), ..u }),
+            Event::Note { text: t } => Event::Note { text: text(t) },
+            Event::Options(offered) => Event::Options(offered.bounded()),
             Event::Error { message } => Event::Error { message: text(message) },
             e @ (Event::Answered { .. } | Event::Done { .. }) => e,
         }
