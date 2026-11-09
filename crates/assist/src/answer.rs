@@ -348,8 +348,8 @@ impl Builder {
                 Block::Code(line)
             }
             (Kind::Rule, _) => Block::Rule,
-            (Kind::Heading(level), _) => Block::Heading { level: *level, spans: self.spans_of(p, false) },
-            (Kind::Title, _) => Block::Heading { level: 1, spans: self.spans_of(p, false) },
+            (Kind::Heading(level), None) => Block::Heading { level: *level, spans: self.spans_of(p, false) },
+            (Kind::Title, None) => Block::Heading { level: 1, spans: self.spans_of(p, false) },
             (_, Some(list)) => {
                 let level = usize::from(list.level);
                 self.numbers.truncate(level.saturating_add(1));
@@ -367,7 +367,9 @@ impl Builder {
                     }
                     "•".to_string()
                 };
-                let spans = self.spans_of(p, false);
+                // A heading in a list keeps its place there, and stands out by its weight.
+                let heading = matches!(p.kind, Kind::Heading(_) | Kind::Title);
+                let spans = self.spans_of(p, heading);
                 self.push(Block::Item { marker, level: list.level, spans });
                 return;
             }
