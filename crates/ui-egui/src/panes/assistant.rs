@@ -2,7 +2,8 @@
 //!
 //! At the top, the assistant new conversations use (whether it is ready, and if not what to do:
 //! for ChatGPT, Continue with ChatGPT, #19) and who it is in the document: its name and role, which the person can change for the
-//! conversation. Then the conversation: the prompts, the answers, thoughts folded away, a row per
+//! conversation. Then the conversation: the prompts, the answers as formatted text
+//! ([`super::answer`]), thoughts folded away, a row per
 //! tool call folded to how it went (open: what it said, and the way to the change it made, #23),
 //! the plan as a checklist, permission requests with their options while they wait, errors, and
 //! why a turn stopped, said plainly. At the bottom, Accept all and Reject all of this assistant's
@@ -10,6 +11,10 @@
 //! into what to write at the caret. Everything it does goes through the `assist.*` and `review.*`
 //! commands, but for the answer to a permission request: that is the person's click alone, which
 //! no script can give for them.
+//!
+//! Once there is a conversation, tabs under the role switch it with its Details
+//! ([`super::assistant_details`]): the conversation's steps and what runs it, read from the same
+//! transcript.
 
 use egui::{Color32, RichText, Stroke, Ui, vec2};
 use serde_json::json;
@@ -19,7 +24,7 @@ use wordcraft_engine::room::Role;
 
 use super::{Tokens, WordApp, regular, semibold};
 use crate::assist::models::{Menus, Row};
-use crate::assist::{chosen, role_label, role_note};
+use crate::assist::{PaneView, chosen, role_label, role_note};
 use crate::i18n::fmt;
 
 /// Rows the prompt box shows.
@@ -47,13 +52,18 @@ pub(super) fn assistant(app: &mut WordApp, ui: &mut Ui) {
             let _ = app.run("assist.useDocument", json!({}));
         }
     }
+    // Sources can be attached before a conversation starts; the web app runs no assistant (#26).
+    let view = if app.conversation().is_some() || crate::assist::desktop(app) { tabs(app, ui) } else { PaneView::Conversation };
     ui.separator();
     // The conversation takes the height that the buttons and the prompt box under it leave, as
     // they measured on the last frame.
     let bottom_id = ui.scope_id().with("assistant_bottom");
     let bottom = ui.data(|d| d.get_temp::<f32>(bottom_id)).unwrap_or(BOTTOM);
     let height = (ui.available_height() - bottom - 3.0 * ui.spacing().item_spacing.y - 6.0).max(MIN_TRANSCRIPT);
-    transcript(app, ui, &t, height);
+    match view {
+        PaneView::Conversation => transcript(app, ui, &t, height),
+        PaneView::Details => super::assistant_details::details(app, ui, &t, height),
+    }
     ui.separator();
     let bottom = ui
         .vertical(|ui| {
@@ -170,6 +180,18 @@ fn who(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     }
 }
 
+/// The tabs that switch the conversation with its Details: the view to show.
+fn tabs(app: &mut WordApp, ui: &mut Ui) -> PaneView {
+    ui.horizontal(|ui| {
+        for (view, label) in [(PaneView::Conversation, "Conversation"), (PaneView::Details, "Details")] {
+            if ui.selectable_label(app.assist.view == view, tl!(label)).clicked() {
+                app.assist.view = view;
+            }
+        }
+    });
+    app.assist.view
+}
+
 /// The conversation so far.
 fn transcript(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
     let entries: Vec<Entry> = app.conversation().map(|a| a.transcript().entries().cloned().collect()).unwrap_or_default();
@@ -182,8 +204,13 @@ fn transcript(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
         if entries.is_empty() {
             ui.label(RichText::new(tl!("Ask the assistant to draft, rewrite or check your writing. It works in the document like a collaborator: with the Suggester role, every edit is a tracked change for you to accept or reject.")).color(t.text_dim));
         }
+        let newest = entries.iter().rposition(|e| !e.details_only());
         for (i, e) in entries.iter().enumerate() {
-            entry(app, ui, t, i, e, waiting);
+            if e.details_only() {
+                continue;
+            }
+            let streaming = busy && newest == Some(i);
+            entry(app, ui, t, i, e, waiting, streaming);
             ui.add_space(6.0);
         }
         if busy {
@@ -197,11 +224,11 @@ fn transcript(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
     });
 }
 
-fn wrapped(ui: &mut Ui, text: RichText) {
+pub(super) fn wrapped(ui: &mut Ui, text: RichText) {
     ui.add(egui::Label::new(text).wrap());
 }
 
-fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waiting: Option<u64>) {
+fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waiting: Option<u64>, streaming: bool) {
     match e {
         Entry::Asked { text } => {
             egui::Frame::NONE.fill(t.checked).corner_radius(6).inner_margin(6).show(ui, |ui| {
@@ -210,7 +237,7 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
                 wrapped(ui, RichText::new(text).color(t.text));
             });
         }
-        Entry::Answer { text } => wrapped(ui, RichText::new(text).color(t.text)),
+        Entry::Answer { text } => super::answer::answer(app, ui, t, text, streaming),
         Entry::Thought { text } => {
             egui::CollapsingHeader::new(RichText::new(tl!("Thinking")).small().color(t.text_dim))
                 .id_salt(("assistant_thought", i))
@@ -242,6 +269,7 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
         Entry::Permission { request, answer } => permission(app, ui, t, request, answer.as_ref(), waiting == Some(request.id)),
         Entry::Model { name, effort, asked } => model_line(ui, t, name, effort.as_deref(), *asked),
         Entry::Note { text } => wrapped(ui, RichText::new(text).small().italics().color(t.orange)),
+        Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) | Entry::Output(_) => {}
         Entry::Stopped { stop } => {
             if let Some(says) = stop.says() {
                 // Stopped by the person reads as a note; any other stop is news to them.
@@ -357,7 +385,7 @@ fn permission(app: &mut WordApp, ui: &mut Ui, t: &Tokens, request: &PermissionRe
 /// How a tool call or a plan entry stands, drawn: an open ring (waiting), a dot (running), a
 /// tick (done) or a cross (failed).
 #[derive(Clone, Copy)]
-enum Mark {
+pub(super) enum Mark {
     Waiting,
     Running,
     Done,
@@ -365,7 +393,7 @@ enum Mark {
 }
 
 impl Mark {
-    fn paint(self, ui: &mut Ui, t: &Tokens) {
+    pub(super) fn paint(self, ui: &mut Ui, t: &Tokens) {
         let (r, _) = ui.allocate_exact_size(vec2(14.0, 16.0), egui::Sense::hover());
         let c = r.center();
         let p = ui.painter();
@@ -512,7 +540,8 @@ fn prompt(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     }
     let enter = r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.is_none());
     let id = if drafting { "assist.draft" } else { "assist.ask" };
-    let can_send = !busy && !app.assist.prompt.trim().is_empty() && crate::widgets::enabled(app, id);
+    let reading = crate::assist::sources_being_read(app);
+    let can_send = !busy && !reading && !app.assist.prompt.trim().is_empty() && crate::widgets::enabled(app, id);
     let menus = crate::assist::models::menus(app);
     ui.horizontal_wrapped(|ui| {
         let send_button = ui.add_enabled(can_send, egui::Button::new(if drafting { tl!("Write") } else { tl!("Send") }));
@@ -524,6 +553,9 @@ fn prompt(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
             let text = app.assist.prompt.clone();
             let params = if drafting { json!({"about": text}) } else { json!({"prompt": text}) };
             send(app, id, params);
+        }
+        if reading {
+            ui.label(RichText::new(tl!("Reading a source…")).small().color(t.text_dim));
         }
         if ui.add_enabled(busy, egui::Button::new(tl!("Stop"))).clicked() {
             let _ = app.run("assist.cancel", json!({}));
