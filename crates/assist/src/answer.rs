@@ -107,43 +107,45 @@ pub fn citations(text: &str) -> Vec<String> {
 
 /// `text` with each citation's marker, `[[cite: "the exact words"]]`, as an index between two
 /// [`CITE`]s, and the words. A marker not closed yet is held back while the answer is `streaming`,
-/// and stays as text once it isn't: it was no marker. So does one too long to be a citation. Each
-/// marker is looked at only as far as the longest it can be: answers are read over again as they
-/// arrive, and a text of false markers mustn't cost its length for each of them.
+/// and stays as text once it isn't: it was no marker. So does one too long to be a citation. The
+/// next close is looked for only once the reading has passed the last one found, so the whole text
+/// costs one pass however many false markers it holds: Details reads every answer each frame.
 fn with_cites(text: &str, streaming: bool) -> (Cow<'_, str>, Vec<String>) {
     const OPEN: &str = "[[cite:";
     const CLOSE: &str = "\"]]";
     if !text.contains(OPEN) {
         return (Cow::Borrowed(text), Vec::new());
     }
+    let longest = MAX_CITE_CHARS.saturating_mul(4);
     let mut out = String::with_capacity(text.len());
     let mut words = Vec::new();
     let mut rest = text;
+    let mut close = text.find(CLOSE);
     while let Some(at) = rest.find(OPEN) {
         let after = rest.get(at.saturating_add(OPEN.len())..).unwrap_or_default();
         out.push_str(rest.get(..at).unwrap_or_default());
-        let quoted = after.trim_start_matches(' ').strip_prefix('"');
-        let longest = MAX_CITE_CHARS.saturating_mul(4).saturating_add(CLOSE.len());
-        let seen = quoted.map(|q| {
-            let mut end = longest.min(q.len());
-            while !q.is_char_boundary(end) {
-                end = end.saturating_sub(1);
-            }
-            (q, q.get(..end).unwrap_or_default().find(CLOSE), end == q.len())
-        });
-        match seen {
-            Some((q, Some(end), _)) if q.get(..end).unwrap_or_default().chars().count() <= MAX_CITE_CHARS => {
-                let cited = q.get(..end).unwrap_or_default();
+        let Some(q) = after.trim_start_matches(' ').strip_prefix('"') else {
+            out.push_str(OPEN);
+            rest = after;
+            continue;
+        };
+        let from = text.len().saturating_sub(q.len());
+        if close.is_some_and(|c| c < from) {
+            close = text.get(from..).and_then(|t| t.find(CLOSE)).map(|c| c.saturating_add(from));
+        }
+        let cited = close.and_then(|c| q.get(..c.saturating_sub(from))).filter(|c| c.len() <= longest && c.chars().count() <= MAX_CITE_CHARS);
+        match cited {
+            Some(cited) => {
                 if !cited.trim().is_empty() && words.len() < MAX_CITES {
                     out.push(CITE);
                     out.push_str(&words.len().to_string());
                     out.push(CITE);
                     words.push(shown(cited.to_string()));
                 }
-                rest = q.get(end.saturating_add(CLOSE.len())..).unwrap_or_default();
+                rest = q.get(cited.len().saturating_add(CLOSE.len())..).unwrap_or_default();
             }
-            Some((_, None, true)) if streaming => return (Cow::Owned(out), words),
-            _ => {
+            None if streaming && close.is_none() && q.len() <= longest => return (Cow::Owned(out), words),
+            None => {
                 out.push_str(OPEN);
                 rest = after;
             }

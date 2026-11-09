@@ -362,7 +362,7 @@ fn a_marker_past_the_read_limit_or_across_it_is_still_a_marker() {
 
 #[test]
 fn markers_that_are_none_can_t_cost_more_than_a_frame() {
-    // Each marker is looked at only as far as the longest it can be.
+    // However many there are, the text costs one pass.
     let many = "[[cite:\"".repeat(32 << 10);
     let at = Instant::now();
     let f = format(&many, false);
@@ -370,4 +370,9 @@ fn markers_that_are_none_can_t_cost_more_than_a_frame() {
     assert!(f.citations.is_empty());
     let far = format!("[[cite:\"{}\"]]", "x".repeat(200 << 10));
     assert!(citations(&far).is_empty());
+    // Nor as much as a transcript holds, which Details reads each frame.
+    let transcript = format!("{}\"]]", "[[cite:\" ".repeat(400 << 10));
+    let at = Instant::now();
+    assert!(citations(&transcript).is_empty());
+    assert!(at.elapsed() < Duration::from_millis(1500), "{:?}", at.elapsed());
 }
