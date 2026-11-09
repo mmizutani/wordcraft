@@ -2131,6 +2131,18 @@ fn adding_a_source_takes_the_person_s_click() {
 
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
+fn a_macro_attaches_another_open_document_to_the_conversation_in_this_window() {
+    let mut a = window("first document");
+    let first = a.session.document_id();
+    a.execute("file.new", json!({})).unwrap();
+    let step = json!({"command": "assist.knowledge", "params": {"document": first}});
+    a.execute("tools.macros", json!({"define": {"name": "Attach", "steps": [step]}})).unwrap();
+    a.run("tools.macros", json!({"run": "Attach"})).unwrap();
+    assert_eq!(super::sources(&a).iter().map(|s| s.text.trim_end()).collect::<Vec<_>>(), ["first document"]);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn the_pane_attaches_another_open_document_by_its_title() {
     use egui_kittest::kittest::Queryable;
     let mut app = window("first document");
