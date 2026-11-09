@@ -43,8 +43,8 @@ pub mod transcript;
 
 pub use assistant::{AssistError, Assistant, MAX_EVENTS_PER_POLL, MAX_PROMPT, Options, role_for};
 pub use backend::{
-    Answer, Backend, BackendInfo, Cancel, Event, PermissionKind, PermissionOption, PermissionPolicy, PermissionRequest, PlanEntry, PlanStatus,
-    Priority, Seat, StopReason, ToolCall, ToolHost, ToolOutput, ToolSpec, ToolStatus, Turn, TurnCtx, Versions, Waker,
+    Answer, Backend, BackendInfo, Cancel, Event, Level, ModelOption, Offered, PermissionKind, PermissionOption, PermissionPolicy, PermissionRequest,
+    PlanEntry, PlanStatus, Priority, Seat, StopReason, ToolCall, ToolHost, ToolOutput, ToolSpec, ToolStatus, Turn, TurnCtx, Versions, Waker,
 };
 pub use context::{Caps, Context};
 pub use fake::{FAKE_ID, Fake, HOLD, Seen, Step};

@@ -971,14 +971,14 @@ mod prefs_tests {
         });
         assert_eq!(tries, 2);
         assert_eq!(on_disk.saved, Some(none.clone()));
-        assert_eq!(*woken.lock().unwrap(), vec![]);
+        assert!(woken.lock().unwrap().is_empty());
         // Nothing changed: nothing written, nothing to wake for.
         save_agent_files(&mut on_disk, none, &ctx, || {
             tries += 1;
             true
         });
         assert_eq!(tries, 2);
-        assert_eq!(*woken.lock().unwrap(), vec![]);
+        assert!(woken.lock().unwrap().is_empty());
         assert_eq!(on_disk.due_in(&all, std::time::Instant::now()), Some(std::time::Duration::ZERO), "a new change is due at once");
     }
 

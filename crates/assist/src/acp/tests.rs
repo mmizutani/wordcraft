@@ -282,7 +282,7 @@ fn an_agent_streams_its_answer_thoughts_tool_calls_and_plan() {
     c.ask("Hi");
     let start = c.tool(START_ROW).unwrap();
     assert_eq!((start.title.as_str(), start.status), ("Start Fake Agent", ToolStatus::Completed));
-    assert!(c.turn().contains(&Entry::Model { name: "Fake Agent 1.0".into() }), "{:?}", c.turn());
+    assert!(c.turn().contains(&Entry::Model { name: "Fake Agent 1.0".into(), effort: None, asked: false }), "{:?}", c.turn());
     assert!(c.turn().contains(&Entry::Thought { text: "Pondering".into() }));
     let t1 = c.tool("t1").unwrap();
     assert_eq!((t1.title.as_str(), t1.kind.as_str(), t1.status), ("Read the document", "read", ToolStatus::Completed));
