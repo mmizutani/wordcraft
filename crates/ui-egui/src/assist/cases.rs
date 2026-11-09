@@ -51,14 +51,35 @@ impl WordApp {
     }
 }
 
-/// Why the shown document's conversation can't take a turn: it has read case notes, and someone
-/// else can read the document now. Stopping recall alone wouldn't do: the model still holds what it
-/// read, and a document could ask it to write that into a comment the newcomer reads.
-pub(crate) fn refuses(app: &WordApp) -> Option<String> {
-    let c = app.assist.conversation.as_ref().filter(|c| c.recalled && !c.assistant.has_ended() && c.document == app.session.document_id())?;
+/// Who can read the shown document besides the person, while its conversation has read case notes
+/// and goes on. `None` otherwise. The model still holds what it read, and a document could ask it
+/// to write that into a comment the newcomer reads, so stopping recall alone wouldn't do. Cheap:
+/// the participant list is in memory, and nothing is looked at until a turn has recalled.
+fn others_while_recalled(app: &WordApp) -> Option<String> {
+    let c =
+        app.assist.conversation.as_ref().filter(|c| c.assistant.recalled() && !c.assistant.has_ended() && c.document == app.session.document_id())?;
     let (room, me) = (app.shared_room()?, app.own_participant()?);
-    let others = Alone::check(&room, me, c.assistant.name()).err()?;
-    Some(format!("This conversation has read your case notes and {} can now read this document. Start a new conversation.", others.names.join(", ")))
+    Alone::check(&room, me, c.assistant.name()).err().map(|others| others.names.join(", "))
+}
+
+/// Why the shown document's conversation can't take a turn: it has read case notes, and someone
+/// else can read the document now.
+pub(crate) fn refuses(app: &WordApp) -> Option<String> {
+    let names = others_while_recalled(app)?;
+    Some(format!("This conversation has read your case notes and {names} can now read this document. Start a new conversation."))
+}
+
+/// Every frame: someone who can read the document now, while a conversation that read case notes
+/// goes on (a turn may be running), ends it, stopping its turn, and the pane says why.
+pub(crate) fn guard(app: &mut WordApp) {
+    let Some(names) = others_while_recalled(app) else { return };
+    if let Some(c) = app.assist.conversation.as_mut() {
+        c.assistant.end();
+    }
+    app.assist.notice = Some(fmt(
+        tl!("{names} can now read this document, and this conversation had read your case notes, so it ended. Start a new one."),
+        &[("names", &names)],
+    ));
 }
 
 /// What the next turn asks to recall: nothing without a bound case, a settings folder, a

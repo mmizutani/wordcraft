@@ -122,6 +122,9 @@ pub struct Assistant {
     choice: (Option<String>, Option<String>),
     /// What the backend last said it offers, once it has.
     offered: Option<Offered>,
+    /// Whether any turn recalled anything from the person's cases: from then on the model holds
+    /// case text, whoever can read the document later.
+    recalled: bool,
     ended: bool,
 }
 
@@ -174,6 +177,7 @@ impl Assistant {
             knowledge: Vec::new(),
             choice: (None, None),
             offered: None,
+            recalled: false,
             ended: false,
         })
     }
@@ -231,6 +235,12 @@ impl Assistant {
     /// Whether the conversation ended ([`Assistant::end`]).
     pub fn has_ended(&self) -> bool {
         self.ended
+    }
+
+    /// Whether any turn recalled anything from the person's cases ([`Assistant::set_recall`]).
+    /// Set from the event itself as it is polled, so it can't miss one.
+    pub fn recalled(&self) -> bool {
+        self.recalled
     }
 
     /// The preferences the conversation's answers marked since the last call.
@@ -378,6 +388,11 @@ impl Assistant {
                     }
                     if let Event::Options(offered) = &e {
                         self.offered = Some(offered.clone());
+                    }
+                    if let Event::Recalled(sent) = &e
+                        && !sent.items.is_empty()
+                    {
+                        self.recalled = true;
                     }
                     self.transcript.record(&e);
                 }

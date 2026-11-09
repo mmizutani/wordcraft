@@ -217,3 +217,65 @@ fn a_conversation_that_recalled_is_refused_a_turn_once_an_invite_is_out() {
 fn a_conversation_that_recalled_is_refused_a_turn_once_someone_joined() {
     refused_once_someone_can_read(true);
 }
+
+/// The flag that a conversation recalled comes from the event itself, not from a scan of entries:
+/// one answer piece with a marker makes more entries than events, which a scan by event count
+/// would miss, and the refusal would fail open.
+#[test]
+fn a_turn_whose_answer_makes_more_entries_than_events_still_counts_as_having_recalled() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    let fake = Fake::new().then(vec![Step::say("Cap it[[remember: Cap liability early.]] early[[used: n1]] now.")]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.execute("assist.ask", json!({"prompt": "Review the liability cap"})).unwrap();
+    // Every event of the turn is queued before the window polls once.
+    let started = std::time::Instant::now();
+    while seen.lock().unwrap().turns.is_empty() && started.elapsed() < std::time::Duration::from_secs(20) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    settle(&mut a);
+    assert_eq!(recalled_json(&seen.lock().unwrap().turns[0]).len(), 3);
+    let room = a.shared_room().unwrap();
+    room.invite("Bob", Role::Viewer).unwrap();
+    let refused = a.execute("assist.ask", json!({"prompt": "Again"})).unwrap_err();
+    assert!(refused.contains("Start a new conversation"), "{refused}");
+    assert_eq!(seen.lock().unwrap().turns.len(), 1);
+}
+
+/// Someone joining while a turn that recalled is still running: the frame stops the turn, ends the
+/// conversation and says why, so the newcomer reads no edit made with the case notes in mind.
+#[test]
+fn someone_joining_mid_turn_ends_a_conversation_that_recalled_and_the_pane_says_why() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    let fake = Fake::new().then(vec![Step::say("Working on it."), Step::Hold]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.execute("assist.ask", json!({"prompt": "Review the liability cap"})).unwrap();
+    let ctx = egui::Context::default();
+    let started = std::time::Instant::now();
+    while !a.conversation().unwrap().recalled() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "the turn never recalled");
+        a.sync_share(&ctx);
+        crate::assist::tick(&mut a);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(a.conversation().unwrap().is_busy(), "the fake holds its turn");
+    assert_eq!(recalled_json(&seen.lock().unwrap().turns[0]).len(), 3);
+    let room = a.shared_room().unwrap();
+    let key = room.invite("Bob", Role::Viewer).unwrap();
+    let _bob = room.join_with(&key).unwrap();
+    crate::assist::tick(&mut a);
+    assert!(a.conversation().unwrap().has_ended(), "the conversation ended on the frame");
+    let notice = a.assist.notice.clone().unwrap_or_default();
+    assert!(notice.contains("Bob can now read this document") && notice.contains("case notes"), "{notice}");
+    settle(&mut a);
+    assert!(!a.conversation().unwrap().is_busy());
+    assert!(seen.lock().unwrap().ended, "the backend was told to stop");
+}
