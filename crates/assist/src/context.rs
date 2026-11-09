@@ -269,11 +269,28 @@ pub fn find_in_final(doc: &Document, words: &str) -> Option<(Pos, Pos)> {
         let mut text = String::new();
         // For each byte of `text`, where in the paragraph it came from.
         let mut from = Vec::new();
+        let mut objects = p.objects.iter();
         for (range, props) in p.run_ranges() {
             let piece = p.text.get(range.clone()).unwrap_or_default();
-            for (i, c) in piece.char_indices().filter(|(_, c)| props.del.is_none() && *c != OBJ) {
-                text.push(c);
-                from.extend(std::iter::repeat_n(range.start.saturating_add(i), c.len_utf8()));
+            for (i, c) in piece.char_indices() {
+                let at = range.start.saturating_add(i);
+                // An object reads as its result, which `final_text` gives too: all of it is the
+                // object's one place in the paragraph.
+                let result = (c == OBJ).then(|| objects.next().map(|o| o.plain_text()).unwrap_or_default());
+                if props.del.is_some() {
+                    continue;
+                }
+                let bytes = match &result {
+                    Some(result) => {
+                        text.push_str(result);
+                        result.len()
+                    }
+                    None => {
+                        text.push(c);
+                        c.len_utf8()
+                    }
+                };
+                from.extend(std::iter::repeat_n(at, bytes));
             }
         }
         let Some(at) = text.find(words) else { continue };

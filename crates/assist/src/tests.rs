@@ -1408,4 +1408,23 @@ mod final_text {
         assert_eq!(find_in_final(&s.doc, "two\nthird"), None);
         assert_eq!(find_in_final(&s.doc, ""), None);
     }
+
+    #[test]
+    fn a_citation_of_a_field_s_result_finds_what_it_verified() {
+        let mut s = Session::new(Document::from_text("Before after"));
+        let field = wordcraft_doc::para::InlineObject::Field {
+            instr: "PAGE".into(),
+            result: "SEVEN".into(),
+            locked: false,
+            dirty: false,
+            code: false,
+            form: String::new(),
+        };
+        s.doc.para_mut(wordcraft_doc::StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().insert_object(7, field, &Default::default()).unwrap();
+        assert!(final_text(&s.doc).contains("Before SEVEN"), "{}", final_text(&s.doc));
+        let (a, b) = find_in_final(&s.doc, "Before SEVEN").expect("found as verified");
+        let p = s.doc.para(wordcraft_doc::StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
+        let object = p.text.find(wordcraft_doc::para::OBJ).unwrap();
+        assert_eq!((a.off, b.off), (0, object + wordcraft_doc::para::OBJ.len_utf8()), "through the object");
+    }
 }

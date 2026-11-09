@@ -266,7 +266,7 @@ impl Builder {
 
     /// A paragraph's text as spans, with its citations as spans of their own. Chips come in the
     /// order of their markers, each once, so what a character entity in an answer makes of our
-    /// placeholder can't add one.
+    /// placeholder can't add one past the limit.
     fn spans_of(&mut self, p: &Para, bold: bool) -> Vec<Span> {
         let spans = spans(p, bold);
         if !spans.iter().any(|s| s.text.contains(CITE)) {
@@ -276,9 +276,10 @@ impl Builder {
         for span in spans {
             for (n, piece) in span.text.split(CITE).enumerate() {
                 if n % 2 == 1 {
-                    if piece.parse() == Ok(self.next_cite) {
-                        out.push(Span { cite: Some(self.next_cite), ..Span::default() });
-                        self.next_cite = self.next_cite.saturating_add(1);
+                    // Past ones code ate, whose markers show nowhere.
+                    if let Some(cite) = piece.parse().ok().filter(|cite| *cite >= self.next_cite) {
+                        out.push(Span { cite: Some(cite), ..Span::default() });
+                        self.next_cite = cite.saturating_add(1);
                     }
                 } else if !piece.is_empty() {
                     out.push(Span { text: piece.to_string(), ..span.clone() });
