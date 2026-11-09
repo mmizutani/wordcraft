@@ -120,13 +120,14 @@ pub(crate) fn rows(session: &Session, name: &str) -> (Vec<OutputRow>, usize) {
     (changes.chain(comments).collect(), more.saturating_add(more_comments))
 }
 
-/// How many times `words` are in the paragraph of `at`: 0 once it is gone. `None` when there is
-/// nothing to count, or the paragraph is too long to look through.
+/// How many times `words` are in the paragraph of `at`. `None` when there is nothing to count, the
+/// paragraph is too long to look through, or it is gone: joined to the one before, it may hold them
+/// still.
 fn occurrences(doc: &Document, at: Option<Anchor>, words: &str) -> Option<u32> {
     if words.is_empty() {
         return None;
     }
-    let Some(at) = at.and_then(|at| doc.pos_of(at, None)) else { return Some(0) };
+    let at = at.and_then(|at| doc.pos_of(at, None))?;
     let text = doc.para(at.story, &at.path).map_or("", |p| p.text.as_str());
     if text.len() > MAX_PARAGRAPH {
         return None;
