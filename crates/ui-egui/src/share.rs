@@ -320,6 +320,11 @@ impl WordApp {
         self.share.as_ref().map(|s| s.room.clone())
     }
 
+    /// Who the window is in the room it shares.
+    pub(crate) fn own_participant(&self) -> Option<ParticipantId> {
+        self.share.as_ref().map(|s| s.copy.id())
+    }
+
     /// Whether the window has every change the room took and the room every change the window
     /// sent (tests wait for it).
     #[cfg(test)]

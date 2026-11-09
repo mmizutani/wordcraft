@@ -21,7 +21,8 @@
 //! What the person accepts and rejects of the conversation's changes starts the next turn's
 //! context (#86, [`review_ended`]); nothing of it is stored.
 //!
-//! What the person keeps for every later conversation is [`memory`]'s (#86).
+//! What the person keeps for every later conversation is [`memory`]'s (#86). What a turn recalls
+//! from the case bound to the document is [`cases`]'s (#107).
 //!
 //! The web app (#26) has the pane and the commands but no assistant: its backends would sign in
 //! through a loopback port or start agents, which take the desktop app ([`desktop`]). The pane
@@ -44,6 +45,7 @@ use wordcraft_engine::room::Role;
 
 use crate::WordApp;
 
+pub(crate) mod cases;
 pub(crate) mod chatgpt;
 mod edits;
 pub(crate) mod memory;
@@ -122,6 +124,8 @@ pub(crate) struct AssistState {
     pub(crate) chatgpt: chatgpt::ChatGptState,
     /// What the assistant remembers across conversations (#86), as last read.
     pub(crate) memory: memory::MemoryState,
+    /// Which case each document is bound to (#107).
+    pub(crate) cases: cases::CasesState,
 }
 
 /// What the Assistant pane shows under its role.
@@ -169,6 +173,10 @@ pub(crate) struct Conversation {
     pub(crate) assistant: Assistant,
     /// The document ([`wordcraft_engine::Session::document_id`]).
     pub(crate) document: u64,
+    /// The case the document was bound to when it started, for its whole life: an ACP session
+    /// keeps what it read and ChatGPT's history holds answers that may quote it, so a document
+    /// bound to another case gets a new conversation, never this one.
+    pub(crate) case: Option<wordcraft_assist::cases::CaseRef>,
 }
 
 impl WordApp {
@@ -771,15 +779,17 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     }
     let role = wanted(app, role);
     let chosen_id = chosen(app).map(|o| o.id.clone());
+    let bound = cases::bound_for(app);
     let keep = app.conversation().is_some_and(|a| {
         !a.has_ended() && role.is_none_or(|r| r == a.role()) && (app.assist.next.is_none()) && chosen_id.as_deref().is_none_or(|id| id == a.info().id)
-    });
+    }) && app.assist.conversation.as_ref().is_some_and(|c| c.case == bound);
     if !keep {
         start(app, role)?;
     }
     let caps = Caps::default();
     edits::record(app);
-    let (mut context, mut sent) = Context::of(&app.session, &caps).rendered(&caps);
+    let ctx = Context::of(&app.session, &caps);
+    let (mut context, mut sent) = ctx.rendered(&caps);
     let (carried, given) = knowledge::for_turn(sources(app));
     sent.knowledge = given;
     if let Some(digest) = app.assist.feedback.digest() {
@@ -813,9 +823,11 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     sync_unattended(app);
     let policy = if app.assist.by_person { PermissionPolicy::Ask } else { unattended(app) };
     let kept = memory::for_turn(app, &mut sent);
+    let recall = cases::for_turn(app, prompt, &ctx, &mut sent);
     let saved = app.conversation().and_then(|a| app.session.prefs.assistant.models.get(&a.info().id)).cloned().unwrap_or_default();
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
     a.set_memory(kept);
+    a.set_recall(recall);
     a.set_knowledge(carried);
     a.choose(saved.model, saved.effort);
     a.ask_with_policy(prompt, Some(context), selection, policy).map_err(|e| e.to_string())?;
@@ -871,7 +883,8 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
         wake,
     };
     let assistant = Assistant::start(&room, backend, options).map_err(|e| e.to_string())?;
-    app.assist.conversation = Some(Conversation { assistant, document: app.session.document_id() });
+    let case = cases::bound_for(app);
+    app.assist.conversation = Some(Conversation { assistant, document: app.session.document_id(), case });
     // Its requests are numbered from 1: the pane opens for each of them.
     app.assist.opened_for = None;
     // It may be about another document, whose turn shouldn't quote this one's text.
@@ -1061,6 +1074,9 @@ pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
             .chain(sent.memory.iter().map(|p| p.text.clone()))
             .collect(),
         Entry::Used { .. } => vec![],
+        Entry::Recalled(sent) => {
+            sent.items.iter().flat_map(|i| std::iter::once(i.text.clone()).chain(i.title.clone())).chain(sent.problem.clone()).collect()
+        }
         Entry::Output(row) => vec![row.text.clone()],
         Entry::Note { text } => vec![text.clone()],
         Entry::Stopped { .. } => vec![],

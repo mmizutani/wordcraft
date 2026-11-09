@@ -59,7 +59,7 @@ fn first_turn(a: &mut WordApp) -> Option<String> {
     a.assist_with(Box::new(fake));
     a.execute("assist.ask", json!({"prompt": "Hello"})).unwrap();
     settle(a);
-    seen.lock().unwrap().turns[0].memory.clone()
+    seen.lock().unwrap().turns[0].memory.as_ref().map(|m| m.as_str().to_string())
 }
 
 /// A kept preference reaches a later conversation, in a window started later; off, removed or
@@ -136,8 +136,8 @@ fn the_next_turn_reads_the_file_again() {
     a.execute("assist.ask", json!({"prompt": "Two"})).unwrap();
     settle(&mut a);
     let turns = seen.lock().unwrap().turns.clone();
-    assert!(!turns[0].memory.as_deref().is_some_and(|m| m.contains("From the other window.")));
-    assert!(turns[1].memory.as_deref().is_some_and(|m| m.contains("From the other window.")), "{:?}", turns[1].memory);
+    assert!(!turns[0].memory.as_ref().is_some_and(|m| m.as_str().contains("From the other window.")));
+    assert!(turns[1].memory.as_ref().is_some_and(|m| m.as_str().contains("From the other window.")), "{:?}", turns[1].memory);
 }
 
 /// A script or an agent with the window's key may read it and may change nothing, and the file

@@ -582,6 +582,76 @@ fn what_is_kept_with_chatgpt_reaches_an_agent_in_a_later_conversation() {
     e.end();
 }
 
+/// What a turn recalls from the person's case reaches ChatGPT in this turn's input, never in its
+/// instructions, and is gone from the next request's history; an ACP agent, whose session keeps
+/// what it read, is told an item once across two turns of one session. Each is alone with the
+/// person in the room when it recalls: the proof `Alone` demands.
+#[test]
+fn what_is_recalled_reaches_chatgpt_as_input_once_and_an_agent_once_per_session() {
+    use wordcraft_assist::cases::{Alone, Body, Click, Day, NoteDraft, PersonOp, Quoted, RecallAsk, Shelf, Topics};
+    const NOTE: &str = "Cap liability at twelve months of fees, and say so early.";
+    let openai = OpenAi::start(vec![says("Noted."), says("Noted again.")]);
+    let mut window = Window::new();
+    let settings = openai.folder.path();
+    let shelf = Shelf::at(settings);
+    let click = Click::by_person(true).unwrap();
+    let today = Day::parse("2026-11-10").unwrap();
+    let wall = shelf.new_wall(click, "Acme", "2026-11-10", 1).unwrap();
+    let at = shelf.new_case(click, &wall, "Acme MSA", "2026-11-10", 2).unwrap();
+    let draft = NoteDraft { body: Body::Pattern { rule: Quoted::parse(NOTE), traps: None }, how: None, topics: Topics::default() };
+    shelf.person(click, &at, PersonOp::AddNote(draft), today).unwrap();
+    let options = || Options { document: "Notes".into(), ..Options::default() };
+    let settle = |window: &mut Window, a: &mut Assistant| {
+        let deadline = Instant::now() + WAIT;
+        while a.is_busy() {
+            assert!(Instant::now() < deadline, "waited for the turn");
+            window.frame(&mut [a]);
+        }
+    };
+
+    let backend = ChatGpt::with_endpoints(settings, openai.endpoints.clone());
+    let mut chatgpt = timed("starting ChatGPT", || Assistant::start(&window.room, Box::new(backend), options())).unwrap();
+    let alone = Alone::check(&window.room, window.own.id(), chatgpt.name()).unwrap();
+    chatgpt.set_recall(Some(RecallAsk::new(shelf.clone(), at.clone(), "the liability cap", today, alone)));
+    timed("asking ChatGPT", || chatgpt.ask("What did we do about the liability cap?", None)).unwrap();
+    settle(&mut window, &mut chatgpt);
+    assert_eq!(answer(&chatgpt), "Noted.");
+    timed("asking ChatGPT again", || chatgpt.ask("And the indemnity?", None)).unwrap();
+    settle(&mut window, &mut chatgpt);
+    let bodies = openai.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "{bodies:#?}");
+    assert!(!bodies[0]["instructions"].as_str().unwrap().contains(NOTE), "never an instruction");
+    assert!(bodies[0]["input"].to_string().contains(NOTE), "in this turn's input: {}", bodies[0]["input"]);
+    assert!(!bodies[1].to_string().contains(NOTE), "gone from the next request: {}", bodies[1]);
+    let recalled = chatgpt.transcript().entries().filter(|e| matches!(e, Entry::Recalled(sent) if sent.items.len() == 1)).count();
+    assert_eq!(recalled, 1, "Details has it once");
+    timed("ending ChatGPT's conversation", || chatgpt.end());
+
+    let mut spec = AgentSpec::new("Fake Agent", Launch::new(std::env::current_exe().unwrap(), AS_AGENT));
+    let script = script(&[("Report", vec![Step::Report])]);
+    spec.env.push((SCRIPT_VAR.into(), serde_json::to_string(&script).unwrap()));
+    spec.reach = Reach::Mcp { cli: PathBuf::from(env!("CARGO_BIN_EXE_wordcraft-cli")), room: window.port.addr() };
+    spec.start_timeout = WAIT;
+    let mut agent = timed("starting the agent", || Assistant::start(&window.room, Box::new(Acp::new(spec)), options())).unwrap();
+    let alone = Alone::check(&window.room, window.own.id(), agent.name()).expect("ChatGPT's invite was taken back");
+    let ask = RecallAsk::new(shelf.clone(), at.clone(), "the liability cap", today, alone);
+    agent.set_recall(Some(ask.clone()));
+    timed("asking the agent", || agent.ask("Report", None)).unwrap();
+    settle(&mut window, &mut agent);
+    assert_eq!(error(&agent), None);
+    let first: Value = serde_json::from_str(&answer(&agent)).unwrap();
+    assert!(first.to_string().contains(NOTE), "the agent's first prompt has it: {first}");
+    agent.set_recall(Some(ask));
+    timed("asking the agent again", || agent.ask("Report", None)).unwrap();
+    settle(&mut window, &mut agent);
+    assert_eq!(error(&agent), None);
+    let second: Value = serde_json::from_str(&answer(&agent)).unwrap();
+    assert!(!second.to_string().contains(NOTE), "the same session isn't told twice: {second}");
+    let again = agent.transcript().entries().filter(|e| matches!(e, Entry::Recalled(sent) if sent.items.iter().all(|i| i.again))).count();
+    assert_eq!(again, 1, "Details says the second turn's item was sent earlier");
+    timed("ending the agent's conversation", || agent.end());
+}
+
 /// Each change another participant makes is a frame their change came in at, a later one in the
 /// same second too, which reuses its author's revision record and adds none.
 #[test]

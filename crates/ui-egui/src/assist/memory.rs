@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use egui::{RichText, Stroke, Ui};
 use serde_json::{Value, json};
-use wordcraft_assist::memory::{ForModel, Item, MAX_TEXT, Memory, SentPreference};
+use wordcraft_assist::memory::{ForModel, Instructions, Item, MAX_TEXT, Memory, SentPreference};
 use wordcraft_assist::{Decision, ProposalAnswer, Sent};
 use wordcraft_engine::cmd::review::AuthoredChange;
 
@@ -66,7 +66,7 @@ pub(crate) fn conversation_started(app: &mut WordApp) {
 /// What the next turn carries, read fresh: another WordCraft's keep counts. Nothing without a
 /// folder to keep it in, so the model isn't asked to propose what no click could keep. `sent` gets
 /// what the pane says about it.
-pub(crate) fn for_turn(app: &mut WordApp, sent: &mut Sent) -> Option<String> {
+pub(crate) fn for_turn(app: &mut WordApp, sent: &mut Sent) -> Option<Instructions> {
     sent.at = wordcraft_engine::cmd::now_iso();
     app.services.settings_dir.as_ref()?;
     reload(app);
@@ -461,4 +461,4 @@ fn add_row(app: &mut WordApp, ui: &mut Ui) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -271,7 +271,7 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
         Entry::Proposal { id, text, answer } => crate::assist::memory::proposal_card(app, ui, t, *id, text, *answer),
         Entry::Model { name, effort, asked } => model_line(ui, t, name, effort.as_deref(), *asked),
         Entry::Note { text } => wrapped(ui, RichText::new(text).small().italics().color(t.orange)),
-        Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) | Entry::Output(_) | Entry::Used { .. } => {}
+        Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) | Entry::Recalled(_) | Entry::Output(_) | Entry::Used { .. } => {}
         Entry::Stopped { stop } => {
             if let Some(says) = stop.says() {
                 // Stopped by the person reads as a note; any other stop is news to them.

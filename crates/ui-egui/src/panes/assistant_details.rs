@@ -30,6 +30,7 @@ pub(super) fn details(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
                 ui.scroll_to_cursor(Some(egui::Align::TOP));
             }
             section(ui, "Memory", |ui| memory(app, ui, t, &details));
+            section(ui, "Recalled", |ui| crate::assist::cases::section(ui, t, &details));
         }
     });
 }
