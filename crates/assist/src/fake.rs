@@ -125,7 +125,7 @@ impl Backend for Fake {
             let asked: String = turn.prompt.chars().take(200).collect();
             vec![Step::Say(format!("I'm the scripted test assistant: I don't write anything. You asked: {asked}"))]
         });
-        ctx.emit(Event::Model { name: "scripted".into() });
+        ctx.emit(Event::Model { name: "scripted".into(), effort: None, asked: false });
         for (n, step) in steps.into_iter().enumerate() {
             if ctx.is_cancelled() {
                 return Ok(StopReason::Cancelled);
