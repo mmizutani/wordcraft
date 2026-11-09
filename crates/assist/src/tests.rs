@@ -1410,6 +1410,14 @@ mod final_text {
     }
 
     #[test]
+    fn a_citation_s_ends_are_where_its_first_and_last_characters_are() {
+        let s = Session::new(Document::from_text("日本語 words é end"));
+        let (a, b) = find_in_final(&s.doc, "語 words é").expect("found");
+        let text = "日本語 words é end";
+        assert_eq!(text.get(a.off..b.off), Some("語 words é"));
+    }
+
+    #[test]
     fn a_tab_reads_as_the_space_the_model_was_given() {
         let s = Session::new(Document::from_text("one\ttwo\nthird"));
         assert!(final_text(&s.doc).contains("one two"), "{}", final_text(&s.doc));

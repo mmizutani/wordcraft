@@ -264,7 +264,9 @@ pub fn final_text(doc: &Document) -> String {
 }
 
 /// Where `words` are in the body as it reads with tracked deletions left out: from where the first
-/// of them is to where the last ends, across anything deleted between them.
+/// of them is to where the last ends, across anything deleted between them. Each paragraph is read
+/// once to look and, only where they are, again to find their ends: a map of every byte would cost
+/// many times the paragraph.
 pub fn find_in_final(doc: &Document, words: &str) -> Option<(Pos, Pos)> {
     if words.is_empty() {
         return None;
@@ -273,35 +275,51 @@ pub fn find_in_final(doc: &Document, words: &str) -> Option<(Pos, Pos)> {
     for path in doc.para_paths(StoryRef::Body) {
         let Some(p) = doc.para(StoryRef::Body, &path) else { continue };
         let mut text = String::new();
-        // For each byte of `text`, where in the paragraph it came from.
-        let mut from = Vec::new();
-        let mut objects = p.objects.iter();
-        for (range, props) in p.run_ranges() {
-            let piece = p.text.get(range.clone()).unwrap_or_default();
-            for (i, c) in piece.char_indices() {
-                let at = range.start.saturating_add(i);
-                // An object reads as its result, which `final_text` gives too: all of it is the
-                // object's one place in the paragraph.
-                let result = (c == OBJ).then(|| objects.next().map(|o| o.plain_text()).unwrap_or_default());
-                if props.del.is_some() {
-                    continue;
-                }
-                let before = text.len();
-                match &result {
-                    Some(result) => text.extend(result.chars().map(flat_char)),
-                    None => text.push(flat_char(c)),
-                }
-                from.extend(std::iter::repeat_n(at, text.len().saturating_sub(before)));
-            }
-        }
+        reading(p, |piece, _, _| text.push_str(piece));
         let Some(at) = text.find(&words) else { continue };
-        let last = at.saturating_add(words.len()).saturating_sub(1);
-        let (Some(&start), Some(&end)) = (from.get(at), from.get(last)) else { continue };
-        let end_char = p.text.get(end..).and_then(|t| t.chars().next()).map_or(1, char::len_utf8);
+        let last = at.saturating_add(words.len());
+        let (mut read, mut start, mut end) = (0usize, None, None);
+        reading(p, |piece, off, len| {
+            let next = read.saturating_add(piece.len());
+            if start.is_none() && next > at {
+                start = Some(off);
+            }
+            if end.is_none() && next >= last {
+                end = Some(off.saturating_add(len));
+            }
+            read = next;
+        });
         let pos = |off| Pos { story: StoryRef::Body, path: path.clone(), off };
-        return Some((pos(start), pos(end.saturating_add(end_char))));
+        if let (Some(start), Some(end)) = (start, end) {
+            return Some((pos(start), pos(end)));
+        }
     }
     None
+}
+
+/// Call `visit` with each piece of `p` as it reads with tracked deletions left out, on one line: a
+/// character, or an object's result, which [`final_text`] gives too, with where it is in the
+/// paragraph and how long it is there.
+fn reading(p: &Paragraph, mut visit: impl FnMut(&str, usize, usize)) {
+    let mut objects = p.objects.iter();
+    let mut piece = [0u8; 4];
+    for (range, props) in p.run_ranges() {
+        let run = p.text.get(range.clone()).unwrap_or_default();
+        for (i, c) in run.char_indices() {
+            let at = range.start.saturating_add(i);
+            let result = (c == OBJ).then(|| objects.next().map(|o| o.plain_text()).unwrap_or_default());
+            if props.del.is_some() {
+                continue;
+            }
+            match result {
+                Some(result) => {
+                    let flat: String = result.chars().map(flat_char).collect();
+                    visit(&flat, at, c.len_utf8());
+                }
+                None => visit(flat_char(c).encode_utf8(&mut piece), at, c.len_utf8()),
+            }
+        }
+    }
 }
 
 /// Count `line` (with `title` when it is the first of its part) against `left`, when there is
