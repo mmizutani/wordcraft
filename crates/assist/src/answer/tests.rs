@@ -388,6 +388,8 @@ fn markers_that_are_none_can_t_cost_more_than_a_frame() {
 fn a_marker_in_code_doesn_t_cost_the_chips_after_it() {
     let f = format("```\n[[cite: \"example\"]]\n```\n\nSays [[cite: \"real words\"]] and [[cite: \"more\"]].", false);
     assert_eq!(f.citations, ["example", "real words", "more"]);
+    let listed = citations("```\n[[cite: \"example\"]]\n```\n\nSays [[cite: \"real words\"]] and [[cite: \"more\"]].");
+    assert_eq!(listed, ["real words", "more"], "what Details lists is what shows");
     let chips: Vec<usize> = f.blocks.iter().flat_map(|b| if let Block::Para(s) = b { s.as_slice() } else { &[] }).filter_map(|s| s.cite).collect();
     assert_eq!(chips, [1, 2]);
 }
