@@ -99,22 +99,28 @@ fn resolve_mark_formatting(para: &mut wordcraft_doc::Paragraph, accept: bool, wh
 
 /// Accept or reject the changes of the table cell `path` is in: the table's, its row's and the
 /// cell's own. Returns whether there were any.
-fn resolve_cell(s: &mut Session, story: StoryRef, path: &wordcraft_doc::Path, accept: bool) -> Result<bool, CmdError> {
+fn resolve_cell(s: &mut Session, story: StoryRef, path: &wordcraft_doc::Path, accept: bool, which: Which) -> Result<bool, CmdError> {
     let Some((tp, r, c)) = path.cell() else { return Ok(false) };
     let has = s.doc.table(story, &tp).is_some_and(|t| {
         let row = t.rows.get(r);
-        t.props.fmt_change.is_some()
-            || row.is_some_and(|x| x.props.fmt_change.is_some())
-            || row.and_then(|x| x.cells.get(c)).is_some_and(|x| x.props.fmt_change.is_some())
+        which.has(t.props.fmt_change.as_ref().map(|ch| ch.rev))
+            || which.has(row.and_then(|x| x.props.fmt_change.as_ref()).map(|ch| ch.rev))
+            || which.has(row.and_then(|x| x.cells.get(c)).and_then(|x| x.props.fmt_change.as_ref()).map(|ch| ch.rev))
     });
     if !has {
         return Ok(false);
     }
     let t = s.doc.table_mut(story, &tp)?;
-    fmt_revisions::resolve_table(t, accept);
+    if which.has(t.props.fmt_change.as_ref().map(|ch| ch.rev)) {
+        fmt_revisions::resolve_table(t, accept);
+    }
     if let Some(row) = t.rows.get_mut(r) {
-        fmt_revisions::resolve_row(row, accept);
-        if let Some(cell) = row.cells.get_mut(c) {
+        if which.has(row.props.fmt_change.as_ref().map(|ch| ch.rev)) {
+            fmt_revisions::resolve_row(row, accept);
+        }
+        if let Some(cell) = row.cells.get_mut(c)
+            && which.has(cell.props.fmt_change.as_ref().map(|ch| ch.rev))
+        {
             fmt_revisions::resolve_cell(cell, accept);
         }
     }
@@ -320,7 +326,6 @@ fn revision_span(p: &Paragraph, off: usize) -> Option<std::ops::Range<usize>> {
 }
 
 fn resolve_sel(s: &mut Session, accept: bool, next: bool, which: Which) -> CmdResult {
-    let everyone = matches!(which, Which::All);
     let (a, b) = s.sel.ordered();
     // A caret right before a tracked paragraph mark (and no tracked text around it): that mark.
     let mut caret_mark = None;
@@ -344,7 +349,7 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool, which: Which) -> CmdRe
                 (a.clone(), a)
             }
             None => {
-                if everyone && resolve_cell(s, a.story, &a.path, accept)? {
+                if resolve_cell(s, a.story, &a.path, accept, which)? {
                     return if next { select_next_unresolved(s) } else { sel_result(s) };
                 }
                 return nav_change(s, 1);
@@ -354,7 +359,17 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool, which: Which) -> CmdRe
         (a, b)
     };
     // Moves with an end in the range: their other ends go with them.
-    let moves = crate::cmd::moves::names_in(s, &a, &b, caret_mark.as_ref());
+    let mut moves = crate::cmd::moves::names_in(s, &a, &b, caret_mark.as_ref());
+    if !matches!(which, Which::All) {
+        // An author's own moves: both ends of anyone else's stay as they are.
+        let revisions = &s.doc.revisions;
+        moves.retain(|name| {
+            revisions
+                .iter()
+                .enumerate()
+                .any(|(i, r)| r.move_name.as_deref() == Some(name.as_str()) && u32::try_from(i).is_ok_and(|i| which.has(Some(i))))
+        });
+    }
     for path in s.doc.paths_between(&a, &b).into_iter().rev() {
         let len = s.doc.para(a.story, &path).map(|p| p.len()).unwrap_or(0);
         let from = if path == a.path { a.off } else { 0 };
@@ -363,8 +378,8 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool, which: Which) -> CmdRe
         let mark = path != b.path || caret_mark.as_ref() == Some(&path);
         let props = (ranged && (path != b.path || to > from)) || caret_props.as_ref() == Some(&path);
         resolve_para(s, a.story, &path, (from, to), (mark, props), accept, which)?;
-        if ranged && everyone {
-            resolve_cell(s, a.story, &path, accept)?;
+        if ranged {
+            resolve_cell(s, a.story, &path, accept, which)?;
         }
     }
     crate::cmd::moves::resolve(s, &moves, accept)?;

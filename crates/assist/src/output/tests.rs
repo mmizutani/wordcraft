@@ -146,12 +146,15 @@ fn past_the_limit_the_rest_are_counted_and_none_is_taken_for_ended() {
     assert_eq!(details.turns[0].output.len(), super::MAX_ROWS);
     assert_eq!(details.more_output, 10);
     // With rows past the limit, a row missing from the list may only have moved past it: nothing
-    // is said to have ended.
-    s.run("select.text", &json!({"text": "word0"})).unwrap();
-    s.run("review.reject", &json!({})).unwrap();
-    note(&mut t, &s);
-    assert_eq!(t.details().more_output, 9);
-    assert!(listed(&t).iter().all(|r| r.2 == OutputState::Open), "{:?}", listed(&t).first());
+    // is said to have ended, and the list stays at its limit as others come in.
+    for n in 0..5 {
+        s.run("select.text", &json!({"text": format!("word{n}")})).unwrap();
+        s.run("review.reject", &json!({})).unwrap();
+        note(&mut t, &s);
+        assert_eq!(t.details().more_output, 9 - n);
+        assert!(listed(&t).iter().all(|r| r.2 == OutputState::Open), "{:?}", listed(&t).first());
+        assert_eq!(listed(&t).len(), super::MAX_ROWS);
+    }
 }
 
 #[test]
