@@ -354,6 +354,9 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
             if let Some(path) = req.get("add").and_then(Value::as_str) {
                 add_source_file(app, path);
             }
+            if let Some(id) = req.get("document").and_then(Value::as_u64) {
+                add_source_document(app, id);
+            }
             Ok(sources_json(app))
         }
         "choice" => choice(app, req),
@@ -526,19 +529,22 @@ fn text_for_source(doc: &wordcraft_doc::Document) -> String {
             break;
         }
         if let Some(p) = doc.para(Body, &path) {
-            text.push_str(&p.plain_text());
+            p.plain_text_up_to(&mut text, knowledge::MAX_SOURCE_BYTES.saturating_add(1));
         }
         text.push('\n');
     }
     text
 }
 
-/// Attach open document `id` as a source.
-pub(crate) fn add_source_document(app: &mut WordApp, id: u64, name: &str) {
-    if source_room(app) {
+/// Attach open document `id`, which the command checked, as a source named by its title.
+fn add_source_document(app: &mut WordApp, id: u64) {
+    let title = app.session.documents().into_iter().find(|d| d.id == id).map(|d| d.title);
+    if let Some(title) = title
+        && source_room(app)
+    {
         match app.session.with_document(id, |s| text_for_source(&s.doc)) {
             Ok(text) => {
-                app.assist.knowledge.push(Knowledge::new(name, &text));
+                app.assist.knowledge.push(Knowledge::new(&title, &text));
                 app.assist.knowledge_rev = app.assist.knowledge_rev.wrapping_add(1);
             }
             Err(e) => app.assist.notice = Some(e.to_string()),

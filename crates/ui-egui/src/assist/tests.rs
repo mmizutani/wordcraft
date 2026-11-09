@@ -2116,6 +2116,26 @@ fn adding_a_source_takes_the_person_s_click() {
 
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
+fn the_pane_attaches_another_open_document_by_its_title() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = window("first document");
+    let first = app.session.document_id();
+    app.execute("file.new", json!({})).unwrap();
+    let title = app.session.documents().into_iter().find(|d| d.id == first).unwrap().title;
+    let mut h = harness(app);
+    h.state_mut().assist.view = crate::assist::PaneView::Details;
+    h.state_mut().run("assist.pane", json!({"value": true})).unwrap();
+    h.run_steps(3);
+    h.get_by_label("Add a source…").click();
+    h.run_steps(2);
+    h.get_all_by_label(&title).last().expect("its row").click();
+    h.run_steps(2);
+    let source = &h.state().assist.knowledge[0];
+    assert_eq!((source.name.as_str(), source.text.trim_end()), (title.as_str(), "first document"));
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn sources_belong_to_their_conversation() {
     let mut a = window("one");
     a.assist_with(Box::new(Fake::new()));
@@ -2185,9 +2205,15 @@ fn another_open_document_can_be_a_source() {
     let first = a.session.document_id();
     a.execute("file.new", json!({})).unwrap();
     assert_ne!(a.session.document_id(), first);
-    super::add_source_document(&mut a, first, "First");
-    assert_eq!(a.assist.knowledge[0].name, "First");
+    let title = a.session.documents().into_iter().find(|d| d.id == first).unwrap().title;
+    let answer = a.execute("assist.knowledge", json!({"document": first})).unwrap();
+    assert_eq!(answer["sources"][0]["name"], json!(title));
     assert_eq!(a.assist.knowledge[0].text.trim_end(), "first document");
+    let shown = a.session.document_id();
+    for bad in [json!({"document": shown}), json!({"document": 999_999}), json!({"document": "first"})] {
+        assert!(a.execute("assist.knowledge", bad.clone()).is_err(), "{bad}");
+    }
+    assert_eq!(a.assist.knowledge.len(), 1);
 
     // A field reads as its result, as the document does opened from a file.
     let mut with_field = window("Before after");
@@ -2207,6 +2233,21 @@ fn another_open_document_can_be_a_source() {
     let text = super::text_for_source(&long.session.doc);
     assert!(text.len() < (64 << 10) + 64, "{}", text.len());
     assert!(wordcraft_assist::Knowledge::new("Long", &text).cut);
+
+    // So is one long paragraph, or one long field in it: nothing past the limit is copied.
+    let one = window(&"x".repeat(1 << 20));
+    assert!(super::text_for_source(&one.session.doc).len() < (64 << 10) + 64);
+    let mut long_field = window("Before after");
+    let field = wordcraft_doc::para::InlineObject::Field {
+        instr: "PAGE".into(),
+        result: "y".repeat(1 << 20),
+        locked: false,
+        dirty: false,
+        code: false,
+        form: String::new(),
+    };
+    long_field.session.doc.para_mut(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().insert_object(7, field, &Default::default()).unwrap();
+    assert!(super::text_for_source(&long_field.session.doc).len() < (64 << 10) + 64);
 }
 
 #[test]

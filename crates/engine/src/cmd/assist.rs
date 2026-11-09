@@ -140,7 +140,7 @@ pub fn specs() -> Vec<CommandSpec> {
         .when(in_window)
         .pure(),
         CommandSpec::new("assist.knowledge", "Assistant Sources", "Home › Assistant", knowledge)
-            .params(r#"{"add"?: string (a full path to read as a source, within the files File › Options › Agents lets commands use), "remove"?: number (which source, from 0)} → the sources the conversation holds: at most 8, 64 KiB of text each, 128 KiB in a turn, what was cut said. Adding reads the file in the background: `pending` counts those on their way, and what went wrong is in `error`. Attached text goes to the assistant's provider"#)
+            .params(r#"{"add"?: string (a full path to read as a source, within the files File › Options › Agents lets commands use), "document"?: number (the id of another open document, as `view.switchWindows` lists them, to read as a source with its unsaved changes), "remove"?: number (which source, from 0)} → the sources the conversation holds: at most 8, 64 KiB of text each, 128 KiB in a turn, what was cut said. Adding reads the file in the background: `pending` counts those on their way, and what went wrong is in `error`. Attached text goes to the assistant's provider"#)
             .when(in_window)
             .pure(),
         CommandSpec::new("assist.model", "Model", "Home › Assistant", |s, v| choice(s, v, "model", "id"))
@@ -403,7 +403,15 @@ fn knowledge(s: &mut Session, v: &Value) -> CmdResult {
         None | Some(Value::Null) => None,
         Some(n) => Some(n.as_u64().ok_or_else(|| CmdError::Params("`remove`: which source, a whole number from 0".into()))?),
     };
-    s.push_ui_request(json!({"assist": "knowledge", "add": add, "remove": remove}));
+    let document = match v.get("document") {
+        None | Some(Value::Null) => None,
+        Some(x) => {
+            let shown = s.document_id();
+            let open = x.as_u64().filter(|id| *id != shown && s.documents().iter().any(|d| d.id == *id));
+            Some(open.ok_or_else(|| CmdError::Params("`document`: the id of another open document".into()))?)
+        }
+    };
+    s.push_ui_request(json!({"assist": "knowledge", "add": add, "document": document, "remove": remove}));
     Ok(json!({}))
 }
 
