@@ -821,6 +821,9 @@ fn a_batch_s_sources_are_the_reads_that_ran() {
     assert_eq!(out.sources[0].target, paragraph_id(&w.session.doc, Body, 1));
     let out = tools.call("batch", &json!({"commands": [{"command": "nope.nope"}, read]}));
     assert!(out.sources.is_empty(), "the read after the error didn't run: {:?}", out.sources);
+    let missing = json!({"command": "document.paragraph", "params": {"path": [99]}});
+    let out = tools.call("batch", &json!({"commands": [missing], "keepGoing": true}));
+    assert!(out.sources.is_empty(), "a read that failed read nothing: {:?}", out.sources);
 }
 
 #[test]
