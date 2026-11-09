@@ -247,6 +247,13 @@ fn a_bullet_list_ends_the_ordered_list_before_it() {
 }
 
 #[test]
+fn a_table_ends_the_ordered_list_before_it() {
+    let f = format("1. first\n\n| a | b |\n|---|---|\n| c | d |\n\n1. again", false);
+    let markers: Vec<&str> = f.blocks.iter().filter_map(|b| if let Block::Item { marker, .. } = b { Some(marker.as_str()) } else { None }).collect();
+    assert_eq!(markers, ["1.", "1."]);
+}
+
+#[test]
 fn two_code_blocks_stay_two() {
     let f = format("```python\nprint(1)\n```\n\n```sh\necho done\n```\n", false);
     assert_eq!(f.blocks, [Block::Code("print(1)".into()), Block::Code("echo done".into())]);
