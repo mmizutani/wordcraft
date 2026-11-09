@@ -89,10 +89,10 @@ one the control channel made does nothing. `assist.knowledge {"add"?: path, "rem
 same from a script, its path held to the files commands may use there. **Output** lists the tracked changes and comments this
 conversation made, newest first and by turn, by the name it joined under, while the pane is open:
 each with its words cut short, Show, and for a change, Accept and Reject of that change alone. A
-change someone resolved, you or anyone in the room, says how it ended, read from how many times its
-words are in its paragraph: fewer than before means an insertion was rejected or a deletion
-accepted, as many means the other way round. A formatting change, a move, or a change in a paragraph
-longer than 64 KiB says only that it was resolved. A comment says whether it is open, resolved or
+change someone resolved, you or anyone in the room, says how it ended, read from its words in its
+paragraph: gone means an insertion was rejected or a deletion accepted, still there means the other
+way round. A formatting change, a move, words that were there more than once, or a paragraph longer
+than 64 KiB says only that it was resolved. A comment says whether it is open, resolved or
 deleted. At most 256 changes and 64 comments are listed, and the rest are counted; Review has them
 all, and while some are past the limit no row is said to have ended. Rows that ended go first when
 the list is full. `review.accept` and `review.reject` take an `author`, which leaves anyone else's
