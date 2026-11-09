@@ -1873,10 +1873,13 @@ fn sources_belong_to_their_conversation() {
     settle(&mut a);
     assert!(a.assist.knowledge.is_empty(), "a new conversation starts without them");
 
-    // One still being read when a new conversation starts doesn't land in it.
+    // One still being read for this document doesn't land in another's new conversation.
     a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
     assert_eq!(a.assist.adding.len(), 1);
-    ask(&mut a, "Another role again", Some("editor"));
+    a.execute("file.new", json!({})).unwrap();
+    a.execute("assist.useDocument", json!({})).unwrap();
+    a.assist_with(Box::new(Fake::new()));
+    ask(&mut a, "In another document", None);
     settle(&mut a);
     assert_eq!(sources_read(&mut a)["sources"], json!([]));
     let _ = std::fs::remove_dir_all(dir);
@@ -2086,5 +2089,28 @@ fn a_source_attached_for_another_document_s_first_turn_reaches_it() {
     ask(&mut a, "In B", None);
     settle(&mut a);
     assert_eq!(seen.lock().unwrap().turns[0].knowledge.first().map(|s| s.name.as_str()), Some("for-b.txt"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_prompt_waits_for_a_source_still_being_read() {
+    let (dir, path) = source_file("slow.txt", "words");
+    let mut a = window("one");
+    let fake = Fake::new();
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    // A read that hasn't ended, whatever the disk does.
+    let (held, rx) = std::sync::mpsc::channel();
+    a.assist.adding.push(rx);
+    let waited = a.execute("assist.ask", json!({"prompt": "Now"}));
+    assert!(waited.is_err() || a.assist.notice.as_deref().is_some_and(|n| n.contains("still being read")), "{waited:?}");
+    assert!(seen.lock().unwrap().turns.is_empty(), "no turn went without it");
+    drop(held);
+    sources_read(&mut a);
+    ask(&mut a, "Now", None);
+    settle(&mut a);
+    assert_eq!(seen.lock().unwrap().turns[0].knowledge.len(), 1);
     let _ = std::fs::remove_dir_all(dir);
 }

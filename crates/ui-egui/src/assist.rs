@@ -424,6 +424,14 @@ fn sources_json(app: &WordApp) -> Value {
     json!({"sources": list, "pending": app.assist.adding.len(), "error": app.assist.notice})
 }
 
+/// Why a prompt waits: it would go without the source the person just chose.
+const READING_SOURCE: &str = "a source is still being read: ask again in a moment";
+
+/// Whether a source for this document is still being read.
+pub(crate) fn sources_being_read(app: &WordApp) -> bool {
+    !app.assist.adding.is_empty() && app.assist.knowledge_for == Some(app.session.document_id())
+}
+
 /// The sources attached in the document shown.
 pub(crate) fn sources(app: &WordApp) -> &[Knowledge] {
     if app.assist.knowledge_for == Some(app.session.document_id()) { &app.assist.knowledge } else { &[] }
@@ -644,6 +652,9 @@ pub(crate) fn ask(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: b
 fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) -> Result<Value, String> {
     if !app.has_document() {
         return Err("no document is open".into());
+    }
+    if sources_being_read(app) {
+        return Err(READING_SOURCE.into());
     }
     let role = wanted(app, role);
     let chosen_id = chosen(app).map(|o| o.id.clone());
