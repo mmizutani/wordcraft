@@ -2114,3 +2114,14 @@ fn a_prompt_waits_for_a_source_still_being_read() {
     assert_eq!(seen.lock().unwrap().turns[0].knowledge.len(), 1);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_plain_text_source_in_another_encoding_reads_as_its_words() {
+    let (dir, path) = source_file("utf16.txt", "");
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend("héllo".encode_utf16().flat_map(u16::to_le_bytes));
+    std::fs::write(&path, bytes).unwrap();
+    assert_eq!(super::read_source(&path).unwrap().text, "héllo");
+    let _ = std::fs::remove_dir_all(dir);
+}

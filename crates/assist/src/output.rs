@@ -136,15 +136,16 @@ fn occurrences(doc: &Document, at: Option<Anchor>, words: &str) -> Option<u32> {
 }
 
 /// How change `row`, gone from the list, ended, read from `doc`. Its words were in its paragraph
-/// `in_paragraph` times. Fewer now: they went, so an insertion was rejected and a deletion accepted.
-/// As many: they stayed, the other way round. Counting holds where the same words are beside them
-/// and whatever else moved. A formatting change, a move, or one with no words can't say.
+/// once, and now they aren't: they went, so an insertion was rejected and a deletion accepted. Still
+/// once: they stayed, the other way round. With its words there more than once (a deletion beside
+/// the insertion that replaces it, say), the count can't tell whose went. That, a formatting change,
+/// a move, or a change with no words says only that it was resolved.
 pub(crate) fn ended(doc: &Document, row: &OutputRow) -> OutputState {
-    let (Some(before), true) = (row.in_paragraph, matches!(row.kind, OutputKind::Insert | OutputKind::Delete)) else {
+    let (Some(1), true) = (row.in_paragraph, matches!(row.kind, OutputKind::Insert | OutputKind::Delete)) else {
         return OutputState::Resolved;
     };
     let Some(now) = occurrences(doc, row.start, &row.text) else { return OutputState::Resolved };
-    let went = now < before;
+    let went = now == 0;
     if went == (row.kind == OutputKind::Delete) { OutputState::Accepted } else { OutputState::Rejected }
 }
 

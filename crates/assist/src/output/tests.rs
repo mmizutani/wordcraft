@@ -187,7 +187,22 @@ fn a_change_of_words_that_repeat_keeps_its_row_and_its_verdict() {
     s.run("review.reject", &json!({})).unwrap();
     note(&mut t, &s);
     let states: Vec<_> = listed(&t).into_iter().map(|r| (r.1, r.2)).collect();
-    assert_eq!(states, [("cat ".to_string(), OutputState::Rejected), (" cat ".to_string(), OutputState::Open)]);
+    assert_eq!(states, [("cat ".to_string(), OutputState::Resolved), (" cat ".to_string(), OutputState::Open)], "the count can't tell which went");
+}
+
+#[test]
+fn a_replacement_holding_the_words_it_replaces_says_only_resolved() {
+    let mut s = Session::new(Document::from_text("a cat b"));
+    s.author = AUTHOR.into();
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    let mut t = Transcript::default();
+    t.asked("Replace");
+    rewrite(&mut s, "cat", "catfish");
+    note(&mut t, &s);
+    s.run("review.rejectAll", &json!({})).unwrap();
+    note(&mut t, &s);
+    assert!(listed(&t).iter().all(|r| r.2 != OutputState::Accepted), "{:?}", listed(&t));
+    assert_eq!(s.doc.plain_text(wordcraft_doc::StoryRef::Body), "a cat b");
 }
 
 #[test]
