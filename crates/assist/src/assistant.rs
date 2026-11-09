@@ -531,7 +531,10 @@ impl Work {
             match CopyTools::join(&self.room, &self.seat.key) {
                 Ok(t) => Box::new(t.stopped_by(self.cancel.clone())),
                 Err(e) => {
+                    // A conversation ended on the frame before this thread joined finds its key
+                    // revoked: the backend still hears that it ended.
                     self.fail_turns(&format!("the assistant couldn't join the shared document: {e}"));
+                    self.end_backend();
                     return;
                 }
             }
