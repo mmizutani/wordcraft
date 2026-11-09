@@ -176,6 +176,10 @@ fn context_row(ui: &mut Ui, t: &Tokens, sent: &Sent) {
     if sent.selection_cut {
         wrapped(ui, RichText::new(tl!("The selection was cut to fit.")).small().color(t.orange));
     }
+    if sent.feedback > 0 {
+        let line = fmt(tl!("Given: what you did with its changes, {size}"), &[("size", &size(sent.feedback as usize))]);
+        wrapped(ui, RichText::new(line).small().color(t.text));
+    }
     for source in &sent.knowledge {
         let line = fmt(tl!("Given: {name}, {size}"), &[("name", &source.name), ("size", &size(source.bytes as usize))]);
         ui.horizontal_wrapped(|ui| {

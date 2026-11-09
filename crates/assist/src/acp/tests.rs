@@ -315,6 +315,61 @@ fn the_prompt_carries_the_note_then_the_context_then_the_prompt() {
     assert_eq!(c.report()["prompt"], json!(["And this"]));
 }
 
+/// A session keeps what it read: what the person kept goes in its first prompt and again only when
+/// it changes, including when none applies any more.
+#[test]
+fn what_the_person_kept_reaches_a_new_session_and_again_when_it_changes() {
+    let mut c = Chat::with(&turns(vec![vec![Step::Report], vec![Step::Report], vec![Step::Report], vec![Step::Report], vec![Step::Report]]));
+    let blocks = |c: &Chat| c.report()["prompt"].as_array().unwrap().iter().map(|b| b.as_str().unwrap().to_string()).collect::<Vec<_>>();
+    c.a.set_memory(Some("Saved: one.".into()));
+    c.ask("First");
+    let first = blocks(&c);
+    assert!(first[0].contains("You are Fake Agent"), "{first:?}");
+    assert_eq!(first[1..], ["Saved: one.", "First"]);
+    c.ask("Same");
+    assert_eq!(blocks(&c), ["Same"]);
+    c.a.set_memory(Some("Saved: two.".into()));
+    c.ask("Changed");
+    assert_eq!(blocks(&c), ["Saved: two.", "Changed"]);
+    c.a.set_memory(None);
+    c.ask("Gone");
+    assert_eq!(blocks(&c), [crate::memory::NONE_APPLY, "Gone"]);
+    c.ask("Still gone");
+    assert_eq!(blocks(&c), ["Still gone"]);
+}
+
+/// A prompt the agent refused may never have reached its model: the next turn says it again.
+#[test]
+fn what_the_person_kept_is_said_again_after_a_failed_prompt() {
+    let fail = Step::Fail { code: -32000, message: "not now".into() };
+    let mut c = Chat::with(&turns(vec![vec![Step::Report], vec![fail], vec![Step::Report]]));
+    c.ask("First");
+    c.a.set_memory(Some("Saved: one.".into()));
+    c.ask("Fails");
+    assert!(c.a.transcript().entries().any(|e| matches!(e, Entry::Error { .. })), "the prompt failed");
+    c.ask("Again");
+    assert_eq!(c.report()["prompt"], json!(["Saved: one.", "Again"]));
+}
+
+/// A new session has read nothing, whatever the last one was told: its first prompt failing, the
+/// next one says it again.
+#[test]
+fn a_new_session_s_failed_first_prompt_is_said_again() {
+    let mut script = Script::default();
+    script.replies.insert("Report".into(), vec![Step::Report]);
+    script.replies.insert("Crash".into(), vec![Step::Crash { code: 3, stderr: "gone".into() }]);
+    script.replies.insert("Fails".into(), vec![Step::Fail { code: -32000, message: "not now".into() }]);
+    let mut c = Chat::with(&script);
+    c.a.set_memory(Some("Saved: one.".into()));
+    c.ask("Report");
+    assert!(c.report()["prompt"].as_array().unwrap().iter().any(|b| b == "Saved: one."));
+    c.ask("Crash");
+    c.ask("Fails");
+    assert!(c.error().is_some(), "the new session's first prompt failed");
+    c.ask("Report");
+    assert_eq!(c.report()["prompt"], json!(["Saved: one.", "Report"]));
+}
+
 #[cfg(unix)]
 #[test]
 fn an_agent_folder_rejects_a_world_writable_parent() {
@@ -1028,6 +1083,32 @@ fn a_stop_while_a_change_is_answered_leaves_what_runs_unknown_so_the_next_turn_s
     let prompt = c.report()["prompt"].as_array().unwrap().iter().map(|b| b.as_str().unwrap().to_string()).collect::<Vec<_>>();
     assert!(prompt.first().is_some_and(|note| note.contains("writing assistant inside WordCraft")), "{prompt:?}");
     assert_eq!(c.a.offered().unwrap().models.len(), 2);
+}
+
+/// Setting a choice first takes nothing from what the person kept: a stop before the first prompt
+/// leaves it owed to that prompt, and a later change goes with the turn that changes a choice too.
+#[test]
+fn what_the_person_kept_reaches_an_agent_whose_choices_are_set_first() {
+    let script = Script { set_ms: 300, ..configured(vec![vec![Step::Report], vec![Step::Report]]) };
+    let mut c = Chat::with(&script);
+    let blocks = |c: &Chat| c.report()["prompt"].as_array().unwrap().iter().map(|b| b.as_str().unwrap().to_string()).collect::<Vec<_>>();
+    c.a.set_memory(Some("Saved: one.".into()));
+    c.a.choose(Some("deep".into()), None);
+    c.a.ask("Hello", None).unwrap();
+    c.until("the agent started", |c| c.tool(START_ROW).is_some_and(|t| t.status == ToolStatus::Completed));
+    std::thread::sleep(Duration::from_millis(50));
+    c.a.cancel();
+    assert!(c.a.wait_idle(WAIT));
+    assert_eq!(c.stopped(), Some(StopReason::Cancelled));
+    c.ask("Again");
+    let first = blocks(&c);
+    assert!(first[0].contains("writing assistant inside WordCraft"), "{first:?}");
+    assert_eq!(first[1..], ["Saved: one.", "Again"]);
+    c.a.set_memory(Some("Saved: two.".into()));
+    c.a.choose(Some("fast".into()), None);
+    c.ask("Changed");
+    assert_eq!(blocks(&c), ["Saved: two.", "Changed"]);
+    assert_eq!(set_config(&c).last(), Some(&pair("the-model", "fast")));
 }
 
 #[test]

@@ -120,6 +120,7 @@ impl WordApp {
     /// UI-level commands (`ui.*`) are handled here, the rest by the engine.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value, String> {
         self.clear_command_targets(id);
+        crate::assist::before_command(self, id);
         if let Some(error) = self.document_required_error(id) {
             return Err(error);
         }
@@ -343,7 +344,11 @@ impl WordApp {
         // return.
         let person = !self.ctx.as_ref().map_or(self.synthetic_pending, |ctx| self.input_from_control(ctx));
         let by_person = std::mem::replace(&mut self.assist.by_person, person);
+        let reviewing = if person { crate::assist::review_started(self, id) } else { None };
         let r = self.execute(id, params);
+        if let (Some(before), true) = (reviewing, r.is_ok()) {
+            crate::assist::review_ended(self, id, before);
+        }
         self.assist.by_person = by_person;
         if let (Err(e), Some(params)) = (&r, retry)
             && wordcraft_engine::io::needs_password(e)
@@ -454,10 +459,13 @@ impl WordApp {
         }
         // The assistant's, from a command `execute` didn't run (it answers those itself): a step
         // of another command, such as a macro. Signing in to ChatGPT or out of it is never one:
-        // anyone may have written the macro the person runs (#19).
+        // anyone may have written the macro the person runs (#19). Nor is changing what the
+        // assistant remembers (#86), for the same reason.
         if let Some(what) = req.get("assist") {
             let r = if what.as_str().is_some_and(|w| w.starts_with("chatgpt")) {
                 Err(crate::assist::chatgpt::YOURS.to_string())
+            } else if what.as_str().is_some_and(|w| w.starts_with("memory.")) {
+                Err(crate::assist::memory::YOURS.to_string())
             } else {
                 crate::assist::handle(self, req)
             };
@@ -1150,6 +1158,8 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "assist.chatgpt.cancelSignIn"
             | "assist.chatgpt.signOut"
     ) || id.starts_with("help.")
+        || id == "assist.memory"
+        || id.starts_with("assist.memory.")
 }
 
 /// Commands that save, export, print, send or replace the document: comment text still being

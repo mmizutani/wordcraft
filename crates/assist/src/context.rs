@@ -63,6 +63,9 @@ pub struct Sent {
     pub cap: u32,
     /// The sources the person attached that the turn carried, beside this.
     pub knowledge: Vec<crate::knowledge::SentSource>,
+    /// Bytes of what the person did with the assistant's changes ([`crate::Feedback`]), which the
+    /// context starts with, beside `bytes`.
+    pub feedback: u32,
 }
 
 /// The document around the selection, as text.
@@ -194,6 +197,7 @@ impl Context {
             bytes: count(out.len()),
             cap: count(total),
             knowledge: Vec::new(),
+            feedback: 0,
         };
         (out, sent)
     }

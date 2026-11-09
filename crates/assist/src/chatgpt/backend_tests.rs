@@ -709,6 +709,21 @@ fn bodies_input(c: &Chat, n: usize) -> Vec<Value> {
     c.bodies()[n]["input"].as_array().unwrap().clone()
 }
 
+/// What the person kept goes in the instructions of every request of the turn, and a turn without
+/// it says nothing of it.
+#[test]
+fn what_the_person_kept_goes_in_the_instructions() {
+    let mut c = chat("one", replies(vec![says("First."), says("Second.")]));
+    c.assistant.set_memory(Some("Saved: use numbered lists.".into()));
+    c.ask("Summarize");
+    c.assistant.set_memory(None);
+    c.ask("Again");
+    let bodies = c.bodies();
+    let said = |b: &Value| b["instructions"].as_str().unwrap().to_string();
+    assert!(said(&bodies[0]).contains("You are ") && said(&bodies[0]).ends_with("Saved: use numbered lists."), "{}", said(&bodies[0]));
+    assert!(!said(&bodies[1]).contains("Saved:"), "{}", said(&bodies[1]));
+}
+
 #[test]
 fn what_each_request_used_adds_up_and_reaches_details() {
     let usage = |input: u64, output: u64, reasoning: u64| {

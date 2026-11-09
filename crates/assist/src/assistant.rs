@@ -91,7 +91,7 @@ pub struct Options {
 enum Job {
     /// A turn, and how its permission requests are answered when not as the conversation's
     /// ([`Assistant::ask_with_policy`]).
-    Turn(Turn, Option<PermissionPolicy>),
+    Turn(Box<Turn>, Option<PermissionPolicy>),
     End,
 }
 
@@ -109,6 +109,8 @@ pub struct Assistant {
     busy: bool,
     /// Whether the next turn is the conversation's first, which carries the note.
     first: bool,
+    /// What each turn from now on carries of what the person kept ([`Assistant::set_memory`]).
+    memory: Option<String>,
     /// What the next turns carry of the sources the person attached.
     knowledge: Vec<crate::knowledge::TurnSource>,
     /// The model and reasoning effort each turn carries ([`Assistant::choose`]).
@@ -161,6 +163,7 @@ impl Assistant {
             transcript: Transcript::default(),
             busy: false,
             first: true,
+            memory: None,
             knowledge: Vec::new(),
             choice: (None, None),
             offered: None,
@@ -221,6 +224,11 @@ impl Assistant {
     /// Whether the conversation ended ([`Assistant::end`]).
     pub fn has_ended(&self) -> bool {
         self.ended
+    }
+
+    /// What the next turns carry of what the person kept ([`crate::memory::Memory::for_model`]).
+    pub fn set_memory(&mut self, memory: Option<String>) {
+        self.memory = memory;
     }
 
     /// The model and reasoning effort the next turns carry: what the person chose for this
@@ -287,11 +295,20 @@ impl Assistant {
         }
         let note = self.first.then(|| crate::note(&self.seat, self.info.in_process_tools));
         let (model, effort) = self.choice.clone();
-        let turn = Turn { prompt: prompt.to_string(), context, note, selection, knowledge: self.knowledge.clone(), model, effort };
+        let turn = Turn {
+            prompt: prompt.to_string(),
+            context,
+            note,
+            memory: self.memory.clone(),
+            selection,
+            knowledge: self.knowledge.clone(),
+            model,
+            effort,
+        };
         // Cleared before the turn is sent: a Stop from now on ends this turn, even one the
         // thread hasn't started yet.
         self.cancel.clear();
-        if self.jobs.send(Job::Turn(turn, policy)).is_err() {
+        if self.jobs.send(Job::Turn(Box::new(turn), policy)).is_err() {
             self.ended = true;
             return Err(AssistError::Ended);
         }
@@ -364,6 +381,11 @@ impl Assistant {
     /// before it changed.
     pub fn set_unattended(&self, allow: bool) {
         self.permissions.set_unattended(allow);
+    }
+
+    /// The person answered proposal `id` ([`Entry::Proposal`]): `kept`, what was stored.
+    pub fn answer_proposal(&mut self, id: u64, answer: crate::transcript::ProposalAnswer, kept: Option<&str>) {
+        self.transcript.answer_proposal(id, answer, kept);
     }
 
     /// The permission request the turn waits on for the person's answer, if one does.
@@ -484,7 +506,7 @@ impl Work {
         }
         while let Ok(job) = self.jobs.recv() {
             let (turn, policy) = match job {
-                Job::Turn(t, policy) => (t, policy.unwrap_or(self.policy)),
+                Job::Turn(t, policy) => (*t, policy.unwrap_or(self.policy)),
                 Job::End => break,
             };
             // The person's selection, in the assistant's copy: WordCraft's own step, not a call

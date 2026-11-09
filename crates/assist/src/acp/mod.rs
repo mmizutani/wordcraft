@@ -268,6 +268,9 @@ pub struct Acp {
     running: Option<Running>,
     /// The note of the conversation's first turn, which every session the agent starts gets.
     note: Option<String>,
+    /// What the running session was last told of what the person kept: it keeps what it read, so
+    /// it hears again only when that changes.
+    memory_told: Option<String>,
     /// Its tool calls in the current turn, to merge their updates into.
     calls: HashMap<String, ToolCall>,
     /// The shared document's version when each call that is still running was first seen: its
@@ -285,7 +288,7 @@ impl Running {
 impl Acp {
     /// A backend that runs the agent `spec` sets up.
     pub fn new(spec: AgentSpec) -> Acp {
-        Acp { spec, seat: None, running: None, note: None, calls: HashMap::new(), started: HashMap::new() }
+        Acp { spec, seat: None, running: None, note: None, memory_told: None, calls: HashMap::new(), started: HashMap::new() }
     }
 
     /// The agent's name, for messages.
@@ -463,6 +466,8 @@ impl Acp {
             running.process.stop(grace);
             running.folder.remove();
         }
+        // The next session has read nothing yet.
+        self.memory_told = None;
     }
 
     /// Set what the person chose for this turn, model first: its answer may change the levels.
@@ -820,8 +825,15 @@ impl Backend for Acp {
         self.show_config(ctx, first || changed);
         // A new session gets the note, which the agent's model reads first.
         let note = if first { self.note.as_deref() } else { None };
+        let memory = if first {
+            turn.memory.as_deref()
+        } else if turn.memory != self.memory_told {
+            Some(turn.memory.as_deref().unwrap_or(crate::memory::NONE_APPLY))
+        } else {
+            None
+        };
         let text = |t: &str| json!({"type": "text", "text": t});
-        let before = [note, turn.context.as_deref()].into_iter().flatten().filter(|t| !t.trim().is_empty()).map(text);
+        let before = [note, memory, turn.context.as_deref()].into_iter().flatten().filter(|t| !t.trim().is_empty()).map(text);
         let Some(running) = self.running.as_mut() else { return Err(format!("{} isn't running", self.spec.label)) };
         let embedded = running.embedded_context;
         let sources = turn.knowledge.iter().enumerate().map(|(n, source)| {
@@ -843,6 +855,10 @@ impl Backend for Acp {
             }
             Err(e) => Err(format!("{}: {e}", self.spec.label)),
         };
+        // A prompt that failed may not have reached it: the next turn says it again.
+        if ended.is_ok() {
+            self.memory_told.clone_from(&turn.memory);
+        }
         if ended.is_err() && self.running.as_mut().is_some_and(|r| !r.process.is_running()) {
             self.stop_agent(STUCK_GRACE);
         }

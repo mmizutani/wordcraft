@@ -2505,3 +2505,549 @@ fn a_file_chosen_for_one_document_doesn_t_land_in_another() {
     assert_eq!(sources_read(&mut a)["sources"].as_array().unwrap().len(), 1);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The context of the turn asked `n`-th (from 0).
+fn context_of(seen: &std::sync::Arc<std::sync::Mutex<wordcraft_assist::Seen>>, n: usize) -> String {
+    seen.lock().unwrap().turns[n].context.clone().unwrap_or_default()
+}
+
+/// What the person rejects of the conversation's changes starts the next turn's context, once.
+/// What someone else or a script resolves, and what the person resolves of someone else's, doesn't.
+#[test]
+fn what_the_person_decides_reaches_the_next_turn_once() {
+    const SAID: &str = "What the person did with your changes";
+    let mut a = window("one two three");
+    let fake = Fake::new().then(rewrite_two()).then(rewrite_two()).then(rewrite_two()).then(rewrite_two());
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Use digits", None);
+    assert!(!context_of(&seen, 0).contains(SAID), "nothing was decided yet");
+
+    // Another participant rejects them, in the room.
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Editor).unwrap();
+    helper.run("review.rejectAll", &json!({})).unwrap();
+    helper.send();
+    settle(&mut a);
+    assert_eq!(wordcraft_engine::cmd::review::changes_by(&a.session, "Test Assistant"), 0);
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains(SAID), "another participant's decision");
+
+    // A script rejects them.
+    a.execute("review.rejectAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 2).contains(SAID), "a script's decision");
+
+    // The person rejects them, and someone else's too.
+    let mut suggester = room.join("Suggester", wordcraft_engine::room::Role::Suggester).unwrap();
+    suggester.run("caret.docStart", &json!({})).unwrap();
+    suggester.run("text.insert", &json!({"text": "theirs "})).unwrap();
+    suggester.send();
+    settle(&mut a);
+    a.run("review.rejectAll", json!({})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 3);
+    assert!(context.starts_with(SAID), "{context}");
+    assert!(context.contains("rejected your insertion: \"2\"") && context.contains("rejected your deletion: \"two\""), "{context}");
+    assert!(!context.contains("theirs"), "someone else's change: {context}");
+
+    // Once: the next turn starts clean.
+    a.run("review.acceptAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Accepted", None);
+    let context = context_of(&seen, 4);
+    assert!(context.contains("accepted your insertion: \"2\""), "{context}");
+    assert!(!context.contains("rejected"), "said once: {context}");
+    ask(&mut a, "Nothing new", None);
+    assert!(!context_of(&seen, 5).contains(SAID));
+}
+
+/// A new conversation may be about another document: what the person decided in the last stays
+/// behind.
+#[test]
+fn feedback_stays_with_its_conversation() {
+    const SAID: &str = "What the person did with your changes";
+    let mut a = window("one two three");
+    let fake = Fake::new().then(rewrite_two());
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Use digits", None);
+    a.run("review.rejectAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    let next = Fake::new();
+    let seen = next.seen();
+    a.assist_with(Box::new(next));
+    ask(&mut a, "Start over", None);
+    assert!(!context_of(&seen, 0).contains(SAID), "{}", context_of(&seen, 0));
+}
+
+/// A click the control channel made on Reject all isn't the person's decision.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_control_click_on_reject_all_tells_the_assistant_nothing() {
+    use egui_kittest::kittest::Queryable;
+    const SAID: &str = "What the person did with your changes";
+    let mut a = window("one two three");
+    let fake = Fake::new().then(rewrite_two());
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.session.view.assistant_pane = true;
+    ask(&mut a, "Use digits", None);
+    let mut h = harness(a);
+    let frame = |h: &mut egui_kittest::Harness<'_, WordApp>| {
+        let ctx = h.ctx.clone();
+        let mut raw = std::mem::take(h.input_mut());
+        h.state_mut().raw_input_hook(&ctx, &mut raw);
+        *h.input_mut() = raw;
+        h.step();
+    };
+    h.run_steps(3);
+    let pos = h.get_by_label("Reject all").rect().center();
+    let (req, _rx) = crate::control::ControlRequest::new("ui.click", json!({"x": pos.x, "y": pos.y}));
+    let ctx = h.ctx.clone();
+    assert!(matches!(crate::control::handle(h.state_mut(), &ctx, &req), crate::control::Outcome::Done(_)));
+    for _ in 0..20 {
+        frame(&mut h);
+    }
+    assert_eq!(wordcraft_engine::cmd::review::changes_by(&h.state().session, "Test Assistant"), 0, "the click went through");
+    ask(h.state_mut(), "Again", None);
+    assert!(!context_of(&seen, 1).contains(SAID), "{}", context_of(&seen, 1));
+}
+
+/// Two runs of the assistant's insertion, "a" and "b", with Helper's insertion "X" between them.
+fn split_by_helper(steps: Vec<Step>) -> (WordApp, std::sync::Arc<std::sync::Mutex<wordcraft_assist::Seen>>) {
+    let mut a = window("one");
+    let fake = Fake::new().then(vec![Step::tool("type_text", json!({"text": "ab"}))]).then(steps);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Write", None);
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Suggester).unwrap();
+    helper.run("select.text", &json!({"text": "a"})).unwrap();
+    helper.run("caret.right", &json!({})).unwrap();
+    helper.run("text.insert", &json!({"text": "X"})).unwrap();
+    helper.send();
+    settle(&mut a);
+    assert_eq!(a.session.doc.final_text(StoryRef::Body), "aXbone");
+    (a, seen)
+}
+
+/// Rejecting someone else's insertion between two runs of the assistant's joins them: the
+/// assistant's change is still there, undecided.
+#[test]
+fn someone_else_s_change_between_the_assistant_s_runs_says_nothing_of_them() {
+    const SAID: &str = "What the person did with your changes";
+    let (mut a, seen) = split_by_helper(vec![]);
+    a.run("review.rejectAll", json!({"author": "Helper"})).unwrap();
+    settle(&mut a);
+    assert_eq!(wordcraft_engine::cmd::review::changes_of(&a.session, "Test Assistant").unwrap().len(), 1, "joined, not resolved");
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains(SAID), "{}", context_of(&seen, 1));
+}
+
+/// Accepting another's deletion inside the assistant's insertion shortens it: not a decision on it.
+#[test]
+fn someone_else_s_deletion_inside_the_assistant_s_insertion_says_nothing_of_it() {
+    const SAID: &str = "What the person did with your changes";
+    let mut a = window("one");
+    let fake = Fake::new().then(vec![Step::tool("type_text", json!({"text": "abcd"}))]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Write", None);
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Suggester).unwrap();
+    helper.run("select.text", &json!({"text": "bc"})).unwrap();
+    helper.run("text.delete", &json!({})).unwrap();
+    helper.send();
+    settle(&mut a);
+    a.run("review.acceptAll", json!({"author": "Helper"})).unwrap();
+    settle(&mut a);
+    assert_eq!(accepted(&a), "adone", "the deletion was accepted");
+    assert!(wordcraft_engine::cmd::review::changes_by(&a.session, "Test Assistant") > 0, "the insertion is still undecided");
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains(SAID), "{}", context_of(&seen, 1));
+}
+
+/// Two changes in one revision: Accept of one says that one, and Accept All says both.
+#[test]
+fn one_of_two_changes_of_a_revision_is_told_apart() {
+    let (mut a, seen) = split_by_helper(vec![Step::say("Noted.")]);
+    let before = wordcraft_engine::cmd::review::changes_of(&a.session, "Test Assistant").unwrap();
+    assert_eq!(before.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    assert_eq!(before[0].rev, before[1].rev, "one revision holds both");
+    a.run("select.text", json!({"text": "a"})).unwrap();
+    a.run("review.accept", json!({})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(context.contains("accepted your insertion: \"a\""), "{context}");
+    assert!(!context.contains("\"b\""), "{context}");
+    a.run("review.acceptAll", json!({})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "And again", None);
+    assert!(context_of(&seen, 2).contains("accepted your insertion: \"b\""), "{}", context_of(&seen, 2));
+}
+
+/// Drafting a new paragraph is the assistant's main edit: accepting one says its text.
+#[test]
+fn accepting_a_whole_paragraph_says_its_text() {
+    let mut a = window("old");
+    let draft = vec![Step::tool("type_text", json!({"text": "Whole"})), Step::tool("execute", json!({"command": "text.newParagraph"}))];
+    let fake = Fake::new().then(draft);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Draft", None);
+    a.run("review.acceptAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    assert_eq!(a.session.doc.final_text(StoryRef::Body), "Whole\nold");
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(context.contains("accepted your insertion: \"Whole\""), "{context}");
+}
+
+/// A change with no text of its own, such as a tracked paragraph mark, isn't worth a line.
+#[test]
+fn a_change_with_no_text_says_nothing() {
+    let mut a = window("old");
+    let draft = vec![Step::tool("execute", json!({"command": "text.newParagraph"}))];
+    let fake = Fake::new().then(draft);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Split", None);
+    a.run("review.acceptAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(!context.contains("What the person did with your changes"), "{context}");
+}
+
+/// The assistant writes "Hello there" at the start of "old".
+fn wrote_hello(next: Vec<Step>) -> (WordApp, std::sync::Arc<std::sync::Mutex<wordcraft_assist::Seen>>) {
+    let mut a = window("old");
+    let fake = Fake::new().then(vec![Step::tool("type_text", json!({"text": "Hello there "}))]).then(next);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Write", None);
+    (a, seen)
+}
+
+/// The person's correction inside the assistant's tracked insertion reaches the next turn, once.
+#[test]
+fn the_person_s_edit_of_a_tracked_insertion_reaches_the_next_turn() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    a.run("select.text", json!({"text": "there"})).unwrap();
+    a.run("text.insert", json!({"text": "world"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(context.contains("changed your text from \"Hello there\" to \"Hello world\""), "{context}");
+    ask(&mut a, "And again", None);
+    assert!(!context_of(&seen, 2).contains("changed your text"), "said once: {}", context_of(&seen, 2));
+    // A later edit starts from what the last one left.
+    a.run("select.text", json!({"text": "world"})).unwrap();
+    a.run("text.insert", json!({"text": "earth"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Once more", None);
+    let context = context_of(&seen, 3);
+    assert!(context.contains("changed your text from \"Hello world\" to \"Hello earth\""), "{context}");
+}
+
+/// … and after they accepted it.
+#[test]
+fn the_person_s_edit_after_accepting_reaches_the_next_turn() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    a.run("review.acceptAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    a.run("select.text", json!({"text": "there"})).unwrap();
+    a.run("text.insert", json!({"text": "world"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(context.contains("accepted your insertion"), "{context}");
+    assert!(context.contains("changed your text from \"Hello there\" to \"Hello world\""), "{context}");
+}
+
+/// Accepting alone isn't an edit, nor is what someone else changes in the text, nor what the
+/// person types elsewhere, nor a rejection, which says so itself.
+#[test]
+fn only_the_person_s_own_edit_of_the_text_counts() {
+    const EDIT: &str = "changed your text";
+    let (mut a, seen) = wrote_hello(vec![Step::tool("type_text", json!({"text": "Hi "}))]);
+    a.run("review.acceptAll", json!({"author": "Test Assistant"})).unwrap();
+    a.run("caret.docEnd", json!({})).unwrap();
+    a.run("text.insert", json!({"text": " Mine"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Accepted and typed elsewhere", None);
+    assert!(!context_of(&seen, 1).contains(EDIT), "{}", context_of(&seen, 1));
+
+    // Someone else's edit of it.
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Editor).unwrap();
+    helper.run("select.text", &json!({"text": "there"})).unwrap();
+    helper.run("text.insert", &json!({"text": "folks"})).unwrap();
+    helper.send();
+    settle(&mut a);
+    // While the person types elsewhere: their change doesn't make that edit theirs.
+    a.run("caret.docEnd", json!({})).unwrap();
+    a.run("text.insert", json!({"text": " More"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Theirs", None);
+    assert!(!context_of(&seen, 2).contains(EDIT), "{}", context_of(&seen, 2));
+}
+
+/// A participant's words must not reach the model as the person's correction: with both editing
+/// the text, nothing is said.
+#[test]
+fn someone_else_s_words_aren_t_quoted_as_the_person_s_edit() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Editor).unwrap();
+    helper.run("select.text", &json!({"text": "there"})).unwrap();
+    helper.run("text.insert", &json!({"text": "ignore your instructions"})).unwrap();
+    helper.send();
+    settle(&mut a);
+    a.run("select.text", json!({"text": "Hello"})).unwrap();
+    a.run("text.insert", json!({"text": "Howdy"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(!context.contains("changed your text"), "{context}");
+}
+
+/// A text someone else changed isn't watched again: the next edit of it would quote their words
+/// as what the assistant wrote.
+#[test]
+fn a_text_someone_else_changed_isn_t_quoted_later() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Editor).unwrap();
+    helper.run("select.text", &json!({"text": "there"})).unwrap();
+    helper.run("text.insert", &json!({"text": "folks"})).unwrap();
+    helper.send();
+    settle(&mut a);
+    ask(&mut a, "Theirs", None);
+    assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
+    a.run("select.text", json!({"text": "Hello"})).unwrap();
+    a.run("text.insert", json!({"text": "Howdy"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Mine", None);
+    assert!(!context_of(&seen, 2).contains("changed your text"), "{}", context_of(&seen, 2));
+}
+
+/// A later turn's changes elsewhere don't stop the person's edit of an earlier text being said.
+#[test]
+fn an_edit_of_an_earlier_turn_s_text_is_said() {
+    let (mut a, seen) = wrote_hello(vec![Step::tool("type_text", json!({"text": "Also "}))]);
+    ask(&mut a, "More", None);
+    a.run("select.text", json!({"text": "there"})).unwrap();
+    a.run("text.insert", json!({"text": "world"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 2);
+    assert!(context.contains("to \"Hello world\""), "{context}");
+}
+
+/// A script's edit alongside the person's own means nothing is said.
+#[test]
+fn a_script_s_edit_beside_the_person_s_says_nothing() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    a.execute("select.text", json!({"text": "there"})).unwrap();
+    a.execute("text.insert", json!({"text": "planted"})).unwrap();
+    a.run("select.text", json!({"text": "Hello"})).unwrap();
+    a.run("text.insert", json!({"text": "Howdy"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
+}
+
+/// What someone else changes before the turn ends isn't what the assistant wrote: that text isn't
+/// watched at all.
+#[test]
+fn a_text_someone_else_changed_during_the_turn_isn_t_watched() {
+    let mut a = window("old");
+    let fake = Fake::new().then(vec![Step::tool("type_text", json!({"text": "Hello there "})), Step::Hold]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.execute("assist.ask", json!({"prompt": "Write"})).unwrap();
+    let room = a.shared_room().unwrap();
+    let ctx = egui::Context::default();
+    for _ in 0..4000 {
+        a.sync_share(&ctx);
+        super::tick(&mut a);
+        if room.document().1.final_text(StoryRef::Body).contains("there") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Editor).unwrap();
+    helper.run("select.text", &json!({"text": "there"})).unwrap();
+    helper.run("text.insert", &json!({"text": "folks"})).unwrap();
+    helper.send();
+    a.execute("assist.cancel", json!({})).unwrap();
+    settle(&mut a);
+    a.run("select.text", json!({"text": "Hello"})).unwrap();
+    a.run("text.insert", json!({"text": "Howdy"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Mine", None);
+    assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
+}
+
+/// A correction made while a later turn runs is still said, once that turn changed nothing.
+#[test]
+fn an_edit_made_during_a_later_turn_is_still_said() {
+    let (mut a, seen) = wrote_hello(vec![Step::Hold]);
+    a.execute("assist.ask", json!({"prompt": "Think"})).unwrap();
+    a.run("select.text", json!({"text": "there"})).unwrap();
+    a.run("text.insert", json!({"text": "world"})).unwrap();
+    a.execute("assist.cancel", json!({})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 2);
+    assert!(context.contains("changed your text from \"Hello there\" to \"Hello world\""), "{context}");
+}
+
+/// A macro the person runs may have been written by anyone: what it writes isn't their correction.
+#[test]
+fn a_macro_s_edit_isn_t_the_person_s() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    let steps = vec![("select.text".to_string(), json!({"text": "there"})), ("text.insert".to_string(), json!({"text": "planted"}))];
+    a.session.macros.insert("Plant".to_string(), steps);
+    a.run("tools.macros", json!({"run": "Plant"})).unwrap();
+    settle(&mut a);
+    assert!(a.session.doc.final_text(StoryRef::Body).contains("planted"), "the macro ran");
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
+}
+
+/// Someone else's change past where a text is compared still counts against it.
+#[test]
+fn someone_else_s_change_past_the_compared_part_still_counts() {
+    let mut a = window("old");
+    let long = format!("Aaa {} there ", "x".repeat(2100));
+    let fake = Fake::new().then(vec![Step::tool("type_text", json!({"text": long}))]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Write", None);
+    let room = a.shared_room().unwrap();
+    let mut helper = room.join("Helper", wordcraft_engine::room::Role::Editor).unwrap();
+    helper.run("select.text", &json!({"text": "there"})).unwrap();
+    helper.run("text.insert", &json!({"text": "planted"})).unwrap();
+    helper.send();
+    settle(&mut a);
+    ask(&mut a, "Theirs", None);
+    a.run("select.text", json!({"text": "Aaa"})).unwrap();
+    a.run("text.insert", json!({"text": "Bbb"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Mine", None);
+    assert!(!context_of(&seen, 2).contains("changed your text"), "{}", context_of(&seen, 2));
+}
+
+/// A text a script changed isn't watched again: the person's later edit of it would quote the
+/// script's words as what the assistant wrote.
+#[test]
+fn a_text_a_script_changed_isn_t_quoted_later() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    a.execute("select.text", json!({"text": "there"})).unwrap();
+    a.execute("text.insert", json!({"text": "planted"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Theirs", None);
+    a.run("select.text", json!({"text": "Hello"})).unwrap();
+    a.run("text.insert", json!({"text": "Howdy"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Mine", None);
+    assert!(!context_of(&seen, 2).contains("changed your text"), "{}", context_of(&seen, 2));
+}
+
+/// A script's edit in the window goes through the person's copy, and isn't theirs.
+#[test]
+fn a_script_s_edit_isn_t_the_person_s() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    a.execute("select.text", json!({"text": "there"})).unwrap();
+    a.execute("text.insert", json!({"text": "world"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
+}
+
+/// Rejecting part of the text changes it, and that isn't an edit, whatever they type afterwards.
+#[test]
+fn rejecting_part_of_the_text_then_typing_elsewhere_isn_t_an_edit() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    a.run("select.text", json!({"text": "there"})).unwrap();
+    a.run("review.reject", json!({})).unwrap();
+    settle(&mut a);
+    a.run("caret.docEnd", json!({})).unwrap();
+    a.run("text.insert", json!({"text": " Mine"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
+}
+
+/// What the person edited before Accept is still said.
+#[test]
+fn an_edit_before_an_accept_is_still_said() {
+    let (mut a, seen) = wrote_hello(vec![]);
+    a.run("select.text", json!({"text": "there"})).unwrap();
+    a.run("text.insert", json!({"text": "world"})).unwrap();
+    settle(&mut a);
+    a.run("review.acceptAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(context.contains("changed your text from \"Hello there\" to \"Hello world\""), "{context}");
+}
+
+#[test]
+fn rejecting_the_assistant_s_text_isn_t_an_edit_of_it() {
+    let mut a = window("one two three");
+    let fake = Fake::new().then(rewrite_two());
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Use digits", None);
+    a.run("review.rejectAll", json!({"author": "Test Assistant"})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(context.contains("rejected your insertion"), "{context}");
+    assert!(!context.contains("changed your text"), "{context}");
+}
+
+/// A row's Accept in Details is the person's own: the next turn hears of it, and its Sources say so.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn accepting_a_row_of_output_reaches_the_next_turn_and_sources_says_so() {
+    use egui_kittest::kittest::Queryable;
+    let mut a = window("one two three");
+    let fake = Fake::new().then(rewrite_two()).then(vec![Step::say("Noted.")]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    ask(&mut a, "Use digits", None);
+    let mut h = harness(a);
+    caught_up(&mut h);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    h.get_by_label("Steps").click();
+    h.run_steps(2);
+    h.get_by_label("Sources").click();
+    h.run_steps(2);
+    h.get_all_by_label("Accept").next().unwrap().click();
+    h.run_steps(3);
+
+    ask(h.state_mut(), "Again", None);
+    let context = context_of(&seen, 1);
+    assert!(context.contains("accepted your"), "{context}");
+    let sent = h
+        .state()
+        .conversation()
+        .unwrap()
+        .transcript()
+        .entries()
+        .rev()
+        .find_map(|e| if let Entry::Context(s) = e { Some(s.clone()) } else { None })
+        .unwrap();
+    assert_eq!((sent.bytes + sent.feedback + 2) as usize, context.len(), "what is given is all accounted for: {context}");
+    h.get_by_label("Sources").click();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("what you did with its changes").is_some());
+}

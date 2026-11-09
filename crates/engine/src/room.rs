@@ -445,6 +445,12 @@ impl Room {
     /// styles or settings alone). What shows a participant's change, such as the one an
     /// assistant's tool call made.
     pub fn where_changed(&self, versions: RangeInclusive<u64>, by: Option<&str>) -> Option<(Anchor, Anchor)> {
+        self.where_changed_in(versions, by).map(|(anchor, focus, _)| (anchor, focus))
+    }
+
+    /// [`Room::where_changed`], with the document those anchors are places in: an anchor's offset
+    /// means nothing in a later version.
+    fn where_changed_in(&self, versions: RangeInclusive<u64>, by: Option<&str>) -> Option<(Anchor, Anchor, Document)> {
         let (first, last) = (*versions.start(), *versions.end());
         if first == 0 || first > last {
             return None;
@@ -480,7 +486,28 @@ impl Room {
         let mut there = places.iter().filter(|p| p.story == story);
         let first = there.next()?;
         let (start, end) = there.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p)));
-        Some((doc.anchor_at(start)?, doc.anchor_at(end)?))
+        let (anchor, focus) = (doc.anchor_at(start)?, doc.anchor_at(end)?);
+        Some((anchor, focus, doc))
+    }
+
+    /// The text at [`Room::where_changed`]'s place as it reads now with every change accepted, at
+    /// most `max` bytes: what a tool call's text has become, whoever changed it since. `None`
+    /// when that place isn't known any more. The hub keeps its latest document alone, so this is
+    /// the only way to read it: what it was has to be read when it was.
+    pub fn text_where_changed(&self, versions: RangeInclusive<u64>, by: Option<&str>, max: usize) -> Option<String> {
+        let (anchor, focus, doc) = self.where_changed_in(versions, by)?;
+        let (a, b) = (doc.pos_of(anchor, None)?, doc.pos_of(focus, None)?);
+        Some(doc.final_text_in(&a, &b, max))
+    }
+
+    /// The names of everyone who changed the document after `version`. `None` when the hub no
+    /// longer keeps those changes.
+    pub fn changed_since(&self, version: u64) -> Option<Vec<String>> {
+        let hub = self.hub();
+        let mut names: Vec<String> = hub.since(version).ok()?.iter().filter_map(|a| hub.name_of(a.by).map(str::to_string)).collect();
+        names.sort_unstable();
+        names.dedup();
+        Some(names)
     }
 
     /// The first and the last version after `version` that participant `name` made (any copy
