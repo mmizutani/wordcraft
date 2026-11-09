@@ -91,7 +91,7 @@ pub struct Options {
 enum Job {
     /// A turn, and how its permission requests are answered when not as the conversation's
     /// ([`Assistant::ask_with_policy`]).
-    Turn(Turn, Option<PermissionPolicy>),
+    Turn(Box<Turn>, Option<PermissionPolicy>),
     End,
 }
 
@@ -308,7 +308,7 @@ impl Assistant {
         // Cleared before the turn is sent: a Stop from now on ends this turn, even one the
         // thread hasn't started yet.
         self.cancel.clear();
-        if self.jobs.send(Job::Turn(turn, policy)).is_err() {
+        if self.jobs.send(Job::Turn(Box::new(turn), policy)).is_err() {
             self.ended = true;
             return Err(AssistError::Ended);
         }
@@ -501,7 +501,7 @@ impl Work {
         }
         while let Ok(job) = self.jobs.recv() {
             let (turn, policy) = match job {
-                Job::Turn(t, policy) => (t, policy.unwrap_or(self.policy)),
+                Job::Turn(t, policy) => (*t, policy.unwrap_or(self.policy)),
                 Job::End => break,
             };
             // The person's selection, in the assistant's copy: WordCraft's own step, not a call
