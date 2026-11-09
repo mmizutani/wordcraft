@@ -254,3 +254,31 @@ fn the_sixty_fifth_unconfirmed_note_replaces_the_oldest_unused() {
     assert!(case.notes.iter().any(|n| matches!(n.standing, Standing::Confirmed { .. })), "the person's note is never evicted");
     assert!(added > *ids.last().unwrap(), "an id is never reused");
 }
+
+#[test]
+fn a_model_balance_never_evicts_a_confirmed_one() {
+    let (shelf, at) = shelf_with_case("balances");
+    let draft = |stance| BalanceDraft { stance, factors: Vec::new() };
+    for _ in 0..MAX_BALANCES {
+        shelf.person(click(), &at, PersonOp::Balance(draft(Stance::Stronger)), today()).unwrap();
+    }
+    // Every slot is the person's: a model's write changes nothing and comes back as a card.
+    assert_eq!(shelf.model(&at, ModelWrite::Balance(draft(Stance::Weaker)), today()), Ok(Applied::Card(ModelWrite::Balance(draft(Stance::Weaker)))));
+    let case = shelf.open(&at).unwrap();
+    assert_eq!(case.balance.len(), MAX_BALANCES);
+    assert!(case.balance.iter().all(|b| matches!(b.standing, Standing::Confirmed { .. }) && b.stance == Stance::Stronger));
+
+    // With one unconfirmed slot, a model's writes only ever replace that one.
+    let mut case = shelf.open(&at).unwrap();
+    case.balance.remove(0);
+    case.apply_model(ModelWrite::Balance(draft(Stance::Even)), today()).unwrap();
+    for _ in 0..3 {
+        assert_eq!(case.apply_model(ModelWrite::Balance(draft(Stance::Weaker)), today()), Ok(Applied::Changed));
+    }
+    assert_eq!(case.balance.len(), MAX_BALANCES);
+    assert_eq!(case.balance.iter().filter(|b| matches!(b.standing, Standing::Confirmed { .. })).count(), MAX_BALANCES - 1);
+    assert_eq!(case.balance.iter().filter(|b| b.standing == Standing::Unconfirmed).count(), 1);
+    // The person's own write past the cap still drops the oldest.
+    case.apply_person(PersonOp::Balance(draft(Stance::Even)), today()).unwrap();
+    assert_eq!(case.balance.len(), MAX_BALANCES);
+}

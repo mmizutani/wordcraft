@@ -775,15 +775,18 @@ impl Case {
         self.notes.iter().any(|n| n.said() == said) || self.dismissed.contains(&key_of(&draft.main()))
     }
 
-    fn push_balance(&mut self, draft: BalanceDraft, standing: Standing, today: Day) -> Result<(), CaseError> {
+    /// Append a balance, after `evict` has made room: past the cap the person drops the oldest,
+    /// and a model drops only the oldest unconfirmed one, so it never removes what the person wrote.
+    fn push_balance(&mut self, draft: BalanceDraft, standing: Standing, today: Day, evict: usize) -> Result<(), CaseError> {
         let BalanceDraft { stance, factors } = draft;
         if factors.len() > MAX_FACTORS || factors.iter().any(|f| f.why.as_ref().is_some_and(|w| w.chars() > MAX_SHORT)) {
             return Err(CaseError::TooLong);
         }
-        self.balance.push(Balance { on: today, stance, factors, standing });
-        if self.balance.len() > MAX_BALANCES {
-            self.balance.remove(0);
+        if self.balance.len() >= MAX_BALANCES && evict < self.balance.len() {
+            self.balance.remove(evict);
         }
+        self.balance.push(Balance { on: today, stance, factors, standing });
+        self.balance.truncate(MAX_BALANCES);
         Ok(())
     }
 
@@ -805,7 +808,7 @@ impl Case {
                 facts.parties.retain(|p| !p.raw().trim().is_empty());
                 self.facts = facts;
             }
-            PersonOp::Balance(draft) => self.push_balance(draft, confirmed, today)?,
+            PersonOp::Balance(draft) => self.push_balance(draft, confirmed, today, 0)?,
             PersonOp::Plan(None) => self.plan = None,
             PersonOp::Plan(Some(plan)) => {
                 let mut plan = Plan { standing: confirmed, ..plan };
@@ -896,7 +899,13 @@ impl Case {
                 Ok(Applied::Changed)
             }
             ModelWrite::Balance(draft) => {
-                self.push_balance(draft, Standing::Unconfirmed, today)?;
+                let oldest_unconfirmed = self.balance.iter().position(|b| !b.standing.is_confirmed());
+                let evict = match oldest_unconfirmed {
+                    Some(i) => i,
+                    None if self.balance.len() >= MAX_BALANCES => return Ok(Applied::Card(ModelWrite::Balance(draft))),
+                    None => 0,
+                };
+                self.push_balance(draft, Standing::Unconfirmed, today, evict)?;
                 Ok(Applied::Changed)
             }
             ModelWrite::Used(ids) => {
