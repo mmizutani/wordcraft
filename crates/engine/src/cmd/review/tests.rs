@@ -1290,6 +1290,14 @@ fn an_author_s_accept_leaves_someone_else_s_move() {
     s.run("review.accept", &json!({"author": "Assistant"})).unwrap();
     assert!(super::changes_by(&s, "Assistant") < formatted, "the assistant's went");
     assert_eq!(super::changes_by(&s, "Colleague"), before, "both ends of the move stay");
+
+    // A move with an end of each author's is someone else's too.
+    let ends: Vec<usize> = s.doc.revisions.iter().enumerate().filter(|(_, r)| r.move_name.is_some()).map(|(i, _)| i).collect();
+    s.doc.revisions[ends[0]].author = "Assistant".into();
+    let colleague = super::changes_by(&s, "Colleague");
+    s.run("select.all", &json!({})).unwrap();
+    s.run("review.accept", &json!({"author": "Assistant"})).unwrap();
+    assert_eq!(super::changes_by(&s, "Colleague"), colleague, "the colleague's end stays");
 }
 
 #[test]
