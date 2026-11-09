@@ -51,6 +51,10 @@ pub enum Entry {
     /// The model proposes that the person keep a preference ([`crate::memory`]). It carries no
     /// authority: only the person's click on the card stores anything.
     Proposal { id: u64, text: String, answer: Option<ProposalAnswer> },
+    /// The turn's answer says preference `id`, which the turn sent, shaped it. Its place in the
+    /// turn's list is its chip's number, and the answer's text holds the chip ([`crate::answer`]).
+    /// Details shows it; the conversation doesn't.
+    Used { id: String },
     /// Which model answers and at what level ([`Event::Model`]), as it last said.
     Model { name: String, effort: Option<String>, asked: bool },
     /// What the agent says it is. Details shows it; the conversation doesn't.
@@ -74,7 +78,7 @@ impl Entry {
     /// Whether only Details shows it: the conversation goes on as if it weren't there, and an
     /// answer that arrives in pieces around it stays one answer.
     pub fn details_only(&self) -> bool {
-        matches!(self, Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) | Entry::Output(_))
+        matches!(self, Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) | Entry::Output(_) | Entry::Used { .. })
     }
 
     fn bytes(&self) -> usize {
@@ -85,6 +89,7 @@ impl Entry {
             | Entry::Note { text }
             | Entry::Proposal { text, .. }
             | Entry::Agent { name: text }
+            | Entry::Used { id: text }
             | Entry::Error { message: text } => text.len(),
             Entry::Model { name, effort, .. } => name.len() + effort.as_ref().map_or(0, String::len),
             Entry::Tool(t) => {
@@ -94,7 +99,10 @@ impl Entry {
             Entry::Plan { entries } => entries.iter().map(|e| e.content.len()).sum(),
             Entry::Permission { request, .. } => request.title.len() + request.options.iter().map(|o| o.name.len() + o.id.len()).sum::<usize>(),
             Entry::Usage(u) => u.cost.as_ref().map_or(0, String::len),
-            Entry::Context(sent) => sent.document.len() + sent.knowledge.iter().map(|s| s.name.len()).sum::<usize>(),
+            Entry::Context(sent) => {
+                let memory = sent.memory.iter().map(|p| p.id.len() + p.text.len()).sum::<usize>();
+                sent.document.len() + sent.at.len() + memory + sent.knowledge.iter().map(|s| s.name.len()).sum::<usize>()
+            }
             Entry::Output(row) => row.text.len(),
             Entry::Stopped { .. } => 0,
         }
@@ -144,6 +152,9 @@ pub struct TurnDetails {
     pub output: Vec<OutputRow>,
     /// What its answers cite, each once, at most [`crate::answer::MAX_CITES`].
     pub citations: Vec<Citation>,
+    /// The preferences its answer marked, in chip order: a chip's number is its place here, from 1.
+    /// The others [`TurnDetails::context`] says it sent apply to the whole answer.
+    pub used: Vec<String>,
     /// How many citations' words the document and the sources don't have
     /// ([`crate::Assistant::details`] can't tell: the window looks, and leaves those out).
     pub unfound: u32,
@@ -205,6 +216,7 @@ struct TurnBuilder<'a> {
     more_sources: u32,
     output: Vec<OutputRow>,
     citations: Vec<Citation>,
+    used: Vec<String>,
     /// The sources seen, listed or not, so each counts once.
     seen: HashSet<(SourceKind, &'a str, Option<&'a str>)>,
 }
@@ -212,10 +224,10 @@ struct TurnBuilder<'a> {
 impl<'a> TurnBuilder<'a> {
     /// Add the turn to `turns`, if it has anything to show, and start another.
     fn finish(&mut self, turns: &mut Vec<TurnDetails>) {
-        let TurnBuilder { asked, plan, calls, context, sources, more_sources, output, citations, .. } = std::mem::take(self);
+        let TurnBuilder { asked, plan, calls, context, sources, more_sources, output, citations, used, .. } = std::mem::take(self);
         let steps = plan.unwrap_or(calls);
         if asked.is_some() || !steps.is_empty() || context.is_some() || !sources.is_empty() || !output.is_empty() || !citations.is_empty() {
-            turns.push(TurnDetails { asked, steps, context, sources, more_sources, output, citations, unfound: 0 });
+            turns.push(TurnDetails { asked, steps, context, sources, more_sources, output, citations, used, unfound: 0 });
         }
     }
 
@@ -276,6 +288,9 @@ pub struct Transcript {
     /// How many proposals the current turn has shown.
     #[serde(skip)]
     proposed: u8,
+    /// The preferences marked that the window hasn't counted yet ([`Transcript::take_used`]).
+    #[serde(skip)]
+    uncounted: Vec<String>,
     /// How many more changes the document has than the entries list ([`crate::output::MAX_ROWS`]).
     #[serde(skip)]
     more_output: usize,
@@ -353,6 +368,7 @@ impl Transcript {
                 Entry::Context(sent) => turn.context = Some(sent.clone()),
                 Entry::Output(row) => turn.output.push(row.clone()),
                 Entry::Answer { text } => turn.cite(text),
+                Entry::Used { id } => turn.used.push(id.clone()),
                 Entry::Thought { .. }
                 | Entry::Permission { .. }
                 | Entry::Proposal { .. }
@@ -448,8 +464,7 @@ impl Transcript {
                     match piece {
                         Piece::Text(t) => self.answer(&t),
                         Piece::Remember(t) => self.propose(&t),
-                        // What shaped the answer is AS7.4's: for now the marker is only taken out.
-                        Piece::Used(_) => {}
+                        Piece::Used(id) => self.mark_used(&id),
                     }
                 }
             }
@@ -527,6 +542,59 @@ impl Transcript {
             let text = kept.map_or(text, str::to_string);
             self.replace(i, Entry::Proposal { id, text, answer: Some(answer) });
         }
+    }
+
+    /// The preferences marked since the last call, each once a turn: what `used` counts.
+    pub fn take_used(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.uncounted)
+    }
+
+    /// The preferences marked in the turn a tracked change dated `date` was made in: the last one
+    /// started at or before then. Dates are as `wordcraft_engine::cmd::now_iso` writes them, which
+    /// sort as they read.
+    pub fn marked_at(&self, date: &str) -> Vec<crate::memory::SentPreference> {
+        let mut turn = None;
+        let mut marked = Vec::new();
+        for entry in &self.entries {
+            match entry {
+                Entry::Context(sent) if sent.at.as_str() > date => break,
+                Entry::Context(sent) => {
+                    turn = Some(sent);
+                    marked.clear();
+                }
+                Entry::Used { id } => marked.extend(turn.and_then(|sent| sent.memory.iter().find(|p| p.id == *id)).cloned()),
+                _ => {}
+            }
+        }
+        marked
+    }
+
+    /// What preference `id` said in the turn of the entry at `entry`, if that turn sent it: the
+    /// person may have reworded it since.
+    pub fn sent_preference(&self, entry: usize, id: &str) -> Option<&str> {
+        let turn =
+            self.entries.iter().take(entry.saturating_add(1)).rev().find_map(|e| if let Entry::Context(sent) = e { Some(sent) } else { None })?;
+        turn.memory.iter().find(|p| p.id == id).map(|p| p.text.as_str())
+    }
+
+    /// The model says preference `id` shaped the answer here: a chip goes in, numbered through the
+    /// turn. One the turn didn't send does nothing, whatever the model writes.
+    fn mark_used(&mut self, id: &str) {
+        if !self.in_turn().any(|(_, e)| matches!(e, Entry::Context(sent) if sent.memory.iter().any(|p| p.id == id))) {
+            return;
+        }
+        let marked: Vec<&str> =
+            self.entries.iter().skip(self.turn_start).filter_map(|e| if let Entry::Used { id } = e { Some(id.as_str()) } else { None }).collect();
+        let number = match marked.iter().position(|m| *m == id) {
+            Some(place) => place.saturating_add(1),
+            None => {
+                let number = marked.len().saturating_add(1);
+                self.uncounted.push(id.to_string());
+                self.push(Entry::Used { id: id.to_string() });
+                number
+            }
+        };
+        self.answer(&crate::answer::used_marker(number, id));
     }
 
     /// A piece of the answer. Only white space right after a proposal starts no entry of its own.

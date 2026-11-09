@@ -40,6 +40,17 @@ pub struct Span {
     pub link: Option<String>,
     /// It stands for this citation of [`Formatted::citations`], and has no text of its own.
     pub cite: Option<usize>,
+    /// It stands for this preference's chip, and has no text of its own.
+    pub used: Option<UsedChip>,
+}
+
+/// A preference's chip in an answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UsedChip {
+    /// Its place in its turn's list, from 1.
+    pub number: usize,
+    /// The preference's id.
+    pub id: String,
 }
 
 /// One block of an answer.
@@ -84,6 +95,7 @@ pub fn format(text: &str, streaming: bool) -> Formatted {
     let text: Cow<'_, str> = if text.contains(OURS) { Cow::Owned(text.replace(OURS, "")) } else { Cow::Borrowed(text) };
     let text = without_our_references(&text);
     let (text, words) = with_cites(&text, streaming, usize::MAX);
+    let text = with_used(text);
     let (read, past) = split_at_line(&text, MAX_PARSED);
     let read = if streaming { settled(read) } else { Cow::Borrowed(read) };
     let (flow, cut) = parsed(read);
@@ -198,6 +210,54 @@ fn with_cites(text: &str, streaming: bool, most: usize) -> (Cow<'_, str>, Vec<St
     }
     out.push_str(rest);
     (Cow::Owned(out), words)
+}
+
+/// What the transcript writes in an answer for a preference's chip: the model's own marker went
+/// when it was read, so this says what it was found to mean.
+pub(crate) fn used_marker(number: usize, id: &str) -> String {
+    format!("{USED_OPEN}{number} {id}]]")
+}
+
+const USED_OPEN: &str = "[[used: ";
+
+/// Longest a [`used_marker`]'s number and id are: the close is looked for only this far, so a text
+/// of false markers still costs one pass.
+const USED_LONGEST: usize = 48;
+
+/// `text` with each [`used_marker`] between two [`CITE`]s, its number and id after a `u`. Anything
+/// else that starts like one stays as text.
+fn with_used(text: Cow<'_, str>) -> Cow<'_, str> {
+    if !text.contains(USED_OPEN) {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest: &str = &text;
+    while let Some(at) = rest.find(USED_OPEN) {
+        out.push_str(rest.get(..at).unwrap_or_default());
+        let after = rest.get(at.saturating_add(USED_OPEN.len())..).unwrap_or_default();
+        let end = after.as_bytes().iter().take(USED_LONGEST).zip(after.as_bytes().iter().skip(1)).position(|pair| pair == (&b']', &b']'));
+        match end.and_then(|end| Some((end, after.get(..end)?))).filter(|(_, inner)| used_chip(inner).is_some()) {
+            Some((end, inner)) => {
+                out.push(CITE);
+                out.push('u');
+                out.push_str(inner);
+                out.push(CITE);
+                rest = after.get(end.saturating_add(2)..).unwrap_or_default();
+            }
+            None => {
+                out.push_str(USED_OPEN);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// A [`used_marker`]'s number and id, read.
+fn used_chip(inner: &str) -> Option<UsedChip> {
+    let (number, id) = inner.split_once(' ')?;
+    Some(UsedChip { number: number.parse().ok()?, id: id.to_string() })
 }
 
 /// `text` as the parser reads it for an answer, and whether a table lost words.
@@ -331,6 +391,10 @@ impl Builder {
             }
             for (n, piece) in span.text.split(CITE).enumerate() {
                 if n % 2 == 1 {
+                    if let Some(chip) = piece.strip_prefix('u') {
+                        out.push(Span { used: used_chip(chip), ..Span::default() });
+                        continue;
+                    }
                     // Past ones code ate, whose markers show nowhere.
                     if let Some(cite) = piece.parse().ok().filter(|cite| *cite >= self.next_cite && self.cited.len() < MAX_CITES) {
                         out.push(Span { cite: Some(self.cited.len()), ..Span::default() });
@@ -499,7 +563,7 @@ fn span_of(text: String, fmt: Option<&Fmt>, bold: bool) -> Span {
     let Some(f) = fmt else { return Span { text, bold, ..Span::default() } };
     // An address too long to show whole isn't a link: cut, it could go somewhere else.
     let link = f.link.as_deref().map(|l| strip_cites(&shown_again(l))).filter(|l| l.chars().count() <= MAX_LABEL).map(|l| label(&l));
-    Span { text, bold: bold || f.bold, italic: f.italic, strike: f.strike, code: f.code, link, cite: None }
+    Span { text, bold: bold || f.bold, italic: f.italic, strike: f.strike, code: f.code, link, cite: None, used: None }
 }
 
 /// The words of an inline: a picture's description, never the picture.

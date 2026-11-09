@@ -66,6 +66,13 @@ pub struct Sent {
     /// Bytes of what the person did with the assistant's changes ([`crate::Feedback`]), which the
     /// context starts with, beside `bytes`.
     pub feedback: u32,
+    /// When the turn started, as a revision's date is written: a tracked change dated from then
+    /// until the next turn started is this turn's.
+    pub at: String,
+    /// The person's preferences the turn carried, beside this.
+    pub memory: Vec<crate::memory::SentPreference>,
+    /// How many more are on but didn't fit.
+    pub memory_left_out: u32,
 }
 
 /// The document around the selection, as text.
@@ -198,6 +205,9 @@ impl Context {
             cap: count(total),
             knowledge: Vec::new(),
             feedback: 0,
+            at: String::new(),
+            memory: Vec::new(),
+            memory_left_out: 0,
         };
         (out, sent)
     }

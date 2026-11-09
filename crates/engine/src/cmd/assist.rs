@@ -32,8 +32,9 @@
 //!
 //! What the assistant remembers across conversations (#86) is a file only the person writes:
 //! `assist.memory` reads it, for the window's key holder, and `assist.memory.add`, `.edit`,
-//! `.remove`, `.clear` and `.enabled` change it from File › Options › Assistant, and `.keep` and
-//! `.dismiss` answer what the model proposes in the Assistant pane. Documents are untrusted and a
+//! `.remove`, `.clear` and `.enabled` change it from the Assistant pane's Details › Memory, and `.keep`
+//! and `.dismiss` answer what the model proposes there, `.keep` what the pane asks about a preference
+//! whose changes keep being rejected. Documents are untrusted and a
 //! kept preference outlasts them, so these writes are [`person_only`] too.
 //!
 //! A writing action is a prompt of ours ([`prompts`]) asked like any other, so its edits are the
@@ -197,38 +198,38 @@ pub fn specs() -> Vec<CommandSpec> {
         .params(r#"{} → WordCraft deletes your ChatGPT sign-in and asks ChatGPT to end it. Yours alone, as signing in is"#)
         .when(can_sign_out)
         .pure(),
-        CommandSpec::new("assist.memory", "What the Assistant Remembers", "File › Options › Assistant", |s, _| {
+        CommandSpec::new("assist.memory", "What the Assistant Remembers", "Home › Assistant", |s, _| {
             s.push_ui_request(json!({"assist": "memory"}));
             Ok(json!({}))
         })
         .params(r#"{} → whether the assistant's memory is on, what it holds, and what the next turn sends and leaves out"#)
         .when(memory_here)
         .pure(),
-        CommandSpec::new("assist.memory.add", "Remember This", "File › Options › Assistant", memory_add)
+        CommandSpec::new("assist.memory.add", "Remember This", "Home › Assistant", memory_add)
             .params(r#"{"text": string (at most 280 characters)} → a preference every later turn of every assistant gets. Yours alone: from a script or an agent (control channel, MCP), as a macro's step or from a key it is an error, and it takes no key and goes on no ribbon or toolbar"#)
             .when(memory_here)
             .pure(),
-        CommandSpec::new("assist.memory.edit", "Edit a Preference", "File › Options › Assistant", memory_edit)
+        CommandSpec::new("assist.memory.edit", "Edit a Preference", "Home › Assistant", memory_edit)
             .params(r#"{"id": string, "text"?: string (at most 280 characters), "off"?: bool (kept, but not sent)}. Yours alone, as `assist.memory.add` is"#)
             .when(memory_here)
             .pure(),
-        CommandSpec::new("assist.memory.remove", "Remove a Preference", "File › Options › Assistant", memory_remove)
+        CommandSpec::new("assist.memory.remove", "Remove a Preference", "Home › Assistant", memory_remove)
             .params(r#"{"id": string}. Yours alone, as `assist.memory.add` is"#)
             .when(memory_here)
             .pure(),
-        CommandSpec::new("assist.memory.clear", "Clear What the Assistant Remembers", "File › Options › Assistant", |s, _| {
+        CommandSpec::new("assist.memory.clear", "Clear What the Assistant Remembers", "Home › Assistant", |s, _| {
             s.push_ui_request(json!({"assist": "memory.clear"}));
             Ok(json!({"cleared": true}))
         })
         .params(r#"{}. Yours alone, as `assist.memory.add` is"#)
         .when(memory_here)
         .pure(),
-        CommandSpec::new("assist.memory.enabled", "Use What the Assistant Remembers", "File › Options › Assistant", memory_enabled)
+        CommandSpec::new("assist.memory.enabled", "Use What the Assistant Remembers", "Home › Assistant", memory_enabled)
             .params(r#"{"value": bool} → off, nothing is sent and items stay until cleared. Yours alone, as `assist.memory.add` is"#)
             .when(memory_here)
             .pure(),
         CommandSpec::new("assist.memory.keep", "Keep This Preference", "Home › Assistant", memory_keep)
-            .params(r#"{"proposal": number, "text"?: string (at most 280 characters, in place of what it proposed)} → the conversation's proposal becomes a preference. Yours alone, as `assist.memory.add` is"#)
+            .params(r#"{"proposal": number, "text"?: string (at most 280 characters, in place of what it proposed)} → the conversation's proposal becomes a preference; or {"id": string} → the preference the pane asks about stays, and its accepted and rejected counts start again. Yours alone, as `assist.memory.add` is"#)
             .when(memory_here)
             .pure(),
         CommandSpec::new("assist.memory.dismiss", "Not This Preference", "Home › Assistant", memory_dismiss)
@@ -359,6 +360,11 @@ fn memory_proposal(v: &Value) -> Result<u64, CmdError> {
 }
 
 fn memory_keep(s: &mut Session, v: &Value) -> CmdResult {
+    if v.get("id").is_some_and(|id| !id.is_null()) {
+        let id = memory_id(v)?;
+        s.push_ui_request(json!({"assist": "memory.keep", "id": id}));
+        return Ok(json!({"kept": true}));
+    }
     let proposal = memory_proposal(v)?;
     let text = if v.get("text").is_some_and(|t| !t.is_null()) { Some(memory_text(v)?) } else { None };
     s.push_ui_request(json!({"assist": "memory.keep", "proposal": proposal, "text": text}));

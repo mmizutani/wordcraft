@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{Block, Formatted, MAX_BLOCKS, MAX_CITE_CHARS, MAX_CITES, MAX_PARSED, MAX_SPANS, Span, citations, format, opens};
+use super::{Block, Formatted, MAX_BLOCKS, MAX_CITE_CHARS, MAX_CITES, MAX_PARSED, MAX_SPANS, Span, UsedChip, citations, format, opens};
 
 fn words(f: &Formatted) -> String {
     let span = |s: &[Span]| s.iter().map(|s| s.text.as_str()).collect::<String>();
@@ -454,4 +454,39 @@ fn a_marker_in_code_doesn_t_cost_the_chips_after_it() {
     assert_eq!(listed, f.citations, "what Details lists is what shows");
     let chips: Vec<usize> = f.blocks.iter().flat_map(|b| if let Block::Para(s) = b { s.as_slice() } else { &[] }).filter_map(|s| s.cite).collect();
     assert_eq!(chips, [0, 1]);
+}
+
+fn chips(f: &Formatted) -> Vec<UsedChip> {
+    let spans = f.blocks.iter().flat_map(|b| match b {
+        Block::Para(s) | Block::Quote(s) | Block::Heading { spans: s, .. } | Block::Item { spans: s, .. } => s.as_slice(),
+        Block::Code(_) | Block::Rule => &[],
+    });
+    spans.filter_map(|s| s.used.clone()).collect()
+}
+
+#[test]
+fn a_preference_s_marker_reads_as_its_chip_in_place() {
+    let f = format("Lists[[used: 2 m7]] and **bold[[used: 1 m1]]** too", false);
+    assert_eq!(chips(&f), [UsedChip { number: 2, id: "m7".into() }, UsedChip { number: 1, id: "m1".into() }]);
+    assert_eq!(words(&f).trim(), "Lists and bold too", "no text of their own");
+}
+
+#[test]
+fn a_preference_s_marker_in_code_or_cut_off_is_no_chip() {
+    let f = format("```\n[[used: 1 m1]]\n```\n\nand `[[used: 2 m2]]`", false);
+    assert!(chips(&f).is_empty(), "{f:?}");
+    assert!(!words(&f).contains("used"), "{f:?}");
+    for text in ["[[used: m1]]", "[[used: 1", "[[used: x m1]]"] {
+        let f = format(text, false);
+        assert!(chips(&f).is_empty(), "{text}: {f:?}");
+        assert_eq!(words(&f).trim(), text);
+    }
+}
+
+#[test]
+fn false_markers_read_within_a_frame_budget() {
+    let text = "[[used: ".repeat(30_000);
+    let start = Instant::now();
+    let _ = format(&text, false);
+    assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
 }

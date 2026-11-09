@@ -1296,6 +1296,95 @@ fn a_used_marker_is_taken_out_and_proposes_nothing() {
     assert_eq!(streamed(&["Numbered: [[used: m999]]one."]), ("Numbered: one.".to_string(), vec![]));
 }
 
+/// A transcript whose turn, started at `at`, sent preferences `m1` and `m2`.
+fn sent_two(t: &mut Transcript, at: &str) {
+    t.asked("Summarize");
+    let memory = ["m1", "m2"].map(|id| crate::memory::SentPreference { id: id.into(), text: format!("Text of {id}.") }).to_vec();
+    t.sent(crate::Sent { at: at.into(), memory, ..crate::Sent::default() });
+}
+
+fn answer_text(t: &Transcript) -> String {
+    t.entries().filter_map(|e| if let Entry::Answer { text } = e { Some(text.as_str()) } else { None }).collect()
+}
+
+#[test]
+fn a_marker_of_what_the_turn_sent_is_a_chip_numbered_through_the_turn() {
+    let mut t = Transcript::default();
+    sent_two(&mut t, "2026-11-09T10:00:00Z");
+    t.record(&Event::Text { text: "One[[used: m2]] two[[us".into() });
+    t.record(&Event::Text { text: "ed: m1]] three[[used: m2]] four".into() });
+    assert_eq!(answer_text(&t), "One[[used: 1 m2]] two[[used: 2 m1]] three[[used: 1 m2]] four");
+    assert_eq!(t.details().turns[0].used, ["m2", "m1"]);
+    assert_eq!(t.take_used(), ["m2", "m1"], "each once");
+    assert!(t.take_used().is_empty());
+    assert_eq!(t.entries().filter(|e| matches!(e, Entry::Answer { .. })).count(), 1, "one answer around them");
+    assert_eq!(t.sent_preference(t.len() - 1, "m1"), Some("Text of m1."));
+}
+
+#[test]
+fn a_chip_s_words_are_what_its_own_turn_sent() {
+    let mut t = Transcript::default();
+    sent_two(&mut t, "2026-11-09T10:00:00Z");
+    t.record(&Event::Text { text: "First[[used: m1]].".into() });
+    let first = t.len() - 1;
+    t.asked("Again");
+    let memory = vec![crate::memory::SentPreference { id: "m1".into(), text: "Reworded.".into() }];
+    t.sent(crate::Sent { at: "2026-11-09T10:01:00Z".into(), memory, ..crate::Sent::default() });
+    t.record(&Event::Text { text: "Second[[used: m1]].".into() });
+    let second = t.len() - 1;
+    assert_eq!(t.sent_preference(first, "m1"), Some("Text of m1."));
+    assert_eq!(t.sent_preference(second, "m1"), Some("Reworded."));
+    assert_eq!(t.sent_preference(first, "m999"), None);
+    assert_eq!(t.sent_preference(second, "m2"), None, "an earlier turn's isn't this one's");
+}
+
+#[test]
+fn a_marker_of_what_the_turn_didn_t_send_does_nothing() {
+    let mut t = Transcript::default();
+    sent_two(&mut t, "2026-11-09T10:00:00Z");
+    t.record(&Event::Text { text: "One[[used: m999]] two[[used: 1 m1]].".into() });
+    assert_eq!(answer_text(&t), "One two.");
+    assert!(t.details().turns[0].used.is_empty());
+    assert!(t.take_used().is_empty());
+}
+
+#[test]
+fn a_marker_in_a_thought_counts_for_nothing() {
+    let mut t = Transcript::default();
+    sent_two(&mut t, "2026-11-09T10:00:00Z");
+    t.record(&Event::Thought { text: "[[used: m1]]".into() });
+    assert!(t.details().turns[0].used.is_empty());
+    assert!(t.take_used().is_empty());
+}
+
+#[test]
+fn a_new_turn_numbers_its_chips_from_one() {
+    let mut t = Transcript::default();
+    sent_two(&mut t, "2026-11-09T10:00:00Z");
+    t.record(&Event::Text { text: "[[used: m1]]".into() });
+    sent_two(&mut t, "2026-11-09T10:01:00Z");
+    t.record(&Event::Text { text: "[[used: m2]]".into() });
+    assert!(answer_text(&t).ends_with("[[used: 1 m2]]"), "{}", answer_text(&t));
+    assert_eq!(t.take_used(), ["m1", "m2"], "a turn's own count");
+}
+
+#[test]
+fn a_change_counts_for_the_last_turn_started_by_its_date() {
+    let mut t = Transcript::default();
+    sent_two(&mut t, "2026-11-09T10:00:00Z");
+    t.record(&Event::Text { text: "[[used: m1]]".into() });
+    sent_two(&mut t, "2026-11-09T10:05:00Z");
+    sent_two(&mut t, "2026-11-09T10:09:00Z");
+    t.record(&Event::Text { text: "[[used: m2]]".into() });
+    let marked = |date: &str| t.marked_at(date).into_iter().map(|p| p.text).collect::<Vec<_>>();
+    assert!(marked("2026-11-09T09:59:59Z").is_empty(), "before the conversation");
+    assert_eq!(marked("2026-11-09T10:00:00Z"), ["Text of m1."], "as its turn started");
+    assert_eq!(marked("2026-11-09T10:04:59Z"), ["Text of m1."]);
+    assert!(marked("2026-11-09T10:05:00Z").is_empty(), "a turn that marked nothing");
+    assert_eq!(marked("2026-11-09T10:09:00Z"), ["Text of m2."]);
+    assert_eq!(marked("2026-11-09T11:00:00Z"), ["Text of m2."]);
+}
+
 #[test]
 fn a_proposal_s_text_is_cleaned_and_answered_once() {
     let mut t = Transcript::default();

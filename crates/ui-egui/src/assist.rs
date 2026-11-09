@@ -265,6 +265,7 @@ pub(crate) fn tick(app: &mut WordApp) {
         }
     }
     edits::tick(app);
+    memory::tick(app);
     // A permission request waits for the person: the pane opens to ask them. Closed while it
     // waits (Home › Assistant, the pane's close), the request is answered cancelled, so the
     // turn doesn't wait, hidden, for an answer no one can give.
@@ -811,7 +812,7 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     // come before this command returns, and must not find a setting from before.
     sync_unattended(app);
     let policy = if app.assist.by_person { PermissionPolicy::Ask } else { unattended(app) };
-    let kept = memory::for_turn(app);
+    let kept = memory::for_turn(app, &mut sent);
     let saved = app.conversation().and_then(|a| app.session.prefs.assistant.models.get(&a.info().id)).cloned().unwrap_or_default();
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
     a.set_memory(kept);
@@ -904,9 +905,11 @@ pub(crate) fn before_command(app: &mut WordApp, id: &str) {
 pub(crate) fn review_ended(app: &mut WordApp, id: &str, before: Vec<AuthoredChange>) {
     let (Some(decision), Some(name)) = (decision(id), app.conversation().map(|a| a.name().to_string())) else { return };
     let Some(after) = changes_of(&app.session, &name) else { return };
-    for change in resolved(before, after) {
+    let gone = resolved(before, after);
+    for change in &gone {
         app.assist.feedback.record(decision, change.kind, &change.text);
     }
+    memory::decided(app, decision, &gone);
 }
 
 /// The changes of `before` that `after` doesn't have, unless one of `after`'s is new: a change with
@@ -1053,7 +1056,11 @@ pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
         Entry::Model { name, effort, .. } => std::iter::once(name.clone()).chain(effort.clone()).collect(),
         Entry::Agent { name } => vec![name.clone()],
         Entry::Usage(u) => u.cost.iter().cloned().collect(),
-        Entry::Context(sent) => std::iter::once(sent.document.clone()).chain(sent.knowledge.iter().map(|s| s.name.clone())).collect(),
+        Entry::Context(sent) => std::iter::once(sent.document.clone())
+            .chain(sent.knowledge.iter().map(|s| s.name.clone()))
+            .chain(sent.memory.iter().map(|p| p.text.clone()))
+            .collect(),
+        Entry::Used { .. } => vec![],
         Entry::Output(row) => vec![row.text.clone()],
         Entry::Note { text } => vec![text.clone()],
         Entry::Stopped { .. } => vec![],

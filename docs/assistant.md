@@ -139,14 +139,16 @@ are.
 
 ## Memory
 
-What you keep reaches every later conversation with every backend. File › Options › Assistant
-has the list: add a preference, edit it, turn it off, remove it or clear them all, and turn the
-whole thing off with **Give the assistant what you kept**. Off, nothing is sent and what you
-kept stays until you clear it. `assist.memory` reads the list for whoever holds the window's key.
+What you keep reaches every later conversation with every backend. Details › Memory in the
+Assistant pane has the list: add a preference, edit it, turn it off, remove it or clear them all,
+and turn the whole thing off with **Give the assistant what you kept**. Off, nothing is sent and
+what you kept stays until you clear it. The pane needs a document, so with none open File › Options
+› Assistant has the list instead; with one open, it says where the list is. `assist.memory` reads
+the list for whoever holds the window's key.
 
 **Only your own click stores anything.** Documents are untrusted: a shared document, a received
 file or a comment can tell a model to remember something, and a stored preference would act on
-later documents. So `assist.memory.add`, `.edit`, `.remove`, `.clear` and `.enabled` refuse a
+later documents. So `assist.memory.add`, `.edit`, `.remove`, `.clear`, `.enabled` and `.keep` refuse a
 script, an agent, a click or key the control channel made and a macro's step, as signing in to
 ChatGPT does, and they take no key and go on no ribbon or toolbar. An invited participant's copy
 refuses them at every role.
@@ -165,6 +167,30 @@ proposal of something you already kept or said no to shows no card, whatever its
 and neither does any proposal while memory is off. The file keeps a hash of what you said no to,
 not the text. No extra request is made: proposals come within the turns you asked for.
 
+**What shaped an answer.** The model is asked to write `[[used: m1]]` where one of your preferences
+shapes its answer. That marker becomes a numbered chip in the answer, such as **M1**: hover over it
+for the preference's words, and click it to go to Details › Memory. There each turn lists what it
+sent: those a chip marked, with their numbers, and the others under **The whole answer**. A marker
+for something the turn didn't send does nothing. The model is also asked to follow the current
+request when a preference conflicts with it, and to say so in its answer.
+
+**When to ask again.** The list says how often each preference was used and what became of the
+changes made with it. `used` and `lastUsed` go up when a marker names a preference, once in a turn,
+and the last used go first in what the next turn sends. When you accept or reject a change the
+assistant made in a turn that marked a preference, that preference's `accepted` or `rejected` goes
+up, unless you have reworded it since.
+A change belongs to the last turn that started by its revision's date, so one made in the same
+second a new turn starts counts for that new turn. Only your own Accept and Reject count, not another
+participant's or a script's, and a change resolved once a new conversation has started counts for
+nothing.
+
+When `rejected` is at least 3 and more than `accepted`, the pane asks whether to keep the preference,
+under the conversation and in the list, with **Keep** and **Remove**. Nothing changes until you
+answer: the preference still goes to every turn. Keep sets `accepted` and `rejected` to 0, so the
+question comes back only after three more rejections. So does changing the preference's wording. A
+preference that is off, or memory that is off, asks nothing. These counts are the only thing a model
+can change here, and they can only reorder what is sent or raise this question.
+
 The list is `assistant-memory.json` in the settings folder, which on Unix only you may read: at
 most 200 preferences of at most 280 characters each. It is never put in a document, a recovery
 copy or the log, it never crosses a room, and signing out doesn't touch it. Two WordCrafts keep
@@ -173,7 +199,7 @@ whole is moved aside as `assistant-memory.json.damaged` before the next write, n
 silence. It is plain JSON, so you can copy it to another computer.
 
 A turn sends the preferences that are on, most recently used first, up to 4 KiB in all. What
-doesn't fit isn't sent, and the list says so. ChatGPT gets them in the request's instructions. An
+doesn't fit isn't sent, and the list and that turn's Details › Memory say so. ChatGPT gets them in the request's instructions. An
 ACP agent gets them in a new session's first prompt and again when they change, including when
 none applies any more. They apply unless the current request says otherwise, and they never
 permit what the role doesn't. While memory is on, a turn also asks the model to propose only what
@@ -599,7 +625,8 @@ own account the way it documents.
 
 **Memory.** With each real backend, state a preference ("from now on, use numbered lists in
 summaries") and see a card under the answer. Keep it, start a new conversation with another
-backend, and see an answer follow it.
+backend, and see an answer follow it with its chip. Click the chip and see the preference in
+Details › Memory. Reject three changes from a turn that marked it, and see the pane ask.
 
 **All at once.** With ChatGPT in the pane, give an agent outside the pane its own seat: get an
 invite with the `room` tool or `room.invite {"name": "Codex"}` on the control channel, and start

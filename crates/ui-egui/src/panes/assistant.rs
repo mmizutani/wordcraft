@@ -6,7 +6,7 @@
 //! ([`super::answer`]), thoughts folded away, a row per
 //! tool call folded to how it went (open: what it said, and the way to the change it made, #23),
 //! the plan as a checklist, permission requests with their options while they wait, what the
-//! model proposes to keep (#86), errors, and why a turn stopped, said plainly. At the bottom, Accept all and Reject all of this assistant's
+//! model proposes to keep and the preferences it asks about (#86), errors, and why a turn stopped, said plainly. At the bottom, Accept all and Reject all of this assistant's
 //! changes, the writing actions (#18), and the prompt box with Send and Stop; Draft turns the box
 //! into what to write at the caret. Everything it does goes through the `assist.*` and `review.*`
 //! commands, but for the answer to a permission request: that is the person's click alone, which
@@ -213,6 +213,7 @@ fn transcript(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
             entry(app, ui, t, i, e, waiting, streaming);
             ui.add_space(6.0);
         }
+        crate::assist::memory::questions(app, ui, t);
         if busy {
             ui.label(RichText::new(tl!("Working…")).small().color(t.text_dim));
         } else if ended && !entries.is_empty() {
@@ -237,7 +238,7 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
                 wrapped(ui, RichText::new(text).color(t.text));
             });
         }
-        Entry::Answer { text } => super::answer::answer(app, ui, t, text, streaming),
+        Entry::Answer { text } => super::answer::answer(app, ui, t, i, text, streaming),
         Entry::Thought { text } => {
             egui::CollapsingHeader::new(RichText::new(tl!("Thinking")).small().color(t.text_dim))
                 .id_salt(("assistant_thought", i))
@@ -270,7 +271,7 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
         Entry::Proposal { id, text, answer } => crate::assist::memory::proposal_card(app, ui, t, *id, text, *answer),
         Entry::Model { name, effort, asked } => model_line(ui, t, name, effort.as_deref(), *asked),
         Entry::Note { text } => wrapped(ui, RichText::new(text).small().italics().color(t.orange)),
-        Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) | Entry::Output(_) => {}
+        Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) | Entry::Output(_) | Entry::Used { .. } => {}
         Entry::Stopped { stop } => {
             if let Some(says) = stop.says() {
                 // Stopped by the person reads as a note; any other stop is news to them.

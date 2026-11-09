@@ -692,6 +692,9 @@ pub struct AuthoredChange {
     /// `insert`, `delete`, `format`…, as the Reviewing Pane names it.
     pub kind: &'static str,
     pub rev: u32,
+    /// Its revision's date, read before the change is resolved: resolving every change clears the
+    /// revisions.
+    pub date: String,
     /// The start of its text, at most [`AUTHORED_TEXT_CHARS`] characters: objects left out, and a
     /// line break for each paragraph mark.
     pub text: String,
@@ -718,7 +721,8 @@ pub fn changes_of(s: &Session, author: &str) -> Option<Vec<AuthoredChange>> {
                 None => {
                     let mut text = String::new();
                     add_text(s, &c, &mut text);
-                    out.push(AuthoredChange { kind: c.kind, rev, text });
+                    let date = s.doc.revisions.get(rev as usize).map_or_else(String::new, |r| r.date.clone());
+                    out.push(AuthoredChange { kind: c.kind, rev, date, text });
                 }
             }
             if out.len() > MOST_AUTHORED_CHANGES {

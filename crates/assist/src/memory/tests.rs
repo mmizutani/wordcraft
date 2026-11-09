@@ -250,3 +250,129 @@ fn a_big_item_doesnt_stop_a_small_one() {
     let sent = m.for_model();
     assert!(sent.sent.last().is_some_and(|id| m.items.last().is_some_and(|i| i.id == *id)), "{:?}", sent.sent);
 }
+
+fn item_with(accepted: u64, rejected: u64) -> super::Item {
+    let mut m = Memory::default();
+    let mut item = m.add("Use numbered lists.", NOW).unwrap();
+    item.accepted = accepted;
+    item.rejected = rejected;
+    item
+}
+
+#[test]
+fn it_asks_at_three_rejections_more_than_accepted() {
+    assert!(!item_with(0, 2).asks(), "rejected 2");
+    assert!(!item_with(3, 3).asks(), "rejected 3, accepted 3");
+    assert!(item_with(2, 3).asks(), "rejected 3, accepted 2");
+    assert!(item_with(0, 3).asks(), "rejected 3, accepted 0");
+    assert!(!item_with(9, 4).asks(), "accepted more");
+}
+
+#[test]
+fn one_that_is_off_asks_nothing() {
+    let mut item = item_with(0, 3);
+    item.off = true;
+    assert!(!item.asks());
+}
+
+#[test]
+fn what_a_marker_names_counts_and_comes_first_next_turn() {
+    let mut m = memory(&["First.", "Second."]);
+    m.items[0].kept = "2026-01-01T00:00:00Z".into();
+    m.items[1].kept = "2026-01-02T00:00:00Z".into();
+    assert_eq!(m.for_model().sent, ["m2", "m1"], "the newest kept goes first");
+    m.note_used(&["m1".into(), "m999".into()], NOW);
+    assert_eq!((m.items[0].used, m.items[0].last_used.as_deref()), (1, Some(NOW)));
+    assert_eq!((m.items[1].used, m.items[1].last_used.as_deref()), (0, None), "only what was named");
+    assert_eq!(m.for_model().sent, ["m1", "m2"], "what was used last goes first");
+}
+
+#[test]
+fn decisions_add_up_without_overflowing() {
+    use crate::feedback::Decision;
+    let mut m = memory(&["First."]);
+    let first = m.preferences(&["m1".into()]).remove(0);
+    m.note_decided(&first, Decision::Accepted, 2);
+    m.note_decided(&first, Decision::Rejected, 3);
+    m.note_decided(&super::SentPreference { id: "m999".into(), text: "First.".into() }, Decision::Rejected, 3);
+    assert_eq!((m.items[0].accepted, m.items[0].rejected), (2, 3));
+    m.note_decided(&first, Decision::Rejected, u64::MAX);
+    assert_eq!(m.items[0].rejected, u64::MAX);
+}
+
+#[test]
+fn a_change_made_under_an_old_wording_doesn_t_count_for_a_new_one() {
+    use crate::feedback::Decision;
+    let mut m = memory(&["First."]);
+    let sent = m.preferences(&["m1".into()]).remove(0);
+    m.edit("m1", Some("  FIRST. "), None).unwrap();
+    m.note_decided(&sent, Decision::Rejected, 1);
+    assert_eq!(m.items[0].rejected, 1, "the same wording");
+    m.edit("m1", Some("Another."), None).unwrap();
+    m.note_decided(&sent, Decision::Rejected, 1);
+    assert_eq!(m.items[0].rejected, 0);
+}
+
+#[test]
+fn keeping_what_it_asked_about_starts_the_counts_again() {
+    let dir = folder("keep-asked");
+    let id = add(&dir, "Use numbered lists.");
+    Memory::update(&dir, |m| {
+        m.items[0].used = 5;
+        m.items[0].accepted = 1;
+        m.items[0].rejected = 3;
+        Ok(())
+    })
+    .unwrap();
+    assert!(Memory::load(&dir).items[0].asks());
+    Memory::update(&dir, |m| m.keep_asked(&id)).unwrap();
+    let item = &Memory::load(&dir).items[0];
+    assert!(!item.asks());
+    assert_eq!((item.used, item.accepted, item.rejected), (5, 0, 0), "what it was used for stays");
+    assert!(Memory::update(&dir, |m| m.keep_asked("m999")).is_err());
+}
+
+#[test]
+fn a_new_wording_starts_the_counts_again_and_the_same_one_doesn_t() {
+    let mut m = memory(&["First."]);
+    m.items[0].rejected = 3;
+    m.edit("m1", Some("  FIRST. "), None).unwrap();
+    assert_eq!(m.items[0].rejected, 3);
+    m.edit("m1", Some("Another."), None).unwrap();
+    assert_eq!(m.items[0].rejected, 0);
+}
+
+#[test]
+fn counting_leaves_a_damaged_file_as_it_is() {
+    let dir = folder("count-damaged");
+    let junk = b"{ not json";
+    std::fs::write(dir.join(FILE), junk).unwrap();
+    Memory::count(&dir, |m| m.note_used(&["m1".into()], NOW)).unwrap();
+    assert_eq!(std::fs::read(dir.join(FILE)).unwrap(), junk);
+    assert!(!dir.join(format!("{FILE}{DAMAGED_SUFFIX}")).exists());
+}
+
+#[test]
+fn counting_keeps_what_another_window_wrote() {
+    let dir = folder("count-writers");
+    add(&dir, "First.");
+    let id = add(&dir, "Second.");
+    Memory::count(&dir, |m| m.note_used(std::slice::from_ref(&id), NOW)).unwrap();
+    let m = Memory::load(&dir);
+    assert_eq!(m.items.len(), 2);
+    assert_eq!((m.items[0].used, m.items[1].used), (0, 1));
+}
+
+#[test]
+fn the_model_is_asked_to_say_when_one_conflicts_and_to_mark_what_it_used() {
+    let text = memory(&["First."]).for_model().text.unwrap();
+    assert!(text.contains("conflicts with the current request") && text.contains("say so"), "{text}");
+    assert!(text.contains("[[used:"), "{text}");
+}
+
+#[test]
+fn what_was_sent_reads_by_id_in_the_order_sent() {
+    let m = memory(&["First.", "Second."]);
+    let sent = m.preferences(&["m2".into(), "m999".into(), "m1".into()]);
+    assert_eq!(sent.iter().map(|p| (p.id.as_str(), p.text.as_str())).collect::<Vec<_>>(), [("m2", "Second."), ("m1", "First.")]);
+}
