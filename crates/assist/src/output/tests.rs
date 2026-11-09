@@ -299,3 +299,18 @@ fn a_long_comment_is_read_only_as_far_as_its_row_shows() {
     let (rows, _) = rows(&s, AUTHOR);
     assert_eq!(rows[0].text.chars().count(), wordcraft_engine::cmd::review::ROW_TEXT_CHARS);
 }
+
+#[test]
+fn a_change_across_paragraphs_says_only_that_it_was_resolved() {
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Remove");
+    s.run("select.range", &json!({"anchor": {"block": 0, "off": 4}, "focus": {"block": 1, "off": 4}})).unwrap();
+    s.run("text.delete", &json!({})).unwrap();
+    note(&mut t, &s);
+    let before = listed(&t);
+    assert!(before.iter().any(|r| r.1.contains("two three") && r.1.contains("four")), "{before:?}");
+    s.run("review.acceptAll", &json!({})).unwrap();
+    note(&mut t, &s);
+    assert!(listed(&t).iter().all(|r| r.2 == OutputState::Resolved), "{:?}", listed(&t));
+}

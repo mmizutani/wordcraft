@@ -176,7 +176,7 @@ fn output_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, row: &OutputRow) {
                 let button = ui.add_enabled(can, egui::Button::new(RichText::new(tl!(label)).small()));
                 // The assistant's change alone, though someone else's overlaps it.
                 if button.clicked() && select(app, &range) {
-                    let _ = app.run(id, json!({"author": name}));
+                    let _ = app.run(id, row.resolve_params(&name));
                 }
             }
         }
