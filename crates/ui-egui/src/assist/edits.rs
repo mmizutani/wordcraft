@@ -56,7 +56,7 @@ pub(super) fn tick(app: &mut WordApp) {
         return;
     }
     app.assist.edits.running = false;
-    read_again(app, false);
+    record(app);
     let Some(a) = app.conversation() else { return };
     let (room, name) = (a.room().clone(), a.name().to_string());
     let calls: Vec<_> = a

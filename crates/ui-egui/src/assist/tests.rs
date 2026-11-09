@@ -1733,6 +1733,20 @@ fn a_text_someone_else_changed_during_the_turn_isn_t_watched() {
     assert!(!context_of(&seen, 1).contains("changed your text"), "{}", context_of(&seen, 1));
 }
 
+/// A correction made while a later turn runs is still said, once that turn changed nothing.
+#[test]
+fn an_edit_made_during_a_later_turn_is_still_said() {
+    let (mut a, seen) = wrote_hello(vec![Step::Hold]);
+    a.execute("assist.ask", json!({"prompt": "Think"})).unwrap();
+    a.run("select.text", json!({"text": "there"})).unwrap();
+    a.run("text.insert", json!({"text": "world"})).unwrap();
+    a.execute("assist.cancel", json!({})).unwrap();
+    settle(&mut a);
+    ask(&mut a, "Again", None);
+    let context = context_of(&seen, 2);
+    assert!(context.contains("changed your text from \"Hello there\" to \"Hello world\""), "{context}");
+}
+
 /// A text a script changed isn't watched again: the person's later edit of it would quote the
 /// script's words as what the assistant wrote.
 #[test]
