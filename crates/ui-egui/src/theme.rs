@@ -701,17 +701,33 @@ fn system_cjk_font(hans: bool, korean: bool) -> Option<&'static wordcraft_fonts:
     .get_or_init(|| {
         let embedded = wordcraft_fonts::ui_cjk_fonts_for(hans, korean);
         let (catalogs, names) = crate::i18n::Lang::cjk_font_text_for(hans, korean);
-        let mut needed = wordcraft_fonts::ui_uncovered_cjk(&catalogs, &embedded);
-        if needed.is_empty() {
-            needed = wordcraft_fonts::ui_uncovered_cjk(&[&names], &embedded);
-            if needed.is_empty() {
-                return None;
-            }
-        }
+        let needed = system_cjk_needed(
+            wordcraft_fonts::ui_uncovered_cjk(&catalogs, &embedded),
+            wordcraft_fonts::ui_uncovered_cjk(&[&names], &embedded),
+            !embedded.is_empty(),
+        )?;
         log::debug!("interface: {} CJK characters lack an embedded glyph", needed.len());
         wordcraft_fonts::system_cjk_ui_font_for(hans, korean, &needed)
     })
     .as_ref()
+}
+
+/// The characters the installed CJK font must cover: those the embedded faces leave out of the
+/// catalogs, else of the language names. `None` when the embedded faces cover both. With no
+/// embedded face and no such characters (a build without craft-fonts and craft-i18n: English-only
+/// catalogs) it is empty, and the font is chosen for a character typical of the language: the
+/// caller asks only when CJK text is on screen, a file name or the Recent list, and returning
+/// `None` here drew that text as boxes.
+fn system_cjk_needed(catalogs: Vec<char>, names: Vec<char>, embedded: bool) -> Option<Vec<char>> {
+    if !catalogs.is_empty() {
+        Some(catalogs)
+    } else if !names.is_empty() {
+        Some(names)
+    } else if embedded {
+        None
+    } else {
+        Some(Vec::new())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -923,6 +939,34 @@ pub fn c32(c: wordcraft_doc::Rgb) -> Color32 {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    /// A Japanese file name in the caption and Recent list was all boxes in a build whose catalogs
+    /// have no CJK text and which embeds no CJK face: the installed CJK font was never looked up.
+    #[test]
+    fn installed_cjk_font_is_wanted_when_nothing_is_embedded_and_the_catalogs_have_no_cjk() {
+        assert_eq!(super::system_cjk_needed(vec![], vec![], false), Some(vec![]));
+        assert_eq!(super::system_cjk_needed(vec![], vec![], true), None, "embedded faces cover the interface");
+        assert_eq!(super::system_cjk_needed(vec!['页'], vec!['日'], true), Some(vec!['页']));
+        assert_eq!(super::system_cjk_needed(vec![], vec!['日'], true), Some(vec!['日']));
+    }
+
+    /// End to end: a Japanese file name has glyphs once the installed CJK font is asked for,
+    /// whatever the catalogs hold. Skipped where no CJK font is installed or embedded.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_japanese_file_name_has_glyphs_with_the_installed_cjk_font() {
+        let name = "秘密保持契約サンプル_条番号自動連番フル活用";
+        if wordcraft_fonts::ui_cjk_fonts_for(false, false).is_empty() && wordcraft_fonts::system_cjk_ui_font_for(false, false, &[]).is_none() {
+            eprintln!("skipped: no CJK font embedded or installed");
+            return;
+        }
+        let ctx = egui::Context::default();
+        ctx.set_fonts(super::font_definitions(false, true));
+        ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
+        for font in [super::regular(14.0), super::semibold(14.0)] {
+            assert!(ctx.fonts_mut(|f| f.has_glyphs(&font, name)), "{name} draws as boxes");
+        }
+    }
 
     /// WCAG contrast ratio between two opaque colours.
     pub(super) fn contrast(a: egui::Color32, b: egui::Color32) -> f32 {
