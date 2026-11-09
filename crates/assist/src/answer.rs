@@ -73,9 +73,7 @@ pub fn opens(address: &str) -> bool {
 pub fn format(text: &str, streaming: bool) -> Formatted {
     let (read, past) = split_at_line(text, MAX_PARSED);
     let read = if streaming { settled(read) } else { Cow::Borrowed(read) };
-    let read = separate_fences(read);
-    let read = without_embedded(&read);
-    let (flow, cut) = markdown::parse_reporting_cuts(&read);
+    let (flow, cut) = parsed(read);
     // The parser reads documents, which hold tables to limits. An answer's words all stay.
     if cut {
         return Formatted { blocks: Vec::new(), rest: text.to_string() };
@@ -87,6 +85,12 @@ pub fn format(text: &str, streaming: bool) -> Formatted {
     let mut formatted = out.done();
     formatted.rest.push_str(past);
     formatted
+}
+
+/// `text` as the parser reads it for an answer, and whether a table lost words.
+fn parsed(text: Cow<'_, str>) -> (wordcraft_formats::model::Flow, bool) {
+    let text = separate_fences(text);
+    markdown::parse_reporting_cuts(&without_embedded(&text))
 }
 
 /// Stands for the `:` of a `data:` address while the parser reads an answer.
