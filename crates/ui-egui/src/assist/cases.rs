@@ -35,11 +35,19 @@ pub(crate) fn bound_for(app: &WordApp) -> Option<CaseRef> {
 }
 
 impl WordApp {
-    /// Bind the shown document to `at`, or unbind it with `None`. For tests, until the commands
-    /// that do this for the person land; nothing else binds a case.
+    /// Bind the shown document to `at`, or unbind it with `None`. A live conversation of the
+    /// document bound to another case ends, stopping its turn: it holds that case's notes, and
+    /// the next ask would only replace it. For tests, until the commands that do this for the
+    /// person land; nothing else binds a case.
     #[doc(hidden)]
     pub fn bind_case(&mut self, at: Option<CaseRef>) {
         let document = self.session.document_id();
+        if let Some(c) = self.assist.conversation.as_mut()
+            && c.document == document
+            && c.case != at
+        {
+            c.assistant.end();
+        }
         match at {
             Some(at) => {
                 self.assist.cases.bound.insert(document, at);
