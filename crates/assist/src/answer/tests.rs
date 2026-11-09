@@ -258,6 +258,22 @@ fn a_heading_in_a_list_keeps_its_place_in_the_list() {
 }
 
 #[test]
+fn what_can_t_carry_a_marker_keeps_its_place_in_the_list() {
+    let markers = |f: &Formatted| -> Vec<String> {
+        f.blocks.iter().filter_map(|b| if let Block::Item { marker, .. } = b { Some(marker.clone()) } else { None }).collect()
+    };
+    let f = format("1. ```\n   echo first\n   echo two\n   ```\n2. Second", false);
+    assert_eq!(markers(&f), ["1.", "2."], "{:?}", f.blocks);
+    assert!(f.blocks.contains(&Block::Code("echo first\necho two".into())), "{:?}", f.blocks);
+    let f = format("1. first\n\n   ```\n   code\n   ```\n\n2. second", false);
+    assert_eq!(markers(&f), ["1.", "2."], "{:?}", f.blocks);
+    let f = format("1. first\n\n   more of it\n\n2. second", false);
+    assert_eq!(markers(&f), ["1.", "2."], "{:?}", f.blocks);
+    let f = format("1. ---\n2. second", false);
+    assert_eq!(markers(&f), ["1.", "2."], "{:?}", f.blocks);
+}
+
+#[test]
 fn a_table_ends_the_ordered_list_before_it() {
     let f = format("1. first\n\n| a | b |\n|---|---|\n| c | d |\n\n1. again", false);
     let markers: Vec<&str> = f.blocks.iter().filter_map(|b| if let Block::Item { marker, .. } = b { Some(marker.as_str()) } else { None }).collect();

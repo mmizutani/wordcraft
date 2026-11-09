@@ -8,7 +8,7 @@
 use std::borrow::Cow;
 
 use wordcraft_formats::markdown;
-use wordcraft_formats::model::{FBlock, Fmt, Inline, Kind, Para};
+use wordcraft_formats::model::{FBlock, Fmt, Inline, Kind, ListInfo, Para};
 
 use crate::backend::{MAX_LABEL, label, shown};
 
@@ -218,6 +218,11 @@ impl Builder {
             self.code_ended = true;
             return;
         }
+        // What can't carry a marker comes after one of its own.
+        if let (Kind::Code | Kind::Rule, Some(list)) = (&p.kind, &p.list) {
+            let marker = self.marker(list);
+            self.push(Block::Item { marker, level: list.level, spans: Vec::new() });
+        }
         let block = match (&p.kind, &p.list) {
             (Kind::Code, _) => {
                 let line = shown_again(&p.inlines.iter().map(inline_text).collect::<String>());
@@ -237,22 +242,7 @@ impl Builder {
             (Kind::Heading(level), None) => Block::Heading { level: *level, spans: spans(p, false) },
             (Kind::Title, None) => Block::Heading { level: 1, spans: spans(p, false) },
             (_, Some(list)) => {
-                let level = usize::from(list.level);
-                self.numbers.truncate(level.saturating_add(1));
-                let marker = if list.ordered {
-                    self.numbers.resize(level.saturating_add(1), None);
-                    let next = self.numbers.get(level).copied().flatten().map_or(list.start, |n| n.saturating_add(1));
-                    if let Some(n) = self.numbers.get_mut(level) {
-                        *n = Some(next);
-                    }
-                    format!("{next}.")
-                } else {
-                    // A bullet ends an ordered list at this depth: the next one starts again.
-                    if let Some(n) = self.numbers.get_mut(level) {
-                        *n = None;
-                    }
-                    "•".to_string()
-                };
+                let marker = self.marker(list);
                 // A heading in a list keeps its place there, and stands out by its weight.
                 let heading = matches!(p.kind, Kind::Heading(_) | Kind::Title);
                 self.push(Block::Item { marker, level: list.level, spans: spans(p, heading) });
@@ -261,8 +251,30 @@ impl Builder {
             (Kind::Quote, None) => Block::Quote(spans(p, false)),
             (Kind::Normal, None) => Block::Para(spans(p, false)),
         };
-        self.numbers.clear();
+        if p.list.is_none() {
+            self.numbers.clear();
+        }
         self.push(block);
+    }
+
+    /// The marker of the list item `list` says this is, counting it.
+    fn marker(&mut self, list: &ListInfo) -> String {
+        let level = usize::from(list.level);
+        self.numbers.truncate(level.saturating_add(1));
+        if list.ordered {
+            self.numbers.resize(level.saturating_add(1), None);
+            let next = self.numbers.get(level).copied().flatten().map_or(list.start, |n| n.saturating_add(1));
+            if let Some(n) = self.numbers.get_mut(level) {
+                *n = Some(next);
+            }
+            format!("{next}.")
+        } else {
+            // A bullet ends an ordered list at this depth: the next one starts again.
+            if let Some(n) = self.numbers.get_mut(level) {
+                *n = None;
+            }
+            "•".to_string()
+        }
     }
 
     fn push(&mut self, block: Block) {
