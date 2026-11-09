@@ -99,26 +99,63 @@ fn resolve_mark_formatting(para: &mut wordcraft_doc::Paragraph, accept: bool, wh
 
 /// Accept or reject the changes of the table cell `path` is in: the table's, its row's and the
 /// cell's own. Returns whether there were any.
-fn resolve_cell(s: &mut Session, story: StoryRef, path: &wordcraft_doc::Path, accept: bool) -> Result<bool, CmdError> {
+fn resolve_cell(s: &mut Session, story: StoryRef, path: &wordcraft_doc::Path, accept: bool, which: Which) -> Result<bool, CmdError> {
     let Some((tp, r, c)) = path.cell() else { return Ok(false) };
     let has = s.doc.table(story, &tp).is_some_and(|t| {
         let row = t.rows.get(r);
-        t.props.fmt_change.is_some()
-            || row.is_some_and(|x| x.props.fmt_change.is_some())
-            || row.and_then(|x| x.cells.get(c)).is_some_and(|x| x.props.fmt_change.is_some())
+        which.has(t.props.fmt_change.as_ref().map(|ch| ch.rev))
+            || which.has(row.and_then(|x| x.props.fmt_change.as_ref()).map(|ch| ch.rev))
+            || which.has(row.and_then(|x| x.cells.get(c)).and_then(|x| x.props.fmt_change.as_ref()).map(|ch| ch.rev))
     });
     if !has {
         return Ok(false);
     }
     let t = s.doc.table_mut(story, &tp)?;
-    fmt_revisions::resolve_table(t, accept);
+    if which.has(t.props.fmt_change.as_ref().map(|ch| ch.rev)) {
+        fmt_revisions::resolve_table(t, accept);
+    }
     if let Some(row) = t.rows.get_mut(r) {
-        fmt_revisions::resolve_row(row, accept);
-        if let Some(cell) = row.cells.get_mut(c) {
+        if which.has(row.props.fmt_change.as_ref().map(|ch| ch.rev)) {
+            fmt_revisions::resolve_row(row, accept);
+        }
+        if let Some(cell) = row.cells.get_mut(c)
+            && which.has(cell.props.fmt_change.as_ref().map(|ch| ch.rev))
+        {
             fmt_revisions::resolve_cell(cell, accept);
         }
     }
     Ok(true)
+}
+
+/// Resolve the tracked formatting of the paragraph mark at `at`, the caret. Whether there was any.
+fn resolve_mark_at(s: &mut Session, at: &Pos, accept: bool, which: Which) -> Result<bool, CmdError> {
+    let at_mark = s.doc.para(at.story, &at.path).is_some_and(|p| at.off == p.len() && which.has_change(p.mark.fmt_change.as_deref()));
+    if at_mark {
+        let para = s.doc.para_mut(at.story, &at.path)?;
+        fmt_revisions::resolve_char(&mut para.mark, accept);
+        para.touch();
+    }
+    Ok(at_mark)
+}
+
+/// Resolve the section's tracked change at `at`, the caret: the change is listed where the section
+/// ends, at the end of its last paragraph or of the document. Whether there was one.
+fn resolve_section_at(s: &mut Session, at: &Pos, accept: bool, which: Which) -> Result<bool, CmdError> {
+    let in_paragraph = s.doc.para(at.story, &at.path).and_then(|p| p.section.as_ref().map(|x| (p.len(), x)));
+    if let Some((len, section)) = in_paragraph
+        && at.off == len
+        && which.has(section.fmt_change.as_ref().map(|ch| ch.rev))
+    {
+        if let Some(section) = s.doc.para_mut(at.story, &at.path)?.section.as_mut() {
+            fmt_revisions::resolve_section(section, accept);
+        }
+        return Ok(true);
+    }
+    if at.story == StoryRef::Body && *at == s.doc.end_of(StoryRef::Body) && which.has(s.doc.last_section.fmt_change.as_ref().map(|ch| ch.rev)) {
+        fmt_revisions::resolve_section(&mut s.doc.last_section, accept);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// A tracked change, for navigation and the Reviewing Pane: its range, kind (`insert`,
@@ -265,9 +302,34 @@ pub(super) fn resolve_all_then(s: &mut Session, v: &Value, accept: bool) -> CmdR
     Ok(out)
 }
 
-/// Accept or Reject at the selection; with `next`, the next change is selected afterwards.
+/// Accept or Reject at the selection; with `next`, the next change is selected afterwards; with
+/// `author`, only that reviewer's changes in the selection are resolved, and with `kind` too, only
+/// their insertions, deletions, formatting or moves: one text can carry a change of each.
 pub(super) fn resolve_sel_then(s: &mut Session, v: &Value, accept: bool) -> CmdResult {
-    resolve_sel(s, accept, p::bool(v, "next") == Some(true))
+    use wordcraft_doc::{Revision, RevisionKind};
+    let next = p::bool(v, "next") == Some(true);
+    let kind: Option<fn(&Revision) -> bool> = match v.get("kind") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(k)) if k == "insert" => Some(|r| r.kind == RevisionKind::Insert),
+        Some(Value::String(k)) if k == "delete" => Some(|r| r.kind == RevisionKind::Delete),
+        Some(Value::String(k)) if k == "format" => Some(|r| r.kind == RevisionKind::Format),
+        // Either end of one, which go together.
+        Some(Value::String(k)) if k == "move" => Some(|r| r.move_name.is_some()),
+        Some(_) => return Err(CmdError::Params("`kind`: insert, delete, format or move".into())),
+    };
+    match v.get("author") {
+        None | Some(Value::Null) if kind.is_none() => resolve_sel(s, accept, next, Which::All),
+        Some(Value::String(author)) if !author.trim().is_empty() => {
+            let author = author.trim();
+            let revisions = s.doc.revisions.iter().enumerate();
+            let theirs: BTreeSet<u32> = revisions
+                .filter(|(_, r)| r.author == author && kind.is_none_or(|wanted| wanted(r)))
+                .filter_map(|(i, _)| u32::try_from(i).ok())
+                .collect();
+            resolve_sel(s, accept, next, Which::Revisions(&theirs))
+        }
+        _ => Err(CmdError::Params("`author` is the name of the reviewer whose changes to resolve, and `kind` goes with it".into())),
+    }
 }
 
 /// The span of the tracked change around `off` in `p`: its run, joined across the comment anchors
@@ -308,13 +370,23 @@ fn revision_span(p: &Paragraph, off: usize) -> Option<std::ops::Range<usize>> {
     Some(start..end)
 }
 
-fn resolve_sel(s: &mut Session, accept: bool, next: bool) -> CmdResult {
+fn resolve_sel(s: &mut Session, accept: bool, next: bool, which: Which) -> CmdResult {
     let (a, b) = s.sel.ordered();
     // A caret right before a tracked paragraph mark (and no tracked text around it): that mark.
     let mut caret_mark = None;
     // A caret in a paragraph whose own formatting changed (and no tracked text around it).
     let mut caret_props = None;
     let ranged = a != b;
+    // One reviewer's row with no text of its own: someone else's run around the caret mustn't stand
+    // in for the table's or the section's change it lists.
+    if a == b && !matches!(which, Which::All) {
+        // One row can list them together, and takes them all. The run before a mark mustn't stand
+        // in for it either.
+        let (cell, section) = (resolve_cell(s, a.story, &a.path, accept, which)?, resolve_section_at(s, &a, accept, which)?);
+        if resolve_mark_at(s, &a, accept, which)? || cell || section {
+            return if next { select_next_unresolved(s) } else { sel_result(s) };
+        }
+    }
     let (a, b) = if a == b {
         // The change at the caret: the run around it, else the paragraph mark right after it,
         // else the paragraph's formatting, else the table cell's.
@@ -332,7 +404,10 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool) -> CmdResult {
                 (a.clone(), a)
             }
             None => {
-                if resolve_cell(s, a.story, &a.path, accept)? {
+                if resolve_cell(s, a.story, &a.path, accept, which)? {
+                    return if next { select_next_unresolved(s) } else { sel_result(s) };
+                }
+                if resolve_section_at(s, &a, accept, which)? {
                     return if next { select_next_unresolved(s) } else { sel_result(s) };
                 }
                 return nav_change(s, 1);
@@ -342,17 +417,30 @@ fn resolve_sel(s: &mut Session, accept: bool, next: bool) -> CmdResult {
         (a, b)
     };
     // Moves with an end in the range: their other ends go with them.
-    let moves = crate::cmd::moves::names_in(s, &a, &b, caret_mark.as_ref());
+    let mut moves = crate::cmd::moves::names_in(s, &a, &b, caret_mark.as_ref());
+    if !matches!(which, Which::All) {
+        // An author's own moves only, every end of them: a move with an end of anyone else's stays.
+        let revisions = &s.doc.revisions;
+        let theirs = |i: usize| u32::try_from(i).is_ok_and(|i| which.has(Some(i)));
+        moves.retain(|name| {
+            let mut ends = revisions.iter().enumerate().filter(|(_, r)| r.move_name.as_deref() == Some(name.as_str())).peekable();
+            ends.peek().is_some() && ends.all(|(i, _)| theirs(i))
+        });
+    }
     for path in s.doc.paths_between(&a, &b).into_iter().rev() {
         let len = s.doc.para(a.story, &path).map(|p| p.len()).unwrap_or(0);
         let from = if path == a.path { a.off } else { 0 };
         let to = if path == b.path { b.off } else { len };
         // A paragraph's mark is in the selection when the selection goes on past it.
         let mark = path != b.path || caret_mark.as_ref() == Some(&path);
-        let props = (ranged && (path != b.path || to > from)) || caret_props.as_ref() == Some(&path);
-        resolve_para(s, a.story, &path, (from, to), (mark, props), accept, Which::All)?;
-        if ranged {
-            resolve_cell(s, a.story, &path, accept)?;
+        // One reviewer's row is the text it names: a paragraph's own change only when that is all
+        // of it, and a table's, a row's or a cell's has a row of its own at the caret.
+        let all = matches!(which, Which::All);
+        let touched = if all { path != b.path || to > from } else { from == 0 && to == len && len > 0 };
+        let props = (ranged && touched) || caret_props.as_ref() == Some(&path);
+        resolve_para(s, a.story, &path, (from, to), (mark, props), accept, which)?;
+        if ranged && all {
+            resolve_cell(s, a.story, &path, accept, which)?;
         }
     }
     crate::cmd::moves::resolve(s, &moves, accept)?;
@@ -655,6 +743,90 @@ fn add_text(s: &Session, c: &Change, text: &mut String) {
     }
     let piece = s.doc.para(c.a.story, &c.a.path).and_then(|p| p.text.get(c.a.off..c.b.off)).unwrap_or_default();
     text.extend(piece.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(room));
+}
+
+/// Most characters of a change's or a comment's text [`change_rows`] and [`comment_rows`] keep.
+pub const ROW_TEXT_CHARS: usize = 120;
+
+/// One of an author's tracked changes in the document, for a list of them. Neighbouring runs of one
+/// change are one here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeRow {
+    /// `insert`, `delete`, `format`…, as the Reviewing Pane names it.
+    pub kind: &'static str,
+    pub a: Pos,
+    pub b: Pos,
+    /// Its text, at most [`ROW_TEXT_CHARS`] characters, objects left out.
+    pub text: String,
+}
+
+/// The first `most` tracked changes `author` made across the document, in every story, and how many
+/// more there are. Each one's text is read from its paragraph without copying it.
+pub fn change_rows(s: &Session, author: &str, most: usize) -> (Vec<ChangeRow>, usize) {
+    let theirs = |rev: u32| s.doc.revisions.get(rev as usize).is_some_and(|r| r.author == author);
+    let mut rows: Vec<ChangeRow> = Vec::new();
+    let mut more = 0usize;
+    for story in std::iter::once(StoryRef::Body).chain(s.doc.parts.keys().map(|id| StoryRef::Part(*id))) {
+        // The piece before, and whether its change is past the limit: what joins it is too.
+        let mut before: Option<(&'static str, u32, Pos, Pos)> = None;
+        let mut omitted = false;
+        for c in changes_in(s, story) {
+            let Some(rev) = c.rev.filter(|r| theirs(*r)) else { continue };
+            // `changes_in` joins a formatting change's own pieces: neighbours are others.
+            let joins = before.as_ref().is_some_and(|(kind, r, start, end)| {
+                *kind == c.kind
+                    && if c.kind == "format" {
+                        // Accept or Reject over one place takes all its changes, so they are one row:
+                        // a table's, a row's and a cell's at a caret, or a paragraph's and all its text.
+                        *start == c.a && *end == c.b
+                    } else {
+                        *r == rev && *end == c.a
+                    }
+            });
+            let same_words = joins && c.kind == "format";
+            before = Some((c.kind, rev, c.a.clone(), c.b.clone()));
+            if !joins {
+                omitted = rows.len() >= most;
+                if omitted {
+                    more = more.saturating_add(1);
+                } else {
+                    rows.push(ChangeRow { kind: c.kind, a: c.a.clone(), b: c.a.clone(), text: String::new() });
+                }
+            }
+            if omitted {
+                continue;
+            }
+            let Some(row) = rows.last_mut() else { continue };
+            row.b = c.b.clone();
+            if c.a.path == c.b.path && !same_words {
+                let piece = s.doc.para(c.a.story, &c.a.path).and_then(|p| p.text.get(c.a.off..c.b.off)).unwrap_or_default();
+                let room = ROW_TEXT_CHARS.saturating_sub(row.text.chars().count());
+                row.text.extend(piece.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(room));
+            }
+        }
+        // Their deletion of someone's insertion shows in the list as the insertion: a change of
+        // theirs all the same.
+        for path in s.doc.para_paths(story) {
+            let Some(p) = s.doc.para(story, &path) else { continue };
+            let at = |off| Pos { story, path: path.clone(), off };
+            let runs = p.run_ranges().filter(|(_, c)| c.ins.is_some() && c.del.is_some_and(theirs)).map(|(r, _)| {
+                let text =
+                    p.text.get(r.clone()).unwrap_or_default().chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(ROW_TEXT_CHARS).collect();
+                (at(r.start), at(r.end), text)
+            });
+            // A paragraph break of someone's that they took out.
+            let mark =
+                mark_change(s, story, &path).filter(|_| p.mark.ins.is_some() && p.mark.del.is_some_and(theirs)).map(|m| (m.a, m.b, String::new()));
+            for (a, b, text) in runs.chain(mark) {
+                if rows.len() >= most {
+                    more = more.saturating_add(1);
+                } else {
+                    rows.push(ChangeRow { kind: "delete", a, b, text });
+                }
+            }
+        }
+    }
+    (rows, more)
 }
 
 pub(super) fn list_changes(s: &mut Session, _: &Value) -> CmdResult {

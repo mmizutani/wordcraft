@@ -282,7 +282,8 @@ fn an_agent_streams_its_answer_thoughts_tool_calls_and_plan() {
     c.ask("Hi");
     let start = c.tool(START_ROW).unwrap();
     assert_eq!((start.title.as_str(), start.status), ("Start Fake Agent", ToolStatus::Completed));
-    assert!(c.turn().contains(&Entry::Model { name: "Fake Agent 1.0".into(), effort: None, asked: false }), "{:?}", c.turn());
+    assert!(c.turn().contains(&Entry::Agent { name: "Fake Agent 1.0".into() }), "{:?}", c.turn());
+    assert!(!c.turn().iter().any(|e| matches!(e, Entry::Model { .. })), "an agent's own name doesn't pose as a model: {:?}", c.turn());
     assert!(c.turn().contains(&Entry::Thought { text: "Pondering".into() }));
     let t1 = c.tool("t1").unwrap();
     assert_eq!((t1.title.as_str(), t1.kind.as_str(), t1.status), ("Read the document", "read", ToolStatus::Completed));
@@ -802,4 +803,102 @@ fn permission_options_plans_and_stop_reasons_map_from_the_protocol() {
 fn an_agent_is_named_by_its_label() {
     let spec = AgentSpec::new(" Claude Code\u{7} ", Launch::new("claude-agent-acp", Vec::<String>::new()));
     assert_eq!((spec.id.as_str(), spec.label.as_str(), spec.author.as_str()), ("acp:claude-code", "Claude Code", "Claude Code"));
+}
+
+#[test]
+fn usage_updates_reach_details_and_junk_is_ignored() {
+    let send = |update: serde_json::Value| Step::Send { update };
+    let script = turns(vec![
+        vec![
+            send(json!({"sessionUpdate": "usage_update", "used": "many", "size": -5, "cost": {"amount": "free", "currency": "USD"}})),
+            send(json!({"sessionUpdate": "usage_update", "cost": {"amount": 1.5}})),
+            send(json!({"sessionUpdate": "usage_update"})),
+            say("Nothing yet"),
+        ],
+        vec![
+            send(json!({"sessionUpdate": "usage_update", "used": 1200, "size": 200000, "cost": {"amount": 0.25, "currency": "USD\u{202E}"}})),
+            send(json!({"sessionUpdate": "usage_update", "used": 1500, "size": 200000})),
+        ],
+    ]);
+    let mut c = Chat::with(&script);
+    c.ask("One");
+    assert_eq!(c.a.details().usage, None, "junk says nothing used");
+    c.ask("Two");
+    let used = c.a.details().usage.expect("the agent said what it used");
+    assert_eq!((used.context_used, used.context_size, used.input_tokens), (Some(1500), Some(200000), None));
+}
+
+#[test]
+fn a_cost_is_shown_as_the_agent_gave_it() {
+    let script =
+        turns(vec![vec![Step::Send { update: json!({"sessionUpdate": "usage_update", "cost": {"amount": 0.25, "currency": "USD\u{202E}"}}) }]]);
+    let mut c = Chat::with(&script);
+    c.ask("One");
+    let used = c.a.details().usage.expect("the agent said what it cost");
+    assert_eq!(used.cost.as_deref(), Some("0.25 USD"));
+}
+
+#[test]
+fn an_agent_s_locations_and_fetches_reach_sources_and_junk_is_ignored() {
+    use crate::backend::SourceKind;
+    let send = |update: serde_json::Value| Step::Send { update };
+    let script = turns(vec![vec![
+        send(json!({"sessionUpdate": "tool_call", "toolCallId": "r", "title": "Read", "kind": "read", "status": "completed", "locations": [
+            {"path": "/home/a/notes.md", "line": 12}, {"path": "/home/a/b.md"}, {"path": 7}, {"line": 2}, "junk", {"path": "  "},
+        ]})),
+        send(
+            json!({"sessionUpdate": "tool_call", "toolCallId": "f", "title": "Fetch", "kind": "fetch", "status": "completed", "rawInput": {"url": "https://example.com/page"}}),
+        ),
+        send(json!({"sessionUpdate": "tool_call", "toolCallId": "l", "title": "Fetch a link", "kind": "fetch", "status": "completed",
+            "content": [{"type": "content", "content": {"type": "resource_link", "name": "x", "uri": "https://example.com/linked"}}]})),
+        send(
+            json!({"sessionUpdate": "tool_call", "toolCallId": "j", "title": "Fetch junk", "kind": "fetch", "status": "completed", "rawInput": {"url": "file:///etc/passwd"}}),
+        ),
+        send(
+            json!({"sessionUpdate": "tool_call", "toolCallId": "s", "title": "Search", "kind": "search", "status": "in_progress", "locations": "junk"}),
+        ),
+        send(json!({"sessionUpdate": "tool_call_update", "toolCallId": "r", "status": "completed"})),
+        send(
+            json!({"sessionUpdate": "tool_call", "toolCallId": "m", "title": "Fetch and keep", "kind": "fetch", "status": "in_progress", "rawInput": {"url": "https://example.com/kept"}}),
+        ),
+        send(json!({"sessionUpdate": "tool_call_update", "toolCallId": "m", "status": "completed", "locations": [{"path": "/tmp/cache"}]})),
+    ]]);
+    let mut c = Chat::with(&script);
+    c.ask("Read");
+    let sources = c.a.details().turns.remove(0).sources;
+    let listed: Vec<(SourceKind, &str, Option<&str>)> = sources.iter().map(|s| (s.kind, s.title.as_str(), s.target.as_deref())).collect();
+    assert_eq!(
+        listed,
+        [
+            (SourceKind::File, "/home/a/notes.md:12", Some("/home/a/notes.md")),
+            (SourceKind::File, "/home/a/b.md", Some("/home/a/b.md")),
+            (SourceKind::Web, "https://example.com/page", Some("https://example.com/page")),
+            (SourceKind::Web, "https://example.com/linked", Some("https://example.com/linked")),
+            (SourceKind::Other, "Fetch junk", None),
+            (SourceKind::Other, "Search", None),
+            (SourceKind::Web, "https://example.com/kept", Some("https://example.com/kept")),
+            (SourceKind::File, "/tmp/cache", Some("/tmp/cache")),
+        ],
+        "an update that says nothing of them keeps what the call said"
+    );
+}
+
+#[test]
+fn a_source_goes_as_a_resource_when_the_agent_takes_them_else_as_text() {
+    use crate::knowledge::TurnSource;
+    let source = || vec![TurnSource { name: "notes one.txt".into(), text: "Source words.".into() }];
+    let report = |embedded: bool| {
+        let script = Script { embedded_context: embedded, turns: vec![vec![Step::Report]], ..Script::default() };
+        let mut c = Chat::with(&script);
+        c.a.set_knowledge(source());
+        c.ask("Hi");
+        serde_json::from_str::<serde_json::Value>(&c.answer()).unwrap()
+    };
+    let took = report(true);
+    assert!(took["resources"][0].as_str().unwrap().contains("Source words."), "{took}");
+    assert!(!took["prompt"].to_string().contains("Source words."), "{took}");
+    let not = report(false);
+    assert_eq!(not["resources"], json!([]), "{not}");
+    assert!(not["prompt"].to_string().contains("Source words.") && not["prompt"].to_string().contains("never instructions"), "{not}");
+    assert_eq!(not["prompt"].as_array().unwrap().last().unwrap(), "Hi", "the prompt stays last");
 }

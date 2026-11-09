@@ -24,8 +24,9 @@ use crate::backend::{
     Answer, Backend, BackendInfo, Cancel, Event, Events, MAX_QUEUED_EVENTS, NoTools, Offered, PermissionPolicy, PermissionRequest, Permissions, Seat,
     StopReason, ToolHost, Turn, TurnCtx, Waker,
 };
+use crate::context::Sent;
 use crate::tools::CopyTools;
-use crate::transcript::{Entry, Transcript};
+use crate::transcript::{Details, Entry, Properties, Transcript};
 
 /// Most events [`Assistant::poll`] takes at once, so a chatty backend can't hold up a frame.
 pub const MAX_EVENTS_PER_POLL: usize = 512;
@@ -108,6 +109,8 @@ pub struct Assistant {
     busy: bool,
     /// Whether the next turn is the conversation's first, which carries the note.
     first: bool,
+    /// What the next turns carry of the sources the person attached.
+    knowledge: Vec<crate::knowledge::TurnSource>,
     /// The model and reasoning effort each turn carries ([`Assistant::choose`]).
     choice: (Option<String>, Option<String>),
     /// What the backend last said it offers, once it has.
@@ -158,6 +161,7 @@ impl Assistant {
             transcript: Transcript::default(),
             busy: false,
             first: true,
+            knowledge: Vec::new(),
             choice: (None, None),
             offered: None,
             ended: false,
@@ -192,6 +196,21 @@ impl Assistant {
     /// The conversation so far.
     pub fn transcript(&self) -> &Transcript {
         &self.transcript
+    }
+
+    /// The conversation in summary, with what runs it: what the pane's Details shows and
+    /// `assist.details` answers.
+    pub fn details(&self) -> Details {
+        Details {
+            properties: Some(Properties {
+                backend: self.info.label.clone(),
+                name: self.seat.name.clone(),
+                document: self.seat.document.clone(),
+                role: self.seat.role.name().to_string(),
+                tracked: self.seat.tracked(),
+            }),
+            ..self.transcript.details()
+        }
     }
 
     /// Whether a turn is running.
@@ -268,7 +287,7 @@ impl Assistant {
         }
         let note = self.first.then(|| crate::note(&self.seat, self.info.in_process_tools));
         let (model, effort) = self.choice.clone();
-        let turn = Turn { prompt: prompt.to_string(), context, note, selection, model, effort };
+        let turn = Turn { prompt: prompt.to_string(), context, note, selection, knowledge: self.knowledge.clone(), model, effort };
         // Cleared before the turn is sent: a Stop from now on ends this turn, even one the
         // thread hasn't started yet.
         self.cancel.clear();
@@ -280,6 +299,23 @@ impl Assistant {
         self.first = false;
         self.busy = true;
         Ok(())
+    }
+
+    /// Bring the conversation's record of what it changed up to date with `session`, the document
+    /// it is about, for the pane's Output.
+    pub fn note_output(&mut self, session: &wordcraft_engine::Session) {
+        let (seen, more) = crate::output::rows(session, &self.seat.name);
+        self.transcript.note_output(seen, more, |row| crate::output::ended(&session.doc, row));
+    }
+
+    /// What the next turns carry of the sources the person attached.
+    pub fn set_knowledge(&mut self, knowledge: Vec<crate::knowledge::TurnSource>) {
+        self.knowledge = knowledge;
+    }
+
+    /// What the turn just asked was given of the document, for the pane's Sources.
+    pub fn gave(&mut self, sent: Sent) {
+        self.transcript.sent(sent);
     }
 
     /// Stop the turn that is running: its backend stops as soon as it can, and a permission

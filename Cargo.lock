@@ -6860,6 +6860,7 @@ dependencies = [
  "windows",
  "wordcraft-doc",
  "wordcraft-engine",
+ "wordcraft-formats",
  "wordcraft-http",
  "wordcraft-mcp",
 ]

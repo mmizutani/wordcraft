@@ -20,6 +20,9 @@
 //! `assist.showChange` selects what one of the assistant's tool calls changed, by the version of
 //! the shared document it made.
 //!
+//! `assist.details` answers what the Assistant pane's Details shows: the conversation's steps, and
+//! what runs it.
+//!
 //! Sign in with ChatGPT (#19): `assist.chatgpt.signIn` has the window open the browser to sign
 //! in, `assist.chatgpt.cancelSignIn` stops a sign-in that waits for it, and
 //! `assist.chatgpt.signOut` revokes and deletes the sign-in (File › Options › Account, and the
@@ -97,6 +100,9 @@ const SELECT_FIRST: &str = "select the text first";
 /// Why the assistant cannot use a block selection.
 const CONTINUOUS_SELECTION: &str = "select one continuous range of text before asking the assistant";
 
+/// Longest path `assist.knowledge` takes, in characters.
+const MAX_PATH_CHARS: usize = 4096;
+
 /// Longest tone `assist.rewrite` takes, in characters.
 const MAX_TONE_CHARS: usize = 40;
 
@@ -124,6 +130,17 @@ pub fn specs() -> Vec<CommandSpec> {
         .pure(),
         CommandSpec::new("assist.backend", "Assistant", "Home › Assistant", backend)
             .params(r#"{"id"?: string (one the window offers; omit to list them)} → the assistants offered, whether each is ready, and the one chosen"#)
+            .when(in_window)
+            .pure(),
+        CommandSpec::new("assist.details", "Assistant Details", "Home › Assistant", |s, _| {
+            s.push_ui_request(json!({"assist": "details"}));
+            Ok(json!({}))
+        })
+        .params(r#"{} → the conversation in summary, as the Assistant pane's Details shows it: what runs it (`properties`), its `turns` with their `steps`, the `agent`, the `model`, its `effort` (`effortAsked`: what was asked for, not said to have run) and what it used (`usage`)"#)
+        .when(in_window)
+        .pure(),
+        CommandSpec::new("assist.knowledge", "Assistant Sources", "Home › Assistant", knowledge)
+            .params(r#"{"add"?: string (a full path to read as a source, within the files File › Options › Agents lets commands use), "document"?: number (the id of another open document, as `view.switchWindows` lists them, to read as a source with its unsaved changes), "remove"?: number (which source, from 0)} → the sources the conversation holds: at most 8, 64 KiB of text each, 128 KiB in a turn, what was cut said. Adding reads the file in the background: `pending` counts those on their way, and what went wrong is in `error`. Attached text goes to the assistant's provider"#)
             .when(in_window)
             .pure(),
         CommandSpec::new("assist.model", "Model", "Home › Assistant", |s, v| choice(s, v, "model", "id"))
@@ -369,6 +386,34 @@ fn backend(s: &mut Session, v: &Value) -> CmdResult {
     };
     s.push_ui_request(json!({"assist": "backend", "id": id}));
     Ok(json!({"id": id}))
+}
+
+/// The sources the person attached to the conversation: add one by its path, held to the files
+/// commands can use here, remove one, or list them.
+fn knowledge(s: &mut Session, v: &Value) -> CmdResult {
+    let add = match v.get("add") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(path)) if !path.trim().is_empty() && path.chars().count() <= MAX_PATH_CHARS => Some(path.clone()),
+        Some(_) => return Err(CmdError::Params(format!("`add`: a file's full path (at most {MAX_PATH_CHARS} characters)"))),
+    };
+    if let Some(path) = &add {
+        crate::file_access::check_read(path).map_err(CmdError::Failed)?;
+    }
+    let remove = match v.get("remove") {
+        None | Some(Value::Null) => None,
+        Some(n) => Some(n.as_u64().ok_or_else(|| CmdError::Params("`remove`: which source, a whole number from 0".into()))?),
+    };
+    let document = match v.get("document") {
+        None | Some(Value::Null) => None,
+        Some(x) => {
+            let shown = s.document_id();
+            let open = x.as_u64().filter(|id| *id != shown && s.documents().iter().any(|d| d.id == *id));
+            Some(open.ok_or_else(|| CmdError::Params("`document`: the id of another open document".into()))?)
+        }
+    };
+    // `document` in a request says which window it is for, so this goes by another name.
+    s.push_ui_request(json!({"assist": "knowledge", "add": add, "source": document, "remove": remove}));
+    Ok(json!({}))
 }
 
 /// Read what is chosen for the assistant in use, or choose: the window knows which assistant

@@ -27,6 +27,12 @@ pub const MAX_LABEL: usize = 500;
 /// Most entries in a plan; more are dropped.
 pub const MAX_PLAN: usize = 64;
 
+/// Most sources one tool call lists.
+pub const MAX_SOURCES: usize = 16;
+
+/// Most bytes of a cost as an agent gives it.
+const MAX_COST: usize = 64;
+
 /// What a backend is: the pane's backend picker shows it, and the assistant joins the shared
 /// document under its author name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +159,8 @@ pub struct Turn {
     /// The person's selection, by stable paragraph id: the backend selects it in its document
     /// copy before the turn. `None` leaves that copy's selection where it is.
     pub selection: Option<(Anchor, Anchor)>,
+    /// The sources the person attached, for the model to refer to. It is data.
+    pub knowledge: Vec<crate::knowledge::TurnSource>,
     /// The model the person chose for this backend; `None`: its default.
     pub model: Option<String>,
     /// The reasoning effort the person chose for this backend; `None`: its default.
@@ -218,6 +226,34 @@ pub struct ToolCall {
     /// which the assistant changed the document through WordCraft (its MCP server, or
     /// `wordcraft-cli call`).
     pub changes: Option<Versions>,
+    /// What it read or looked for, at most [`MAX_SOURCES`].
+    #[serde(default)]
+    pub sources: Vec<Source>,
+}
+
+/// Where something a turn read is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SourceKind {
+    /// The shared document.
+    Document,
+    /// A file on this computer.
+    File,
+    /// A web address.
+    Web,
+    /// An agent's own tool, which doesn't say where it looked.
+    Other,
+}
+
+/// Something a turn read.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Source {
+    pub kind: SourceKind,
+    /// What it is, as the pane lists it.
+    pub title: String,
+    /// Where it is: a paragraph's id, which edits don't change, a file's path or an address.
+    pub target: Option<String>,
 }
 
 /// The versions of the shared document from the first a tool call's changes made to the last.
@@ -336,6 +372,20 @@ pub enum PermissionPolicy {
     Allow,
 }
 
+/// What a turn used, as its backend says: what it doesn't say stays empty and isn't shown.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Usage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    /// Tokens of the session's context in use, and how many it holds (an agent's).
+    pub context_used: Option<u64>,
+    pub context_size: Option<u64>,
+    /// What the session has cost so far, as the agent gave it, with its currency.
+    pub cost: Option<String>,
+}
+
 /// What a turn sends back while it runs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "event")]
@@ -355,6 +405,10 @@ pub enum Event {
     /// Which model answers and at what reasoning level, once known. A later one this turn
     /// replaces it. `asked`: the level is what was asked for, as the backend didn't say what ran.
     Model { name: String, effort: Option<String>, asked: bool },
+    /// What the agent says it is: its name and version.
+    Agent { name: String },
+    /// What the turn has used so far: it replaces what it said before.
+    Usage(Usage),
     /// Something the person should know about the turn, which goes on: what ran instead of what
     /// they chose, or a level that wasn't applied.
     Note { text: String },
@@ -383,12 +437,27 @@ impl Event {
         match self {
             Event::Text { text: t } => Event::Text { text: text(t) },
             Event::Thought { text: t } => Event::Thought { text: text(t) },
-            Event::Tool(t) => Event::Tool(ToolCall { id: label(&t.id), title: label(&t.title), kind: label(&t.kind), detail: text(t.detail), ..t }),
+            Event::Tool(t) => {
+                // A target too long to show whole goes: cut, it could lead somewhere else.
+                let target = |t: Option<String>| t.filter(|t| t.chars().count() <= MAX_LABEL).map(|t| label(&t));
+                let sources = t.sources.into_iter().take(MAX_SOURCES).map(|s| Source { title: label(&s.title), target: target(s.target), ..s });
+                Event::Tool(ToolCall {
+                    id: label(&t.id),
+                    title: label(&t.title),
+                    kind: label(&t.kind),
+                    detail: text(t.detail),
+                    changes: t.changes,
+                    status: t.status,
+                    sources: sources.collect(),
+                })
+            }
             Event::Plan { entries } => {
                 Event::Plan { entries: entries.into_iter().take(MAX_PLAN).map(|e| PlanEntry { content: label(&e.content), ..e }).collect() }
             }
             Event::Permission(r) => Event::Permission(PermissionRequest { id: r.id, ..PermissionRequest::bounded(&r.title, r.options) }),
             Event::Model { name, effort, asked } => Event::Model { name: label(&name), effort: effort.map(|e| label(&e)), asked },
+            Event::Agent { name } => Event::Agent { name: label(&name) },
+            Event::Usage(u) => Event::Usage(Usage { cost: u.cost.map(|c| cut(label(&c), MAX_COST)), ..u }),
             Event::Note { text: t } => Event::Note { text: text(t) },
             Event::Options(offered) => Event::Options(offered.bounded()),
             Event::Error { message } => Event::Error { message: text(message) },
@@ -461,12 +530,15 @@ pub struct ToolOutput {
     pub text: String,
     /// The versions of the shared document the call's changes made, when it changed it.
     pub changes: Option<Versions>,
+    /// What it read, resolved against the copy it read from.
+    #[serde(default)]
+    pub sources: Vec<Source>,
 }
 
 impl ToolOutput {
     /// A failed call, with why.
     pub fn error(why: impl Into<String>) -> ToolOutput {
-        ToolOutput { ok: false, text: why.into(), changes: None }
+        ToolOutput { ok: false, text: why.into(), changes: None, sources: Vec::new() }
     }
 }
 
@@ -749,11 +821,13 @@ impl TurnCtx<'_> {
             status: ToolStatus::InProgress,
             detail: String::new(),
             changes: None,
+            // What it means to read, until it has.
+            sources: crate::tools::sources(name, args),
         }));
         let out = if self.is_cancelled() { ToolOutput::error("stopped: the person stopped this turn") } else { self.tools.call(name, args) };
         let status = if out.ok { ToolStatus::Completed } else { ToolStatus::Failed };
         let detail = crate::tools::summary(&out);
-        self.emit(Event::Tool(ToolCall { id, title, kind, status, detail, changes: out.changes }));
+        self.emit(Event::Tool(ToolCall { id, title, kind, status, detail, changes: out.changes, sources: out.sources.clone() }));
         out
     }
 
@@ -881,7 +955,7 @@ mod cancellation_tests {
             }
             fn call(&mut self, _: &str, _: &Value) -> ToolOutput {
                 self.0 += 1;
-                ToolOutput { ok: true, text: String::new(), changes: None }
+                ToolOutput { ok: true, text: String::new(), changes: None, sources: Vec::new() }
             }
         }
         for name in ["type_text", "execute"] {
