@@ -66,6 +66,8 @@ pub(crate) struct AssistState {
     pub(crate) focus_prompt: u8,
     /// The sources attached for the conversation: they carry on until a new one starts.
     pub(crate) knowledge: Vec<Knowledge>,
+    /// The document they were attached in: no other document's turn gets them.
+    knowledge_for: Option<u64>,
     /// Sources being read off the frame thread.
     adding: Vec<Receiver<Result<Knowledge, String>>>,
     /// Sources' Add shows what to add.
@@ -320,7 +322,7 @@ pub(crate) fn handle(app: &mut WordApp, req: &Value) -> Result<Value, String> {
         "details" => details(app),
         "knowledge" => {
             if let Some(n) = req.get("remove").and_then(Value::as_u64) {
-                remove_source(app, usize::try_from(n).unwrap_or(usize::MAX)).map(|()| ())?;
+                remove_source(app, usize::try_from(n).unwrap_or(usize::MAX))?;
             }
             if let Some(path) = req.get("add").and_then(Value::as_str) {
                 add_source_file(app, path);
@@ -348,13 +350,23 @@ fn details(app: &WordApp) -> Result<Value, String> {
 
 /// What `assist.knowledge` answers.
 fn sources_json(app: &WordApp) -> Value {
-    let sources: Vec<Value> =
-        app.assist.knowledge.iter().map(|s| json!({"name": s.name, "bytes": s.text.len(), "size": s.size, "cut": s.cut})).collect();
-    json!({"sources": sources, "pending": app.assist.adding.len(), "error": app.assist.notice})
+    let list: Vec<Value> = sources(app).iter().map(|s| json!({"name": s.name, "bytes": s.text.len(), "size": s.size, "cut": s.cut})).collect();
+    json!({"sources": list, "pending": app.assist.adding.len(), "error": app.assist.notice})
 }
 
-/// Whether there is room for one more source.
+/// The sources attached in the document shown.
+pub(crate) fn sources(app: &WordApp) -> &[Knowledge] {
+    if app.assist.knowledge_for == Some(app.session.document_id()) { &app.assist.knowledge } else { &[] }
+}
+
+/// Whether there is room for one more source. The list is the document shown's from here on.
 fn source_room(app: &mut WordApp) -> bool {
+    let document = app.session.document_id();
+    if app.assist.knowledge_for != Some(document) {
+        app.assist.knowledge.clear();
+        app.assist.adding.clear();
+        app.assist.knowledge_for = Some(document);
+    }
     let room = app.assist.knowledge.len().saturating_add(app.assist.adding.len()) < MAX_SOURCES;
     if !room {
         app.assist.notice = Some(format!("a conversation holds at most {MAX_SOURCES} sources: remove one first"));
@@ -384,24 +396,51 @@ pub(crate) fn add_source_file(app: &mut WordApp, path: &str) {
 }
 
 /// Most bytes of a file read as a source: its text is cut to much less, but only after importing it.
-const MAX_SOURCE_FILE: u64 = 64 << 20;
+const MAX_SOURCE_FILE: u64 = 16 << 20;
 
-/// `path` as a source, through the importers documents open with.
+/// Files that are their text already: read as they are, since a text importer makes a paragraph of
+/// every line, which a file of line breaks would make millions of.
+const PLAIN_TEXT: &[&str] = &["txt", "text", "md", "markdown", "csv", "tsv", "log"];
+
+/// `path` as a source, read as far as the limit from the file as it is now: through the importers
+/// documents open with, or as it is when it is plain text.
 fn read_source(path: &std::path::Path) -> Result<Knowledge, String> {
+    use std::io::Read as _;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let fail = |why: String| format!("{name} couldn't be read as a source: {why}");
-    let size = std::fs::metadata(path).map_err(|e| fail(e.to_string()))?.len();
-    if size > MAX_SOURCE_FILE {
+    let file = std::fs::File::open(path).map_err(|e| fail(e.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SOURCE_FILE.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| fail(e.to_string()))?;
+    if u64::try_from(bytes.len()).is_ok_and(|n| n > MAX_SOURCE_FILE) {
         return Err(fail(format!("it is larger than {} MB", MAX_SOURCE_FILE >> 20)));
     }
-    let doc = wordcraft_engine::io::open_path(path).map_err(fail)?;
+    let extension = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if PLAIN_TEXT.contains(&extension.as_str()) {
+        return Ok(Knowledge::new(&name, &String::from_utf8_lossy(&bytes)));
+    }
+    let doc = wordcraft_engine::io::open_bytes(&name, &bytes).map_err(fail)?;
     Ok(Knowledge::new(&name, &doc.plain_text(wordcraft_doc::StoryRef::Body)))
+}
+
+/// The start of `doc`'s text, past what a source keeps: as much as it takes to say it was cut, read
+/// without copying the rest of a long document.
+fn text_for_source(doc: &wordcraft_doc::Document) -> String {
+    use wordcraft_doc::StoryRef::Body;
+    let mut text = String::new();
+    for path in doc.para_paths(Body) {
+        if text.len() > knowledge::MAX_SOURCE_BYTES {
+            break;
+        }
+        text.extend(doc.para(Body, &path).map_or("", |p| p.text.as_str()).chars().filter(|c| *c != wordcraft_doc::para::OBJ));
+        text.push('\n');
+    }
+    text
 }
 
 /// Attach open document `id` as a source.
 pub(crate) fn add_source_document(app: &mut WordApp, id: u64, name: &str) {
     if source_room(app) {
-        match app.session.with_document(id, |s| s.doc.plain_text(wordcraft_doc::StoryRef::Body)) {
+        match app.session.with_document(id, |s| text_for_source(&s.doc)) {
             Ok(text) => app.assist.knowledge.push(Knowledge::new(name, &text)),
             Err(e) => app.assist.notice = Some(e.to_string()),
         }
@@ -410,8 +449,8 @@ pub(crate) fn add_source_document(app: &mut WordApp, id: u64, name: &str) {
 
 /// Remove source `n`.
 pub(crate) fn remove_source(app: &mut WordApp, n: usize) -> Result<(), String> {
-    if n >= app.assist.knowledge.len() {
-        return Err(format!("`remove`: there are {} sources", app.assist.knowledge.len()));
+    if n >= sources(app).len() {
+        return Err(format!("`remove`: there are {} sources", sources(app).len()));
     }
     app.assist.knowledge.remove(n);
     Ok(())
@@ -540,8 +579,8 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     }
     let caps = Caps::default();
     let (context, mut sent) = Context::of(&app.session, &caps).rendered(&caps);
-    let (carried, sources) = knowledge::for_turn(&app.assist.knowledge);
-    sent.knowledge = sources;
+    let (carried, given) = knowledge::for_turn(sources(app));
+    sent.knowledge = given;
     // The person's selection, by paragraph id: the assistant's copy finds it there, though the
     // paragraphs moved with edits it has and the window hasn't yet.
     let doc = &app.session.doc;
@@ -601,6 +640,8 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
     // Sources belong to their conversation: those attached before the first go with it.
     if app.assist.conversation.is_some() {
         app.assist.knowledge.clear();
+        // One still being read would land in this conversation.
+        app.assist.adding.clear();
     }
     end(app);
     if !app.shows_shared_document() {

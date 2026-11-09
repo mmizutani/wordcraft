@@ -79,7 +79,7 @@ fn sources(app: &mut WordApp, ui: &mut Ui, t: &Tokens, details: &Details) {
 /// The sources attached for the conversation, each with its name, its size and whether it was cut,
 /// and the way to add one: the person's alone, as a program's click does nothing.
 fn attached(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
-    let rows: Vec<(String, String, bool)> = app.assist.knowledge.iter().map(|s| (s.name.clone(), size(s.size), s.cut)).collect();
+    let rows: Vec<(String, String, bool)> = crate::assist::sources(app).iter().map(|s| (s.name.clone(), size(s.size), s.cut)).collect();
     for (n, (name, size, cut)) in rows.iter().enumerate() {
         ui.push_id(("source", n), |ui| {
             ui.scope(|ui| {

@@ -1862,7 +1862,9 @@ fn adding_a_source_takes_the_person_s_click() {
 fn sources_belong_to_their_conversation() {
     let mut a = window("one");
     a.assist_with(Box::new(Fake::new()));
-    a.assist.knowledge.push(wordcraft_assist::Knowledge::new("before.txt", "words"));
+    let (dir, path) = source_file("before.txt", "words");
+    a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    sources_read(&mut a);
     ask(&mut a, "First", None);
     settle(&mut a);
     assert_eq!(a.assist.knowledge.len(), 1, "what was attached before the first goes with it");
@@ -1870,6 +1872,50 @@ fn sources_belong_to_their_conversation() {
     ask(&mut a, "Another role", Some("viewer"));
     settle(&mut a);
     assert!(a.assist.knowledge.is_empty(), "a new conversation starts without them");
+
+    // One still being read when a new conversation starts doesn't land in it.
+    a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    assert_eq!(a.assist.adding.len(), 1);
+    ask(&mut a, "Another role again", Some("editor"));
+    settle(&mut a);
+    assert_eq!(sources_read(&mut a)["sources"], json!([]));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_source_attached_in_one_document_doesn_t_reach_another() {
+    let mut a = window("first");
+    let fake = Fake::new();
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    let (dir, path) = source_file("private.txt", "words");
+    a.execute("assist.knowledge", json!({"add": path.to_string_lossy()})).unwrap();
+    assert_eq!(sources_read(&mut a)["sources"].as_array().unwrap().len(), 1);
+    a.execute("file.new", json!({})).unwrap();
+    assert_eq!(a.execute("assist.knowledge", json!({})).unwrap()["sources"], json!([]));
+    ask(&mut a, "First prompt, here", None);
+    settle(&mut a);
+    assert!(seen.lock().unwrap().turns[0].knowledge.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_plain_text_file_of_line_breaks_is_read_as_text_and_a_file_past_the_limit_refused() {
+    let (dir, breaks) = source_file("breaks.txt", &"\n".repeat(1 << 20));
+    let mut a = window("one");
+    a.assist_with(Box::new(Fake::new()));
+    a.execute("assist.knowledge", json!({"add": breaks.to_string_lossy()})).unwrap();
+    let now = sources_read(&mut a);
+    assert_eq!(now["sources"][0]["cut"], true, "{now}");
+    let big = dir.join("big.txt");
+    std::fs::write(&big, vec![b'x'; (super::MAX_SOURCE_FILE + 1) as usize]).unwrap();
+    a.execute("assist.knowledge", json!({"add": big.to_string_lossy()})).unwrap();
+    let now = sources_read(&mut a);
+    assert_eq!(now["sources"].as_array().unwrap().len(), 1, "{now}");
+    assert!(now["error"].as_str().unwrap_or_default().contains("larger than"), "{now}");
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -1882,4 +1928,10 @@ fn another_open_document_can_be_a_source() {
     super::add_source_document(&mut a, first, "First");
     assert_eq!(a.assist.knowledge[0].name, "First");
     assert_eq!(a.assist.knowledge[0].text.trim_end(), "first document");
+
+    // A long one is read only as far as it takes to say it was cut.
+    let long = window(&"long words\n".repeat(64 << 10));
+    let text = super::text_for_source(&long.session.doc);
+    assert!(text.len() < (64 << 10) + 64, "{}", text.len());
+    assert!(wordcraft_assist::Knowledge::new("Long", &text).cut);
 }

@@ -306,6 +306,11 @@ impl WordApp {
             }
             AfterPick::AssistantSource => {
                 let Some(path) = picked else { return Ok(json!({"cancelled": true})) };
+                // The built-in browser takes typing: a program's isn't the person's choice.
+                if self.ctx.clone().is_some_and(|ctx| self.input_from_control(&ctx)) {
+                    self.assist.notice = Some(tl!("Only you can add a source: click it yourself.").to_string());
+                    return Err("only the person can add a source this way".into());
+                }
                 crate::assist::add_source_file(self, &path);
                 Ok(json!({"adding": path}))
             }

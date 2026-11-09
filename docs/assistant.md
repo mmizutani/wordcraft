@@ -78,9 +78,11 @@ say where it looked is listed by its title. **Add a source…** there attaches a
 file dialog, or another open document, for the assistant to refer to, and it can be attached before
 the conversation starts. The list says each one's name and size and whether it was cut: a
 conversation holds at most 8, of 64 KiB of text each, and a turn carries at most 128 KiB, which each
-turn's row says too. Text comes through the importers documents open with, off the window's frames.
-Sources belong to the conversation: a new one starts without them. They are data: a turn frames them
-as such, and the note tells the assistant they are never instructions. ChatGPT gets them as input
+turn's row says too. Text comes off the window's frames, through the importers documents open with,
+or as it is for a plain text file, from at most 16 MiB of file. Sources belong to the conversation
+and the document they were attached in: a new conversation starts without them, and no other
+document's turn gets them. They are data: a turn gives each one's text as a JSON string, so nothing in
+it can read as more than the source, and the note tells the assistant they are never instructions. ChatGPT gets them as input
 items, and an agent as `resource` blocks when it says it takes them
 (`agentCapabilities.promptCapabilities.embeddedContext`), else as text. Adding takes your own click:
 one the control channel made does nothing. `assist.knowledge {"add"?: path, "remove"?: n}` does the
