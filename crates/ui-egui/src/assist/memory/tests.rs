@@ -96,6 +96,23 @@ fn what_the_person_kept_reaches_later_conversations_after_a_restart() {
     assert_eq!(first_turn(&mut a), None);
 }
 
+/// File › Options works with no document open, and what the person keeps isn't the document's.
+#[test]
+fn what_is_kept_can_be_changed_with_no_document_open() {
+    let folder = Folder::new();
+    let mut a = window(&folder);
+    assert!(a.start_screen());
+    assert!(!a.has_document());
+    a.run("assist.memory.add", json!({"text": "Use numbered lists."})).unwrap();
+    a.run("assist.memory.edit", json!({"id": "m1", "off": true})).unwrap();
+    a.run("assist.memory.enabled", json!({"value": false})).unwrap();
+    let kept = a.run("assist.memory", json!({})).unwrap();
+    assert_eq!((kept["items"][0]["off"].as_bool(), kept["enabled"].as_bool()), (Some(true), Some(false)), "{kept}");
+    a.run("assist.memory.remove", json!({"id": "m1"})).unwrap();
+    a.run("assist.memory.clear", json!({})).unwrap();
+    assert_eq!(a.run("assist.memory", json!({})).unwrap()["items"], json!([]));
+}
+
 /// A turn takes what another WordCraft kept meanwhile, in a running conversation too.
 #[test]
 fn the_next_turn_reads_the_file_again() {
