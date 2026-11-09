@@ -12,7 +12,9 @@
 //! A wall is a folder, so recall can open one wall and nothing else. There is no index, so a
 //! delete can't leave a shadow in one. Every write locks, reads fresh, applies one typed op and
 //! replaces the file in a rename, and never creates a folder: a case deleted in another window
-//! returns [`CaseError::Gone`] and stays deleted.
+//! returns [`CaseError::Gone`] and stays deleted. A symlink where a wall or case folder should be
+//! is never followed: a listing skips it and a write finds it `Gone`, so nothing here can touch a
+//! folder outside `assistant-cases/`.
 
 use std::fs;
 use std::io::Read;
@@ -119,6 +121,7 @@ pub struct Listing {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WallFile {
     version: u32,
     name: Quoted,
@@ -160,11 +163,13 @@ impl Shelf {
                 continue;
             };
             if name.starts_with(TRASH) {
-                let _ = fs::remove_dir_all(entry.path());
+                if is_real_dir(&entry) {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
                 continue;
             }
             match WallId::parse(name) {
-                Some(id) if entry.path().is_dir() => walls.push((id, entry.path())),
+                Some(id) if is_real_dir(&entry) => walls.push((id, entry.path())),
                 _ => out.skipped = out.skipped.saturating_add(1),
             }
         }
@@ -179,10 +184,12 @@ impl Shelf {
                 let file = entry.file_name();
                 let Some(file) = file.to_str() else { continue };
                 if file.starts_with(TRASH) {
-                    let _ = fs::remove_dir_all(entry.path());
+                    if is_real_dir(&entry) {
+                        let _ = fs::remove_dir_all(entry.path());
+                    }
                     continue;
                 }
-                let Some(case) = CaseId::parse(file).filter(|_| entry.path().is_dir()) else { continue };
+                let Some(case) = CaseId::parse(file).filter(|_| is_real_dir(&entry)) else { continue };
                 let read = read_case(&entry.path().join(CASE_FILE));
                 cases.push(CaseHeader { id: case, title: read.title, damaged: read.damaged });
             }
@@ -194,11 +201,24 @@ impl Shelf {
 
     /// The case as its file holds it. A file of at most 1 MiB: tolerated on a frame.
     pub fn open(&self, at: &CaseRef) -> Result<Case, CaseError> {
-        let path = self.case_dir(at).join(CASE_FILE);
+        let dir = self.real_case_dir(at)?;
+        let path = dir.join(CASE_FILE);
         if fs::symlink_metadata(&path).is_err() {
             return Err(CaseError::Gone);
         }
         Ok(read_case(&path))
+    }
+
+    /// The wall's folder, if it is a folder and not a link to one.
+    fn real_wall_dir(&self, wall: &WallId) -> Result<PathBuf, CaseError> {
+        let dir = self.wall_dir(wall);
+        real_dir(&dir).then_some(dir).ok_or(CaseError::Gone)
+    }
+
+    /// The case's folder, if it and its wall are folders and not links to one.
+    fn real_case_dir(&self, at: &CaseRef) -> Result<PathBuf, CaseError> {
+        let dir = self.real_wall_dir(&at.wall)?.join(&at.case.0);
+        real_dir(&dir).then_some(dir).ok_or(CaseError::Gone)
     }
 
     /// Cheap: one stat. Other windows learn of a delete here.
@@ -206,24 +226,27 @@ impl Shelf {
         self.case_dir(at).join(CASE_FILE).is_file()
     }
 
-    /// A new, unique folder under `parent`, named from `stamp` and `counter`.
+    /// A new, unique folder under `parent`, named from `stamp` and `counter`. `parent` must exist:
+    /// a wall deleted meanwhile is `Gone`, not made again without its `wall.json`.
     fn new_dir(&self, parent: &Path, stamp: &str, counter: u64) -> Result<String, CaseError> {
-        let io = |e: std::io::Error| CaseError::Io(format!("{}: {e}", parent.display()));
-        make_dir(parent, true).map_err(io)?;
         for attempt in 0..ID_TRIES {
             let id = id_from(stamp, counter, attempt);
             match make_dir(&parent.join(&id), false) {
                 Ok(()) => return Ok(id),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(io(e)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(CaseError::Gone),
+                Err(e) => return Err(CaseError::Io(format!("{}: {e}", parent.display()))),
             }
         }
         Err(CaseError::Io("a new case folder can't be named".into()))
     }
 
     /// A wall called `name`. `stamp` is the time as the caller writes it and `counter` a number
-    /// the caller changes between calls.
+    /// the caller changes between calls. Together they must be unique in this process (say, the
+    /// process id and a sub-second time): a deleted id made again would take the writes of a
+    /// window still holding the old reference.
     pub fn new_wall(&self, _click: Click, name: &str, stamp: &str, counter: u64) -> Result<WallId, CaseError> {
+        make_dir(&self.root, true).map_err(|e| CaseError::Io(format!("{}: {e}", self.root.display())))?;
         let id = self.new_dir(&self.root, stamp, counter)?;
         let mut name = Quoted::parse(name);
         name.cut(super::record::MAX_TEXT);
@@ -232,10 +255,13 @@ impl Shelf {
         WallId::parse(&id).ok_or_else(|| CaseError::Io("a new id isn't one".into()))
     }
 
-    /// A case called `title` in `wall`.
+    /// A case called `title` in `wall`. `stamp` and `counter` as for [`Shelf::new_wall`]: unique
+    /// in this process, or a deleted case's id can come back.
     pub fn new_case(&self, _click: Click, wall: &WallId, title: &str, stamp: &str, counter: u64) -> Result<CaseRef, CaseError> {
         let dir = self.wall_dir(wall);
-        if !dir.is_dir() {
+        // Only a link is refused here. A wall that is gone is found by `create_dir` itself, so no
+        // check-then-create window can bring it back.
+        if fs::symlink_metadata(&dir).is_ok_and(|m| m.is_symlink()) {
             return Err(CaseError::Gone);
         }
         let id = self.new_dir(&dir, stamp, counter)?;
@@ -246,13 +272,10 @@ impl Shelf {
     }
 
     /// Lock, read fresh, `change`, write. Never creates a folder. `move_damaged` says whether a
-    /// file that can't be read whole is moved aside first (a person's write) or left for the
-    /// person (a model's).
+    /// file that can't be read whole is copied aside first (a person's write) or left for the
+    /// person (a model's). A write that would pass [`MAX_FILE`] is refused before the file changes.
     fn update<T>(&self, at: &CaseRef, move_damaged: bool, change: impl FnOnce(&mut Case) -> Result<T, CaseError>) -> Result<T, CaseError> {
-        let dir = self.case_dir(at);
-        if !dir.is_dir() {
-            return Err(CaseError::Gone);
-        }
+        let dir = self.real_case_dir(at)?;
         let _lock = Lock::take(&self.lock_path(at)).map_err(|e| match e {
             LockError::Busy => CaseError::Busy,
             LockError::Io(e) => CaseError::Io(e),
@@ -267,10 +290,17 @@ impl Shelf {
             return Err(CaseError::Damaged);
         }
         let r = change(&mut case)?;
-        if damaged {
-            atomic::rename_if_there(&path, &dir.join(format!("{CASE_FILE}{DAMAGED_SUFFIX}"))).map_err(CaseError::Io)?;
+        let bytes = case.to_bytes().map_err(CaseError::Io)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_FILE {
+            return Err(CaseError::Full("file"));
         }
-        atomic::write(&path, &case.to_bytes().map_err(CaseError::Io)?).map_err(CaseError::Io)?;
+        if damaged {
+            // A copy, not a rename: `case.json` is there at every moment, so a crash here can't
+            // make the case read as deleted.
+            fs::copy(&path, dir.join(format!("{CASE_FILE}{DAMAGED_SUFFIX}")))
+                .map_err(|e| CaseError::Io(format!("{} can't be copied aside: {e}", path.display())))?;
+        }
+        atomic::write(&path, &bytes).map_err(CaseError::Io)?;
         Ok(r)
     }
 
@@ -305,13 +335,14 @@ impl Shelf {
 
     /// The case goes, under its lock, so a write racing it finds it gone rather than half there.
     pub fn delete_case(&self, _click: Click, at: &CaseRef) -> Result<(), CaseError> {
+        let dir = self.real_case_dir(at)?;
         let lock_path = self.lock_path(at);
         {
             let _lock = Lock::take(&lock_path).map_err(|e| match e {
                 LockError::Busy => CaseError::Busy,
                 LockError::Io(e) => CaseError::Io(e),
             })?;
-            self.trash(&self.case_dir(at), at.case.as_str())?;
+            self.trash(&dir, at.case.as_str())?;
         }
         let _ = fs::remove_file(&lock_path);
         Ok(())
@@ -319,17 +350,27 @@ impl Shelf {
 
     /// The wall and every case in it go.
     pub fn delete_wall(&self, _click: Click, wall: &WallId) -> Result<(), CaseError> {
-        self.trash(&self.wall_dir(wall), wall.as_str())
+        self.trash(&self.real_wall_dir(wall)?, wall.as_str())
     }
 }
 
-/// A folder only its owner can enter. `ok_if_there` for a parent that may exist.
-fn make_dir(path: &Path, ok_if_there: bool) -> std::io::Result<()> {
+/// A folder only its owner can enter. `recursive` makes missing parents and accepts one that exists.
+fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
     let mut builder = fs::DirBuilder::new();
-    builder.recursive(ok_if_there);
+    builder.recursive(recursive);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(path)
+}
+
+/// A folder, and not a link to one.
+fn real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// [`real_dir`] from a listing, without another stat.
+fn is_real_dir(entry: &fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|t| t.is_dir())
 }
 
 /// At most [`MAX_FILE`] bytes of `path`; `None` when there are more or it can't be read.

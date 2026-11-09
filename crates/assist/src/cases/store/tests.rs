@@ -283,6 +283,120 @@ fn a_model_balance_never_evicts_a_confirmed_one() {
     assert_eq!(case.balance.len(), MAX_BALANCES);
 }
 
+/// A note in four-byte characters, numbered so no two say the same thing.
+fn wide_note(n: usize) -> NoteDraft {
+    let wide = |n: usize| Quoted::parse(&"😀".repeat(n));
+    NoteDraft {
+        body: Body::Position {
+            topic: crate::cases::Topic::Liability,
+            moved: Side::Them,
+            terms: Quoted::parse(&format!("{n:04}{}", "😀".repeat(MAX_TEXT - 4))),
+            traded_for: Some(wide(MAX_SHORT)),
+            landed: true,
+        },
+        how: Some(wide(MAX_SHORT)),
+        topics: crate::cases::Topic::ALL.into_iter().collect(),
+    }
+}
+
+#[test]
+fn a_write_past_the_file_limit_is_refused_and_the_file_kept() {
+    let (shelf, at) = shelf_with_case("file-limit");
+    let path = shelf.case_dir(&at).join("case.json");
+    let mut case = Case::new(&"😀".repeat(MAX_TEXT));
+    let wide = |n: usize| Quoted::parse(&"😀".repeat(n));
+    case.facts = Facts { parties: (0..MAX_LIST).map(|_| wide(MAX_SHORT)).collect(), ..Facts::default() };
+    for _ in 0..MAX_BALANCES {
+        let factors = (0..MAX_FACTORS).map(|_| Factor { kind: FactorKind::Deadline, favors: Side::Them, why: Some(wide(MAX_SHORT)) }).collect();
+        case.apply_person(PersonOp::Balance(BalanceDraft { stance: Stance::Weaker, factors }), today()).unwrap();
+    }
+    case.apply_person(
+        PersonOp::Plan(Some(Plan { goal: wide(MAX_TEXT), next: (0..MAX_LIST).map(|_| wide(MAX_TEXT)).collect(), standing: Standing::Unconfirmed })),
+        today(),
+    )
+    .unwrap();
+    let mut n = 0;
+    let next = loop {
+        let mut more = case.clone();
+        more.apply_person(PersonOp::AddNote(wide_note(n)), today()).unwrap();
+        if more.to_bytes().unwrap().len() as u64 > MAX_FILE {
+            break wide_note(n);
+        }
+        case = more;
+        n += 1;
+    };
+    let bytes = case.to_bytes().unwrap();
+    assert!(bytes.len() as u64 <= MAX_FILE && case.notes.len() < MAX_NOTES, "{} bytes, {} notes", bytes.len(), case.notes.len());
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(!shelf.open(&at).unwrap().damaged);
+
+    assert_eq!(shelf.person(click(), &at, PersonOp::AddNote(next.clone()), today()), Err(CaseError::Full("file")));
+    assert_eq!(shelf.model(&at, ModelWrite::Note(next), today()), Err(CaseError::Full("file")));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes, "the file is as it was");
+    assert_eq!(shelf.open(&at).unwrap(), case, "and still reads whole");
+}
+
+#[test]
+fn a_case_is_never_made_on_a_deleted_wall() {
+    let shelf = Shelf::at(&folder("gone-wall"));
+    let wall = shelf.new_wall(click(), "Acme", TODAY, 1).unwrap();
+    let dir = shelf.wall_dir(&wall);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(shelf.new_case(click(), &wall, "Late", TODAY, 2), Err(CaseError::Gone));
+    assert!(!dir.exists(), "the wall is not recreated");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_wall_is_skipped_and_its_target_left_alone() {
+    let settings = folder("symlink-wall");
+    let shelf = Shelf::at(&settings);
+    shelf.new_wall(click(), "Real", TODAY, 1).unwrap();
+    let target = folder("symlink-wall-target");
+    let other = Shelf::at(&target);
+    let wall = other.new_wall(click(), "Elsewhere", TODAY, 1).unwrap();
+    let trash = other.wall_dir(&wall).join(".trash-x");
+    std::fs::create_dir(&trash).unwrap();
+    std::os::unix::fs::symlink(other.wall_dir(&wall), shelf.root.join("00000000000000aa")).unwrap();
+    let listing = shelf.list();
+    assert_eq!(listing.walls.len(), 1);
+    assert_eq!(listing.walls[0].name.for_person(), "Real");
+    assert_eq!(listing.skipped, 1, "the link is skipped, not followed");
+    assert!(trash.is_dir(), "nothing behind the link is swept");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_case_behind_a_symlinked_wall_is_gone() {
+    let shelf = Shelf::at(&folder("symlink-case"));
+    shelf.new_wall(click(), "Real", TODAY, 9).unwrap();
+    let (other, at) = shelf_with_case("symlink-case-target");
+    std::os::unix::fs::symlink(other.wall_dir(&at.wall), shelf.wall_dir(&at.wall)).unwrap();
+    let path = other.case_dir(&at).join("case.json");
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(shelf.model(&at, ModelWrite::Note(pitfall("through a link")), today()), Err(CaseError::Gone));
+    assert_eq!(shelf.person(click(), &at, PersonOp::AddNote(pitfall("through a link")), today()), Err(CaseError::Gone));
+    assert_eq!(shelf.open(&at), Err(CaseError::Gone));
+    assert_eq!(shelf.delete_case(click(), &at), Err(CaseError::Gone));
+    assert_eq!(shelf.delete_wall(click(), &at.wall), Err(CaseError::Gone));
+    assert_eq!(std::fs::read(&path).unwrap(), before, "the target is untouched");
+    assert!(other.exists(&at));
+}
+
+#[test]
+fn setting_a_damaged_file_aside_never_leaves_the_case_without_one() {
+    let (shelf, at) = shelf_with_case("aside");
+    let dir = shelf.case_dir(&at);
+    let path = dir.join("case.json");
+    std::fs::write(&path, b"{not json").unwrap();
+    std::fs::create_dir(dir.join("case.json.tmp")).unwrap();
+    let r = shelf.person(click(), &at, PersonOp::Close(crate::cases::Stage::Signed), today());
+    assert!(matches!(r, Err(CaseError::Io(_))), "{r:?}");
+    assert!(path.is_file(), "case.json is still there");
+    assert_ne!(shelf.open(&at), Err(CaseError::Gone));
+    assert!(shelf.open(&at).unwrap().damaged);
+}
+
 #[test]
 fn a_field_this_build_does_not_know_is_damage() {
     let (shelf, at) = shelf_with_case("unknown-field");
