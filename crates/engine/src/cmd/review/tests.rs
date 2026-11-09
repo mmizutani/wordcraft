@@ -1335,3 +1335,39 @@ fn a_kind_keeps_an_author_s_other_change_on_the_same_text() {
     assert!(s.run("review.accept", &json!({"kind": "format"})).is_err(), "a kind goes with an author");
     assert!(s.run("review.accept", &json!({"author": "Assistant", "kind": "other"})).is_err());
 }
+
+#[test]
+fn an_author_s_row_lists_their_deletion_of_someone_s_insertion() {
+    let mut s = Session::new(wordcraft_doc::Document::from_text("one"));
+    s.run("review.trackChanges", &json!({"value": true})).unwrap();
+    s.author = "Colleague".into();
+    s.run("caret.docEnd", &json!({})).unwrap();
+    s.run("text.insert", &json!({"text": " two"})).unwrap();
+    s.author = "Assistant".into();
+    s.run("select.text", &json!({"text": " two"})).unwrap();
+    s.run("text.delete", &json!({})).unwrap();
+    let (rows, _) = super::change_rows(&s, "Assistant", 8);
+    assert_eq!(rows.iter().map(|r| (r.kind, r.text.as_str())).collect::<Vec<_>>(), [("delete", " two")]);
+    s.run("select.range", &json!({"anchor": super::pos_json(&rows[0].a), "focus": super::pos_json(&rows[0].b)})).unwrap();
+    s.run("review.reject", &json!({"author": "Assistant", "kind": "delete"})).unwrap();
+    assert!(super::change_rows(&s, "Assistant", 8).0.is_empty());
+    assert_eq!(super::changes_by(&s, "Colleague"), 1, "the colleague's insertion waits still");
+}
+
+#[test]
+fn an_author_s_row_resolves_their_page_setup_change() {
+    use wordcraft_doc::{Revision, RevisionKind, StoryRef};
+    let mut s = Session::new(wordcraft_doc::Document::from_text("one"));
+    s.doc.revisions.push(Revision::new(RevisionKind::Format, "Assistant", ""));
+    s.doc.last_section.fmt_change = Some(Box::new(wordcraft_doc::props::PropChange { rev: 0, old: Default::default() }));
+    let rows = super::change_rows(&s, "Assistant", 8).0;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    s.run("select.range", &json!({"anchor": super::pos_json(&rows[0].a), "focus": super::pos_json(&rows[0].b)})).unwrap();
+    // Someone else's name leaves it, as a reviewer's row would.
+    s.run("review.accept", &json!({"author": "Colleague"})).unwrap();
+    assert!(s.doc.last_section.fmt_change.is_some());
+    s.run("select.range", &json!({"anchor": super::pos_json(&rows[0].a), "focus": super::pos_json(&rows[0].b)})).unwrap();
+    s.run("review.accept", &json!({"author": "Assistant", "kind": "format"})).unwrap();
+    assert!(s.doc.last_section.fmt_change.is_none());
+    assert_eq!(s.doc.plain_text(StoryRef::Body), "one");
+}
