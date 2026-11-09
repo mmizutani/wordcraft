@@ -90,7 +90,7 @@ document's turn gets them. They are data: a turn gives each one's text as a JSON
 it can read as more than the source, and the note tells the assistant they are never instructions. ChatGPT gets them as input
 items, and an agent as `resource` blocks when it says it takes them
 (`agentCapabilities.promptCapabilities.embeddedContext`), else as text. Adding takes your own click:
-one the control channel made does nothing. `assist.knowledge {"add"?: path, "remove"?: n}` does the
+one the control channel made does nothing. `assist.knowledge {"add"?: path, "document"?: id, "remove"?: n}` does the
 same from a script, its path held to the files commands may use there. **Output** lists the tracked changes and comments this
 conversation made, newest first and by turn, by the name it joined under, while the pane is open:
 each with its words cut short, Show, and for a change, Accept and Reject of that change alone. A

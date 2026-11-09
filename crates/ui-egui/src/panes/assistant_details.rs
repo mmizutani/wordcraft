@@ -119,7 +119,9 @@ fn attached(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     for document in documents {
         if ui.small_button(&document.title).clicked() && !app.input_from_control(ui.ctx()) {
             app.assist.add_open = false;
-            crate::assist::add_source_document(app, document.id, &document.title);
+            if let Err(e) = app.run("assist.knowledge", json!({"document": document.id})) {
+                app.assist.notice = Some(e.to_string());
+            }
         }
     }
 }
