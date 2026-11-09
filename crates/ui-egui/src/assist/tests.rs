@@ -2125,3 +2125,21 @@ fn a_plain_text_source_in_another_encoding_reads_as_its_words() {
     assert_eq!(super::read_source(&path).unwrap().text, "héllo");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_file_chosen_for_one_document_doesn_t_land_in_another() {
+    use crate::file_dialogs::AfterPick;
+    let (dir, path) = source_file("chosen.txt", "words");
+    let mut a = window("first");
+    let first = a.session.document_id();
+    a.execute("file.new", json!({})).unwrap();
+    let r = a.finish_pick(AfterPick::AssistantSource { document: first }, Some(path.to_string_lossy().into_owned()));
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(sources_read(&mut a)["sources"], json!([]));
+    assert!(a.assist.notice.as_deref().is_some_and(|n| n.contains("another document")), "{:?}", a.assist.notice);
+    let shown = a.session.document_id();
+    assert!(a.finish_pick(AfterPick::AssistantSource { document: shown }, Some(path.to_string_lossy().into_owned())).is_ok());
+    assert_eq!(sources_read(&mut a)["sources"].as_array().unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}

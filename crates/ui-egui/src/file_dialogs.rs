@@ -85,8 +85,8 @@ pub(crate) enum AfterPick {
     /// Add the picked folder to the folders agents can use, read-only (File › Options › Agents,
     /// #31).
     AgentFolder,
-    /// Attach the picked file to the assistant's conversation as a source.
-    AssistantSource,
+    /// Attach the picked file to the assistant's conversation about `document` as a source.
+    AssistantSource { document: u64 },
 }
 
 /// What to do once Save As has written the document.
@@ -304,8 +304,13 @@ impl WordApp {
                 let Some(path) = picked else { return Ok(json!({"cancelled": true})) };
                 crate::options::add_agent_folder(self, &path)
             }
-            AfterPick::AssistantSource => {
+            AfterPick::AssistantSource { document } => {
                 let Some(path) = picked else { return Ok(json!({"cancelled": true})) };
+                // Another document is shown now: its turns aren't what the file was chosen for.
+                if self.session.document_id() != document {
+                    self.assist.notice = Some(tl!("That source was for another document: add it there.").to_string());
+                    return Err("that source was for another document".into());
+                }
                 // The built-in browser takes typing: a program's isn't the person's choice.
                 if self.ctx.clone().is_some_and(|ctx| self.input_from_control(&ctx)) {
                     self.assist.notice = Some(tl!("Only you can add a source: click it yourself.").to_string());
