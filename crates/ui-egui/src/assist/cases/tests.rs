@@ -279,3 +279,31 @@ fn someone_joining_mid_turn_ends_a_conversation_that_recalled_and_the_pane_says_
     assert!(!a.conversation().unwrap().is_busy());
     assert!(seen.lock().unwrap().ended, "the backend was told to stop");
 }
+
+#[test]
+fn someone_joining_while_another_document_is_shown_still_ends_a_conversation_that_recalled() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    let fake = Fake::new().then(vec![Step::say("Working on it."), Step::Hold]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.execute("assist.ask", json!({"prompt": "Review the liability cap"})).unwrap();
+    let ctx = egui::Context::default();
+    let started = std::time::Instant::now();
+    while !a.assist.conversation.as_ref().unwrap().assistant.recalled() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "the turn never recalled");
+        a.sync_share(&ctx);
+        crate::assist::tick(&mut a);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let room = a.shared_room().unwrap();
+    a.execute("file.new", json!({})).unwrap();
+    let key = room.invite("Bob", Role::Viewer).unwrap();
+    let _bob = room.join_with(&key).unwrap();
+    crate::assist::tick(&mut a);
+    assert!(a.assist.conversation.as_ref().unwrap().assistant.has_ended(), "the conversation ended though its document isn't shown");
+    settle(&mut a);
+    assert!(seen.lock().unwrap().ended, "the backend was told to stop");
+}

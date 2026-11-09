@@ -56,10 +56,16 @@ impl WordApp {
 /// to write that into a comment the newcomer reads, so stopping recall alone wouldn't do. Cheap:
 /// the participant list is in memory, and nothing is looked at until a turn has recalled.
 fn others_while_recalled(app: &WordApp) -> Option<String> {
-    let c =
-        app.assist.conversation.as_ref().filter(|c| c.assistant.recalled() && !c.assistant.has_ended() && c.document == app.session.document_id())?;
-    let (room, me) = (app.shared_room()?, app.own_participant()?);
-    Alone::check(&room, me, c.assistant.name()).err().map(|others| others.names.join(", "))
+    let c = app.assist.conversation.as_ref().filter(|c| c.assistant.recalled() && !c.assistant.has_ended())?;
+    // The conversation's own room, whichever document is shown: someone can join it while the
+    // person looks at another one.
+    let room = c.assistant.room();
+    let me = app.shared_room().filter(|shared| std::sync::Arc::ptr_eq(shared, room)).and_then(|_| app.own_participant());
+    let Some(me) = me else {
+        // The window no longer shares that room, so it can't say who reads it: fail closed.
+        return Some(tl!("someone else").to_string());
+    };
+    Alone::check(room, me, c.assistant.name()).err().map(|others| others.names.join(", "))
 }
 
 /// Why the shown document's conversation can't take a turn: it has read case notes, and someone
