@@ -245,6 +245,47 @@ struct Focus {
     selection_cut: bool,
 }
 
+/// `doc`'s body as it reads with tracked deletions left out, a line for each paragraph: what a turn
+/// gives the model, and so what its citations can quote.
+pub fn final_text(doc: &Document) -> String {
+    let mut text = String::new();
+    for path in doc.para_paths(StoryRef::Body) {
+        if let Some(p) = doc.para(StoryRef::Body, &path) {
+            text.extend(final_chars(p, 0, p.text.len()));
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// Where `words` are in the body as it reads with tracked deletions left out: from where the first
+/// of them is to where the last ends, across anything deleted between them.
+pub fn find_in_final(doc: &Document, words: &str) -> Option<(Pos, Pos)> {
+    if words.is_empty() || words.contains('\n') {
+        return None;
+    }
+    for path in doc.para_paths(StoryRef::Body) {
+        let Some(p) = doc.para(StoryRef::Body, &path) else { continue };
+        let mut text = String::new();
+        // For each byte of `text`, where in the paragraph it came from.
+        let mut from = Vec::new();
+        for (range, props) in p.run_ranges() {
+            let piece = p.text.get(range.clone()).unwrap_or_default();
+            for (i, c) in piece.char_indices().filter(|(_, c)| props.del.is_none() && *c != OBJ) {
+                text.push(c);
+                from.extend(std::iter::repeat_n(range.start.saturating_add(i), c.len_utf8()));
+            }
+        }
+        let Some(at) = text.find(words) else { continue };
+        let last = at.saturating_add(words.len()).saturating_sub(1);
+        let (Some(&start), Some(&end)) = (from.get(at), from.get(last)) else { continue };
+        let end_char = p.text.get(end..).and_then(|t| t.chars().next()).map_or(1, char::len_utf8);
+        let pos = |off| Pos { story: StoryRef::Body, path: path.clone(), off };
+        return Some((pos(start), pos(end.saturating_add(end_char))));
+    }
+    None
+}
+
 /// Count `line` (with `title` when it is the first of its part) against `left`, when there is
 /// one and it fits: whether it was.
 fn take(left: &mut usize, line: Option<&String>, title: &str, first: bool) -> bool {

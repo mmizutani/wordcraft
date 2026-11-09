@@ -67,7 +67,8 @@ words to the limits a document's tables have.
 The note asks the assistant to cite what a claim rests on with the exact words, in a marker the pane
 reads: `[[cite: "the exact words"]]`, at most 200 characters, and at most 64 show in an answer. The
 pane takes the marker out and shows a numbered chip that selects those words, or says which attached
-source has them. A marker whose words are in neither the document nor a source shows no chip, so a
+source has them. The document is read as it will read, with tracked deletions left out, as the model
+got it. A marker whose words are in neither the document's body nor a source shows no chip, so a
 made-up citation can't look real, and Sources says how many couldn't be found. Quoting needs nothing
 of the tools: quoted words still resolve after edits elsewhere. A marker not closed yet is held back
 while the answer arrives, and shows as text if the turn ends first. A thought's markers aren't read.

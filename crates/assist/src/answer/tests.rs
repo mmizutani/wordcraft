@@ -335,3 +335,38 @@ fn what_an_answer_can_t_forge_or_lose() {
     let f = format(&format!("{}\nend [[cite: \"w\"]] of it", "word ".repeat(30_000)), false);
     assert!(f.rest.ends_with("end  of it"), "{}", f.rest.chars().rev().take(20).collect::<String>());
 }
+
+#[test]
+fn a_placeholder_a_character_entity_makes_can_t_add_a_chip() {
+    let forged = format!("[[cite:\"w\"]] {}", "&#xF8FD;0&#xF8FD; ".repeat(70));
+    let f = format(&forged, false);
+    let Block::Para(spans) = &f.blocks[0] else { panic!("{f:?}") };
+    assert_eq!(spans.iter().filter(|s| s.cite.is_some()).count(), 1);
+    assert!(!words(&f).contains('\u{F8FD}'), "{f:?}");
+}
+
+#[test]
+fn a_placeholder_doesn_t_reach_an_address() {
+    let f = format(r#"[go](https://example.com/[[cite:"w"]]x)"#, false);
+    let Block::Para(spans) = &f.blocks[0] else { panic!("{f:?}") };
+    assert_eq!(spans.iter().find_map(|s| s.link.as_deref()), Some("https://example.com/x"), "{spans:?}");
+}
+
+#[test]
+fn a_marker_past_the_read_limit_or_across_it_is_still_a_marker() {
+    let f = format(&format!("{} [[cite: \"w\"]]", "x".repeat(MAX_PARSED - 3)), false);
+    assert!(!words(&f).contains("cite"), "{}", words(&f).len());
+    let open = format!("{}\nend [[cite: \"unfinished", "word ".repeat(30_000));
+    assert!(!format(&open, true).rest.contains("cite"), "held back while it arrives");
+}
+
+#[test]
+fn markers_that_are_none_can_t_cost_more_than_a_frame() {
+    let many = "[[cite:\"".repeat(32 << 10);
+    let at = Instant::now();
+    let f = format(&many, false);
+    assert!(at.elapsed() < Duration::from_millis(1500), "{:?}", at.elapsed());
+    assert!(f.citations.is_empty());
+    let far = format!("[[cite:\"{}\"]]", "x".repeat(200 << 10));
+    assert!(citations(&far).is_empty());
+}

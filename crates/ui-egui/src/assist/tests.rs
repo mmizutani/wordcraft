@@ -2009,3 +2009,59 @@ fn a_citation_in_a_thought_isn_t_read() {
     assert!(h.query_by_label_contains("[[cite:").is_some(), "a thought shows as it came");
     assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "1").is_none(), "no chip");
 }
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_source_replaced_by_another_leaves_no_chip_for_words_it_alone_had() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = window("one two three");
+    app.assist_with(Box::new(Fake::new().then(vec![Step::say(r#"Yes [[cite: "only the old one"]]."#)])));
+    let (dir, old) = source_file("old.txt", "only the old one");
+    let new = dir.join("new.txt");
+    std::fs::write(&new, "something else").unwrap();
+    app.execute("assist.knowledge", json!({"add": old.to_string_lossy()})).unwrap();
+    sources_read(&mut app);
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Go"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if !h.state().conversation().is_some_and(|c| c.is_busy()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(2);
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "1").is_some());
+    h.state_mut().execute("assist.knowledge", json!({"remove": 0})).unwrap();
+    h.state_mut().execute("assist.knowledge", json!({"add": new.to_string_lossy()})).unwrap();
+    sources_read(h.state_mut());
+    h.run_steps(2);
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "1").is_none(), "the same number of sources, others' words");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_chip_selects_in_the_body_from_wherever_the_caret_is_and_past_a_deletion() {
+    use egui_kittest::kittest::Queryable;
+    let mut app = window("one obsolete two");
+    app.execute("select.text", json!({"text": "obsolete "})).unwrap();
+    app.execute("review.trackChanges", json!({"value": true})).unwrap();
+    app.execute("text.delete", json!({})).unwrap();
+    app.assist_with(Box::new(Fake::new().then(vec![Step::say(r#"Yes [[cite: "one two"]] and [[cite: "obsolete"]]."#)])));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Go"})).unwrap();
+    for _ in 0..4000 {
+        h.run_steps(1);
+        if !h.state().conversation().is_some_and(|c| c.is_busy()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.run_steps(2);
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "2").is_none(), "words deleted aren't the document's");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "1").click();
+    h.run_steps(2);
+    let s = &h.state().session;
+    assert_eq!((s.sel.anchor.off, s.sel.focus.off), (0, "one obsolete two".len()));
+}

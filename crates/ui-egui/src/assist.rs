@@ -75,7 +75,9 @@ pub(crate) struct AssistState {
     pub(crate) add_open: bool,
     /// Where citations' words were found, for the document and revision and sources it was looked
     /// at with.
-    cited: Option<((u64, u64, usize), HashMap<String, Cited>)>,
+    cited: Option<CitedHeld>,
+    /// Goes up each time the sources change: what they hold was looked at with it.
+    knowledge_rev: u64,
     /// The document and its revision the conversation's record of what it changed last read.
     output_at: Option<(u64, u64)>,
     /// What the pane shows: the conversation, or what the assistant is doing and what runs it.
@@ -107,6 +109,14 @@ pub(crate) struct AssistState {
 }
 
 /// What the Assistant pane shows under its role.
+/// The document's text and where citations' words were found, for what it was looked at with: the
+/// document, its revision and the sources' [`AssistState::knowledge_rev`].
+struct CitedHeld {
+    at: (u64, u64, u64),
+    text: String,
+    found: HashMap<String, Cited>,
+}
+
 /// Where a citation's words are.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Cited {
@@ -359,30 +369,34 @@ fn details(app: &mut WordApp) -> Result<Value, String> {
     serde_json::to_value(details_for(app)).map_err(|e| e.to_string())
 }
 
-/// Where `words` are: in the document, as `select.text` finds them, or in an attached source. Looked
-/// for once a revision: answers are drawn each frame.
-// ponytail: each word's look goes through the document; an index of its text if citations multiply.
+/// Where `words` are: in the document as it reads, or in an attached source. The document's text is
+/// read once a revision, and only when an answer cites anything.
 pub(crate) fn cited(app: &mut WordApp, words: &str) -> Cited {
-    use wordcraft_doc::StoryRef::Body;
-    let at = (app.session.document_id(), app.session.rev(), sources(app).len());
-    let held = app.assist.cited.get_or_insert_with(|| (at, HashMap::new()));
-    if held.0 != at {
-        *held = (at, HashMap::new());
+    let at = (app.session.document_id(), app.session.rev(), app.assist.knowledge_rev);
+    if app.assist.cited.as_ref().is_none_or(|held| held.at != at) {
+        let text = wordcraft_assist::context::final_text(&app.session.doc);
+        app.assist.cited = Some(CitedHeld { at, text, found: HashMap::new() });
     }
-    if let Some(found) = held.1.get(words) {
+    if let Some(found) = app.assist.cited.as_ref().and_then(|held| held.found.get(words)) {
         return found.clone();
     }
-    let doc = &app.session.doc;
-    let in_document = doc.para_paths(Body).iter().any(|path| doc.para(Body, path).is_some_and(|p| p.text.contains(words)));
+    let in_document = !words.contains('\n') && app.assist.cited.as_ref().is_some_and(|held| held.text.contains(words));
     let found = if in_document {
         Cited::Document
     } else {
         sources(app).iter().find(|s| s.text.contains(words)).map_or(Cited::Nowhere, |s| Cited::Source(s.name.clone()))
     };
     if let Some(held) = app.assist.cited.as_mut() {
-        held.1.insert(words.to_string(), found.clone());
+        held.found.insert(words.to_string(), found.clone());
     }
     found
+}
+
+/// Select `words` in the document, as they read: true when they are there.
+pub(crate) fn select_cited(app: &mut WordApp, words: &str) -> bool {
+    let Some((anchor, focus)) = wordcraft_assist::context::find_in_final(&app.session.doc, words) else { return false };
+    let range = json!({"anchor": wordcraft_engine::cmd::pos_json(&anchor), "focus": wordcraft_engine::cmd::pos_json(&focus)});
+    app.run("select.range", range).is_ok()
 }
 
 /// The conversation in summary, with its citations looked for: a made-up one is only counted.
@@ -419,6 +433,7 @@ pub(crate) fn sources(app: &WordApp) -> &[Knowledge] {
 fn source_room(app: &mut WordApp) -> bool {
     let document = app.session.document_id();
     if app.assist.knowledge_for != Some(document) {
+        app.assist.knowledge_rev = app.assist.knowledge_rev.wrapping_add(1);
         app.assist.knowledge.clear();
         app.assist.adding.clear();
         app.assist.knowledge_for = Some(document);
@@ -497,7 +512,10 @@ fn text_for_source(doc: &wordcraft_doc::Document) -> String {
 pub(crate) fn add_source_document(app: &mut WordApp, id: u64, name: &str) {
     if source_room(app) {
         match app.session.with_document(id, |s| text_for_source(&s.doc)) {
-            Ok(text) => app.assist.knowledge.push(Knowledge::new(name, &text)),
+            Ok(text) => {
+                app.assist.knowledge.push(Knowledge::new(name, &text));
+                app.assist.knowledge_rev = app.assist.knowledge_rev.wrapping_add(1);
+            }
             Err(e) => app.assist.notice = Some(e.to_string()),
         }
     }
@@ -509,6 +527,7 @@ pub(crate) fn remove_source(app: &mut WordApp, n: usize) -> Result<(), String> {
         return Err(format!("`remove`: there are {} sources", sources(app).len()));
     }
     app.assist.knowledge.remove(n);
+    app.assist.knowledge_rev = app.assist.knowledge_rev.wrapping_add(1);
     Ok(())
 }
 
@@ -518,6 +537,7 @@ fn take_sources(app: &mut WordApp) {
     adding.retain(|rx| match rx.try_recv() {
         Ok(Ok(source)) => {
             app.assist.knowledge.push(source);
+            app.assist.knowledge_rev = app.assist.knowledge_rev.wrapping_add(1);
             false
         }
         Ok(Err(why)) => {
@@ -696,6 +716,7 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
     // Sources belong to their conversation: those attached before the first go with it.
     if app.assist.conversation.is_some() {
         app.assist.knowledge.clear();
+        app.assist.knowledge_rev = app.assist.knowledge_rev.wrapping_add(1);
         // One still being read would land in this conversation.
         app.assist.adding.clear();
     }

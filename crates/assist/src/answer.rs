@@ -82,20 +82,20 @@ pub fn opens(address: &str) -> bool {
 /// finished is closed or held back ([`settled`]), so no `**` shows and then goes away.
 pub fn format(text: &str, streaming: bool) -> Formatted {
     let text: Cow<'_, str> = if text.contains(OURS) { Cow::Owned(text.replace(OURS, "")) } else { Cow::Borrowed(text) };
+    let (text, citations) = with_cites(&text, streaming);
     let (read, past) = split_at_line(&text, MAX_PARSED);
-    let (read, citations) = with_cites(read, streaming);
-    let read = if streaming { settled(&read) } else { read };
+    let read = if streaming { settled(read) } else { Cow::Borrowed(read) };
     let (flow, cut) = parsed(read);
     // The parser reads documents, which hold tables to limits. An answer's words all stay.
     if cut {
-        return Formatted { blocks: Vec::new(), rest: strip_cites(&with_cites(&text, false).0), citations: Vec::new() };
+        return Formatted { blocks: Vec::new(), rest: strip_cites(&text), citations: Vec::new() };
     }
     let mut out = Builder::default();
     for block in &flow.blocks {
         out.block(block);
     }
     let mut formatted = out.done();
-    formatted.rest.push_str(&strip_cites(&with_cites(past, false).0));
+    formatted.rest.push_str(&strip_cites(past));
     formatted.citations = citations;
     formatted
 }
@@ -107,59 +107,55 @@ pub fn citations(text: &str) -> Vec<String> {
 
 /// `text` with each citation's marker, `[[cite: "the exact words"]]`, as an index between two
 /// [`CITE`]s, and the words. A marker not closed yet is held back while the answer is `streaming`,
-/// and stays as text once it isn't: it was no marker. So does one too long to be a citation.
+/// and stays as text once it isn't: it was no marker. So does one too long to be a citation. Each
+/// marker is looked at only as far as the longest it can be, and a text of markers that are none
+/// stops being looked through: an answer is read over again as it arrives.
 fn with_cites(text: &str, streaming: bool) -> (Cow<'_, str>, Vec<String>) {
     const OPEN: &str = "[[cite:";
     const CLOSE: &str = "\"]]";
+    /// Markers that are none before the rest is taken for plain text.
+    const MOST_FALSE: usize = 256;
     if !text.contains(OPEN) {
         return (Cow::Borrowed(text), Vec::new());
     }
     let mut out = String::with_capacity(text.len());
     let mut words = Vec::new();
     let mut rest = text;
-    while let Some(at) = rest.find(OPEN) {
+    let mut false_markers = 0usize;
+    while false_markers < MOST_FALSE {
+        let Some(at) = rest.find(OPEN) else { break };
         let after = rest.get(at.saturating_add(OPEN.len())..).unwrap_or_default();
         out.push_str(rest.get(..at).unwrap_or_default());
         let quoted = after.trim_start_matches(' ').strip_prefix('"');
-        let marker = quoted
-            .and_then(|q| q.find(CLOSE).map(|end| (q.get(..end).unwrap_or_default(), q.get(end.saturating_add(CLOSE.len())..).unwrap_or_default())));
-        match marker {
-            Some((cited, tail)) if cited.chars().count() <= MAX_CITE_CHARS => {
+        let longest = MAX_CITE_CHARS.saturating_mul(4).saturating_add(CLOSE.len());
+        let seen = quoted.map(|q| {
+            let mut end = longest.min(q.len());
+            while !q.is_char_boundary(end) {
+                end = end.saturating_sub(1);
+            }
+            (q, q.get(..end).unwrap_or_default().find(CLOSE), end == q.len())
+        });
+        match seen {
+            Some((q, Some(end), _)) if q.get(..end).unwrap_or_default().chars().count() <= MAX_CITE_CHARS => {
+                let cited = q.get(..end).unwrap_or_default();
                 if !cited.trim().is_empty() && words.len() < MAX_CITES {
                     out.push(CITE);
                     out.push_str(&words.len().to_string());
                     out.push(CITE);
                     words.push(shown(cited.to_string()));
                 }
-                rest = tail;
+                rest = q.get(end.saturating_add(CLOSE.len())..).unwrap_or_default();
             }
-            None if streaming => return (Cow::Owned(out), words),
+            Some((_, None, true)) if streaming => return (Cow::Owned(out), words),
             _ => {
                 out.push_str(OPEN);
                 rest = after;
+                false_markers = false_markers.saturating_add(1);
             }
         }
     }
     out.push_str(rest);
     (Cow::Owned(out), words)
-}
-
-/// `spans` with the citations in their text, as [`with_cites`] left them, as spans of their own.
-fn cited(spans: Vec<Span>) -> Vec<Span> {
-    if !spans.iter().any(|s| s.text.contains(CITE)) {
-        return spans;
-    }
-    let mut out = Vec::new();
-    for span in spans {
-        for (n, piece) in span.text.split(CITE).enumerate() {
-            if n % 2 == 1 {
-                out.push(Span { cite: piece.parse().ok(), ..Span::default() });
-            } else if !piece.is_empty() {
-                out.push(Span { text: piece.to_string(), ..span.clone() });
-            }
-        }
-    }
-    out
 }
 
 /// `text` as the parser reads it for an answer, and whether a table lost words.
@@ -262,11 +258,37 @@ struct Builder {
     numbers: Vec<Option<u32>>,
     /// The code block drawn last ended: the next line of code starts another.
     code_ended: bool,
+    /// The citation the next chip must be.
+    next_cite: usize,
 }
 
 impl Builder {
     fn done(self) -> Formatted {
         self.formatted
+    }
+
+    /// A paragraph's text as spans, with its citations as spans of their own. Chips come in the
+    /// order of their markers, each once, so what a character entity in an answer makes of our
+    /// placeholder can't add one.
+    fn spans_of(&mut self, p: &Para, bold: bool) -> Vec<Span> {
+        let spans = spans(p, bold);
+        if !spans.iter().any(|s| s.text.contains(CITE)) {
+            return spans;
+        }
+        let mut out = Vec::new();
+        for span in spans {
+            for (n, piece) in span.text.split(CITE).enumerate() {
+                if n % 2 == 1 {
+                    if piece.parse() == Ok(self.next_cite) {
+                        out.push(Span { cite: Some(self.next_cite), ..Span::default() });
+                        self.next_cite = self.next_cite.saturating_add(1);
+                    }
+                } else if !piece.is_empty() {
+                    out.push(Span { text: piece.to_string(), ..span.clone() });
+                }
+            }
+        }
+        out
     }
 
     fn block(&mut self, block: &FBlock) {
@@ -283,7 +305,7 @@ impl Builder {
                         }
                         for b in &cell.blocks {
                             if let FBlock::Para(p) = b {
-                                line.extend(spans(p, cell.header));
+                                line.extend(self.spans_of(p, cell.header));
                             }
                         }
                     }
@@ -314,8 +336,8 @@ impl Builder {
                 Block::Code(line)
             }
             (Kind::Rule, _) => Block::Rule,
-            (Kind::Heading(level), _) => Block::Heading { level: *level, spans: spans(p, false) },
-            (Kind::Title, _) => Block::Heading { level: 1, spans: spans(p, false) },
+            (Kind::Heading(level), _) => Block::Heading { level: *level, spans: self.spans_of(p, false) },
+            (Kind::Title, _) => Block::Heading { level: 1, spans: self.spans_of(p, false) },
             (_, Some(list)) => {
                 let level = usize::from(list.level);
                 self.numbers.truncate(level.saturating_add(1));
@@ -333,11 +355,12 @@ impl Builder {
                     }
                     "•".to_string()
                 };
-                self.push(Block::Item { marker, level: list.level, spans: spans(p, false) });
+                let spans = self.spans_of(p, false);
+                self.push(Block::Item { marker, level: list.level, spans });
                 return;
             }
-            (Kind::Quote, None) => Block::Quote(spans(p, false)),
-            (Kind::Normal, None) => Block::Para(spans(p, false)),
+            (Kind::Quote, None) => Block::Quote(self.spans_of(p, false)),
+            (Kind::Normal, None) => Block::Para(self.spans_of(p, false)),
         };
         self.numbers.clear();
         self.push(block);
@@ -392,7 +415,7 @@ fn spans(p: &Para, bold: bool) -> Vec<Span> {
             _ => out.push(span),
         }
     }
-    cited(out)
+    out
 }
 
 /// `text` without the citations [`with_cites`] left in it: code shows no chip.
@@ -406,7 +429,7 @@ fn strip_cites(text: &str) -> String {
 fn span_of(text: String, fmt: Option<&Fmt>, bold: bool) -> Span {
     let Some(f) = fmt else { return Span { text, bold, ..Span::default() } };
     // An address too long to show whole isn't a link: cut, it could go somewhere else.
-    let link = f.link.as_deref().map(shown_again).filter(|l| l.chars().count() <= MAX_LABEL).map(|l| label(&l));
+    let link = f.link.as_deref().map(|l| strip_cites(&shown_again(l))).filter(|l| l.chars().count() <= MAX_LABEL).map(|l| label(&l));
     Span { text, bold: bold || f.bold, italic: f.italic, strike: f.strike, code: f.code, link, cite: None }
 }
 

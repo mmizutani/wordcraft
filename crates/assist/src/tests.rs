@@ -1383,3 +1383,29 @@ mod citations {
         assert_eq!(crate::answer::citations(&marker), ["the exact words"], "{note}");
     }
 }
+
+mod final_text {
+    use serde_json::json;
+    use wordcraft_doc::Document;
+    use wordcraft_engine::Session;
+
+    use crate::context::{final_text, find_in_final};
+
+    #[test]
+    fn a_citation_reads_the_document_as_it_will_read() {
+        let mut s = Session::new(Document::from_text("one obsolete two\nthird"));
+        s.run("review.trackChanges", &json!({"value": true})).unwrap();
+        s.run("select.text", &json!({"text": "obsolete "})).unwrap();
+        s.run("text.delete", &json!({})).unwrap();
+        let text = final_text(&s.doc);
+        assert!(!text.contains("obsolete") && text.contains("one two"), "{text}");
+
+        let (a, b) = find_in_final(&s.doc, "one two").expect("found");
+        assert_eq!((a.off, b.off), (0, "one obsolete two".len()), "it spans what was deleted between");
+        let (a, b) = find_in_final(&s.doc, "third").expect("found");
+        assert_eq!((a.path.last(), a.off, b.off), (1, 0, 5));
+        assert_eq!(find_in_final(&s.doc, "obsolete"), None);
+        assert_eq!(find_in_final(&s.doc, "two\nthird"), None);
+        assert_eq!(find_in_final(&s.doc, ""), None);
+    }
+}

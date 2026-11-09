@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use egui::cache::{ComputerMut, FrameCache};
 use egui::{RichText, Stroke, Ui};
-use serde_json::json;
 use wordcraft_assist::answer::{Block, Formatted, Span, format, opens};
 
 use super::{Tokens, WordApp, semibold};
@@ -153,7 +152,7 @@ impl Chips<'_> {
 
 /// Select the words a citation cites.
 pub(super) fn select_cited(app: &mut WordApp, words: &str) {
-    if app.run("select.text", json!({"text": words})).is_err() {
+    if !crate::assist::select_cited(app, words) {
         app.assist.notice = Some(tl!("Those words aren't in the document any more.").to_string());
     }
 }
