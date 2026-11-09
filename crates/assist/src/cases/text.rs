@@ -54,7 +54,10 @@ pub fn tokens(text: &str) -> impl Iterator<Item = Token> + '_ {
                     if !is_cjk_word(n) {
                         break;
                     }
-                    run.push(n);
+                    // More than MAX_TOKENS + 1 characters make more bigrams than are ever read.
+                    if run.len() <= MAX_TOKENS {
+                        run.push(n);
+                    }
                     chars.next();
                 }
                 if run.len() == 1 {
@@ -81,8 +84,8 @@ pub fn tokens(text: &str) -> impl Iterator<Item = Token> + '_ {
 /// English and Japanese terms per topic. An ASCII term matches at the start of a word (indemn
 /// finds indemnify and indemnity); a Japanese term matches anywhere.
 pub const TERMS: &[(Topic, &[&str])] = &[
-    (Topic::Liability, &["liabilit", "liable", "cap on damages", "consequential loss", "責任制限", "責任の上限", "損害賠償", "間接損害"]),
-    (Topic::Indemnity, &["indemn", "hold harmless", "補償", "免責"]),
+    (Topic::Liability, &["liabilit", "liable", "cap on damages", "consequential loss", "責任制限", "責任の上限", "損害賠償", "間接損害", "免責"]),
+    (Topic::Indemnity, &["indemn", "hold harmless", "補償"]),
     (Topic::Ip, &["intellectual property", "copyright", "patent", "trade mark", "trademark", "知的財産", "著作権", "特許"]),
     (Topic::Confidentiality, &["confidential", "non-disclosure", "nondisclosure", "nda", "秘密保持", "秘密情報", "機密"]),
     (Topic::Termination, &["terminat", "expir", "notice period", "解除", "解約", "終了", "予告期間"]),

@@ -112,13 +112,15 @@ pub fn fit(now: &Applies, then: &Applies) -> f32 {
 /// Pitfall: a silent edit is a trap whoever is stronger. Leverage is the most circumstantial.
 /// Position is asymmetric: a concession won while stronger says little to someone weaker now
 /// (gap -2), and one won while weaker is a floor for someone stronger now (gap +2).
-const TRANSFER: [[f32; 6]; 5] = [
-    [1.00, 1.00, 1.00, 1.00, 1.00, 1.00],
-    [0.70, 0.85, 1.00, 0.85, 0.70, 0.85],
-    [0.50, 0.75, 1.00, 0.90, 0.80, 0.80],
-    [0.20, 0.50, 1.00, 0.60, 0.40, 0.60],
-    [0.25, 0.60, 1.00, 0.95, 0.90, 0.60],
-];
+fn transfer_row(kind: Kind) -> [f32; 6] {
+    match kind {
+        Kind::Pitfall => [1.00, 1.00, 1.00, 1.00, 1.00, 1.00],
+        Kind::Pattern => [0.70, 0.85, 1.00, 0.85, 0.70, 0.85],
+        Kind::Lesson => [0.50, 0.75, 1.00, 0.90, 0.80, 0.80],
+        Kind::Leverage => [0.20, 0.50, 1.00, 0.60, 0.40, 0.60],
+        Kind::Position => [0.25, 0.60, 1.00, 0.95, 0.90, 0.60],
+    }
+}
 
 fn rung(stance: Stance) -> i8 {
     match stance {
@@ -133,7 +135,7 @@ pub fn transfer(kind: Kind, then: Option<Stance>, now: Option<Stance>) -> f32 {
         (Some(then), Some(now)) => usize::from((rung(now) - rung(then) + 2).unsigned_abs()).min(4),
         _ => 5,
     };
-    TRANSFER.get(kind as usize).and_then(|row| row.get(column)).copied().unwrap_or(1.0)
+    transfer_row(kind).get(column).copied().unwrap_or(1.0)
 }
 
 /// Half-life in days, by kind. Leverage is about one deal's moment; a pitfall or a lesson lasts.
