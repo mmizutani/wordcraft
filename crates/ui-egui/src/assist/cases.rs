@@ -3,8 +3,10 @@
 //! `memory.case.*` and `memory.wall.*` writes behind Details › Case ([`page`]).
 //!
 //! The binding is never in a document. The person's click binds, and the shelf keeps that binding
-//! for the document's file ([`Shelf::bind_file`]), so the file binds again when it is next opened
-//! ([`restore`]); an unsaved document's binding is the window's alone. A conversation belongs to
+//! for the document's file ([`Shelf::bind_file`]), so the case is offered again when the file is
+//! next opened ([`offer`]), and binds only with the person's click: a path doesn't say which
+//! document is there, and another client's document at it would recall the first client's case.
+//! An unsaved document's binding is the window's alone. A conversation belongs to
 //! the case its document was bound to when it started ([`super::Conversation::case`]); a document
 //! bound to another case gets a new conversation. Recall runs only when a case is bound and no one
 //! but the person and this conversation's assistant can read the document ([`Alone`]); otherwise
@@ -61,10 +63,11 @@ const MAX_TRIES: u32 = 600;
 pub(crate) struct CasesState {
     /// By document id ([`wordcraft_engine::Session::document_id`]): a window holds several documents.
     bound: BTreeMap<u64, CaseRef>,
-    /// Documents whose file was looked up for an earlier binding ([`restore`]), once each.
+    /// Documents whose file was looked up for an earlier binding ([`offer`]), once each.
     looked_up: BTreeSet<u64>,
-    /// Documents bound by that lookup and not by a click in this window: the pane says so.
-    restored: BTreeSet<u64>,
+    /// The case each document's file was bound to when it was last open, with its title, offered
+    /// until the person binds the document or says not now. Never bound without that click.
+    offered: BTreeMap<u64, (CaseRef, String)>,
     /// The shown document's case as its file last read, with when (`clock::now_ms`).
     open: Option<(CaseRef, Case)>,
     read_at: Option<f64>,
@@ -191,7 +194,7 @@ fn changed(app: &mut WordApp) {
 /// Every frame: what the conversation's answers marked for its case goes there, by the one route.
 /// A marker with no case bound to the conversation is dropped, as a `[[used:]]` for nothing is.
 pub(crate) fn tick(app: &mut WordApp) {
-    restore(app);
+    offer(app);
     let assist = &mut app.assist;
     if let Some(c) = assist.conversation.as_mut() {
         let marked = c.assistant.take_case_markers();
@@ -386,7 +389,7 @@ fn new_case(app: &mut WordApp, shelf: &Shelf, click: Click, req: &Value) -> Resu
 fn keep(app: &mut WordApp, shelf: &Shelf, click: Click, at: Option<&CaseRef>) {
     let Some(file) = app.session.path.clone() else { return };
     let kept = match at {
-        Some(at) => shelf.bind_file(click, &file, at, &app.session.doc.block_ids()).map(|_| ()),
+        Some(at) => shelf.bind_file(click, &file, at).map(|_| ()),
         None => shelf.unbind_file(click, &file),
     };
     if let Err(e) = kept {
@@ -396,46 +399,60 @@ fn keep(app: &mut WordApp, shelf: &Shelf, click: Click, at: Option<&CaseRef>) {
     }
 }
 
-/// The first time a saved document is shown, the binding the person made for its file, if the
-/// document still holds some of the blocks it held then and its case is still there
-/// ([`Shelf::file_bound`]): another document saved over the path binds to nothing. Once per
-/// document: one saved later under a path that was bound doesn't take that binding, as one opened
-/// from the path does.
-pub(crate) fn restore(app: &mut WordApp) {
+/// The first time a saved document is shown, the case the person bound its file to, if that case
+/// is still there ([`Shelf::file_bound`]), is offered: [`offer_line`]. It isn't bound: a path
+/// doesn't say which document is there (another client's saved over it, one made from the same
+/// template), and a bound case's notes go to the model. Once per document: one saved later under a
+/// path that was bound isn't offered its case, as one opened from the path is.
+pub(crate) fn offer(app: &mut WordApp) {
     let document = app.session.document_id();
     if !app.assist.cases.looked_up.insert(document) || app.assist.cases.bound.contains_key(&document) {
         return;
     }
     let (Some(dir), Some(file)) = (app.services.settings_dir.as_ref(), app.session.path.as_ref()) else { return };
-    if let Some(at) = Shelf::at(dir).file_bound(file, &app.session.doc.block_ids()) {
-        app.assist.cases.bound.insert(document, at);
-        app.assist.cases.restored.insert(document);
-    }
+    let shelf = Shelf::at(dir);
+    let Some(at) = shelf.file_bound(file) else { return };
+    let title = shelf.open(&at).map(|case| case.title.for_person().to_string()).unwrap_or_default();
+    app.assist.cases.offered.insert(document, (at, title));
 }
 
-/// Whether the shown document's binding came back with its file rather than from a click in this
-/// window ([`restore`]).
-pub(crate) fn restored(app: &WordApp) -> bool {
-    app.assist.cases.restored.contains(&app.session.document_id())
+/// The case offered to the shown document ([`offer`]), and its title, while the document is bound
+/// to none.
+pub(crate) fn offered(app: &WordApp) -> Option<&(CaseRef, String)> {
+    let document = app.session.document_id();
+    app.assist.cases.offered.get(&document).filter(|_| !app.assist.cases.bound.contains_key(&document))
 }
 
-/// What the pane says of a binding that came back with the file.
-pub(crate) fn restored_words(title: &str) -> String {
+/// The person's Bind again: the offered case, through the person-only command a click in the case
+/// list runs.
+pub(crate) fn rebind(app: &mut WordApp) {
+    let Some((at, _)) = offered(app).cloned() else { return };
+    run(app, "assist.memory.case.bind", json!({"wall": at.wall.as_str(), "case": at.case.as_str()}));
+}
+
+/// The person's Not now: no offer for this document while it is open. The file's binding stays,
+/// so it is offered again the next time the file is opened.
+pub(crate) fn not_now(app: &mut WordApp) {
+    app.assist.cases.offered.remove(&app.session.document_id());
+}
+
+/// What the pane says of a case offered to a file.
+pub(crate) fn offer_words(title: &str) -> String {
     let title = if title.is_empty() { tl!("Untitled case") } else { title };
-    fmt(tl!("Bound to {case} as when you last had this file open."), &[("case", title)])
+    fmt(tl!("When you last had this file open, it was bound to {case}."), &[("case", title)])
 }
 
-/// Above the conversation, while the shown document's binding is one that came back with its
-/// file: which case, and Unbind, before a turn recalls from it.
-pub(crate) fn restored_line(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
-    if !restored(app) {
-        return;
-    }
-    let Some((_, case)) = open_case(app, false) else { return };
+/// Above the conversation and on Details › Case, while a case is offered to the shown document:
+/// which case, **Bind again** and **Not now**. Nothing recalls from it until the person binds it.
+pub(crate) fn offer_line(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
+    let Some((_, title)) = offered(app).cloned() else { return };
     ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(restored_words(case.title.for_person())).small().color(t.text_dim));
-        if ui.small_button(tl!("Unbind")).on_hover_text(tl!("This document stops using the case; its conversation ends.")).clicked() {
-            run(app, "assist.memory.case.unbind", json!({}));
+        ui.label(RichText::new(offer_words(&title)).small().color(t.text_dim));
+        if ui.small_button(tl!("Bind again")).on_hover_text(tl!("Each turn recalls from this case again.")).clicked() {
+            rebind(app);
+        }
+        if ui.small_button(tl!("Not now")).on_hover_text(tl!("Nothing is recalled; it is offered again the next time you open the file.")).clicked() {
+            not_now(app);
         }
     });
 }
@@ -493,7 +510,7 @@ impl WordApp {
         self.assist.cases.open = None;
         self.assist.cases.read_at = None;
         let document = self.session.document_id();
-        self.assist.cases.restored.remove(&document);
+        self.assist.cases.offered.remove(&document);
         if self.assist.cases.bound.get(&document) != at.as_ref() {
             // The page's forms hold the old case's text.
             self.assist.cases.drafts.close_forms();
