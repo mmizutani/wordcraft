@@ -679,6 +679,28 @@ fn a_files_binding_survives_a_restart_and_a_copy_saved_under_another_name_does_n
     assert_eq!(crate::assist::cases::bound_for(&a), None, "a copy saved under another name doesn't inherit the binding");
 }
 
+/// Another client's document saved over a bound file's path binds to nothing when it is opened,
+/// so its turns never recall the first client's case; the bound document, opened again, does.
+#[test]
+fn another_document_saved_over_a_bound_files_path_binds_to_nothing() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let file = folder.0.join("NDA.docx");
+    let mut a = window(&folder);
+    a.run("file.saveAs", json!({"path": file.to_string_lossy()})).unwrap();
+    a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+    drop(a);
+    assert_eq!(crate::assist::cases::bound_for(&reopened(&folder, &file)), Some(c.here.clone()), "the bound document binds again");
+
+    let mut b = window(&folder);
+    b.run("text.insert", json!({"text": "Another client's NDA. "})).unwrap();
+    b.run("file.saveAs", json!({"path": file.to_string_lossy()})).unwrap();
+    drop(b);
+    let a = reopened(&folder, &file);
+    assert_eq!(crate::assist::cases::bound_for(&a), None, "another document at the path binds to nothing");
+    assert!(!crate::assist::cases::restored(&a));
+}
+
 /// Unbind and Delete change what the file binds to next time, and an unsaved document's binding
 /// is the window's alone.
 #[test]

@@ -386,7 +386,7 @@ fn new_case(app: &mut WordApp, shelf: &Shelf, click: Click, req: &Value) -> Resu
 fn keep(app: &mut WordApp, shelf: &Shelf, click: Click, at: Option<&CaseRef>) {
     let Some(file) = app.session.path.clone() else { return };
     let kept = match at {
-        Some(at) => shelf.bind_file(click, &file, at).map(|_| ()),
+        Some(at) => shelf.bind_file(click, &file, at, &app.session.doc.block_ids()).map(|_| ()),
         None => shelf.unbind_file(click, &file),
     };
     if let Err(e) = kept {
@@ -396,16 +396,18 @@ fn keep(app: &mut WordApp, shelf: &Shelf, click: Click, at: Option<&CaseRef>) {
     }
 }
 
-/// The first time a saved document is shown, the binding the person made for its file, if its
-/// case is still there ([`Shelf::file_bound`]). Once per document: one saved later under a path
-/// that was bound doesn't take that binding, as one opened from the path does.
+/// The first time a saved document is shown, the binding the person made for its file, if the
+/// document still holds some of the blocks it held then and its case is still there
+/// ([`Shelf::file_bound`]): another document saved over the path binds to nothing. Once per
+/// document: one saved later under a path that was bound doesn't take that binding, as one opened
+/// from the path does.
 pub(crate) fn restore(app: &mut WordApp) {
     let document = app.session.document_id();
     if !app.assist.cases.looked_up.insert(document) || app.assist.cases.bound.contains_key(&document) {
         return;
     }
     let (Some(dir), Some(file)) = (app.services.settings_dir.as_ref(), app.session.path.as_ref()) else { return };
-    if let Some(at) = Shelf::at(dir).file_bound(file) {
+    if let Some(at) = Shelf::at(dir).file_bound(file, &app.session.doc.block_ids()) {
         app.assist.cases.bound.insert(document, at);
         app.assist.cases.restored.insert(document);
     }

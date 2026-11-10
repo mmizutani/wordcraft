@@ -237,18 +237,21 @@ lesson. They are yours alone, as [Memory](#memory)'s are, and refuse a script, a
 key the control channel made and a macro's step. There is no command that reads a case: the pane
 reads the file itself, so holding the window's key doesn't list every client's cases.
 
-**Binding.** You bind a document to a case; nothing in the file says which, so a document can't
-name a case and a saved file carries no id. WordCraft remembers your binding for the file, by its
+**Binding.** You bind a document to a case; nothing in the file says which, so a document can't name
+a case and a saved file carries no case's id. WordCraft remembers your binding for the file, by its
 full path, in your settings folder: when you open that file again, after a restart too, it is bound
 again, and the pane says "Bound to <case> as when you last had this file open" with **Unbind**,
-before any turn recalls from it. Unbind, or a binding to another case, changes what the file binds
-to next time, and deleting a case forgets every file bound to it; a binding whose case is gone is
-dropped quietly when its file opens. The binding belongs to that path: a copy saved under another
-name binds to nothing until you bind it, and a document you bind before it is first saved is bound
-while it is open in this window, so bind it again once it has a file to keep it. A conversation
-belongs to the case its document was bound to when it started. Binding the document to another
-case, or unbinding it, ends the conversation, stopping a running turn, since the model holds what
-that case's notes said and the next turn would run under another case.
+before any turn recalls from it. It binds again only while it is the document you bound: the binding
+keeps the ids of a few of its paragraphs, which Word files keep, so another document saved over that
+path binds to nothing. Files in other formats (text, Markdown, RTF, ODF, HTML) keep no paragraph
+ids, and you bind them again each time you open them. Unbind, or a binding to another case, changes
+what the file binds to next time, and deleting a case forgets every file bound to it; a binding
+whose case is gone is dropped quietly when its file opens. The binding belongs to that path: a copy
+saved under another name binds to nothing until you bind it, and a document you bind before it is
+first saved is bound while it is open in this window, so bind it again once it has a file to keep
+it. A conversation belongs to the case its document was bound to when it started. Binding the
+document to another case, or unbinding it, ends the conversation, stopping a running turn, since the
+model holds what that case's notes said and the next turn would run under another case.
 
 **What a turn recalls.** With a case bound, each turn carries what ranks highest for the prompt and
 the text around the caret: this case's notes, the confirmed notes and latest balance of the
@@ -393,7 +396,8 @@ as `case.json.damaged` (or `assistant-lessons.json.damaged`) by your next change
 silence; while the lessons file is damaged a turn recalls no lesson and Details › Recalled says so.
 Two WordCrafts keep each other's changes: each write
 takes the case's lock, or the lessons file's, and reads the file again. Which files are bound to
-which case is `assistant-cases/bindings.json`: each file's path and the ids of its client and case,
+which case is `assistant-cases/bindings.json`: each file's path, the ids of its client and case,
+and at most 32 of its paragraphs' ids,
 at most 200 files (binding a 201st forgets the one bound longest ago) and 1 MiB. Only your bind and
 unbind add or change a binding; a delete, and a file whose case is gone, only remove one. Each write
 takes the file's own lock, and one that can't be read whole binds nothing and is moved aside as
