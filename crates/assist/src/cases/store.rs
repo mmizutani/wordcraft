@@ -390,7 +390,11 @@ impl Shelf {
 
     /// What the person did, with their click: the case as written.
     pub fn person(&self, _click: Click, at: &CaseRef, op: PersonOp, today: Day) -> Result<Case, CaseError> {
-        self.update(at, true, Lock::take, |case| {
+        // A draft's print is written for the person's bind, not as an edit of the case: binding
+        // a damaged case must not move it aside and keep only what could be read, which would
+        // quietly make a truncated case recallable. Only an edit the person makes repairs one.
+        let repairs = !matches!(op, PersonOp::AddDraft(_));
+        self.update(at, repairs, Lock::take, |case| {
             case.apply_person(op, today)?;
             Ok(case.clone())
         })

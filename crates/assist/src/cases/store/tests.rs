@@ -208,6 +208,24 @@ fn the_newest_cases_of_every_wall_are_read_up_to_a_count_and_a_byte_budget() {
     assert_eq!(shelf.wall_name(&b).for_person(), "Bluefin Systems Ltd");
 }
 
+/// Binding a damaged case keeps its draft's print only if the case can be read whole: the print
+/// is the window's own write on the person's bind, not an edit of the case, so it leaves the file
+/// as it is, damaged, for the person's next real change to move aside.
+#[test]
+fn a_draft_print_never_repairs_a_damaged_case() {
+    let (shelf, at) = shelf_with_case("damaged-print");
+    let path = shelf.case_dir(&at).join("case.json");
+    let aside = shelf.case_dir(&at).join(format!("case.json{DAMAGED_SUFFIX}"));
+    let junk = b"{not json".to_vec();
+    std::fs::write(&path, &junk).unwrap();
+    let doc = wordcraft_doc::Document::from_text("Clause 1. Kestrel Freight KK shall perform the services with reasonable skill and care.");
+    let print = crate::cases::DraftPrint::of(&doc, "Kestrel MSA", today());
+    assert_eq!(shelf.person(click(), &at, PersonOp::AddDraft(print), today()), Err(CaseError::Damaged));
+    assert_eq!(std::fs::read(&path).unwrap(), junk, "the damaged file is untouched");
+    assert!(std::fs::symlink_metadata(&aside).is_err(), "nothing was moved aside");
+    assert!(shelf.open(&at).unwrap().damaged, "the case still reads as damaged");
+}
+
 #[test]
 fn a_damaged_case_moves_aside() {
     let (shelf, at) = shelf_with_case("damaged");
