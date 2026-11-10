@@ -23,7 +23,7 @@ Use a dedicated checkout with the Rust `wasm32-unknown-unknown` target, `worker-
 
 Cloudflare documents [Rust Workers](https://developers.cloudflare.com/workers/languages/rust/), and Sites documents [managed identity and storage](https://learn.chatgpt.com/docs/sites/data-and-connections). Live acceptance of the generated server WASM modules and routing of the browser asset under a custom Worker are open questions. Verify both before expanding the implementation. If either fails, record the failure and revisit the packaging boundary under the repository's Rust requirement.
 
-Next package the full Trunk build with the same font inputs as Pages. The Pages WASM measured 62,432,793 bytes uncompressed on 2026-11-10. Personal Cloudflare Workers documents a [25 MiB per-file static asset limit](https://developers.cloudflare.com/workers/platform/limits/#static-assets). Measure the candidate and test the managed Sites upload and browser load directly. If the full WASM cannot ship as a managed static asset, test serving its unchanged bytes from an immutable, versioned R2 object at the corresponding same-origin asset path. That path requires a verified owner-only seeding step. Verify the object digest and availability before deploying a build that references it, and serve it with `application/wasm`. Preserve font coverage in either delivery path.
+Package the full Trunk build with the same font inputs as Pages. Sites rejected the 62,364,711-byte raw editor WASM from `2a70a95a89643fa0b3d2d71c8eee2d0bdb7d4774` at the same [25 MiB per-file limit](https://developers.cloudflare.com/workers/platform/limits/#static-assets) as Cloudflare Workers. The package compresses an oversized Trunk WASM file with deterministic gzip. The Worker streams it through the original content-hashed URL with `application/wasm`, `Content-Encoding: gzip`, and manual response encoding. The browser decodes the same WASM bytes, preserving the bundled fonts. If the gzip asset also outgrows the limit, revisit delivery from a versioned R2 object before publishing.
 
 ## Storage and identity probe
 
@@ -45,6 +45,8 @@ Gate the probe at the Worker as well as at the Site. Requests without an authent
 The first private version, built from `9c06e307d1a087b072669df397fe70580a1a53df`, ran the Rust-generated Worker and served the eight-byte browser WASM module as `application/wasm`. Managed D1 applied the probe migration. Signed-out requests were denied at the Site. The Worker returned 401 for a Site service request without visitor identity. In the signed-in owner's browser, the four storage requests returned `201`, `200`, `204`, and `404`. The Worker compares the exact R2 bytes before returning 200.
 
 The same-source static package loaded under `/editor/` in headless Chrome. Opening a multilingual text fixture and using the browser download fallback produced a DOCX that retained its text. The private capability probe and full editor use separate source revisions because Sites reused the saved version when given a different archive for the same commit.
+
+The local gzip package passed Wrangler's dry run and initialized the editor in Chrome. Its 22,736,873-byte response decoded to the original 62,364,711-byte WASM, with a matching SHA-256 digest.
 
 ## Boundaries for later phases
 

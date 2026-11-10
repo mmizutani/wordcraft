@@ -49,6 +49,20 @@ else
   . "$ROOT/packaging/env.sh"
   (cd "$ROOT/apps/wordcraft-web" && trunk build --release --dist "$stage/client")
   copy_docs "$stage/client"
+
+  # The Worker serves oversized WASM at its original Trunk URL from a gzip asset.
+  asset_limit=$((25 * 1024 * 1024))
+  for wasm in "$stage/client"/wordcraft-web-*_bg.wasm; do
+    test -s "$wasm"
+    if (( $(wc -c < "$wasm") > asset_limit )); then
+      gzip -n -9 -c "$wasm" > "$wasm.gz"
+      if (( $(wc -c < "$wasm.gz") > asset_limit )); then
+        echo 'Compressed editor WASM exceeds the Workers asset limit. Use an R2 delivery path.' >&2
+        exit 1
+      fi
+      rm -- "$wasm"
+    fi
+  done
 fi
 
 test -s "$stage/client/index.html"
