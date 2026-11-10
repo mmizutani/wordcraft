@@ -6,7 +6,7 @@ use super::record::{
     Applies, Balance, Body, Case, ContractKind, CounterpartyKind, Day, Facts, Kind, Law, Note, NoteId, OurSide, Paper, Quoted, Side, Stance,
     Standing, Topic, Topics,
 };
-use super::text::{TERMS, tokens, topics_in};
+use super::text::{TERMS, shares_run, tokens, topics_in};
 
 fn day(s: &str) -> Day {
     Day::parse(s).unwrap()
@@ -420,4 +420,12 @@ fn applies_holds_no_text() {
     fn is_copy<T: Copy>() {}
     is_copy::<Applies>();
     assert_eq!(Kind::ALL.len(), 5);
+}
+
+#[test]
+fn a_paste_that_differs_only_in_case_or_full_width_letters_still_shares_a_run() {
+    let note = "Liability capped at twelve months of fees paid before the claim.";
+    assert!(shares_run("LIABILITY CAPPED AT TWELVE MONTHS OF FEES PAID", note, 36));
+    assert!(shares_run("ＬＩＡＢＩＬＩＴＹ ＣＡＰＰＥＤ ＡＴ ＴＷＥＬＶＥ ＭＯＮＴＨＳ ＯＦ ＦＥＥＳ", note, 36));
+    assert!(!shares_run("Liability capped at six months", note, 36));
 }
