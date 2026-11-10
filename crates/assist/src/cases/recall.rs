@@ -615,17 +615,16 @@ pub struct RecalledItem {
 }
 
 impl RecalledItem {
-    /// What [`Told`] remembers an item by. A ladder is its rungs: one whose rungs changed is
-    /// new text, so it is keyed by their content and not by its id alone.
+    /// What [`Told`] remembers an item by. A ladder is its rungs: one whose rungs changed in
+    /// anything the model reads (a new position, a confirmation, the balance now) is new text, so
+    /// it is keyed by every field of every rung, serialized whole, and not by its id alone.
     fn told_key(&self) -> String {
         if self.rungs.is_empty() {
             return self.id.to_string();
         }
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        for r in &self.rungs {
-            (&r.title, r.on, r.terms.as_str(), r.traded_for.as_deref(), r.landed, r.moved as u8).hash(&mut h);
-        }
+        serde_json::to_string(&self.rungs).unwrap_or_default().hash(&mut h);
         format!("{}#{:x}", self.id, h.finish())
     }
 }
@@ -821,11 +820,19 @@ fn compose(pool: &Pool, query: &Query) -> Recalled {
             let mut rungs = ladder(topic, pool, now);
             let all = u32::try_from(rungs.len()).unwrap_or(u32::MAX);
             rungs.truncate(MAX_RUNGS);
-            let kept = u32::try_from(rungs.len()).unwrap_or(u32::MAX);
-            let (item, json) = ladder_item(topic, rungs, now);
-            let sent = ranked.score >= MIN_SCORE && push(&mut out, item, json);
-            let left = if sent { all.saturating_sub(kept) } else { all };
-            out.sent.left_out = out.sent.left_out.saturating_add(left);
+            // A ladder too long for what is left of the budget goes with the rungs that fit, in
+            // order, so a topic is never dropped for its length; the rest are counted.
+            let mut sent = 0u32;
+            while ranked.score >= MIN_SCORE && !rungs.is_empty() {
+                let kept = u32::try_from(rungs.len()).unwrap_or(u32::MAX);
+                let (item, json) = ladder_item(topic, rungs.clone(), now);
+                if push(&mut out, item, json) {
+                    sent = kept;
+                    break;
+                }
+                rungs.pop();
+            }
+            out.sent.left_out = out.sent.left_out.saturating_add(all.saturating_sub(sent));
             continue;
         }
         if ranked.score < MIN_SCORE {
@@ -1379,7 +1386,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn position(n: u8, on: &str, terms: &str, landed: bool, standing: Standing) -> Note {
+    /// Trades that share no 36-byte quote window, so the quote check can tell them apart.
+    const TRADES: [&str; 4] = [
+        "A longer initial term of three years, offered by us.",
+        "Quarterly invoicing in arrears with sixty-day payment terms.",
+        "A service credit of ten percent below ninety-nine point five.",
+        "Mutual carve-outs for data breaches and infringement claims.",
+    ];
+
+    fn position(n: u8, on: &str, terms: &str, trade: &str, landed: bool, standing: Standing) -> Note {
         Note {
             id: NoteId::parse(&format!("n{n}")).unwrap(),
             at: day(on),
@@ -1387,7 +1402,7 @@ mod tests {
                 topic: Topic::Liability,
                 moved: Side::Us,
                 terms: Quoted::parse(terms),
-                traded_for: Some(Quoted::parse(&format!("Trade {n}: a longer initial term with no termination for convenience."))),
+                traded_for: Some(Quoted::parse(trade)),
                 landed,
             },
             how: None,
@@ -1411,7 +1426,7 @@ mod tests {
     fn ladder_pool() -> Pool {
         let mut here = Case::new("here");
         here.balance.push(balance("2026-01-01", Stance::Weaker));
-        here.notes.push(position(1, "2026-03-01", "Cap at twelve months of fees paid, here.", false, Standing::Unconfirmed));
+        here.notes.push(position(1, "2026-03-01", "Cap at twelve months of fees paid, here.", TRADES[0], false, Standing::Unconfirmed));
         here.notes.push(Note {
             id: NoteId::parse("n2").unwrap(),
             at: day("2026-03-01"),
@@ -1425,8 +1440,8 @@ mod tests {
         let mut nb = Case::new("Kestrel Freight renewal");
         nb.balance.push(balance("2025-01-01", Stance::Stronger));
         nb.balance.push(balance("2025-06-01", Stance::Weaker));
-        nb.notes.push(position(1, "2025-02-01", "Cap at fees paid in the prior year, stronger then.", true, confirmed()));
-        nb.notes.push(position(2, "2025-07-01", "Cap at six months of fees, weaker then.", true, confirmed()));
+        nb.notes.push(position(1, "2025-02-01", "Cap at fees paid in the prior year, stronger then.", TRADES[1], true, confirmed()));
+        nb.notes.push(position(2, "2025-07-01", "Cap at six months of fees, weaker then.", TRADES[2], true, confirmed()));
         Pool { here, neighbors: vec![Neighbor::of(id(1), nb)], damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false }
     }
 
@@ -1479,7 +1494,7 @@ mod tests {
         assert_eq!(json["rungs"][2]["balance"], "then stronger, now weaker");
         assert_eq!(json["rungs"][1]["confirmed"], false);
         assert_eq!(json["rungs"][0]["place"], "the same client's case \"Kestrel Freight renewal\"");
-        assert_eq!(json["rungs"][0]["tradedFor"], "Trade 2: a longer initial term with no termination for convenience.");
+        assert_eq!(json["rungs"][0]["tradedFor"], TRADES[2]);
         let mut fewer = ladder_pool();
         fewer.neighbors[0].case.notes.pop();
         let out = compose(&fewer, &liability_query(&fewer));
@@ -1559,10 +1574,36 @@ mod tests {
     fn ladder_rungs_are_indexed_for_the_quote_check() {
         let pool = ladder_pool();
         let sent = compose(&pool, &liability_query(&pool)).sent();
+        let rungs = sent.items.iter().find(|i| matches!(i.id, ItemId::Ladder { .. })).unwrap().rungs.clone();
+        assert_eq!(rungs.len(), 3);
         let mut t = crate::Transcript::default();
         t.record(&crate::Event::Recalled(sent));
-        assert!(t.quotes_recalled_for_test("Cap at fees paid in the prior year, stronger then."));
-        assert!(t.quotes_recalled_for_test("Trade 2: a longer initial term with no termination for convenience."));
+        for r in &rungs {
+            assert!(t.quotes_recalled_for_test(&r.terms), "{}", r.terms);
+            let trade = r.traded_for.as_deref().unwrap();
+            assert!(t.quotes_recalled_for_test(trade), "{trade}");
+        }
+        assert!(!t.quotes_recalled_for_test(TRADES[3]), "a trade no rung holds isn't flagged");
+    }
+
+    /// A ladder too long for the budget whole still goes, with the rungs that fit in their order;
+    /// the rest are counted as left out. The topic is never dropped for its length.
+    #[test]
+    fn ladder_too_long_for_the_budget_sends_the_rungs_that_fit() {
+        let mut here = Case::new("here");
+        here.balance.push(balance("2026-01-01", Stance::Weaker));
+        for n in 0..8u8 {
+            let terms = format!("{n}{}", "責任上限は前年の支払額とする。".repeat(25));
+            let trade = format!("{n}{}", "初期契約期間を三年とする。".repeat(25));
+            here.notes.push(position(n + 1, "2026-03-01", &terms, &trade, true, confirmed()));
+        }
+        let pool = Pool { here, neighbors: Vec::new(), damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false };
+        let out = compose(&pool, &liability_query(&pool));
+        let ladder = out.sent.items.iter().find(|i| matches!(i.id, ItemId::Ladder { .. }));
+        let kept = ladder.map_or(0, |l| l.rungs.len());
+        assert!((1..8).contains(&kept), "{kept} rungs: {:?}", out.sent.items);
+        assert!(out.json.iter().map(|j| j.to_string().len()).sum::<usize>() <= BUDGET);
+        assert_eq!(out.sent.left_out as usize, 8 - kept);
     }
 
     /// A retaining session told a ladder isn't told the same ladder again, but is told one whose
@@ -1578,11 +1619,17 @@ mod tests {
         told.filter(&mut same, Some(0));
         assert!(same.sent.items.iter().find(is_ladder).unwrap().again);
         let mut grown = ladder_pool();
-        grown.here.notes.push(position(3, "2026-10-01", "Cap at eighteen months of fees, new.", false, confirmed()));
+        grown.here.notes.push(position(3, "2026-10-01", "Cap at eighteen months of fees, new.", TRADES[3], false, confirmed()));
         let mut changed = compose(&grown, &liability_query(&grown));
         told.filter(&mut changed, Some(0));
         let ladder = changed.sent.items.iter().find(is_ladder).unwrap();
         assert!(!ladder.again, "{ladder:?}");
+        let mut confirmed_since = ladder_pool();
+        confirmed_since.here.notes[0].standing = confirmed();
+        let mut changed = compose(&confirmed_since, &liability_query(&confirmed_since));
+        told.filter(&mut changed, Some(0));
+        let ladder = changed.sent.items.iter().find(is_ladder).unwrap();
+        assert!(!ladder.again, "a rung confirmed since is new to the model: {ladder:?}");
     }
 
     #[test]
