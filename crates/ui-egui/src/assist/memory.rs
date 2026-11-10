@@ -5,15 +5,17 @@
 //! under it keep being rejected.
 //!
 //! Only the person changes what it says. A model's marker raises `used` and the person's Accept and
-//! Reject raise `accepted` and `rejected`, and those counts only lead to a question. The window refuses a write from a script or an agent, a click or
-//! key the control channel made and a macro's step: a document can tell a model to keep something,
-//! and a kept preference acts on later documents.
+//! Reject raise `accepted` and `rejected`, and those counts only lead to a question. The window
+//! refuses a write from a script or an agent, a click or key the control channel made and a macro's
+//! step: a document can tell a model to keep something, and a kept preference acts on later
+//! documents. A model writes only inside a case the person bound, as unconfirmed notes that stay
+//! there ([`super::cases::tick`]); nothing it writes becomes a preference.
 
 use std::collections::BTreeMap;
 
 use egui::{RichText, Stroke, Ui};
 use serde_json::{Value, json};
-use wordcraft_assist::memory::{ForModel, Item, MAX_TEXT, Memory, SentPreference};
+use wordcraft_assist::memory::{ForModel, Instructions, Item, MAX_TEXT, Memory, SentPreference};
 use wordcraft_assist::{Decision, ProposalAnswer, Sent};
 use wordcraft_engine::cmd::review::AuthoredChange;
 
@@ -66,7 +68,7 @@ pub(crate) fn conversation_started(app: &mut WordApp) {
 /// What the next turn carries, read fresh: another WordCraft's keep counts. Nothing without a
 /// folder to keep it in, so the model isn't asked to propose what no click could keep. `sent` gets
 /// what the pane says about it.
-pub(crate) fn for_turn(app: &mut WordApp, sent: &mut Sent) -> Option<String> {
+pub(crate) fn for_turn(app: &mut WordApp, sent: &mut Sent) -> Option<Instructions> {
     sent.at = wordcraft_engine::cmd::now_iso();
     app.services.settings_dir.as_ref()?;
     reload(app);
@@ -136,12 +138,15 @@ pub(crate) fn read(app: &mut WordApp) -> Result<Value, String> {
 }
 
 /// One of the `assist.memory.*` writes, whose params the command checked. Only the person's: the
-/// one guard every write passes.
+/// one guard every write passes, the person's cases (`memory.case.*`, `memory.wall.*`) included.
 pub(crate) fn write(app: &mut WordApp, what: &str, req: &Value) -> Result<Value, String> {
     if !app.assist.by_person {
         return Err(YOURS.into());
     }
     let dir = app.services.settings_dir.clone().ok_or(NO_FOLDER)?;
+    if what.starts_with("memory.case.") || what.starts_with("memory.wall.") {
+        return super::cases::write(app, &dir, what, req);
+    }
     let text = req.get("text").and_then(Value::as_str);
     let id = req.get("id").and_then(Value::as_str).unwrap_or("");
     let keeps_item = what == "memory.keep" && req.get("id").is_some();
@@ -461,4 +466,4 @@ fn add_row(app: &mut WordApp, ui: &mut Ui) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

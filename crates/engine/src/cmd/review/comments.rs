@@ -242,11 +242,14 @@ pub struct CommentRow {
     pub at: Option<Pos>,
     /// Its text, at most [`super::changes::ROW_TEXT_CHARS`] characters.
     pub text: String,
+    /// Its paragraphs, a line break between them, as far as [`super::changes::ROW_FULL_BYTES`].
+    pub full: String,
     pub resolved: bool,
 }
 
 /// The first `most` comments and replies `author` made, in the order of the document, and how
-/// many more there are. Each one's text is its first paragraph's, read without copying the rest.
+/// many more there are. Each one's shown text is its first paragraph's; its full text is every
+/// paragraph's, read without copying them.
 pub fn comment_rows(s: &Session, author: &str, most: usize) -> (Vec<CommentRow>, usize) {
     let all = comment_list(s);
     // A reply has no place of its own: its place is its thread's. Imported threads can hold a loop.
@@ -267,9 +270,18 @@ pub fn comment_rows(s: &Session, author: &str, most: usize) -> (Vec<CommentRow>,
         .take(most)
         .filter_map(|id| {
             let c = s.doc.comments.get(&id)?;
-            let first = s.doc.para(StoryRef::Part(c.part), &wordcraft_doc::Path::top(0)).map(|p| p.text.as_str()).unwrap_or_default();
-            let text = first.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(super::changes::ROW_TEXT_CHARS).collect();
-            Some(CommentRow { id, at: place(id), text, resolved: c.resolved })
+            let story = StoryRef::Part(c.part);
+            let (mut text, mut full) = (String::new(), String::new());
+            for (i, path) in s.doc.para_paths(story).into_iter().enumerate() {
+                let Some(p) = s.doc.para(story, &path) else { continue };
+                let chars = p.text.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ);
+                if i == 0 {
+                    super::changes::add_row_text(&mut text, &mut full, chars);
+                } else {
+                    super::changes::add_full(&mut full, std::iter::once('\n').chain(chars));
+                }
+            }
+            Some(CommentRow { id, at: place(id), text, full, resolved: c.resolved })
         })
         .collect();
     (rows, more)

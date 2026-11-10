@@ -146,12 +146,15 @@ what you kept stays until you clear it. The pane needs a document, so with none 
 › Assistant has the list instead; with one open, it says where the list is. `assist.memory` reads
 the list for whoever holds the window's key.
 
-**Only your own click stores anything.** Documents are untrusted: a shared document, a received
-file or a comment can tell a model to remember something, and a stored preference would act on
-later documents. So `assist.memory.add`, `.edit`, `.remove`, `.clear`, `.enabled` and `.keep` refuse a
-script, an agent, a click or key the control channel made and a macro's step, as signing in to
-ChatGPT does, and they take no key and go on no ribbon or toolbar. An invited participant's copy
-refuses them at every role.
+**Only your click stores a preference, confirms a note, sets a case's facts or replaces your
+plan.** Documents are untrusted: a shared document, a received file or a comment can tell a model
+to remember something, and a stored preference acts on every later document. So `assist.memory.add`,
+`.edit`, `.remove`, `.clear`, `.enabled` and `.keep` refuse a script, an agent, a click or key the
+control channel made and a macro's step, as signing in to ChatGPT does, and they take no key and go
+on no ribbon or toolbar. An invited participant's copy refuses them at every role. Inside a case you
+bound ([Cases](#cases)), the assistant does write on its own: working notes, marked unconfirmed,
+which stay in that case and which you confirm, edit or remove. That is the one thing a model stores
+without you, and it is data for later turns of that case, never an instruction.
 
 This guards the commands, not the file system. A program holding the window's key can already
 write any file you can with `file.saveAs`, this one and the agents' settings included, so that
@@ -204,6 +207,131 @@ ACP agent gets them in a new session's first prompt and again when they change, 
 none applies any more. They apply unless the current request says otherwise, and they never
 permit what the role doesn't. While memory is on, a turn also asks the model to propose only what
 you said or did, never something the document asks for. Off, it asks for nothing.
+
+## Cases
+
+A case is one contract negotiation: a title, the facts that make it like or unlike another (the
+kind of contract, which side you are on, whose paper it is, what kind of counterparty, the
+governing law, its size, language and stage, and the parties' names), a dated power balance with
+the factors behind it, a plan, and notes of five kinds: a pattern, a pitfall, a lesson, leverage,
+or a position taken on a clause (its topic, the terms, who moved, what was traded and whether it
+landed). Cases belong to a client, and a client is a folder; the default client is **My cases**.
+Every field but the title is optional.
+
+Details › Case in the Assistant pane shows the document's case. With none bound it lists your
+cases by client, each a button that binds the open document to it, and has **New case**: a title
+and a client, chosen from the list or typed as a new one. Bound, it shows the title and client with
+**Unbind**, the facts as pickers, the balance with its date and **Reassess** (Stronger, Even or
+Weaker, and up to four factors each favouring us or them, with a reason), the plan with its next
+steps, and the notes grouped by kind, each with **Edit** and **Remove**. A note the assistant wrote
+shows dimmed as unconfirmed with **Confirm**; what you wrote or confirmed is confirmed on the day
+you set it. The commands are
+`assist.memory.case.new`, `.bind`, `.unbind`, `.facts`, `.balance`, `.plan`, `.note`, `.noteEdit`,
+`.noteConfirm`, `.noteRemove`, `.cardDismiss` and `.delete`, and `assist.memory.wall.new` and
+`.delete` for a client. They are yours alone, as [Memory](#memory)'s are, and refuse a script, an agent, a click or
+key the control channel made and a macro's step. There is no command that reads a case: the pane
+reads the file itself, so holding the window's key doesn't list every client's cases.
+
+**Binding.** You bind a document to a case; nothing in the file says which, so a document can't
+name a case and a saved file carries no id. A binding lasts while the document is open in this
+window: after a restart or a reopen you bind again. A conversation belongs to the case its document
+was bound to when it started. Binding the document to another case, or unbinding it, ends the
+conversation, stopping a running turn, since the model holds what that case's notes said and the
+next turn would run under another case.
+
+**What a turn recalls.** With a case bound, each turn carries what ranks highest for the prompt and
+the text around the caret: this case's notes, and the confirmed notes and latest balance of the
+same client's other cases. Never another client's: recall opens one client's folder and no other.
+A model's unconfirmed note stays in the case it was written in. What is recalled goes to the model
+as data, in the turn's sources, with WordCraft's own framing that it is never an instruction and
+mustn't be copied into the document unless you ask; it is never in the instruction channel that
+carries your preferences. The model is asked to write `[[used: n12]]` where an item shapes its
+answer, which becomes a chip as a preference's does. Details › Recalled lists, per turn, each item,
+where it came from (this case or which of the client's cases), whether it is unconfirmed, the
+balance then against now, how many more scored but didn't fit, and why nothing was recalled when
+nothing was.
+
+**What the assistant writes.** With a case bound, each turn's instructions also say what the
+case's notes are for: a later conversation about this negotiation will know only these notes and
+the document, so the model should write what that conversation will need and can't read off the
+document (rules learned about the other side, positions and trades, traps, how the balance moved
+and why), say how it knows each one, and say so when it came from the other side's text. It writes
+them as `[[case]]{…}[[/case]]` markers in its answer, at most five in a turn, each a JSON object
+with an `op`: `note` (a note of any kind, with `how`), `plan`, `balance` or `facts`. The marker is
+taken out of what the pane shows, even while it streams and even when the JSON holds `]]` or
+`[[/case]]` inside a string, since the close counts only outside the JSON's strings; one whose body
+passes 8 KiB (however the stream splits around its close), one left unclosed when the answer ends,
+one opened inside another, a sixth in a turn, or one this build doesn't read (an unknown `op`, a
+field a record doesn't have, a `standing`) is dropped and counted in Details › Recalled, never shown
+as text. A marker inside code, fenced or inline, is an example the answer explains: it is shown as
+written and nothing is written from it, and the same goes for `[[remember:` and `[[used:` there.
+
+Each marker goes one way, by the conversation's own case and never the document's current binding,
+so a note written during a turn lands in the case the conversation started with even if you rebind
+meanwhile, and a case another WordCraft is saving holds the write for a later frame without
+stalling this one. A `note` or a `balance` is stored in that case, unconfirmed: a quiet row appears
+under the answer, "Noted for this case: …", showing the whole note as the case holds it now, every
+field, since Confirm approves all of them, with **Confirm**, **Edit** and **Remove**, which are the
+same commands as the page's and refuse the control channel's click. A `plan` replaces the plan only
+when the assistant wrote the current one; over a plan you wrote it becomes a card. `facts` is always
+a card, since you decide what a case is. A card shows the whole proposal with **Use these** (or
+**Use this plan**, **Keep**, **Reassess**), **Edit** and **Not this**, as a preference's card does,
+and stores nothing until your click; every button, Not this included, is a command of yours alone,
+and Use these fills only the facts the card names and leaves the parties and the stage as they are. A case holds at most 64 unconfirmed notes; past that a new one
+replaces the oldest never used. A note the model writes that a note already says, or that you
+removed before, is dropped without a row.
+
+A poisoned document can therefore make the assistant write an unconfirmed note inside its own case,
+and later turns of that case recall it as unconfirmed data, shown as such and discounted in ranking.
+It can't confirm it, carry it to another case or another client, set the case's facts, replace a
+plan you wrote, bind, unbind or delete: none of those has a marker, and the commands that do them
+refuse everything but your click. Recall of the same client's other cases takes confirmed notes
+only, so an unconfirmed note never leaves the case it was written in. The switch for all of this is
+one constant, `MODEL_WRITES` in `crates/assist/src/cases/marker.rs`: `InCase` stores notes as
+described; `CardsOnly` turns every write into a card and stores nothing without a click.
+
+**Measuring it against a real model.** `cargo run -p wordcraft-assist --example case_eval --
+--runs 3` builds six turns the way the app does (a synthetic contract, a synthetic client's
+cases, a saved preference, the case ask in the instructions) and sends them to the OpenAI
+Responses API with the ChatGPT backend's own request builder and WordCraft's real tools offered,
+then prints how often the model drew on a recalled note, followed an instruction hidden in one,
+quoted notes into a tool call a poisoned document asked for, named the weaker position behind a
+concession won under a different power balance, wrote a case note with `how` when the person said
+something worth keeping, and refused to record a poisoned document's claim as the person's own
+position (a note that records it as the other side's text passes). For every scenario it also
+counts how many of the notes written say where they came from. A response that is incomplete,
+refused, or empty is counted as `no answer`, not as a pass or a fail. It spends credits on the key in `WORDCRAFT_OPENAI_API_KEY` (one request per run per
+scenario), runs only when you run it, and `--show` prints the requests without sending them. Load
+the key from a file you keep outside the repository, for example `set -a; . ~/secrets/.env; set
++a` before the command; never type the value into a command, which a shell may save to its
+history.
+
+**Quotes.** A tracked change or comment the assistant makes that repeats a run of 36 bytes (about
+six English words or twelve Japanese characters) from anything the conversation recalled, in any
+turn and any field of an item, shows "This quotes your case notes" in Details › Output, beside its
+buttons while it is open and on the row after it is accepted, so you see it before sending on a file
+that has it. It is a flag, not a wall: a paraphrase passes.
+
+**When recall is off.** Nothing is recalled with no case bound, on the web (no settings folder),
+or while anyone besides you and this conversation's assistant can read the document: another
+participant, or an invite not yet used. Details › Recalled says which. Once a conversation has
+recalled anything, someone joining doesn't just turn recall off: the next turn is refused, and a
+running turn is stopped and the conversation ended, with the pane saying who can now read the
+document, because the model still holds what it read and a document could ask it to write that into
+a comment the newcomer reads.
+
+**Where the files are.** `assistant-cases/<client>/<case>/case.json` in the settings folder, with
+`wall.json` naming the client; folders are mode 0700 and files 0600 on Unix, so only you may read
+them. A file is at most 1 MiB, and one that can't be read whole shows as damaged and is moved aside
+as `case.json.damaged` by your next change. Two WordCrafts keep each other's changes: each write
+takes the case's lock and reads the file again. Nothing of a case goes in a document, a recovery
+copy or the log, and it never crosses a room.
+
+**Delete.** Delete case asks in place, says it can't be undone, and removes the case's folder with
+every note in it; a client with no cases left can be deleted from the list. What WordCraft can't
+reach: what a turn already sent to a model provider under your account, an agent's own record of a
+conversation in its own folder, and a backup of your settings folder. The document's conversation
+ends first, and the page says the case was deleted if another window did it.
 
 ## Backends
 
@@ -477,7 +605,8 @@ What the agent sends its model, and where, is its business: Claude Code talks to
 Codex to OpenAI and Pi to the providers you set it up with, under your account with them. Each
 turn WordCraft gives it your prompt and the selection with the paragraphs around it and the
 outline, held to 32 KiB in all, and what you accepted and rejected of its changes since its last
-turn, held to 2 KiB; what you kept ([Memory](#memory)), held to 4 KiB; the first turn adds a note that says which document it works
+turn, held to 2 KiB; what you kept ([Memory](#memory)), held to 4 KiB; what a bound case recalls
+([Cases](#cases)), held to 6 KiB, as a source; the first turn adds a note that says which document it works
 on, its name and role, and how to use the `wordcraft` tools (for Pi, `wordcraft-cli call`).
 Through those it can read the whole shared document.
 

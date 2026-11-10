@@ -1,16 +1,24 @@
-//! Case memory for the assistant (#107): typed records of past contract cases, and the ranker that
-//! recalls their notes for a similar one. This is the pure core: no files, no window, no model.
-//! Similarity is a function of closed types ([`record`]) over English and Japanese text
-//! ([`text`]), and the power balance then against now is a table ([`recall`]).
+//! Case memory for the assistant (#107): typed records of past contract cases, the ranker that
+//! recalls their notes for a similar one, and the shelf that keeps them on disk. Similarity is a
+//! function of closed types ([`record`]) over English and Japanese text ([`text`]), the power
+//! balance then against now is a table ([`recall`]), and every change to a case on disk is a typed
+//! operation under a lock ([`store`]). A turn bound to a case carries what ranks highest from it
+//! and the same client's other cases, as data ([`recall::RecallAsk`]), and a model writes working
+//! notes back into that case through a marker in its answer ([`marker`]), unconfirmed.
 
+pub mod marker;
 pub mod recall;
 pub mod record;
+pub mod store;
 pub mod text;
 
+pub use marker::{CASE_ASK, Card, CaseMarker, MODEL_WRITES, ModelWrites, Route};
+pub use recall::{Alone, BalanceGap, ItemId, Others, Place, RecallAsk, RecallSent, RecalledItem};
 pub use record::{
-    Applies, Balance, Body, Case, ContractKind, CounterpartyKind, Day, Facts, Kind, Lang, Law, Note, OurSide, Paper, Quoted, Side, SizeBand, Stance,
-    Standing, Topic, Topics,
+    Applied, Applies, Balance, BalanceDraft, Body, Case, CaseError, Click, ContractKind, CounterpartyKind, Day, Factor, FactorKind, Facts, Kind,
+    Lang, Law, ModelWrite, Note, NoteDraft, NoteId, OurSide, Paper, PersonOp, Plan, Quoted, Side, SizeBand, Stage, Stance, Standing, Topic, Topics,
 };
+pub use store::{CaseHeader, CaseId, CaseRef, Listing, Shelf, Wall, WallId};
 
 #[cfg(test)]
 mod tests;

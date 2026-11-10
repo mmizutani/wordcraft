@@ -40,6 +40,7 @@ use crate::backend::{
     Answer, Backend, BackendInfo, Event, MAX_OPTIONS, MAX_PLAN, MAX_SOURCES, Offered, PermissionKind, PermissionOption, PermissionPolicy,
     PermissionRequest, PlanEntry, PlanStatus, Priority, Seat, Source, SourceKind, StopReason, ToolCall, ToolStatus, Turn, TurnCtx, Usage, label,
 };
+use crate::memory::Instructions;
 use config::{Config, Select};
 pub use room_port::RoomPort;
 pub use rpc::{AUTH_REQUIRED, MAX_LINE, METHOD_NOT_FOUND, STDERR_TAIL};
@@ -270,7 +271,10 @@ pub struct Acp {
     note: Option<String>,
     /// What the running session was last told of what the person kept: it keeps what it read, so
     /// it hears again only when that changes.
-    memory_told: Option<String>,
+    memory_told: Option<Instructions>,
+    /// Sessions this backend has ended so far: the one running (or the next to start) keeps what
+    /// it was sent, so the conversation sends a recalled item once per value ([`Backend::retains`]).
+    sessions_ended: u64,
     /// Its tool calls in the current turn, to merge their updates into.
     calls: HashMap<String, ToolCall>,
     /// The shared document's version when each call that is still running was first seen: its
@@ -288,7 +292,7 @@ impl Running {
 impl Acp {
     /// A backend that runs the agent `spec` sets up.
     pub fn new(spec: AgentSpec) -> Acp {
-        Acp { spec, seat: None, running: None, note: None, memory_told: None, calls: HashMap::new(), started: HashMap::new() }
+        Acp { spec, seat: None, running: None, note: None, memory_told: None, sessions_ended: 0, calls: HashMap::new(), started: HashMap::new() }
     }
 
     /// The agent's name, for messages.
@@ -468,6 +472,7 @@ impl Acp {
         }
         // The next session has read nothing yet.
         self.memory_told = None;
+        self.sessions_ended = self.sessions_ended.saturating_add(1);
     }
 
     /// Set what the person chose for this turn, model first: its answer may change the levels.
@@ -826,9 +831,9 @@ impl Backend for Acp {
         // A new session gets the note, which the agent's model reads first.
         let note = if first { self.note.as_deref() } else { None };
         let memory = if first {
-            turn.memory.as_deref()
+            turn.memory.as_ref().map(Instructions::as_str)
         } else if turn.memory != self.memory_told {
-            Some(turn.memory.as_deref().unwrap_or(crate::memory::NONE_APPLY))
+            Some(turn.memory.as_ref().map_or(crate::memory::NONE_APPLY, Instructions::as_str))
         } else {
             None
         };
@@ -867,6 +872,15 @@ impl Backend for Acp {
 
     fn end(&mut self) {
         self.stop_agent(EXIT_GRACE);
+    }
+
+    fn retains(&mut self) -> Option<u64> {
+        // An agent that exited since the last turn keeps nothing: the next turn starts a new
+        // session, whose number is read after it.
+        if self.running.as_mut().is_some_and(|r| !r.process.is_running()) {
+            return None;
+        }
+        Some(self.sessions_ended)
     }
 }
 
