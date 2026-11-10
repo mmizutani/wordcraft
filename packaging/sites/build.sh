@@ -48,6 +48,11 @@ else
   # shellcheck source=../env.sh
   . "$ROOT/packaging/env.sh"
   (cd "$ROOT/apps/wordcraft-web" && trunk build --release --dist "$stage/client")
+  # Enable the same-origin library only in the authenticated Sites editor.
+  editor_html="$stage/client/index.html"
+  sed 's|</head>|<meta name="wordcraft-cloud-documents" content="enabled"></head>|' "$editor_html" > "$stage/editor.html"
+  grep -Fq '<meta name="wordcraft-cloud-documents" content="enabled">' "$stage/editor.html"
+  mv "$stage/editor.html" "$editor_html"
   copy_docs "$stage/client"
 
   # The Worker serves oversized WASM at its original Trunk URL from a gzip asset.

@@ -1292,9 +1292,12 @@ fn password_dialog(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             o.insert("password".into(), json!(password.as_str()));
         }
         // `execute`, not `run`: Save Changes was asked when the open began.
-        match app.execute("file.open", p) {
-            Ok(_) => {
-                app.ui.backstage = false;
+        let command = if p.get("cloud").and_then(Value::as_bool) == Some(true) { "ui.cloudApply" } else { "file.open" };
+        match app.execute(command, p) {
+            Ok(result) => {
+                if result.get("pending").is_none() {
+                    app.ui.backstage = false;
+                }
                 return true;
             }
             Err(e) if wordcraft_engine::io::wrong_password(&e) => {

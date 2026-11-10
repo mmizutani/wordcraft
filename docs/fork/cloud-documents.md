@@ -97,6 +97,18 @@ Storage logs use outcome codes and timings. Keep owner identifiers, file names, 
 
 **Early verification.** Before connecting the UI, verify the two-account identity boundary and a full-size streamed write, conditional publication, and read against the private Site. Prove the R2 cleanup marker prevents a racing create-only upload. If the managed runtime fails any of these prerequisites, resolve the affected contract before opening the pilot to tester documents.
 
+## Private Worker verification
+
+Sites version 5, built from `1478d28117dd03c9581aa98590648803e6826841`, applied both cloud tables. The owner round-tripped 16,777,216 synthetic bytes, received a strong revision ETag, and saw stale and oversized writes rejected. In an upload racing a delete, the Worker logged `cleanup_marker_confirmed` and `upload_fenced`, Delete returned `204`, and the document stayed hidden.
+
+An invited viewer signed in on a separate machine. Its library returned `200` and omitted the owner's synthetic document. Open, Save, and Delete of that document returned `404`. The owner still received the original bytes at revision 1 and removed the fixture with `204`. A synthetic identity header on the owner's request did not override the owner identity. [Isolation checkpoint](https://github.com/mmizutani/wordcraft/issues/114#issuecomment-6758024081)
+
+## Editor verification
+
+In local Chromium with workerd, a DOCX imported through Browse was edited, saved to Cloud, and reopened after an editor reload. Its download matched the committed bytes and retained both custom XML parts and their document binding. In two browser tabs, the first Save advanced the revision and the stale Save returned `412`. The stale tab downloaded its own edits and asked before discarding them for the newer revision. The unmarked standalone build served under a subpath opened and saved the same fixture locally.
+
+The hosted editor accepts new documents and local DOCX imports for a first cloud Save. It refuses formats that would lose preserved VBA and requires a successful DOCX parse when opening cloud bytes. The original local file picker continues to support its existing formats.
+
 ## Pilot operations
 
 Build the Worker with `worker-build --release --out-dir /absolute/output/path -- --locked` from `packaging/sites/worker`. From the repository root, run `python3 packaging/sites/tests/cloud_documents.py /absolute/output/path` against Wrangler 4. The harness uses disposable local bindings. For a managed check, build and publish the private editor artifact using the [Phase 1 runbook](hosted-wordcraft.md#verify-the-deployment-boundary-first) and use synthetic data. Compare the saved version with the tested source commit and verify the migration before the first request. Roll back to the prior saved version if needed and leave the additive migration in place.

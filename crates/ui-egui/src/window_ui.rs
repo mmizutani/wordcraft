@@ -162,6 +162,7 @@ impl WordApp {
             // App-wide.
             session: _,
             services: _,
+            cloud: _,
             printing: _,
             print_feedback_seen: _,
             font_generation: _,

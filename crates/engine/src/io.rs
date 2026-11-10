@@ -219,6 +219,49 @@ pub fn open_bytes_in(name: &str, bytes: &[u8], password: Option<&str>, region: &
     Ok((doc, encrypted))
 }
 
+/// Open an ordinary or encrypted DOCX for a caller that requires the DOCX format.
+pub fn open_docx_bytes(bytes: &[u8], password: Option<&str>) -> Result<(Document, bool), String> {
+    let mut doc = read_docx(bytes, password).map_err(|error| error.to_string())?;
+    if docx_has_vba(&doc) {
+        return Err("A DOCX save would omit this document's VBA project.".into());
+    }
+    opened(&mut doc);
+    load_embedded_fonts(&doc);
+    Ok((doc, wordcraft_docx::is_encrypted(bytes)))
+}
+
+/// A DOCX save would omit the document's preserved VBA project.
+pub fn docx_has_vba(doc: &Document) -> bool {
+    doc.passthrough.get(wordcraft_docx::VBA_PROJECT_PART).is_some_and(|bytes| !bytes.is_empty())
+}
+
+#[cfg(test)]
+mod strict_docx_tests {
+    use super::*;
+
+    #[test]
+    fn strict_docx_open_has_no_format_fallback() {
+        let rtf = br"{\rtf1\ansi Text in an RTF file.}";
+        assert!(open_bytes("renamed.docx", rtf).is_ok());
+        assert!(open_docx_bytes(rtf, None).is_err());
+        let doc = Document::from_text("Text in a DOCX file.");
+        let bytes = save_bytes("real.docx", &doc).unwrap();
+        assert!(matches!(open_docx_bytes(&bytes, None), Ok((_, false))));
+        let protected = save_bytes_with("real.docx", &doc, Some("synthetic password"), &Default::default()).unwrap();
+        assert!(needs_password(&open_docx_bytes(&protected, None).unwrap_err()));
+        assert!(matches!(open_docx_bytes(&protected, Some("synthetic password")), Ok((_, true))));
+    }
+
+    #[test]
+    fn strict_docx_open_rejects_a_vba_package_without_discarding_local_support() {
+        let mut doc = Document::from_text("A document with an opaque VBA fixture.");
+        doc.passthrough.insert(wordcraft_docx::VBA_PROJECT_PART.into(), std::sync::Arc::new(b"synthetic retained bytes".to_vec()));
+        let bytes = save_bytes("macro.docm", &doc).unwrap();
+        assert!(docx_has_vba(&open_bytes("macro.docm", &bytes).unwrap()));
+        assert!(open_docx_bytes(&bytes, None).is_err());
+    }
+}
+
 /// Load the fonts `doc` embeds (#1171) for this run, in memory only: text set in a font that isn't
 /// installed then lays out and exports with it instead of a fallback. Faces already available
 /// stay as they are.

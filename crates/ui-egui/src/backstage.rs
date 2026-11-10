@@ -7,13 +7,14 @@ use crate::theme::{Tokens, medium, regular, semibold};
 use crate::{WordApp, icons};
 
 /// The side menu: page id, label and icon (#1714).
-const PAGES: [(&str, &str, &str); 12] = [
+const PAGES: [(&str, &str, &str); 13] = [
     ("home", "Home", "homeFolder"),
     ("new", "New", "blankPage"),
     ("open", "Open", "open"),
     ("info", "Info", "info"),
     ("recover", "Recover", "recover"),
     ("save", "Save", "save"),
+    ("cloudSave", "Save to Cloud", "cloudSave"),
     ("saveAs", "Save As", "saveAs"),
     ("print", "Print", "print"),
     ("share", "Share", "share"),
@@ -121,6 +122,9 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             }
             ui.add_space(if mac { 12.0 } else { 6.0 });
             for (id, label, icon) in PAGES {
+                if id == "cloudSave" && app.services.cloud.is_none() {
+                    continue;
+                }
                 // No document open (#1129): Info, Save, Save As, Print, Share and Export are greyed out.
                 let on = has_document || works_without_document(id);
                 let (r, resp) = ui.add_enabled_ui(on, |ui| ui.allocate_exact_size(vec2(200.0, 38.0), Sense::click())).inner;
@@ -181,11 +185,16 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             crate::rtl::root(ui, |ui| export_page(app, ui));
             return;
         }
+        crate::cloud::show_waiting_navigation(app, ui);
         egui::ScrollArea::vertical().show(ui, |ui| {
             crate::rtl::root(ui, |ui| match app.ui.backstage_page.as_str() {
                 "home" => home_page(app, ui),
                 "new" => new_page(app, ui),
                 "open" => open_page(app, ui),
+                "cloudSave" if app.services.cloud.is_some() => {
+                    heading(ui, "Save to Cloud");
+                    crate::cloud::show_save(app, ui);
+                }
                 "saveAs" => save_as_page(app, ui),
                 "info" => info_page(app, ui),
                 "recover" => recovery_page(app, ui),
@@ -266,12 +275,25 @@ pub(crate) fn go_to_page(app: &mut WordApp, id: &str) {
         }
         "save" => {
             let r = app.run("file.save", json!({}));
+            if app.cloud_saves_current() {
+                if r.is_ok() {
+                    app.ui.backstage = false;
+                    app.canvas.want_focus = true;
+                } else {
+                    app.ui.backstage_page = "cloudSave".into();
+                }
+                return;
+            }
             if r.is_ok_and(|v| v.get("saved").and_then(serde_json::Value::as_bool) == Some(true) || v.get("downloaded").is_some()) {
                 app.ui.backstage = false;
                 app.canvas.want_focus = true;
             } else {
                 app.ui.backstage_page = "saveAs".into();
             }
+        }
+        "cloudSave" if app.services.cloud.is_some() => {
+            app.cloud.draft_name = app.default_cloud_name();
+            app.ui.backstage_page = id.into();
         }
         "saveAs" => {
             app.ui.backstage_page = "saveAs".into();
@@ -677,6 +699,10 @@ fn open_page(app: &mut WordApp, ui: &mut Ui) {
         let _ = app.run("ui.fileBrowser", json!({}));
     }
     ui.add_space(18.0);
+    if app.services.cloud.is_some() {
+        crate::cloud::show_library(app, ui);
+        ui.add_space(18.0);
+    }
     open_list(app, ui);
 }
 

@@ -35,6 +35,8 @@ pub fn start() {
         // on the canvas (`host`). The host guards leaving the page, so this one doesn't.
         let bridge = crate::host::Bridge::detect(&canvas);
         let app_bridge = bridge.clone();
+        let cloud_enabled =
+            bridge.is_none() && document.query_selector("meta[name=wordcraft-cloud-documents][content=enabled]").ok().flatten().is_some();
         let dirty = Rc::new(Cell::new(false));
         let saves = AsyncSaves::default();
         if bridge.is_none()
@@ -75,6 +77,8 @@ pub fn start() {
                     let mut services = services(inbox.clone(), cc.egui_ctx.clone(), dirty, saves.clone(), messages.clone());
                     if let Some(bridge) = &app_bridge {
                         bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone());
+                    } else if cloud_enabled {
+                        services.cloud = Some(crate::cloud::service(cc.egui_ctx.clone()));
                     }
                     let mut app = WordApp::new(session, services);
                     // Pasted pictures wait apart from dropped files: the app inserts one only when the page is the edit target (#1349).

@@ -38,9 +38,9 @@ impl WordApp {
     }
 
     /// Tell the host whether the document has unsaved changes ([`Services::on_dirty`]).
-    pub(super) fn report_dirty(&self) {
+    pub(crate) fn report_dirty(&self) {
         if let Some(f) = &self.services.on_dirty {
-            f(self.session.dirty || panes::has_comment_drafts(self));
+            f(if self.services.cloud.is_some() { self.has_unsaved_documents() } else { self.session.dirty || panes::has_comment_drafts(self) });
         }
     }
 
@@ -72,6 +72,14 @@ impl WordApp {
                     return;
                 }
                 crate::language_packs::bar(self, ui);
+                if self.cloud_saves_current() || self.cloud.held() {
+                    egui::Panel::top("cloud_document_status").show(ui, |ui| {
+                        if self.cloud_saves_current() {
+                            crate::cloud::show_status(self, ui);
+                        }
+                        crate::cloud::show_waiting_navigation(self, ui);
+                    });
+                }
                 chrome::status_bar(self, ui);
                 panes::show(self, ui);
             }

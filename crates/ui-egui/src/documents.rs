@@ -53,6 +53,7 @@ impl WordApp {
         if self.windows.native() && self.follow_in_windows(id) {
             return;
         }
+        self.cancel_cloud_navigation();
         let left = std::mem::replace(&mut self.shown_document, id);
         let seen = self.carry_document_state(left, id);
         self.window_shows(id);
@@ -143,7 +144,7 @@ impl WordApp {
     pub(crate) fn document_unsaved_by_id(&self, id: u64) -> bool {
         let dirty = self.session.document_dirty(id);
         let unconfirmed = self.saves_in_flight.iter().any(|s| s.marked_saved && s.document == id);
-        dirty || unconfirmed
+        dirty || unconfirmed || self.cloud.unsaved(id)
     }
 
     /// Whether the open document `id` has comment or reply text typed but not yet written to
