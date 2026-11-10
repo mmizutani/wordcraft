@@ -125,7 +125,9 @@ waiting on a question for you, the pane goes back to the conversation, where the
 What you accept and reject of the assistant's changes reaches its next turn. The turn's context
 starts with a short list, newest first, of what you decided since its last turn, each change's
 text cut to 120 characters and the list to 2 KiB, so the assistant adjusts within the
-conversation. Nothing of it is stored, and a new conversation starts without it. Only your own
+conversation. It stays with the conversation, and a new conversation starts without it; the one
+place a decision is kept is a case's record, when you turned that on for the case
+([The record](#the-record) below). Only your own
 Accept and Reject count: not another participant's, a script's, a macro's, or a click the control
 channel made. A row's Accept and Reject in Output count as yours too, and Sources says when a turn
 was given such a list, and how long it was.
@@ -229,7 +231,7 @@ steps, and the notes grouped by kind, each with **Edit** and **Remove**. A note 
 shows dimmed as unconfirmed with **Confirm**; what you wrote or confirmed is confirmed on the day
 you set it; a confirmed note also has **Make a lesson**. The commands are
 `assist.memory.case.new`, `.bind`, `.unbind`, `.facts`, `.balance`, `.plan`, `.note`, `.noteEdit`,
-`.noteConfirm`, `.noteRemove`, `.cardDismiss` and `.delete`, `assist.memory.wall.new` and
+`.noteConfirm`, `.noteRemove`, `.cardDismiss`, `.record`, `.recordDelete` and `.delete`, `assist.memory.wall.new` and
 `.delete` for a client, and `assist.memory.lesson.keep`, `.edit`, `.off` and `.remove` for a
 lesson. They are yours alone, as [Memory](#memory)'s are, and refuse a script, an agent, a click or
 key the control channel made and a macro's step. There is no command that reads a case: the pane
@@ -355,6 +357,28 @@ running turn is stopped and the conversation ended, with the pane saying who can
 document, because the model still holds what it read and a document could ask it to write that into
 a comment the newcomer reads.
 
+**The record.** A case can keep a record of its negotiation, the transcript layer of its memory,
+which the review pass of a later change will read; no turn reads it. It is off for every case
+until you tick **Keep a record of this negotiation** under Details › Case › Record, and the
+checkbox says what it stores and where. On, each conversation on the case is one file,
+`log/<time>-<n>.jsonl` in the case's own folder in the settings folder (mode 0600, only you can
+read it), one record a line: each turn as it ended (what you asked, the answer with the `[[case]]`
+and other markers taken out, the tool calls, the model, how it stopped, and the ids recalled and
+used; nothing is written while a turn streams), your Accept or Reject of anyone's tracked change
+with its author, kind and text (a script's, a macro's or the control channel's click writes
+nothing), your edit of what the assistant wrote (what it said, what it says now), and a snapshot
+of the other side's tracked changes and comments with author, date, text and position when the
+conversation first takes the draft up, scrubbed metadata showing as it is. Each line goes to the
+case the conversation started on, never the document's current binding. The file has one writer,
+the conversation's own thread, fed without waiting, so a frame never waits for the disk; records
+that don't fit the queue become one `dropped` line with their count, a file stops at 16 MiB, and a
+case keeps at most 64 MiB of record, its oldest conversation's file going first. It isn't fsynced,
+so a power cut can lose the last lines, and a crash cuts at most the last line, which a search
+skips and counts. A link where `log/` or a file in it should be is never followed. The section
+shows the record's size and a search box whose search runs on a worker; **Delete the record**
+(`assist.memory.case.recordDelete`) removes `log/` and leaves the case, and deleting the case
+removes it too. Both are yours alone, as every case command is.
+
 **Where the files are.** `assistant-cases/<client>/<case>/case.json` in the settings folder, with
 `wall.json` naming the client, and `assistant-lessons.json` beside `assistant-cases/` for the
 lessons; folders are mode 0700 and files 0600 on Unix, so only you may read
@@ -366,12 +390,15 @@ takes the case's lock, or the lessons file's, and reads the file again. Nothing 
 copy or the log, and it never crosses a room.
 
 **Delete.** Delete case asks in place, says it can't be undone, and removes the case's folder with
-every note in it; it lists the lessons kept from the case with **Delete these too** ticked, and
+every note and its record in it, on a worker: the document's conversation ends first and its
+record's file is closed there before the folder is renamed, so the frame never waits, and a
+delete another WordCraft refuses (its lock, a file in use) comes back as a notice and loses
+nothing. It lists the lessons kept from the case with **Delete these too** ticked, and
 unticked they stay and lose the link to the case. A client with no cases left can be deleted from
 the list, its cases' lessons having been asked about case by case. What WordCraft can't
 reach: what a turn already sent to a model provider under your account, an agent's own record of a
-conversation in its own folder, and a backup of your settings folder. The document's conversation
-ends first, and the page says the case was deleted if another window did it.
+conversation in its own folder, and a backup of your settings folder. The page says the case was
+deleted if another window did it.
 
 ## Backends
 
