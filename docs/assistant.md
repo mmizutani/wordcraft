@@ -436,9 +436,31 @@ Again** asks you again. **Sign Out** deletes the sign-in and asks ChatGPT to end
 can't be reached, the sign-in is deleted here anyway and the page says you can disconnect
 WordCraft in ChatGPT's settings.
 
-The sign-in is kept in `chatgpt-credentials.json` in the settings folder, which only you may
-read (mode 0600 on Unix), never in a document, a recovery copy or the log. Signing in and out
-are yours alone: `assist.chatgpt.signIn`, `assist.chatgpt.cancelSignIn` and
+Where the sign-in is kept depends on whether the computer has a keychain WordCraft can use: the
+macOS Keychain, the Windows Credential Manager, or the Secret Service (GNOME Keyring, KWallet) on
+Linux and the BSDs. The page under who is signed in, and the pane under its picker while ChatGPT
+is chosen, say which of the two it is:
+
+- **With a keychain**, the sign-in is sealed with AES-256-GCM in `chatgpt-credentials.sealed` in
+  the settings folder (mode 0600 on Unix), and the key, 256 random bits made at the first
+  sign-in, is the only thing in the keychain, under the service `WordCraft` and an account
+  `chatgpt-credentials-key:` followed by a short hash of the settings folder's path. Only the key
+  goes there because Windows keeps at most 2,560 bytes in one credential, and the tokens can be
+  more. The file alone opens nothing.
+- **Without one** (there is none, it is locked and you didn't unlock it, or it fails), the
+  sign-in is kept in memory while WordCraft runs, and nothing of it is written to disk: you sign
+  in again the next time you open WordCraft.
+
+A `chatgpt-credentials.json` an older WordCraft left, with the tokens readable, is sealed (or,
+without a keychain, taken into memory) and deleted the first time WordCraft opens. **Sign Out**
+deletes the sealed file, any such older file, the key in the keychain and the copy in memory.
+WordCraft asks the keychain on a thread of its own, never the window's: if the keychain waits for
+you to unlock it, the pane says to sign in until it answers, and then shows who is signed in. A
+sealed file that is cut short, changed, of another version, or doesn't open with the key reads
+as signed out, and the next sign-in replaces it. None of it reaches a document, a recovery copy
+or the log.
+
+Signing in and out are yours alone: `assist.chatgpt.signIn`, `assist.chatgpt.cancelSignIn` and
 `assist.chatgpt.signOut` run from the buttons or Search. From a script or an agent (the control
 channel, MCP, also addressed to another document) they are an error, as is a click or key the
 control channel made and a step of a macro, whoever wrote it; and they take no key and go on no
@@ -681,6 +703,13 @@ Sources you attach go to the assistant's provider with every turn of the convers
 ChatGPT, and to whatever the agent's model is for an agent. Attach only what you are willing to send
 there.
 
+Your ChatGPT sign-in, which lets WordCraft use your plan, is never on disk where another program
+or a copy of your settings folder can read it: it is sealed with a key kept in your computer's
+keychain, or, without a keychain, kept in memory for the session only (see
+[Signing in to ChatGPT](#signing-in-to-chatgpt)). An agent never sees it: agents sign in to their
+own accounts themselves. The web app keeps no ChatGPT sign-in at all, since it has no ChatGPT
+([On the web](#on-the-web)).
+
 ## On the web
 
 The web app has the Assistant pane and every `assist.*` command, but no assistant to run them.
@@ -783,8 +812,11 @@ own account the way it documents.
 
 1. In File › Options › Account, click Continue with ChatGPT: your browser opens ChatGPT's
    sign-in; sign in and allow WordCraft to use your plan. Back in WordCraft, the page shows who
-   is signed in and that WordCraft may use your plan, and the settings folder has
-   `chatgpt-credentials.json`, which on Unix only you may read.
+   is signed in, that WordCraft may use your plan and that the sign-in is kept in the computer's
+   keychain. The settings folder has `chatgpt-credentials.sealed`, which on Unix only you may
+   read, with no token readable in it, and the keychain (Keychain Access on macOS, Credential
+   Manager on Windows, Seahorse or KWalletManager on Linux) has a `WordCraft` item whose account
+   starts `chatgpt-credentials-key:`. Quit WordCraft and open it again: you are still signed in.
 2. In the assistant pane pick ChatGPT and ask it to rewrite the first sentence in a friendlier
    tone: the answer streams in, the rewrite is a tracked change by "ChatGPT", and its tool rows
    open to the change. The turn's line reads `GPT-6-Luna · Medium`. If it says `(requested)`, the
@@ -796,8 +828,8 @@ own account the way it documents.
    them, and the conversation goes on.
 3. Ask for something long, and press Stop while it answers: it stops at once and says so. Ask
    again: it answers.
-4. Sign Out on the same page: `chatgpt-credentials.json` is gone, and the pane says to sign in,
-   with Continue with ChatGPT under it.
+4. Sign Out on the same page: `chatgpt-credentials.sealed` and the keychain item are gone, and
+   the pane says to sign in, with Continue with ChatGPT under it.
 
 **Each agent** (Claude Code, Codex, Pi):
 

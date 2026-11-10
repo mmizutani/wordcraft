@@ -121,6 +121,12 @@ fn picker(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
         combo.response.labelled_by(label.id);
     });
     if let Some(o) = &current {
+        // Where ChatGPT's sign-in is kept, while someone is signed in: the keychain, or this
+        // session only.
+        #[cfg(not(target_arch = "wasm32"))]
+        if o.id == wordcraft_assist::chatgpt::ID {
+            crate::assist::chatgpt::kept(app, ui, t);
+        }
         let text = match &o.readiness {
             Readiness::Ready => return,
             // A backend's sign-in hint already says what to do ("Sign in with …"), with the

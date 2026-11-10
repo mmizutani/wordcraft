@@ -31,6 +31,14 @@ chrono = { workspace = true }
 ureq = { workspace = true }
 base64 = { workspace = true }
 getrandom = { workspace = true }
+# The ChatGPT sign-in at rest (`chatgpt::vault`): sealed with AES-256-GCM, whose key is in the
+# system's keychain. ring (Apache-2.0 AND ISC) is already in the lock through rustls. keyring 4
+# (MIT OR Apache-2.0) with its default `v1` stores is pure Rust over the system's own APIs: Keychain
+# Services (security-framework, already in the lock), Windows Credential Manager (windows-sys,
+# already in the lock) and the Secret Service over zbus 5 with async-io, which AccessKit already
+# builds, and RustCrypto for the session's encryption: no libdbus and no OpenSSL.
+ring = "0.17"
+keyring = "4.2"
 
 [target.'cfg(unix)'.dependencies]
 # Ending an ACP agent's whole process group: an adapter run through npx is a few processes.
