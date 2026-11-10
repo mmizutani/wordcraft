@@ -44,7 +44,8 @@ pub(crate) async fn respond(mut request: Request, env: &Env) -> Result<Response>
         Ok(response) => (response, "ok"),
         Err(Failure(status, code)) => (Response::from_json(&ErrorBody { code })?.with_status(status), code),
     };
-    response.headers_mut().set("Cache-Control", "private, no-store")?;
+    // Edge compression can weaken a revision ETag that the next write needs for If-Match.
+    response.headers_mut().set("Cache-Control", "private, no-store, no-transform")?;
     response.headers_mut().set("X-Content-Type-Options", "nosniff")?;
     console_log!("cloud_documents {} {} {}ms", response.status_code(), outcome, Date::now().as_millis().saturating_sub(start));
     Ok(response)

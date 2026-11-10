@@ -58,7 +58,7 @@ class Api:
 def expect(response, status, code=None):
     observed, headers, body = response
     assert observed == status, (status, observed, body[:300])
-    assert headers.get("cache-control") == "private, no-store", headers
+    assert headers.get("cache-control") == "private, no-store, no-transform", headers
     if code is not None:
         assert json.loads(body)["code"] == code, body
     return headers, body
