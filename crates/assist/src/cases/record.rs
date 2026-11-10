@@ -669,6 +669,10 @@ pub struct Case {
     dismissed: Vec<String>,
     #[serde(default)]
     last_note: u64,
+    /// Whether the case keeps a record of its conversations ([`super::log`]). Off for every new
+    /// case; only [`PersonOp::Record`] turns it on, so no marker can.
+    #[serde(default)]
+    pub record: bool,
     /// The file held more than this build reads, so it can't be written back without losing
     /// something: the next person's write moves it aside first. Never written.
     #[serde(skip)]
@@ -689,6 +693,7 @@ impl Case {
             notes: Vec::new(),
             dismissed: Vec::new(),
             last_note: 0,
+            record: false,
             damaged: false,
         }
     }
@@ -875,6 +880,7 @@ impl Case {
                 }
             }
             PersonOp::Close(stage) => self.facts.stage = stage,
+            PersonOp::Record(on) => self.record = on,
         }
         Ok(())
     }
@@ -1003,6 +1009,8 @@ pub enum PersonOp {
     Confirm(NoteId),
     RemoveNote(NoteId),
     Close(Stage),
+    /// Keep a record of this case's conversations, or stop.
+    Record(bool),
 }
 
 /// Everything a model can do to a case. It has no Confirm, no Facts, no bind and no delete.

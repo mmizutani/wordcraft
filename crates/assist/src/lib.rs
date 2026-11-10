@@ -21,7 +21,8 @@
 //! - [`Context`]: the selection, the paragraphs around it and the outline, as text, held to hard
 //!   caps on a document of any size.
 //! - [`Feedback`]: what the person accepted and rejected of the assistant's changes since its last
-//!   turn, which the next turn's context starts with. Nothing of it is stored.
+//!   turn, which the next turn's context starts with. It stays with its conversation; a case the
+//!   person turned a record on for keeps each decision as a line ([`cases::log`]).
 //! - [`memory`]: what the person keeps for every later conversation with every backend, which
 //!   only their own click writes.
 //! - [`cases`]: typed records of past contract cases, the shelf that keeps them, and the ranker

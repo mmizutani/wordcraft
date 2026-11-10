@@ -261,6 +261,12 @@ impl Assistant {
         self.transcript.take_case_markers()
     }
 
+    /// The turn that just ended, once, as one line for this conversation's case record
+    /// ([`crate::cases::log`]); `None` while a turn runs or when the last one was taken.
+    pub fn take_finished_turn(&mut self) -> Option<crate::cases::Record> {
+        self.transcript.take_finished_turn()
+    }
+
     /// A marker's write landed in the conversation's case: the pane shows a quiet row.
     pub fn case_written(&mut self, what: crate::transcript::Written, note: Option<crate::cases::NoteId>, text: &str) {
         self.transcript.case_written(what, note, text);

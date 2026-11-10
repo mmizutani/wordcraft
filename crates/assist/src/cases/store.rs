@@ -7,6 +7,7 @@
 //!     wall.json             its name
 //!     <case id>.lock        beside the folder, not in it, so a delete can rename the folder while holding it
 //!     <case id>/case.json   the typed record, at most 1 MiB, mode 0600
+//!     <case id>/log/        the case's record, one conversation a file, opt-in ([`super::log`])
 //! ```
 //!
 //! A wall is a folder, so recall can open one wall and nothing else. There is no index, so a
@@ -194,6 +195,11 @@ impl Shelf {
         self.wall_dir(&at.wall).join(format!("{}.lock", at.case.0))
     }
 
+    /// Where the case's record lives ([`super::log`]), whether or not it has one.
+    pub(crate) fn log_dir(&self, at: &CaseRef) -> PathBuf {
+        self.case_dir(at).join(super::log::FOLDER)
+    }
+
     /// Walls and cases, swept first of `.trash-*` folders an interrupted delete left. A scan,
     /// so off the frame.
     pub fn list(&self) -> Listing {
@@ -260,7 +266,7 @@ impl Shelf {
     }
 
     /// The case's folder, if it and its wall are folders and not links to one.
-    fn real_case_dir(&self, at: &CaseRef) -> Result<PathBuf, CaseError> {
+    pub(crate) fn real_case_dir(&self, at: &CaseRef) -> Result<PathBuf, CaseError> {
         let dir = self.real_wall_dir(&at.wall)?.join(&at.case.0);
         real_dir(&dir).then_some(dir).ok_or(CaseError::Gone)
     }
@@ -404,7 +410,7 @@ impl Shelf {
 
     /// Rename `dir` to a trash folder under the root, then remove it. Safe to run twice, and a
     /// crash between the two is finished by the next [`Shelf::list`].
-    fn trash(&self, dir: &Path, id: &str) -> Result<(), CaseError> {
+    pub(crate) fn trash(&self, dir: &Path, id: &str) -> Result<(), CaseError> {
         let trash = self.root.join(format!("{TRASH}{id}"));
         match fs::rename(dir, &trash) {
             Ok(()) => {}
@@ -459,7 +465,7 @@ impl Shelf {
 }
 
 /// A folder only its owner can enter. `recursive` makes missing parents and accepts one that exists.
-fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
+pub(crate) fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(recursive);
     #[cfg(unix)]
