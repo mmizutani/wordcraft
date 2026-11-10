@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use wordcraft_engine::room::{ParticipantId, Room};
 
 use super::lessons::{KeptLesson, LessonId};
+use super::log::REVIEW_RECORD_BYTES;
 use super::record::{Applies, Body, Case, CaseError, Day, Kind, Note, Quoted, Side, Stance, Standing, Topic, Topics};
 use super::store::{CaseId, CaseRef, Shelf};
 use super::text::{Bm25, Token, tokens, topics_in};
@@ -348,6 +349,9 @@ pub struct RecallAsk {
     /// Windows of recalled text the conversation's transcript can still take
     /// ([`crate::Transcript::recall_room`]): a recall with more is withheld.
     room: usize,
+    /// A review's turn ([`super::marker::REVIEW_ASK`]): the whole case and its recent record go
+    /// as the one item, nothing is ranked, and nothing is held back as sent before.
+    review: bool,
 }
 
 impl std::fmt::Debug for RecallAsk {
@@ -366,7 +370,16 @@ impl RecallAsk {
             alone,
             after_reading: None,
             room: crate::transcript::MAX_WINDOWS,
+            review: false,
         }
+    }
+
+    /// What **Review this case** carries: the case's notes with their ids, standing, how and
+    /// dates, its facts, balance and plan, and the most recent [`REVIEW_RECORD_BYTES`] of its
+    /// record, as one data-grade source. The same proof as a recall, since the same text leaves
+    /// the case; nothing of the client's other cases or the lessons goes.
+    pub fn review(shelf: Shelf, at: CaseRef, today: Day, alone: Alone) -> RecallAsk {
+        RecallAsk { review: true, ..RecallAsk::new(shelf, at, "", today, alone) }
     }
 
     /// With `room` windows left in the conversation's transcript, set as the turn is sent.
@@ -392,20 +405,31 @@ impl RecallAsk {
         if let Err(o) = self.alone.recheck() {
             return others(o);
         }
-        let pool = match Pool::load(&self.shelf, &self.at) {
-            Ok(pool) => pool,
-            Err(e) => return Recalled::nothing(format!("the case couldn't be read: {e}")),
+        let mut recalled = if self.review {
+            match compose_review(&self.shelf, &self.at) {
+                Ok(recalled) => recalled,
+                Err(e) => return Recalled::nothing(format!("the case couldn't be read: {e}")),
+            }
+        } else {
+            let pool = match Pool::load(&self.shelf, &self.at) {
+                Ok(pool) => pool,
+                Err(e) => return Recalled::nothing(format!("the case couldn't be read: {e}")),
+            };
+            let query = Query::new(&self.about, pool.here.applies(self.today), self.today);
+            let mut recalled = compose(&pool, &query);
+            recalled.sent.problem = pool.problem();
+            recalled
         };
-        let query = Query::new(&self.about, pool.here.applies(self.today), self.today);
-        let mut recalled = compose(&pool, &query);
-        recalled.sent.problem = pool.problem();
         if let Some(f) = self.after_reading {
             f();
         }
         if let Err(o) = self.alone.recheck() {
             return others(o);
         }
-        told.filter(&mut recalled, retains);
+        // A review is asked for whole each time: what a session had of it before doesn't count.
+        if !self.review {
+            told.filter(&mut recalled, retains);
+        }
         // Fail closed: text that can't be checked for quotes afterwards isn't sent. Nothing in
         // the set leaves to make room, since a retaining session still holds what it was sent.
         if crate::transcript::recall_windows(recalled.sent().sent_text.iter().map(String::as_str)) > self.room {
@@ -489,16 +513,30 @@ impl Neighbor {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "where")]
 pub enum ItemId {
-    Here { note: super::record::NoteId },
-    Neighbor { case: CaseId, note: super::record::NoteId },
-    NeighborBalance { case: CaseId },
-    Lesson { lesson: LessonId },
-    Ladder { topic: Topic },
+    Here {
+        note: super::record::NoteId,
+    },
+    Neighbor {
+        case: CaseId,
+        note: super::record::NoteId,
+    },
+    NeighborBalance {
+        case: CaseId,
+    },
+    Lesson {
+        lesson: LessonId,
+    },
+    Ladder {
+        topic: Topic,
+    },
+    /// The whole case and its recent record, as a review's turn carries them.
+    Review,
 }
 
 impl std::fmt::Display for ItemId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ItemId::Review => write!(f, "review"),
             ItemId::Here { note } => write!(f, "{note}"),
             ItemId::Neighbor { case, note } => write!(f, "{}:{note}", case.as_str()),
             ItemId::NeighborBalance { case } => write!(f, "{}:balance", case.as_str()),
@@ -718,6 +756,43 @@ impl Recalled {
             origin: SourceOrigin::Recalled,
         }]
     }
+}
+
+/// What a review's turn carries ([`RecallAsk::review`]): the case as its file holds it, less its
+/// dismissed hashes, and the most recent record lines up to [`REVIEW_RECORD_BYTES`], as one item.
+/// A damaged case reviews nothing, since what it holds may be cut; a case with no record reviews
+/// its notes alone.
+fn compose_review(shelf: &Shelf, at: &CaseRef) -> Result<Recalled, CaseError> {
+    let case = shelf.open(at)?;
+    if case.damaged {
+        return Ok(Recalled::nothing("this case's file is damaged, so it can't be reviewed".into()));
+    }
+    let (record, skipped, cut) = super::log::recent_records(shelf, at, REVIEW_RECORD_BYTES)?;
+    let json = json!({
+        "title": case.title.for_person(),
+        "facts": case.facts,
+        "balance": case.balance,
+        "plan": case.plan,
+        "notes": case.notes,
+        "record": record,
+        "recordLinesUnreadable": skipped,
+        "recordOlderLinesLeftOut": cut,
+    });
+    let text = format!("{} notes, the balance and plan, and {} record lines", case.notes.len(), record.len());
+    let problem = (skipped > 0).then(|| format!("{skipped} lines of the record couldn't be read"));
+    let bytes = u32::try_from(json.to_string().len()).unwrap_or(u32::MAX);
+    let item = RecalledItem {
+        id: ItemId::Review,
+        place: Place::ThisCase,
+        title: None,
+        kind: None,
+        text,
+        balance: None,
+        confirmed: true,
+        again: false,
+        rungs: Vec::new(),
+    };
+    Ok(Recalled { sent: RecallSent { items: vec![item], left_out: 0, bytes, problem, sent_text: Vec::new() }, json: vec![json] })
 }
 
 /// For the evaluation harness (`examples/case_eval.rs`): what a turn bound to `at` would carry

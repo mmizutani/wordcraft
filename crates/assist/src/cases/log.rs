@@ -464,45 +464,84 @@ pub fn search_log(shelf: &Shelf, at: &CaseRef, query: &str, limit: usize) -> Res
     let query = query.trim().to_lowercase();
     let mut out = LogSearch::default();
     for (path, _) in files_in(&dir).into_iter().rev() {
-        // Listed as a plain file a moment ago; a link put there since is refused here too.
-        let Ok(file) = open_plain(&path) else {
-            out.skipped = out.skipped.saturating_add(1);
-            continue;
-        };
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut reader = std::io::BufReader::new(file);
-        let mut line_no = 0u32;
-        loop {
-            line_no = line_no.saturating_add(1);
-            let mut buf = Vec::new();
-            let n = match (&mut reader).take(MAX_LINE_BYTES as u64 + 1).read_until(b'\n', &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            let ended = buf.last() == Some(&b'\n');
-            if !ended {
-                // Cut by a crash at the end, or longer than a line may be: skip to the next line.
-                out.skipped = out.skipped.saturating_add(1);
-                if n > MAX_LINE_BYTES && !skip_line(&mut reader) {
-                    break;
-                }
-                if n <= MAX_LINE_BYTES {
-                    break;
-                }
-                continue;
-            }
-            match serde_json::from_slice::<Record>(&buf) {
-                Ok(record) if record.matches(&query) => {
-                    if out.hits.len() < limit {
-                        out.hits.push(LogHit { file: name.clone(), line: line_no, record });
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => out.skipped = out.skipped.saturating_add(1),
+        let (lines, skipped) = records_in(&path);
+        out.skipped = out.skipped.saturating_add(skipped);
+        for (line, record, _) in lines {
+            if record.matches(&query) && out.hits.len() < limit {
+                out.hits.push(LogHit { file: name.clone(), line, record });
             }
         }
     }
     Ok(out)
+}
+
+/// Most bytes of record lines a review carries, newest first.
+pub const REVIEW_RECORD_BYTES: usize = 96 << 10;
+
+/// The most recent records of `at`, oldest first, as many of the newest as fit `max_bytes` of
+/// their lines; how many lines couldn't be read; and whether older records were left out. A case
+/// with no record gives none, which is not an error: a review works without one. Reads whole
+/// files from the newest back until the budget is spent: off the frame.
+pub fn recent_records(shelf: &Shelf, at: &CaseRef, max_bytes: usize) -> Result<(Vec<Record>, u32, bool), CaseError> {
+    let dir = shelf.real_case_dir(at)?.join(FOLDER);
+    let mut newest_first: Vec<Record> = Vec::new();
+    let mut skipped = 0u32;
+    let mut left = max_bytes;
+    let mut more = false;
+    'files: for (path, _) in files_in(&dir).into_iter().rev() {
+        let (lines, bad) = records_in(&path);
+        skipped = skipped.saturating_add(bad);
+        for (_, record, bytes) in lines.into_iter().rev() {
+            if bytes > left {
+                more = true;
+                break 'files;
+            }
+            left = left.saturating_sub(bytes);
+            newest_first.push(record);
+        }
+    }
+    newest_first.reverse();
+    Ok((newest_first, skipped, more))
+}
+
+/// Every record in the file at `path`, with its line number and the line's bytes, and how many
+/// lines were skipped: one that can't be read, is longer than [`MAX_LINE_BYTES`], or was cut by a
+/// crash. A file that can't be opened as a plain file is one skipped line.
+fn records_in(path: &std::path::Path) -> (Vec<(u32, Record, usize)>, u32) {
+    let mut out = Vec::new();
+    let mut skipped = 0u32;
+    // Listed as a plain file a moment ago; a link put there since is refused here too.
+    let Ok(file) = open_plain(path) else {
+        return (out, 1);
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line_no = 0u32;
+    loop {
+        line_no = line_no.saturating_add(1);
+        let mut buf = Vec::new();
+        let n = match (&mut reader).take(MAX_LINE_BYTES as u64 + 1).read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let ended = buf.last() == Some(&b'\n');
+        if !ended {
+            // Cut by a crash at the end, or longer than a line may be: skip to the next line.
+            skipped = skipped.saturating_add(1);
+            if n > MAX_LINE_BYTES && !skip_line(&mut reader) {
+                break;
+            }
+            if n <= MAX_LINE_BYTES {
+                break;
+            }
+            continue;
+        }
+        match serde_json::from_slice::<Record>(&buf) {
+            Ok(record) => out.push((line_no, record, n)),
+            Err(_) => skipped = skipped.saturating_add(1),
+        }
+    }
+    (out, skipped)
 }
 
 /// `path` open for reading, if it is a plain file and not a link: checked first, and on Unix the

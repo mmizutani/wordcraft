@@ -261,6 +261,16 @@ impl Assistant {
         self.transcript.take_case_markers()
     }
 
+    /// The turn just asked is a review's: see [`crate::Transcript::review_turn`].
+    pub fn review_turn(&mut self) {
+        self.transcript.review_turn();
+    }
+
+    /// The window dropped a case marker: see [`crate::Transcript::drop_case_marker`].
+    pub fn drop_case_marker(&mut self) {
+        self.transcript.drop_case_marker();
+    }
+
     /// The turn that just ended, once, as one line for this conversation's case record
     /// ([`crate::cases::log`]); `None` while a turn runs or when the last one was taken.
     pub fn take_finished_turn(&mut self) -> Option<crate::cases::Record> {

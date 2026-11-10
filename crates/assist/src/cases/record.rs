@@ -530,6 +530,12 @@ impl Body {
         }
     }
 
+    /// Replace the main text, keeping the kind and every other field: what a review's correction
+    /// changes.
+    pub fn set_main(&mut self, text: Quoted) {
+        *self.texts_mut().0 = text;
+    }
+
     /// The topic a position names; other kinds state none here.
     pub(crate) fn topic(&self) -> Option<Topic> {
         match self {
@@ -868,27 +874,52 @@ impl Case {
                     note.standing = confirmed;
                 }
             }
-            PersonOp::RemoveNote(id) => {
-                let i = self.notes.iter().position(|n| n.id == id).ok_or(CaseError::NoSuchNote(id))?;
-                let gone = self.notes.remove(i);
-                let key = key_of(gone.body.texts().next().map_or("", Quoted::raw));
-                if !self.dismissed.contains(&key) {
-                    self.dismissed.push(key);
-                }
-                if self.dismissed.len() > MAX_DISMISSED {
-                    self.dismissed.remove(0);
-                }
-            }
+            PersonOp::RemoveNote(id) => self.remove_note(id)?,
             PersonOp::Close(stage) => self.facts.stage = stage,
             PersonOp::Record(on) => self.record = on,
         }
         Ok(())
     }
 
-    /// What a model wrote. Nothing here confirms, sets facts or removes: what it writes is
-    /// `Unconfirmed`, and over what the person wrote it becomes a card.
+    /// The note goes, and a hash of its main text stays so a model doesn't note it again.
+    fn remove_note(&mut self, id: NoteId) -> Result<(), CaseError> {
+        let i = self.notes.iter().position(|n| n.id == id).ok_or(CaseError::NoSuchNote(id))?;
+        let gone = self.notes.remove(i);
+        let key = key_of(gone.body.texts().next().map_or("", Quoted::raw));
+        if !self.dismissed.contains(&key) {
+            self.dismissed.push(key);
+        }
+        if self.dismissed.len() > MAX_DISMISSED {
+            self.dismissed.remove(0);
+        }
+        Ok(())
+    }
+
+    /// What a model wrote. Nothing here confirms, sets facts or removes what the person wrote:
+    /// what it writes is `Unconfirmed`, and over what the person wrote it becomes a card. A
+    /// review's correction or retirement of its own unconfirmed note is an in-case write like any
+    /// other; of a confirmed note it is a card.
     pub(crate) fn apply_model(&mut self, write: ModelWrite, today: Day) -> Result<Applied, CaseError> {
         match write {
+            ModelWrite::Correct { note, text, why } => {
+                let n = self.note_mut(note)?;
+                if n.standing.is_confirmed() {
+                    return Ok(Applied::Card(ModelWrite::Correct { note, text, why }));
+                }
+                n.body.set_main(text);
+                n.how = Some(why);
+                if n.clamp() {
+                    return Err(CaseError::TooLong);
+                }
+                Ok(Applied::Edited(note))
+            }
+            ModelWrite::Retire { note, why } => {
+                if self.note_mut(note)?.standing.is_confirmed() {
+                    return Ok(Applied::Card(ModelWrite::Retire { note, why }));
+                }
+                self.remove_note(note)?;
+                Ok(Applied::Removed(note))
+            }
             ModelWrite::Note(draft) => {
                 if self.knows(&draft) {
                     return Ok(Applied::Known);
@@ -1013,7 +1044,9 @@ pub enum PersonOp {
     Record(bool),
 }
 
-/// Everything a model can do to a case. It has no Confirm, no Facts, no bind and no delete.
+/// Everything a model can do to a case. It has no Confirm, no Facts, no bind and no delete. The
+/// last two come only from a review's answer ([`super::marker::CaseMarker::review_only`]) and
+/// reach a confirmed note only as a card.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ModelWrite {
@@ -1021,6 +1054,17 @@ pub enum ModelWrite {
     Plan(Plan),
     Balance(BalanceDraft),
     Used(Vec<NoteId>),
+    /// The note's main text becomes `text`, and `why` its `how`.
+    Correct {
+        note: NoteId,
+        text: Quoted,
+        why: Quoted,
+    },
+    /// The note goes, its text joining `dismissed`.
+    Retire {
+        note: NoteId,
+        why: Quoted,
+    },
 }
 
 /// What [`Case::apply_model`] did.
@@ -1031,6 +1075,10 @@ pub enum Applied {
         added: NoteId,
         evicted: NoteId,
     },
+    /// A review corrected this unconfirmed note.
+    Edited(NoteId),
+    /// A review retired this unconfirmed note.
+    Removed(NoteId),
     /// A note already says it, or the person said no to it.
     Known,
     Changed,

@@ -179,6 +179,14 @@ pub enum Written {
     Note,
     Plan,
     Balance,
+    /// A review corrected an unconfirmed note ([`crate::cases::ModelWrite::Correct`]).
+    Corrected,
+    /// A review retired an unconfirmed note ([`crate::cases::ModelWrite::Retire`]).
+    Retired,
+    /// A review found the record bears a note out: the text is its evidence. Nothing changed.
+    Supported,
+    /// A review's question for the person: the text is the question. Nothing changed.
+    Gap,
 }
 
 impl Entry {
@@ -421,9 +429,13 @@ pub struct Transcript {
     /// The case markers parsed that the window hasn't routed yet ([`Transcript::take_case_markers`]).
     #[serde(skip)]
     unrouted: Vec<CaseMarker>,
-    /// How many case markers the current turn has kept.
+    /// How many case markers the current turn has kept, and the most it may
+    /// ([`crate::cases::marker::MAX_PER_TURN`], or [`crate::cases::marker::MAX_PER_REVIEW`] for
+    /// a review's turn).
     #[serde(skip)]
     case_marked: u8,
+    #[serde(skip)]
+    marker_cap: u8,
     /// The last card's number.
     #[serde(skip)]
     last_card: u64,
@@ -642,8 +654,21 @@ impl Transcript {
         self.turn_start = self.entries.len();
         self.proposed = 0;
         self.case_marked = 0;
+        self.marker_cap = MAX_PER_TURN;
         self.turns = self.turns.saturating_add(1);
         self.push(Entry::Asked { text: text.to_string() });
+    }
+
+    /// The turn just asked is a review's ([`crate::cases::marker::REVIEW_ASK`]): it may carry a
+    /// marker per note. Called right after [`Transcript::asked`], by the window that sent it.
+    pub fn review_turn(&mut self) {
+        self.marker_cap = crate::cases::marker::MAX_PER_REVIEW;
+    }
+
+    /// The window dropped a case marker of the turn (a review's verb outside a review, or a note
+    /// id this case doesn't have): Details counts it with the ones that didn't parse.
+    pub fn drop_case_marker(&mut self) {
+        self.dropped_marker();
     }
 
     /// The turn that just ended as one line for the case's record ([`crate::cases::log`]), once:
@@ -837,7 +862,7 @@ impl Transcript {
             Piece::Remember(t) => self.propose(&t),
             Piece::Used(id) => self.mark_used(&id),
             Piece::Case(body) => match CaseMarker::parse(&body) {
-                Some(marker) if self.case_marked < MAX_PER_TURN => {
+                Some(marker) if self.case_marked < self.marker_cap.max(MAX_PER_TURN) => {
                     self.case_marked = self.case_marked.saturating_add(1);
                     self.unrouted.push(marker);
                 }
