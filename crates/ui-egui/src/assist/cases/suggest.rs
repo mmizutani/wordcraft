@@ -42,9 +42,10 @@ type Version = (u64, u64);
 
 #[derive(Default)]
 pub(crate) struct SuggestState {
-    /// The document and version the result stands for.
-    computed: Option<Version>,
-    pending: Option<(Version, Receiver<Option<Suggestion>>)>,
+    /// The document and version the result stands for, and its body paragraphs then, counted up
+    /// to [`MIN_PARAGRAPHS`] ([`paragraphs`]).
+    computed: Option<(Version, usize)>,
+    pending: Option<(Version, usize, Receiver<Option<Suggestion>>)>,
     found: Option<(u64, Suggestion)>,
     /// Documents the person said Not this for, in this window. No file write.
     dismissed: BTreeSet<u64>,
@@ -82,22 +83,21 @@ pub(crate) fn refresh(app: &mut WordApp) -> Option<Suggestion> {
     }
     let now = version(app);
     let state = &mut app.assist.cases.suggest;
-    if let Some((at, rx)) = &state.pending {
+    if let Some((at, seen, rx)) = &state.pending {
         // Anything but Empty: the worker is done, and one that ended without an answer found nothing.
         let answer = rx.try_recv();
         if !matches!(answer, Err(TryRecvError::Empty)) {
-            let at = *at;
+            let (at, seen) = (*at, *seen);
             state.pending = None;
             // A result for a document no longer shown is dropped; the one shown starts its own.
             if at.0 == now.0 {
-                state.computed = Some(at);
+                state.computed = Some((at, seen));
                 state.found = answer.ok().flatten().map(|s| (at.0, s));
             }
         }
     }
-    let fresh = state.computed.is_some_and(|(document, changes)| document == now.0 && now.1.saturating_sub(changes) < RECHECK_EVERY);
     // One worker at a time: another document waits until the running one returns.
-    if !fresh && state.pending.is_none() {
+    if app.assist.cases.suggest.pending.is_none() && !fresh(app, now) {
         start(app, now);
     }
     let state = &app.assist.cases.suggest;
@@ -111,12 +111,26 @@ fn version(app: &WordApp) -> Version {
     (app.session.document_id(), app.session.changes().version())
 }
 
+/// The shown document's body paragraphs, counted up to [`MIN_PARAGRAPHS`]: a document with
+/// fewer was too short to compare when it was last looked at.
+fn paragraphs(app: &WordApp) -> usize {
+    app.session.doc.para_paths(wordcraft_doc::StoryRef::Body).len().min(MIN_PARAGRAPHS)
+}
+
+/// Whether the result stands for the shown document as it is now: the same document, fewer than
+/// [`RECHECK_EVERY`] changes since, and, when it was too short to compare then, no paragraph added
+/// or removed since. A draft pasted into a blank document is one change, and is looked at again
+/// at once rather than 64 changes later. Paragraphs are counted only for a document that was short
+/// and has changed since, so a long one costs nothing here.
+fn fresh(app: &WordApp, now: Version) -> bool {
+    let Some(((document, changes), seen)) = app.assist.cases.suggest.computed else { return false };
+    document == now.0 && now.1.saturating_sub(changes) < RECHECK_EVERY && (seen >= MIN_PARAGRAPHS || now.1 == changes || paragraphs(app) == seen)
+}
+
 /// Whether the shown document's result is in: nothing pending and a result for its version.
 #[cfg(test)]
 pub(crate) fn settled(app: &WordApp) -> bool {
-    let now = version(app);
-    let state = &app.assist.cases.suggest;
-    state.pending.is_none() && state.computed.is_some_and(|(document, changes)| document == now.0 && now.1.saturating_sub(changes) < RECHECK_EVERY)
+    app.assist.cases.suggest.pending.is_none() && fresh(app, version(app))
 }
 
 /// The worker: the document's print from a clone, then the cases' prints ([`best`]). Its result
@@ -128,7 +142,8 @@ fn start(app: &mut WordApp, at: Version) {
     let name = app.title_stem();
     let ctx = app.ctx.clone();
     let (tx, rx) = std::sync::mpsc::channel();
-    app.assist.cases.suggest.pending = Some((at, rx));
+    let seen = paragraphs(app);
+    app.assist.cases.suggest.pending = Some((at, seen, rx));
     #[cfg(test)]
     let hold = {
         app.assist.cases.suggest.started += 1;
@@ -302,6 +317,22 @@ mod tests {
             settled(a)
         });
         refresh(a)
+    }
+
+    /// A blank document is too short to compare when the pane first shows it; a later draft
+    /// pasted into it in one change is looked at again then, not 64 changes later.
+    #[test]
+    fn a_draft_pasted_into_a_blank_document_is_suggested() {
+        let folder = Folder::new();
+        let c = cases(&folder);
+        let first = clauses(30);
+        bind_first(&folder, &c, &first);
+        let mut b = window_on(&folder, &[String::new()]);
+        assert_eq!(suggestion(&mut b), None, "a blank document matches nothing");
+        b.execute("text.insert", json!({"paragraphs": true, "text": first.join("\n")})).unwrap();
+        let s = suggestion(&mut b).expect("the pasted draft is suggested");
+        assert_eq!(s.at, c.here);
+        assert_eq!(bound_for(&b), None, "a suggestion binds nothing");
     }
 
     #[test]
