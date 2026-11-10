@@ -282,6 +282,10 @@ impl WordApp {
         self.assist.cases.open = None;
         self.assist.cases.read_at = None;
         let document = self.session.document_id();
+        if self.assist.cases.bound.get(&document) != at.as_ref() {
+            // The page's forms hold the old case's text.
+            self.assist.cases.drafts.close_forms();
+        }
         if let Some(c) = self.assist.conversation.as_mut()
             && c.document == document
             && c.case != at

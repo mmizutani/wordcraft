@@ -20,6 +20,9 @@ use crate::theme::{Tokens, semibold};
 #[derive(Default)]
 pub(crate) struct Drafts {
     pub(crate) new_case: NewCase,
+    /// The case the forms below were opened on. A save into any other case is refused, so text
+    /// typed for one client never lands in another's file.
+    pub(crate) on: Option<CaseRef>,
     /// The names and the law being edited.
     facts: Option<FactsText>,
     reassess: Option<Reassess>,
@@ -29,6 +32,22 @@ pub(crate) struct Drafts {
     note: Option<NoteForm>,
     /// Delete case was clicked: the page asks.
     deleting: bool,
+}
+
+impl Drafts {
+    fn any_form(&self) -> bool {
+        self.facts.is_some() || self.reassess.is_some() || self.plan.is_some() || self.note.is_some() || self.deleting
+    }
+
+    /// Every form of the bound case closes, unsaved. New case stays: it belongs to no case.
+    pub(crate) fn close_forms(&mut self) {
+        self.on = None;
+        self.facts = None;
+        self.reassess = None;
+        self.plan = None;
+        self.note = None;
+        self.deleting = false;
+    }
 }
 
 #[derive(Default)]
@@ -254,6 +273,17 @@ fn run(app: &mut WordApp, id: &str, params: Value) -> bool {
     }
 }
 
+/// A form's write, refused when the form was opened on a case other than the one now bound.
+/// `true` when the form is done, saved or refused.
+fn save(app: &mut WordApp, id: &str, params: Value) -> bool {
+    let on = &app.assist.cases.drafts.on;
+    if on.is_some() && *on != super::bound_for(app) {
+        app.assist.notice = Some(tl!("This was written for another case, so it wasn't saved.").to_string());
+        return true;
+    }
+    run(app, id, params)
+}
+
 /// The section. Only with a settings folder, which the caller checks.
 pub(crate) fn section(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     match super::open_case(app, false) {
@@ -375,6 +405,12 @@ fn bound(app: &mut WordApp, ui: &mut Ui, t: &Tokens, at: &CaseRef, case: &Case) 
     notes(app, ui, t, case);
     ui.add_space(6.0);
     delete(app, ui, t, case);
+    let drafts = &mut app.assist.cases.drafts;
+    if !drafts.any_form() {
+        drafts.on = None;
+    } else if drafts.on.is_none() {
+        drafts.on = Some(at.clone());
+    }
 }
 
 fn heading(ui: &mut Ui, title: &str) {
@@ -448,7 +484,7 @@ fn facts_text(app: &mut WordApp, ui: &mut Ui, current: &Facts) {
                 app.assist.notice = Some(tl!("Governing law is a country code such as JP, or a country and region such as US-NY.").to_string());
             } else {
                 let names: Vec<&str> = text.parties.lines().map(str::trim).filter(|n| !n.is_empty()).collect();
-                open = !run(app, "assist.memory.case.facts", json!({"facts": f.with_parties(&names)}));
+                open = !save(app, "assist.memory.case.facts", json!({"facts": f.with_parties(&names)}));
             }
         }
         if ui.small_button(tl!("Cancel")).clicked() {
@@ -567,7 +603,7 @@ fn reassess(app: &mut WordApp, ui: &mut Ui, draft: &mut Reassess) -> bool {
                 .iter()
                 .map(|(k, s, why)| json!({"kind": k, "favors": s, "why": (!why.trim().is_empty()).then(|| why.trim())}))
                 .collect();
-            open = !run(app, "assist.memory.case.balance", json!({"stance": draft.stance, "factors": factors}));
+            open = !save(app, "assist.memory.case.balance", json!({"stance": draft.stance, "factors": factors}));
         }
         if ui.small_button(tl!("Cancel")).clicked() {
             open = false;
@@ -585,7 +621,7 @@ fn plan(app: &mut WordApp, ui: &mut Ui, t: &Tokens, case: &Case) {
         ui.horizontal(|ui| {
             if ui.add_enabled(!goal.trim().is_empty(), egui::Button::new(tl!("Save")).small()).clicked() {
                 let next: Vec<&str> = steps.lines().map(str::trim).filter(|s| !s.is_empty()).collect();
-                open = !run(app, "assist.memory.case.plan", json!({"goal": goal.trim(), "next": next}));
+                open = !save(app, "assist.memory.case.plan", json!({"goal": goal.trim(), "next": next}));
             }
             if ui.small_button(tl!("Cancel")).clicked() {
                 open = false;
@@ -731,7 +767,7 @@ fn note_form(app: &mut WordApp, ui: &mut Ui, form: &mut NoteForm) -> bool {
     ui.horizontal(|ui| {
         if ui.add_enabled(!form.main.trim().is_empty(), egui::Button::new(tl!("Save")).small()).clicked() {
             let id = if form.id.is_some() { "assist.memory.case.noteEdit" } else { "assist.memory.case.note" };
-            open = !run(app, id, form.to_json());
+            open = !save(app, id, form.to_json());
         }
         if ui.small_button(tl!("Cancel")).clicked() {
             open = false;
@@ -759,7 +795,7 @@ fn delete(app: &mut WordApp, ui: &mut Ui, t: &Tokens, case: &Case) {
         );
         ui.horizontal(|ui| {
             if ui.small_button(tl!("Delete")).clicked() {
-                run(app, "assist.memory.case.delete", json!({}));
+                save(app, "assist.memory.case.delete", json!({}));
                 app.assist.cases.drafts.deleting = false;
             }
             if ui.small_button(tl!("Cancel")).clicked() {

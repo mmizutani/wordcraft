@@ -459,6 +459,57 @@ fn a_control_click_on_create_makes_no_case() {
     assert!(crate::assist::cases::bound_for(h.state()).is_some(), "and bound the document to it");
 }
 
+/// A note form opened on one case holds that case's text. Rebinding the document closes it, and a
+/// form that somehow outlives its case is refused at Save: the other client's file never gets the
+/// text.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_form_opened_on_one_case_never_saves_into_another() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let shelf = Shelf::at(&folder.0);
+    let before = [shelf.open(&c.here).unwrap(), shelf.open(&c.neighbor).unwrap()];
+    let mut a = window(&folder);
+    a.session.view.assistant_pane = true;
+    a.assist.view = crate::assist::PaneView::Details;
+    a.bind_case(Some(c.here.clone()));
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 3000.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    // Facts has an Edit too; the note's is the last.
+    h.get_all_by_label("Edit").last().unwrap().click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Save").is_some(), "the note form is open");
+    h.state_mut().bind_case(Some(c.neighbor.clone()));
+    h.run_steps(2);
+    assert!(h.query_by_label("Save").is_none(), "rebinding closed the form");
+
+    h.get_all_by_label("Edit").last().unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("Rule").focus();
+    h.run_steps(1);
+    h.get_by_label("Rule").type_text(" PLANTED");
+    h.run_steps(2);
+    h.state_mut().assist.cases.drafts.on = Some(c.here.clone());
+    h.get_by_label("Save").click();
+    h.run_steps(2);
+    let notice = h.state().assist.notice.clone().unwrap_or_default();
+    assert!(notice.contains("another case"), "{notice}");
+    assert!(h.query_by_label("Save").is_none(), "the refused form closed");
+    assert_eq!([shelf.open(&c.here).unwrap(), shelf.open(&c.neighbor).unwrap()], before, "neither case changed");
+    for entry in walkdir(&cases_dir(&folder).join(c.neighbor.wall.as_str()).join(c.neighbor.case.as_str())) {
+        let text = std::fs::read_to_string(&entry).unwrap_or_default();
+        assert!(!text.contains(HERE) && !text.contains("PLANTED"), "{} holds the other case's text", entry.display());
+    }
+}
+
 /// Create by client name while the first listing is still being read finds the client in a
 /// listing made on the spot, so no second client of the name appears.
 #[test]
