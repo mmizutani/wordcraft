@@ -97,6 +97,11 @@ impl Day {
         self.0.year()
     }
 
+    /// The first day of `year`: what a lesson, which keeps only its year, ages from.
+    pub fn first_of(year: i32) -> Option<Day> {
+        NaiveDate::from_ymd_opt(year, 1, 1).map(Day)
+    }
+
     /// Days from `earlier` to `self`, zero when `earlier` is later.
     pub fn days_since(self, earlier: Day) -> i64 {
         (self.0 - earlier.0).num_days().max(0)
@@ -427,8 +432,10 @@ pub struct Facts {
 
 /// The part of a case that may travel with a lesson. It is `Copy`, so the compiler proves it holds
 /// no text: a client's name can't cross a wall in this struct. Coarse on purpose: a year, not a
-/// day, and no size band, so it doesn't identify the deal to a provider.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// day, and no size band, so it doesn't identify the deal to a provider. Written to the lessons
+/// file as it is, and a `size` key there reads as damage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct Applies {
     pub kind: Option<ContractKind>,
     pub side: Option<OurSide>,
@@ -1050,6 +1057,8 @@ pub enum CaseError {
     TooLong,
     #[error("{0}: no such note")]
     NoSuchNote(NoteId),
+    #[error("{0}: no such lesson")]
+    NoSuchLesson(super::lessons::LessonId),
     /// The file can't be read whole; a model's write waits for the person's, which moves it aside.
     #[error("this case's file is damaged: your next change moves it aside")]
     Damaged,

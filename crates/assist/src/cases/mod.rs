@@ -4,14 +4,17 @@
 //! balance then against now is a table ([`recall`]), and every change to a case on disk is a typed
 //! operation under a lock ([`store`]). A turn bound to a case carries what ranks highest from it
 //! and the same client's other cases, as data ([`recall::RecallAsk`]), and a model writes working
-//! notes back into that case through a marker in its answer ([`marker`]), unconfirmed.
+//! notes back into that case through a marker in its answer ([`marker`]), unconfirmed. A lesson
+//! the person kept on a card crosses clients, as text and coarse facts only ([`lessons`]).
 
+pub mod lessons;
 pub mod marker;
 pub mod recall;
 pub mod record;
 pub mod store;
 pub mod text;
 
+pub use lessons::{KeptLesson, LessonDraft, LessonId, LessonOp, LessonProposal, Lessons, names_in};
 pub use marker::{CASE_ASK, Card, CaseMarker, MODEL_WRITES, ModelWrites, Route};
 pub use recall::{Alone, BalanceGap, ItemId, Others, Place, RecallAsk, RecallSent, RecalledItem};
 pub use record::{

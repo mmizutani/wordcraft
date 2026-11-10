@@ -748,6 +748,7 @@ fn end(app: &mut WordApp) {
     if let Some(c) = app.assist.conversation.as_mut() {
         c.assistant.end();
     }
+    app.assist.cases.lesson_cards.clear();
 }
 
 /// The role a prompt is for: the one it names, else the one chosen in the pane.
@@ -892,6 +893,8 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
     let assistant = Assistant::start(&room, backend, options).map_err(|e| e.to_string())?;
     let case = cases::bound_for(app);
     app.assist.conversation = Some(Conversation { assistant, document: app.session.document_id(), case });
+    // The last conversation's lesson cards: their ids start again here.
+    app.assist.cases.lesson_cards.clear();
     // Its requests are numbered from 1: the pane opens for each of them.
     app.assist.opened_for = None;
     // It may be about another document, whose turn shouldn't quote this one's text.
@@ -1089,6 +1092,7 @@ pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
         Entry::CaseCard { card, .. } => {
             let texts: Vec<String> = match card {
                 wordcraft_assist::cases::Card::Facts(_) => vec![],
+                wordcraft_assist::cases::Card::Lesson(l) => vec![l.text.for_person().to_string()],
                 wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Note(d)) => {
                     d.body.texts().chain(d.how.iter()).map(|q| q.for_person().to_string()).collect()
                 }

@@ -409,6 +409,10 @@ fn writes() -> Vec<(&'static str, Value)> {
         ("assist.memory.case.cardDismiss", json!({"card": 1})),
         ("assist.memory.case.delete", json!({})),
         ("assist.memory.wall.delete", json!({"wall": id})),
+        ("assist.memory.lesson.keep", json!({"text": "Planted lesson"})),
+        ("assist.memory.lesson.edit", json!({"id": "l1", "text": "Planted"})),
+        ("assist.memory.lesson.off", json!({"id": "l1", "value": true})),
+        ("assist.memory.lesson.remove", json!({"id": "l1"})),
     ]
 }
 
@@ -983,4 +987,176 @@ fn a_facts_card_names_the_facts_as_the_case_page_does() {
     let (_, lines, _) = super::card_words(&wordcraft_assist::cases::Card::Facts(facts));
     assert!(lines.contains(&"Contract: Master services agreement".to_string()), "{lines:?}");
     assert!(lines.contains(&"Our side: Customer".to_string()), "{lines:?}");
+}
+
+const LESSON: &str = "Ask for the SLA credit before the liability cap: it is cheaper to give.";
+const PARTY: &str = "Harbourline KK";
+
+fn lesson_marker(text: &str) -> String {
+    format!(r#"[[case]]{{"op":"lesson","text":"{text}","notes":["n1"]}}[[/case]]"#)
+}
+
+fn kept(folder: &Folder) -> Vec<wordcraft_assist::cases::KeptLesson> {
+    Shelf::at(&folder.0).lessons().lessons
+}
+
+/// A case with a party named and typed facts, so a lesson from it has names to flag and facts to
+/// travel.
+fn name_and_facts(folder: &Folder, at: &CaseRef) {
+    let facts = wordcraft_assist::cases::Facts {
+        kind: Some(wordcraft_assist::cases::ContractKind::Saas),
+        law: wordcraft_assist::cases::Law::parse("JP"),
+        parties: vec![Quoted::parse(PARTY)],
+        ..wordcraft_assist::cases::Facts::default()
+    };
+    Shelf::at(&folder.0).person(click(), at, PersonOp::Facts(facts), today()).unwrap();
+}
+
+/// A lesson kept from one client's case reaches another client's turn, as its text and coarse
+/// facts; that client's notes, the source case's notes, its id and its party's name never do.
+#[test]
+fn a_kept_lesson_reaches_another_clients_turn_and_nothing_else_of_its_case_does() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    name_and_facts(&folder, &c.here);
+    let shelf = Shelf::at(&folder.0);
+    let here = shelf.open(&c.here).unwrap();
+    let draft = wordcraft_assist::cases::LessonDraft {
+        text: Quoted::parse(LESSON),
+        applies: here.applies(today()),
+        topics: Default::default(),
+        from: Some(c.here.case.clone()),
+    };
+    shelf.lesson(click(), wordcraft_assist::cases::LessonOp::Keep(draft)).unwrap();
+    let mut a = window(&folder);
+    a.bind_case(Some(c.other.clone()));
+    let seen = ask(&mut a, Fake::new(), "Review the liability cap and the SLA credit");
+    let turns = seen.lock().unwrap().turns.clone();
+    let items = recalled_json(&turns[0]);
+    let mut ids: Vec<&str> = items.iter().map(|i| i["id"].as_str().unwrap()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["l1", "n1"], "the other client's own note and the lesson, nothing of the lesson's client: {items:#?}");
+    let lesson = items.iter().find(|i| i["id"] == "l1").unwrap();
+    assert_eq!(lesson["text"], LESSON);
+    assert_eq!(lesson["place"], "a lesson the person kept");
+    assert_eq!(lesson["contract"], "saas");
+    assert_eq!(lesson["law"], "JP");
+    assert_eq!(lesson["year"], 2026);
+    assert!(lesson.get("from").is_none() && lesson.get("size").is_none(), "{lesson:?}");
+    let everything = format!("{turns:?}");
+    for canary in [HERE, NEIGHBOR, UNCONFIRMED_CANARY, PARTY, c.here.case.as_str(), c.here.wall.as_str()] {
+        assert!(!everything.contains(canary), "{canary} reached the other client's turn: {everything}");
+    }
+    let details = crate::assist::details_for(&mut a);
+    let recalled = details.turns[0].recalled.as_ref().unwrap();
+    let shown = recalled.items.iter().find(|i| i.id.to_string() == "l1").unwrap();
+    assert_eq!((shown.place, shown.title.clone(), shown.text.clone()), (wordcraft_assist::cases::Place::Lesson, None, LESSON.to_string()));
+
+    a.bind_case(Some(c.here.clone()));
+    a.run("assist.memory.case.delete", json!({"keepLessons": true})).unwrap();
+    let left = kept(&folder);
+    assert_eq!(left.len(), 1, "kept, unlinked");
+    assert!(!left[0].is_from(&c.here.case));
+    assert!(!shelf.exists(&c.here));
+}
+
+/// A model's `lesson` marker is a card: nothing is stored until the person's Keep, and a click
+/// the control channel makes on Keep or Not this stores nothing and leaves the card waiting.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_models_lesson_marker_is_a_card_and_stores_nothing_until_the_persons_keep() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let mut a = poisoned_window(&folder, &c.here);
+    a.session.view.assistant_pane = true;
+    ask(&mut a, Fake::new().then(vec![Step::Say(format!("Summarized. {}", lesson_marker(LESSON)))]), "Summarize this");
+    let mut h = harness(a);
+    assert!(kept(&folder).is_empty(), "the marker alone stored nothing");
+    assert_eq!(notes_of(&folder, &c.here).len(), 1, "and wrote no note");
+    assert!(entries(h.state()).iter().any(|e| matches!(e, Entry::CaseCard { card: Card::Lesson(_), answer: None, .. })));
+    assert!(h.query_by_label_contains(LESSON).is_some(), "the card shows the whole text");
+    assert!(h.query_by_label_contains("every client").is_some(), "and says where it goes");
+    crate::assist::memory::tests::control_click(&mut h, "Keep");
+    assert!(kept(&folder).is_empty(), "the control channel's click on Keep");
+    crate::assist::memory::tests::control_click(&mut h, "Not this");
+    assert!(entries(h.state()).iter().any(|e| matches!(e, Entry::CaseCard { card: Card::Lesson(_), answer: None, .. })), "still waiting");
+    h.get_by_label("Keep").click();
+    h.run_steps(3);
+    let kept = kept(&folder);
+    assert_eq!(kept.len(), 1, "the person's Keep stores it");
+    assert_eq!(kept[0].text.for_person(), LESSON);
+    assert!(kept[0].is_from(&c.here.case));
+    assert!(entries(h.state()).iter().any(|e| matches!(e, Entry::CaseCard { card: Card::Lesson(_), answer: Some(_), .. })), "answered");
+}
+
+/// The card flags a party's name in the text; Keep waits for a second confirmation while it is
+/// there; a fact unticked stays home and the rest travel.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_card_flags_a_partys_name_and_an_unticked_fact_stays_home() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let c = cases(&folder);
+    name_and_facts(&folder, &c.here);
+    let mut a = poisoned_window(&folder, &c.here);
+    a.session.view.assistant_pane = true;
+    let named = "HARBOURLINE moves on the cap once the SLA credit is on the table.".to_string();
+    ask(&mut a, Fake::new().then(vec![Step::Say(format!("Summarized. {}", lesson_marker(&named)))]), "Summarize this");
+    let mut h = harness(a);
+    assert!(h.query_by_label_contains("names a party of this case: harbourline").is_some(), "flagged, folded");
+    h.get_by_label("Keep").click();
+    h.run_steps(3);
+    assert!(kept(&folder).is_empty(), "Keep waits for the second confirmation");
+    h.get_by_label("Contract: SaaS").click();
+    h.run_steps(2);
+    h.get_by_label("Keep it with the name").click();
+    h.run_steps(2);
+    h.get_by_label("Keep").click();
+    h.run_steps(3);
+    let kept = kept(&folder);
+    assert_eq!(kept.len(), 1, "kept after the second confirmation");
+    assert_eq!(kept[0].text.for_person(), named);
+    assert_eq!(kept[0].applies.kind, None, "the unticked fact stayed home");
+    assert_eq!(kept[0].applies.law, wordcraft_assist::cases::Law::parse("JP"), "the ticked one travels");
+    assert_eq!(kept[0].applies.year, Some(2026));
+}
+
+/// Card ids start again with each conversation, so a lesson card from a conversation on one case
+/// is never reused for a new conversation's proposal with the same id on another case: the new
+/// card shows the new case's facts and flags its party, never the old case's.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_lesson_card_belongs_to_its_conversations_case_and_a_later_conversation_gets_its_own() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let c = cases(&folder);
+    name_and_facts(&folder, &c.here);
+    let shelf = Shelf::at(&folder.0);
+    let other_facts = wordcraft_assist::cases::Facts {
+        kind: Some(wordcraft_assist::cases::ContractKind::Nda),
+        parties: vec![Quoted::parse("Zenith Ltd")],
+        ..wordcraft_assist::cases::Facts::default()
+    };
+    shelf.person(click(), &c.other, PersonOp::Facts(other_facts), today()).unwrap();
+    let mut a = poisoned_window(&folder, &c.here);
+    a.session.view.assistant_pane = true;
+    ask(&mut a, Fake::new().then(vec![Step::Say(format!("Summarized. {}", lesson_marker("Harbourline moves last on the cap.")))]), "Summarize this");
+    let mut h = harness(a);
+    assert!(h.query_by_label_contains("names a party of this case: harbourline").is_some());
+    assert!(h.query_by_label("Contract: SaaS").is_some());
+    h.state_mut().bind_case(Some(c.other.clone()));
+    let fake = Fake::new().then(vec![Step::Say(format!("Summarized. {}", lesson_marker("Zenith moves last on the cap.")))]);
+    h.state_mut().assist_with(Box::new(fake));
+    h.state_mut().execute("assist.ask", json!({"prompt": "Summarize this"})).unwrap();
+    let started = std::time::Instant::now();
+    while h.state().conversation().is_some_and(|c| c.is_busy()) {
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "the second conversation never settled");
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    h.run_steps(4);
+    assert!(h.query_by_label_contains("names a party of this case: zenith").is_some(), "the new case's party is flagged");
+    assert!(h.query_by_label_contains("harbourline").is_none(), "the old case's party is not");
+    assert!(h.query_by_label("Contract: NDA").is_some() && h.query_by_label("Contract: SaaS").is_none(), "the new case's facts");
 }

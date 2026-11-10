@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::lessons::LessonProposal;
 use super::record::{
     BalanceDraft, ContractKind, CounterpartyKind, Lang, Law, ModelWrite, NoteDraft, OurSide, Paper, Plan, Quoted, SizeBand, Standing,
 };
@@ -23,6 +24,7 @@ pub enum CaseMarker {
     Plan(PlanDraft),
     Balance(BalanceDraft),
     Facts(FactsDraft),
+    Lesson(LessonProposal),
 }
 
 /// A plan as a marker gives it: the shelf sets its standing.
@@ -55,12 +57,14 @@ pub enum Route {
     Card(Card),
 }
 
-/// What the person answers with a click: facts, which a model never sets, or a write the case
-/// didn't take ([`super::record::Applied::Card`]) or that [`ModelWrites::CardsOnly`] turned into one.
+/// What the person answers with a click: facts, which a model never sets, a lesson, which crosses
+/// clients and so is always theirs to keep, or a write the case didn't take
+/// ([`super::record::Applied::Card`]) or that [`ModelWrites::CardsOnly`] turned into one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", tag = "card")]
 pub enum Card {
     Facts(FactsDraft),
+    Lesson(LessonProposal),
     Write(ModelWrite),
 }
 
@@ -87,10 +91,11 @@ impl CaseMarker {
         serde_json::from_str(body).ok()
     }
 
-    /// What the marker does under `writes`. Facts are always a card.
+    /// What the marker does under `writes`. Facts and a lesson are always a card.
     pub fn route(self, writes: ModelWrites) -> Route {
         let write = match self {
             CaseMarker::Facts(facts) => return Route::Card(Card::Facts(facts)),
+            CaseMarker::Lesson(lesson) => return Route::Card(Card::Lesson(lesson)),
             CaseMarker::Note(draft) => ModelWrite::Note(draft),
             CaseMarker::Plan(PlanDraft { goal, next }) => ModelWrite::Plan(Plan { goal, next, standing: Standing::Unconfirmed }),
             CaseMarker::Balance(draft) => ModelWrite::Balance(draft),
@@ -131,7 +136,8 @@ pub const CASE_ASK: &str = "This conversation is bound to a case: one contract n
 - note: a kind and its fields. pattern or lesson: rule, traps; pitfall: trap, guard; leverage: what, favors (us, them, neither), until (YYYY-MM-DD); position: topic (liability, indemnity, ip, confidentiality, termination, dataProtection, governingLaw, assignment, warranties, sla, payment), moved (us, them), terms, traded_for, landed (true or false). Example: [[case]]{\"op\":\"note\",\"kind\":\"position\",\"topic\":\"liability\",\"moved\":\"them\",\"terms\":\"Cap at twelve months of fees.\",\"traded_for\":\"notice cut from 90 to 60 days\",\"landed\":true,\"how\":\"The person reported it from today's call.\"}[[/case]]\n\
 - plan: goal and next, the steps. Example: [[case]]{\"op\":\"plan\",\"goal\":\"Hold the cap at twelve months of fees.\",\"next\":[\"Offer the shorter notice period first.\"]}[[/case]]\n\
 - balance: stance (stronger, even, weaker) and factors, each a kind (dependence, alternatives, deadline, soleSource, repeatRelationship, pen, other), favors (us, them, neither) and why. Example: [[case]]{\"op\":\"balance\",\"stance\":\"weaker\",\"factors\":[{\"kind\":\"deadline\",\"favors\":\"them\",\"why\":\"Our quarter closes first.\"}]}[[/case]]\n\
-- facts: kind (nda, msa, saas, licence, services, supply, distribution, employment, lease, loan, acquisition, other), side (vendor, customer, licensor, licensee, employer, employee, lender, borrower, buyer, seller, landlord, tenant, other), paper (ours, theirs, thirdParty), theirs (startup, sme, enterprise, public, individual, other), law (JP, US-NY), size (small, medium, large, huge), language (en, ja, other). The person decides these: a facts marker is only a suggestion to them. Example: [[case]]{\"op\":\"facts\",\"kind\":\"saas\",\"side\":\"customer\",\"paper\":\"theirs\",\"law\":\"JP\"}[[/case]]";
+- facts: kind (nda, msa, saas, licence, services, supply, distribution, employment, lease, loan, acquisition, other), side (vendor, customer, licensor, licensee, employer, employee, lender, borrower, buyer, seller, landlord, tenant, other), paper (ours, theirs, thirdParty), theirs (startup, sme, enterprise, public, individual, other), law (JP, US-NY), size (small, medium, large, huge), language (en, ja, other). The person decides these: a facts marker is only a suggestion to them. Example: [[case]]{\"op\":\"facts\",\"kind\":\"saas\",\"side\":\"customer\",\"paper\":\"theirs\",\"law\":\"JP\"}[[/case]]\n\
+- lesson: text, one sentence that would help in a similar deal for any client, naming no party, and notes, the ids of this case's notes it rests on. The person decides whether to keep it: a lesson marker is only a proposal to them. Example: [[case]]{\"op\":\"lesson\",\"text\":\"Ask for the SLA credit before the cap: it is cheaper for the vendor to give.\",\"notes\":[\"n3\"]}[[/case]]";
 
 #[cfg(test)]
 mod tests {
@@ -149,9 +155,11 @@ mod tests {
                 CaseMarker::Plan(_) => "plan",
                 CaseMarker::Balance(_) => "balance",
                 CaseMarker::Facts(_) => "facts",
+                CaseMarker::Lesson(_) => "lesson",
             })
             .collect();
-        assert_eq!(ops, ["note", "plan", "balance", "facts"]);
+        assert_eq!(ops, ["note", "plan", "balance", "facts", "lesson"]);
+        assert!(matches!(&markers[4], CaseMarker::Lesson(l) if l.notes.len() == 1));
         assert!(matches!(&markers[0], CaseMarker::Note(n) if n.body.kind() == Kind::Position && n.how.is_some()));
         assert!(CASE_ASK.len() < 4 << 10, "{}", CASE_ASK.len());
     }
@@ -180,9 +188,12 @@ mod tests {
             assert!(matches!(m.clone().route(ModelWrites::InCase), Route::Write(_)), "{m:?}");
             assert!(matches!(m.route(ModelWrites::CardsOnly), Route::Card(Card::Write(_))));
         }
+        let lesson = || CaseMarker::parse(r#"{"op":"lesson","text":"Ask for the credit first.","notes":["n1"]}"#).unwrap();
         for writes in [ModelWrites::InCase, ModelWrites::CardsOnly] {
             assert!(matches!(facts().route(writes), Route::Card(Card::Facts(f)) if f.kind == Some(ContractKind::Msa)));
+            assert!(matches!(lesson().route(writes), Route::Card(Card::Lesson(l)) if l.notes.len() == 1));
         }
+        assert!(CaseMarker::parse(r#"{"op":"lesson","text":"x","from":"0123456789abcdef"}"#).is_none(), "a marker names no case");
         match note().route(ModelWrites::InCase) {
             Route::Write(ModelWrite::Note(n)) => assert!(matches!(n.body, Body::Pitfall { .. }) && n.how.is_some()),
             other => panic!("{other:?}"),

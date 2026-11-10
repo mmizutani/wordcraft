@@ -238,7 +238,7 @@ fn pool(cases: &[Case]) -> Vec<Candidate<'_>> {
         .enumerate()
         .flat_map(|(i, c)| {
             let place = if i == 0 { Place::ThisCase } else { Place::SameClient };
-            c.notes.iter().map(move |n| Candidate { note: n, case: c, place })
+            c.notes.iter().map(move |n| Candidate::Note { note: n, case: c, place })
         })
         .collect()
 }
@@ -248,7 +248,7 @@ fn query(cases: &[Case], about: &str) -> Query {
 }
 
 fn text_of(r: &Ranked<'_>) -> String {
-    r.candidate.note.body.texts().map(Quoted::for_person).collect::<Vec<_>>().join(" ")
+    r.candidate.note().unwrap().body.texts().map(Quoted::for_person).collect::<Vec<_>>().join(" ")
 }
 
 fn rank_of(ranked: &[Ranked<'_>], needle: &str) -> usize {
@@ -311,7 +311,7 @@ fn a_stale_item_ranks_below_an_equal_fresh_one() {
     let ranked = rank(&query(&cases, "incoterm and insurance cost"), &pool);
     let both: Vec<&Ranked<'_>> = ranked.iter().filter(|r| text_of(r) == text).collect();
     assert_eq!(both.len(), 2);
-    assert_eq!(both[0].candidate.note.at, day("2026-10-01"));
+    assert_eq!(both[0].candidate.note().unwrap().at, day("2026-10-01"));
     assert!(both[0].score > both[1].score);
 }
 
@@ -327,7 +327,7 @@ fn similar_facts_with_no_topic_or_word_in_common_recall_nothing() {
     let cases = corpus();
     let mut twin = cases[0].clone();
     twin.notes = vec![pattern("2026-06-01", "Quarterly business reviews happen every third Tuesday.")];
-    let pool = vec![Candidate { note: &twin.notes[0], case: &twin, place: Place::SameClient }];
+    let pool = vec![Candidate::Note { note: &twin.notes[0], case: &twin, place: Place::SameClient }];
     let q = Query::new("governing law and jurisdiction", cases[0].applies(day(TODAY)), day(TODAY));
     assert!(rank(&q, &pool).is_empty());
 }

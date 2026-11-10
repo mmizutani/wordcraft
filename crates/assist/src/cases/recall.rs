@@ -17,24 +17,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use wordcraft_engine::room::{ParticipantId, Room};
 
+use super::lessons::{KeptLesson, LessonId};
 use super::record::{Applies, Body, Case, CaseError, Day, Kind, Note, Quoted, Stance, Standing, Topics};
 use super::store::{CaseId, CaseRef, Shelf};
 use super::text::{Bm25, Token, tokens, topics_in};
 use crate::backend::{cut, label, shown};
 use crate::knowledge::{SourceOrigin, TurnSource};
 
-/// Where a candidate comes from, against the query's case.
+/// Where a candidate comes from, against the query's case. A lesson is from any client, and is
+/// worth more than a neighbor's note because the person chose it, less than this case's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Place {
     ThisCase,
     SameClient,
+    Lesson,
 }
 
 impl Place {
     fn weight(self) -> f32 {
         match self {
             Place::ThisCase => 1.5,
+            Place::Lesson => 1.2,
             Place::SameClient => 1.0,
         }
     }
@@ -54,21 +58,71 @@ impl Query {
     }
 }
 
-/// A note seen from the query's case.
+/// A note seen from the query's case, or a lesson the person kept.
 #[derive(Clone, Copy)]
-pub struct Candidate<'a> {
-    pub note: &'a Note,
-    pub case: &'a Case,
-    pub place: Place,
+pub enum Candidate<'a> {
+    Note { note: &'a Note, case: &'a Case, place: Place },
+    Lesson(&'a KeptLesson),
 }
 
-impl Candidate<'_> {
+impl<'a> Candidate<'a> {
+    /// The facts and stance as of when the item was learned.
     fn applies(&self) -> Applies {
-        self.case.applies(self.note.at)
+        match self {
+            Candidate::Note { note, case, .. } => case.applies(note.at),
+            Candidate::Lesson(l) => l.applies,
+        }
     }
 
     fn tokens(&self) -> Vec<Token> {
-        self.note.texts().flat_map(tokens).take(super::text::MAX_TOKENS).collect()
+        match self {
+            Candidate::Note { note, .. } => note.texts().flat_map(tokens).take(super::text::MAX_TOKENS).collect(),
+            Candidate::Lesson(l) => tokens(l.text.raw()),
+        }
+    }
+
+    fn topics(&self) -> Topics {
+        match self {
+            Candidate::Note { note, .. } => note.topics(),
+            Candidate::Lesson(l) => l.topics.union(topics_in(l.text.raw())),
+        }
+    }
+
+    fn kind(&self) -> Kind {
+        match self {
+            Candidate::Note { note, .. } => note.kind(),
+            Candidate::Lesson(_) => Kind::Lesson,
+        }
+    }
+
+    fn place(&self) -> Place {
+        match self {
+            Candidate::Note { place, .. } => *place,
+            Candidate::Lesson(_) => Place::Lesson,
+        }
+    }
+
+    /// A lesson keeps only its year, so it ages from that year's first day; with none it doesn't age.
+    fn age(&self, today: Day) -> f32 {
+        match self {
+            Candidate::Note { note, .. } => age(note.kind(), note.at, today),
+            Candidate::Lesson(l) => l.applies.year.and_then(Day::first_of).map_or(1.0, |on| age(Kind::Lesson, on, today)),
+        }
+    }
+
+    fn standing(&self) -> f32 {
+        match self {
+            Candidate::Note { note, .. } => standing(note.standing),
+            Candidate::Lesson(_) => 1.0,
+        }
+    }
+
+    /// The note, when it is one: for the corpus tests.
+    pub fn note(&self) -> Option<&'a Note> {
+        match self {
+            Candidate::Note { note, .. } => Some(note),
+            Candidate::Lesson(_) => None,
+        }
     }
 }
 
@@ -181,8 +235,8 @@ fn standing(s: Standing) -> f32 {
 /// About the thing at hand: stated or found topics in common, plus word overlap. Zero recalls
 /// nothing, so similar facts alone never do.
 fn relevance(q: &Query, c: &Candidate<'_>, words: &Bm25) -> f32 {
-    let topics = TOPIC * q.topics.shared(c.note.topics()) as f32;
-    let floor = if q.topics.is_empty() && !q.tokens.is_empty() && c.note.kind() == Kind::Pitfall { PITFALL_FLOOR } else { 0.0 };
+    let topics = TOPIC * q.topics.shared(c.topics()) as f32;
+    let floor = if q.topics.is_empty() && !q.tokens.is_empty() && c.kind() == Kind::Pitfall { PITFALL_FLOOR } else { 0.0 };
     (topics + words.score(&q.tokens, &c.tokens())).max(floor)
 }
 
@@ -192,12 +246,7 @@ pub fn score(q: &Query, c: &Candidate<'_>, words: &Bm25) -> f32 {
         return 0.0;
     }
     let then = c.applies();
-    relevance
-        * fit(&q.applies, &then)
-        * transfer(c.note.kind(), then.stance, q.applies.stance)
-        * age(c.note.kind(), c.note.at, q.today)
-        * c.place.weight()
-        * standing(c.note.standing)
+    relevance * fit(&q.applies, &then) * transfer(c.kind(), then.stance, q.applies.stance) * c.age(q.today) * c.place().weight() * c.standing()
 }
 
 fn ranked_by<'a>(pool: &[Candidate<'a>], mut f: impl FnMut(&Candidate<'a>, &Bm25) -> f32) -> Vec<Ranked<'a>> {
@@ -347,11 +396,7 @@ impl RecallAsk {
         };
         let query = Query::new(&self.about, pool.here.applies(self.today), self.today);
         let mut recalled = compose(&pool, &query);
-        if pool.damaged {
-            recalled.sent.problem = Some("this case's file is damaged, so nothing of it was recalled".into());
-        } else if pool.skipped > 0 {
-            recalled.sent.problem = Some(format!("{} of this client's cases couldn't be read", pool.skipped));
-        }
+        recalled.sent.problem = pool.problem();
         if let Some(f) = self.after_reading {
             f();
         }
@@ -368,15 +413,19 @@ impl RecallAsk {
     }
 }
 
-/// What recall can see: the bound case and the other cases of its wall. Built from one wall's
-/// folder and nothing else.
+/// What recall can see: the bound case, the other cases of its wall, and the lessons the person
+/// kept from any client. Built from one wall's folder and the lessons file, and nothing else.
 struct Pool {
     here: Case,
     neighbors: Vec<Neighbor>,
+    /// The kept lessons that aren't off, from every client.
+    lessons: Vec<KeptLesson>,
     /// The bound case's file is damaged: it reads as empty here.
     damaged: bool,
     /// Other cases of the wall skipped as damaged or unreadable.
     skipped: u32,
+    /// The lessons file is damaged: no lesson is sent.
+    lessons_damaged: bool,
 }
 
 impl Pool {
@@ -387,7 +436,30 @@ impl Pool {
             here = Case::new("");
         }
         let (cases, skipped) = shelf.recent_cases(at, MAX_NEIGHBORS, MAX_NEIGHBOR_BYTES);
-        Ok(Pool { here, neighbors: cases.into_iter().map(|(id, case)| Neighbor::of(id, case)).collect(), damaged, skipped })
+        let kept = shelf.lessons();
+        let lessons = if kept.damaged { Vec::new() } else { kept.on().cloned().collect() };
+        Ok(Pool {
+            here,
+            neighbors: cases.into_iter().map(|(id, case)| Neighbor::of(id, case)).collect(),
+            lessons,
+            damaged,
+            skipped,
+            lessons_damaged: kept.damaged,
+        })
+    }
+
+    /// Why less than expected was recalled, when the person should know.
+    fn problem(&self) -> Option<String> {
+        let mut problems = Vec::new();
+        if self.damaged {
+            problems.push("this case's file is damaged, so nothing of it was recalled".to_string());
+        } else if self.skipped > 0 {
+            problems.push(format!("{} of this client's cases couldn't be read", self.skipped));
+        }
+        if self.lessons_damaged {
+            problems.push("the lessons file is damaged, so no lesson was recalled".to_string());
+        }
+        (!problems.is_empty()).then(|| problems.join("; "))
     }
 }
 
@@ -410,14 +482,15 @@ impl Neighbor {
 }
 
 /// What a recalled item is called in `[[used: …]]` and in Details: `n12` for this case's note,
-/// `<case>:n12` for another case's, `<case>:balance` for its balance. Disjoint from a preference's
-/// `m1`.
+/// `<case>:n12` for another case's, `<case>:balance` for its balance, `l3` for a lesson. Disjoint
+/// from a preference's `m1`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "where")]
 pub enum ItemId {
     Here { note: super::record::NoteId },
     Neighbor { case: CaseId, note: super::record::NoteId },
     NeighborBalance { case: CaseId },
+    Lesson { lesson: LessonId },
 }
 
 impl std::fmt::Display for ItemId {
@@ -426,6 +499,7 @@ impl std::fmt::Display for ItemId {
             ItemId::Here { note } => write!(f, "{note}"),
             ItemId::Neighbor { case, note } => write!(f, "{}:{note}", case.as_str()),
             ItemId::NeighborBalance { case } => write!(f, "{}:balance", case.as_str()),
+            ItemId::Lesson { lesson } => write!(f, "{lesson}"),
         }
     }
 }
@@ -613,10 +687,11 @@ impl Told {
 /// [`MAX_ITEMS`] in all, nothing below [`MIN_SCORE`]. An other case's newest confirmed balance
 /// rides with its first note that made the cut, so the model sees why that case stood where it did.
 fn compose(pool: &Pool, query: &Query) -> Recalled {
-    let here: Vec<Candidate<'_>> = pool.here.notes.iter().map(|note| Candidate { note, case: &pool.here, place: Place::ThisCase }).collect();
+    let here: Vec<Candidate<'_>> = pool.here.notes.iter().map(|note| Candidate::Note { note, case: &pool.here, place: Place::ThisCase }).collect();
     let theirs =
-        pool.neighbors.iter().flat_map(|nb| nb.case.notes.iter().map(move |note| Candidate { note, case: &nb.case, place: Place::SameClient }));
-    let candidates: Vec<Candidate<'_>> = here.into_iter().chain(theirs).collect();
+        pool.neighbors.iter().flat_map(|nb| nb.case.notes.iter().map(move |note| Candidate::Note { note, case: &nb.case, place: Place::SameClient }));
+    let lessons = pool.lessons.iter().map(Candidate::Lesson);
+    let candidates: Vec<Candidate<'_>> = here.into_iter().chain(theirs).chain(lessons).collect();
     let now = pool.here.stance_now().map(|(stance, _)| stance);
     let mut out = Recalled { sent: RecallSent::default(), json: Vec::new() };
     let mut bytes = 0usize;
@@ -636,15 +711,24 @@ fn compose(pool: &Pool, query: &Query) -> Recalled {
             out.sent.left_out = out.sent.left_out.saturating_add(1);
             continue;
         }
-        let c = ranked.candidate;
-        let neighbor = pool.neighbors.iter().find(|nb| std::ptr::eq(&nb.case, c.case));
+        let (note, case) = match ranked.candidate {
+            Candidate::Note { note, case, .. } => (note, case),
+            Candidate::Lesson(lesson) => {
+                let (item, json) = lesson_item(lesson, now);
+                if !push(&mut out, item, json) {
+                    out.sent.left_out = out.sent.left_out.saturating_add(1);
+                }
+                continue;
+            }
+        };
+        let neighbor = pool.neighbors.iter().find(|nb| std::ptr::eq(&nb.case, case));
         if let Some(nb) = neighbor
             && per_neighbor.get(&nb.id).copied().unwrap_or(0) >= MAX_PER_NEIGHBOR
         {
             out.sent.left_out = out.sent.left_out.saturating_add(1);
             continue;
         }
-        let (item, json) = note_item(&c, neighbor, now);
+        let (item, json) = note_item(note, case, neighbor, now);
         if !push(&mut out, item, json) {
             out.sent.left_out = out.sent.left_out.saturating_add(1);
             continue;
@@ -687,14 +771,35 @@ fn facts_json(json: &mut serde_json::Map<String, Value>, applies: &Applies) {
     put("law", applies.law.map(|l| Value::String(String::from(l))));
 }
 
-fn note_item(c: &Candidate<'_>, neighbor: Option<&Neighbor>, now: Option<Stance>) -> (RecalledItem, Value) {
-    let note = c.note;
+/// A lesson as the model sees it: its text, its coarse facts, the balance it was kept under
+/// against now. No case, no client, no name: it is the one item that crosses clients.
+fn lesson_item(lesson: &KeptLesson, now: Option<Stance>) -> (RecalledItem, Value) {
+    let id = ItemId::Lesson { lesson: lesson.id };
+    let gap = BalanceGap { then: lesson.applies.stance, now };
+    let text = lesson.text.for_person().to_string();
+    let mut json = serde_json::Map::new();
+    json.insert("id".into(), Value::String(id.to_string()));
+    json.insert("place".into(), Value::String("a lesson the person kept".into()));
+    json.insert("kind".into(), Value::String("lesson".into()));
+    json.insert("text".into(), Value::String(text.clone()));
+    if let Some(year) = lesson.applies.year {
+        json.insert("year".into(), Value::from(year));
+    }
+    facts_json(&mut json, &lesson.applies);
+    json.insert("balance".into(), Value::String(gap.words()));
+    json.insert("confirmed".into(), Value::Bool(true));
+    let item =
+        RecalledItem { id, place: Place::Lesson, title: None, kind: Some(Kind::Lesson), text, balance: Some(gap), confirmed: true, again: false };
+    (item, Value::Object(json))
+}
+
+fn note_item(note: &Note, case: &Case, neighbor: Option<&Neighbor>, now: Option<Stance>) -> (RecalledItem, Value) {
     let id = match neighbor {
         None => ItemId::Here { note: note.id },
         Some(nb) => ItemId::Neighbor { case: nb.id.clone(), note: note.id },
     };
     let (place, title, place_words) = place_words(neighbor);
-    let then = c.case.stance_on(note.at);
+    let then = case.stance_on(note.at);
     let gap = BalanceGap { then, now };
     let confirmed = matches!(note.standing, Standing::Confirmed { .. });
     let text = note.body.texts().next().map_or(String::new(), |q| q.for_person().to_string());
@@ -734,7 +839,7 @@ fn note_item(c: &Candidate<'_>, neighbor: Option<&Neighbor>, now: Option<Stance>
         json.insert("how".into(), how);
     }
     json.insert("on".into(), Value::String(String::from(note.at)));
-    facts_json(&mut json, &c.case.applies(note.at));
+    facts_json(&mut json, &case.applies(note.at));
     json.insert("balance".into(), Value::String(gap.words()));
     json.insert("confirmed".into(), Value::Bool(confirmed));
     let item = RecalledItem { id, place, title, kind: Some(note.kind()), text, balance: Some(gap), confirmed, again: false };
@@ -802,6 +907,47 @@ mod tests {
         CaseId::parse(&format!("{n:016x}")).unwrap()
     }
 
+    /// A kept lesson is an item of its own kind, with its text, its coarse facts and the balance
+    /// gap, and nothing that names the case it came from; one that is off isn't read, and a
+    /// damaged lessons file sends none and says so.
+    #[test]
+    fn a_kept_lesson_is_an_item_with_no_case_and_a_damaged_file_sends_none() {
+        use crate::cases::lessons::{LessonDraft, LessonOp, Lessons};
+        use crate::cases::record::{ContractKind, Law};
+        let mut kept = Lessons::default();
+        let from = Some(id(7));
+        let applies =
+            Applies { kind: Some(ContractKind::Saas), law: Law::parse("JP"), stance: Some(Stance::Stronger), year: Some(2025), ..Applies::default() };
+        let draft = |text: &str| LessonDraft { text: Quoted::parse(text), applies, topics: Topics::default(), from: from.clone() };
+        kept.apply(LessonOp::Keep(draft("Ask for the SLA credit before the liability cap."))).unwrap();
+        let off = kept.apply(LessonOp::Keep(draft("Off: the liability cap moves last."))).unwrap().unwrap();
+        kept.apply(LessonOp::Off(off, true)).unwrap();
+        let mut here = Case::new("here");
+        here.balance.push(Balance {
+            on: day("2026-01-01"),
+            stance: Stance::Weaker,
+            factors: Vec::new(),
+            standing: Standing::Confirmed { on: day("2026-01-01") },
+        });
+        let pool = Pool { here, neighbors: Vec::new(), damaged: false, skipped: 0, lessons: kept.on().cloned().collect(), lessons_damaged: false };
+        let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
+        let out = compose(&pool, &query);
+        assert_eq!(out.sent.items.len(), 1, "{:?}", out.sent.items);
+        let item = &out.sent.items[0];
+        assert_eq!((item.id.to_string(), item.place), ("l1".to_string(), Place::Lesson));
+        assert_eq!(item.balance, Some(BalanceGap { then: Some(Stance::Stronger), now: Some(Stance::Weaker) }));
+        let json = out.json[0].to_string();
+        assert!(
+            json.contains(r#""place":"a lesson the person kept""#) && json.contains(r#""contract":"saas""#) && json.contains(r#""year":2025"#),
+            "{json}"
+        );
+        assert!(!json.contains("from") && !json.contains(&id(7).as_str().to_string()) && !json.contains("size"), "{json}");
+        assert!(pool.problem().is_none());
+        let damaged = Pool { lessons: Vec::new(), lessons_damaged: true, ..pool };
+        assert!(compose(&damaged, &query).sent.items.is_empty());
+        assert_eq!(damaged.problem().as_deref(), Some("the lessons file is damaged, so no lesson was recalled"));
+    }
+
     #[test]
     fn a_neighbor_gives_at_most_three_notes_and_its_balance_and_the_rest_is_counted() {
         let confirmed = Standing::Confirmed { on: day("2026-01-01") };
@@ -810,6 +956,8 @@ mod tests {
             neighbors: (1..=3).map(|n| Neighbor::of(id(n), case(&format!("case {n}"), 10, confirmed))).collect(),
             damaged: false,
             skipped: 0,
+            lessons: Vec::new(),
+            lessons_damaged: false,
         };
         let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
         let out = compose(&pool, &query);
@@ -846,7 +994,7 @@ mod tests {
             used: 0,
             last_used: None,
         });
-        let pool = Pool { here, neighbors: Vec::new(), damaged: false, skipped: 0 };
+        let pool = Pool { here, neighbors: Vec::new(), damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false };
         let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
         let sent = compose(&pool, &query).sent();
         assert_eq!(sent.items.len(), 1);
@@ -947,7 +1095,8 @@ mod tests {
     #[test]
     fn only_the_items_sent_are_indexed_for_the_quote_check() {
         let confirmed = Standing::Confirmed { on: day("2026-01-01") };
-        let pool = Pool { here: case("here", 1, confirmed), neighbors: Vec::new(), damaged: false, skipped: 0 };
+        let pool =
+            Pool { here: case("here", 1, confirmed), neighbors: Vec::new(), damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false };
         let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
         let rule = "Liability cap pattern 0 for the renewal.";
         let mut told = Told::default();
@@ -1020,7 +1169,8 @@ mod tests {
     #[test]
     fn a_session_that_retains_is_told_each_item_once_and_a_new_session_again() {
         let confirmed = Standing::Confirmed { on: day("2026-01-01") };
-        let pool = Pool { here: case("here", 2, confirmed), neighbors: Vec::new(), damaged: false, skipped: 0 };
+        let pool =
+            Pool { here: case("here", 2, confirmed), neighbors: Vec::new(), damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false };
         let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
         let mut told = Told::default();
         let mut first = compose(&pool, &query);

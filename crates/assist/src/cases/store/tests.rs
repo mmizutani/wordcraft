@@ -72,7 +72,7 @@ fn two_writers_keep_both_notes() {
 fn a_deleted_case_does_not_come_back() {
     let (shelf, at) = shelf_with_case("deleted");
     let other = shelf.clone();
-    shelf.delete_case(click(), &at).unwrap();
+    shelf.delete_case(click(), &at, false).unwrap();
     assert_eq!(other.person(click(), &at, PersonOp::AddNote(pitfall("late")), today()), Err(CaseError::Gone));
     assert_eq!(other.model(&at, ModelWrite::Note(pitfall("later")), today()), Err(CaseError::Gone));
     assert!(!shelf.exists(&at));
@@ -91,7 +91,7 @@ fn a_client_with_a_case_is_never_deleted_and_an_empty_one_is() {
     assert_eq!(shelf.delete_empty_wall(click(), &at.wall), Err(CaseError::NotEmpty));
     assert!(shelf.exists(&at), "the case is still there");
     assert_eq!(shelf.list().walls.len(), 1);
-    shelf.delete_case(click(), &at).unwrap();
+    shelf.delete_case(click(), &at, false).unwrap();
     shelf.delete_empty_wall(click(), &at.wall).unwrap();
     assert!(!shelf.wall_dir(&at.wall).exists());
     assert!(shelf.list().walls.is_empty());
@@ -391,7 +391,7 @@ fn a_case_behind_a_symlinked_wall_is_gone() {
     assert_eq!(shelf.model(&at, ModelWrite::Note(pitfall("through a link")), today()), Err(CaseError::Gone));
     assert_eq!(shelf.person(click(), &at, PersonOp::AddNote(pitfall("through a link")), today()), Err(CaseError::Gone));
     assert_eq!(shelf.open(&at), Err(CaseError::Gone));
-    assert_eq!(shelf.delete_case(click(), &at), Err(CaseError::Gone));
+    assert_eq!(shelf.delete_case(click(), &at, false), Err(CaseError::Gone));
     assert_eq!(shelf.delete_empty_wall(click(), &at.wall), Err(CaseError::Gone));
     assert_eq!(std::fs::read(&path).unwrap(), before, "the target is untouched");
     assert!(other.exists(&at));
@@ -451,4 +451,77 @@ fn note_ids_that_run_out_stop_the_write() {
     v["lastNote"] = serde_json::json!(max + 1);
     std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
     assert!(shelf.open(&at).unwrap().damaged, "past the maximum is damage");
+}
+
+fn lesson_draft(text: &str, from: Option<&CaseRef>) -> crate::cases::LessonDraft {
+    crate::cases::LessonDraft {
+        text: Quoted::parse(text),
+        applies: Default::default(),
+        topics: Topics::default(),
+        from: from.map(|at| at.case.clone()),
+    }
+}
+
+/// Deleting a case with "Delete these too" removes the lessons kept from it; without, they stay
+/// and lose the link, so a later delete of another case never reaches them.
+#[test]
+fn a_deleted_case_s_lessons_go_with_it_or_stay_unlinked() {
+    use crate::cases::LessonOp;
+    let (shelf, at) = shelf_with_case("lessons-delete");
+    let other = shelf.new_case(click(), &at.wall, "Acme SaaS", TODAY, 3).unwrap();
+    shelf.lesson(click(), LessonOp::Keep(lesson_draft("From the MSA.", Some(&at)))).unwrap();
+    shelf.lesson(click(), LessonOp::Keep(lesson_draft("From the SaaS deal.", Some(&other)))).unwrap();
+    shelf.lesson(click(), LessonOp::Keep(lesson_draft("From nowhere.", None))).unwrap();
+    assert_eq!(shelf.lessons().from_case(&at.case).count(), 1);
+    shelf.delete_case(click(), &other, true).unwrap();
+    let kept = shelf.lessons();
+    assert_eq!(kept.lessons.len(), 3, "kept, unlinked");
+    assert_eq!(kept.from_case(&other.case).count(), 0, "the link is gone");
+    assert_eq!(kept.from_case(&at.case).count(), 1);
+    shelf.delete_case(click(), &at, false).unwrap();
+    let left: Vec<String> = shelf.lessons().lessons.iter().map(|l| l.text.for_person().to_string()).collect();
+    assert_eq!(left, ["From the SaaS deal.", "From nowhere."]);
+    assert!(!shelf.exists(&at));
+}
+
+/// A damaged lessons file is moved aside on the person's next write, never replaced in silence,
+/// and until then is read as damaged with no lesson in it.
+#[test]
+fn a_damaged_lessons_file_moves_aside() {
+    use crate::cases::LessonOp;
+    use crate::cases::lessons::FILE;
+    let (shelf, at) = shelf_with_case("lessons-damaged");
+    let path = shelf.lessons.clone();
+    assert!(path.ends_with(FILE));
+    let aside = path.with_extension(format!("json{DAMAGED_SUFFIX}"));
+    shelf.lesson(click(), LessonOp::Keep(lesson_draft("Kept before the damage.", Some(&at)))).unwrap();
+    let newer = br#"{"version": 2, "lessons": [{"id": "l1", "text": "From a newer build", "applies": {"size": "huge"}}]}"#.to_vec();
+    for (what, bytes) in [("junk", b"{not json".to_vec()), ("an unknown version or field", newer)] {
+        std::fs::write(&path, &bytes).unwrap();
+        let _ = std::fs::remove_file(&aside);
+        let read = shelf.lessons();
+        assert!(read.damaged && read.lessons.is_empty(), "{what} reads as damaged, with nothing in it");
+        shelf.lesson(click(), LessonOp::Keep(lesson_draft("Kept after.", None))).unwrap();
+        assert_eq!(std::fs::read(&aside).unwrap(), bytes, "{what} is moved aside, not replaced in silence");
+        let now = shelf.lessons();
+        assert!(!now.damaged);
+        assert_eq!(now.lessons.len(), 1);
+        assert_eq!(now.lessons[0].text.for_person(), "Kept after.");
+    }
+}
+
+#[test]
+fn a_lesson_s_text_is_held_to_the_limit_and_ids_are_not_reused() {
+    use crate::cases::LessonOp;
+    let (shelf, _) = shelf_with_case("lessons-limit");
+    let long: String = "x".repeat(MAX_TEXT + 1);
+    assert_eq!(shelf.lesson(click(), LessonOp::Keep(lesson_draft(&long, None))), Err(CaseError::TooLong));
+    assert_eq!(shelf.lesson(click(), LessonOp::Keep(lesson_draft("  ", None))), Err(CaseError::TooLong));
+    let first = shelf.lesson(click(), LessonOp::Keep(lesson_draft("One.", None))).unwrap().unwrap();
+    shelf.lesson(click(), LessonOp::Remove(first)).unwrap();
+    let second = shelf.lesson(click(), LessonOp::Keep(lesson_draft("Two.", None))).unwrap().unwrap();
+    assert_ne!(first, second);
+    assert_eq!(shelf.lesson(click(), LessonOp::Edit(first, "x".into())), Err(CaseError::NoSuchLesson(first)));
+    shelf.lesson(click(), LessonOp::Off(second, true)).unwrap();
+    assert!(shelf.lessons().lessons[0].off);
 }

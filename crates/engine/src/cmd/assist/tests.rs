@@ -541,11 +541,11 @@ fn yours_alone_in_the_params_doc_and_person_only_agree() {
     for c in reg.all() {
         let says = c.params.contains("Yours alone");
         assert_eq!(says, super::person_only(c.id), "{}: params say \"Yours alone\" = {says}, person_only = {}", c.id, !says);
-        if c.id.starts_with("assist.memory.case.") || c.id.starts_with("assist.memory.wall.") {
+        if c.id.starts_with("assist.memory.case.") || c.id.starts_with("assist.memory.wall.") || c.id.starts_with("assist.memory.lesson.") {
             cases += 1;
         }
     }
-    assert_eq!(cases, 14, "the case and wall commands are registered");
+    assert_eq!(cases, 18, "the case, wall and lesson commands are registered");
 }
 
 /// The case commands check the shape of what they are given and hand the window a request; the
@@ -567,7 +567,23 @@ fn the_case_commands_check_what_they_are_given() {
     assert_eq!(requests(&mut s), [json!({"assist": "memory.case.plan", "goal": "Sign by March", "next": ["Send redline", "Call"]})]);
     s.run("assist.memory.case.noteEdit", &json!({"id": "n12", "note": {"kind": "pattern", "rule": "x"}, "how": " seen "})).unwrap();
     assert_eq!(requests(&mut s), [json!({"assist": "memory.case.noteEdit", "id": "n12", "note": {"kind": "pattern", "rule": "x"}, "how": "seen"})]);
+    s.run("assist.memory.lesson.keep", &json!({"text": " Ask for the credit first. ", "applies": {"kind": "saas"}, "from": wall})).unwrap();
+    assert_eq!(
+        requests(&mut s),
+        [json!({"assist": "memory.lesson.keep", "text": "Ask for the credit first.", "applies": {"kind": "saas"}, "from": wall})]
+    );
+    s.run("assist.memory.lesson.off", &json!({"id": "l3", "value": true})).unwrap();
+    assert_eq!(requests(&mut s), [json!({"assist": "memory.lesson.off", "id": "l3", "value": true})]);
+    s.run("assist.memory.case.delete", &json!({"keepLessons": true})).unwrap();
+    assert_eq!(requests(&mut s), [json!({"assist": "memory.case.delete", "keepLessons": true})]);
     for (id, bad) in [
+        ("assist.memory.lesson.keep", json!({"text": ""})),
+        ("assist.memory.lesson.keep", json!({"text": "x", "applies": "saas"})),
+        ("assist.memory.lesson.keep", json!({"text": "x", "from": "../x"})),
+        ("assist.memory.lesson.edit", json!({"id": "n3", "text": "x"})),
+        ("assist.memory.lesson.edit", json!({"id": "l3"})),
+        ("assist.memory.lesson.remove", json!({"id": "l"})),
+        ("assist.memory.lesson.off", json!({"id": "l3"})),
         ("assist.memory.wall.new", json!({})),
         ("assist.memory.wall.new", json!({"name": "x".repeat(401)})),
         ("assist.memory.wall.delete", json!({"wall": "../../etc"})),

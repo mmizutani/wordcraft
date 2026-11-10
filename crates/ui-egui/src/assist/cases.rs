@@ -20,8 +20,9 @@ use std::collections::{BTreeMap, VecDeque};
 use egui::{RichText, Ui};
 use serde_json::{Value, json};
 use wordcraft_assist::cases::{
-    Alone, Applied, BalanceDraft, Body, Card, Case, CaseError, CaseId, CaseRef, Click, Day, Factor, Facts, Listing, ModelWrite, ModelWrites,
-    NoteDraft, NoteId, PersonOp, Place, Plan, Quoted, RecallAsk, RecallSent, Route, Shelf, Stance, Standing, Topics, WallId,
+    Alone, Applied, BalanceDraft, Body, Card, Case, CaseError, CaseId, CaseRef, Click, Day, Factor, Facts, LessonDraft, LessonId, LessonOp, Lessons,
+    Listing, ModelWrite, ModelWrites, NoteDraft, NoteId, PersonOp, Place, Plan, Quoted, RecallAsk, RecallSent, Route, Shelf, Stance, Standing,
+    Topics, WallId,
 };
 use wordcraft_assist::{Context, Details, ProposalAnswer, Sent, Written};
 
@@ -29,6 +30,7 @@ use crate::WordApp;
 use crate::i18n::fmt;
 use crate::theme::Tokens;
 
+pub(crate) mod lesson;
 pub(crate) mod page;
 
 /// Why a turn recalled nothing, as Details says it.
@@ -62,6 +64,13 @@ pub(crate) struct CasesState {
     /// Every client's cases, read on a worker: a folder scan.
     listing: ListState,
     listed_at: Option<f64>,
+    /// The lessons file as last read, with when.
+    lessons: Option<Lessons>,
+    lessons_at: Option<f64>,
+    /// The lesson cards under answers, by card id: the text as edited and the facts left ticked.
+    /// Card ids start again with each conversation, so this is cleared when one starts, ends or
+    /// is rebound, and a card is reused only while its case is still the conversation's.
+    pub(crate) lesson_cards: BTreeMap<u64, lesson::LessonCard>,
     /// What the page is in the middle of.
     pub(crate) drafts: page::Drafts,
     /// A model's writes, each for the case its conversation belongs to, waiting for the file:
@@ -152,10 +161,22 @@ fn list_on_worker(app: &mut WordApp) {
     }
 }
 
-/// After a write: the case and the listing are read again before the next frame shows them.
+/// The lessons as last read, read again when stale: one file of at most 1 MiB, as the case is.
+pub(crate) fn lessons(app: &mut WordApp) -> Lessons {
+    let stale = app.assist.cases.lessons_at.is_none_or(|t| crate::clock::now_ms() - t > READ_EVERY);
+    if stale || app.assist.cases.lessons.is_none() {
+        app.assist.cases.lessons_at = Some(crate::clock::now_ms());
+        app.assist.cases.lessons = app.services.settings_dir.as_ref().map(|dir| Shelf::at(dir).lessons());
+    }
+    app.assist.cases.lessons.clone().unwrap_or_default()
+}
+
+/// After a write: the case, the listing and the lessons are read again before the next frame
+/// shows them.
 fn changed(app: &mut WordApp) {
     app.assist.cases.read_at = None;
     app.assist.cases.listed_at = None;
+    app.assist.cases.lessons_at = None;
 }
 
 /// Every frame: what the conversation's answers marked for its case goes there, by the one route.
@@ -279,10 +300,31 @@ pub(crate) fn write(app: &mut WordApp, dir: &std::path::Path, what: &str, req: &
         }
         "memory.case.delete" => {
             let at = bound_for(app).ok_or(NOT_BOUND)?;
+            let keep_lessons = req.get("keepLessons") == Some(&Value::Bool(true));
             // The conversation holds the case's notes: it ends first, with its transcript.
             app.bind_case(None);
             super::end(app);
-            shelf.delete_case(click, &at).map_err(|e| e.to_string()).map(|()| json!({"deleted": at.case.as_str()}))
+            shelf.delete_case(click, &at, keep_lessons).map_err(|e| e.to_string()).map(|()| json!({"deleted": at.case.as_str()}))
+        }
+        "memory.lesson.keep" => {
+            let text = req.get("text").and_then(Value::as_str).unwrap_or("");
+            let applies = serde_json::from_value(req.get("applies").cloned().unwrap_or(json!({}))).map_err(|e| format!("`applies`: {e}"))?;
+            let from = match req.get("from").and_then(Value::as_str) {
+                Some(id) => Some(CaseId::parse(id).ok_or("`from`: not an id")?),
+                None => None,
+            };
+            let draft = LessonDraft { text: Quoted::parse(text), applies, topics: Topics::default(), from };
+            let id = shelf.lesson(click, LessonOp::Keep(draft)).map_err(|e| e.to_string())?;
+            Ok(json!({"id": id.map(|id| id.to_string())}))
+        }
+        "memory.lesson.edit" | "memory.lesson.remove" | "memory.lesson.off" => {
+            let id = LessonId::parse(req.get("id").and_then(Value::as_str).unwrap_or("")).ok_or("`id`: not a lesson's")?;
+            let op = match what {
+                "memory.lesson.edit" => LessonOp::Edit(id, req.get("text").and_then(Value::as_str).unwrap_or("").to_string()),
+                "memory.lesson.remove" => LessonOp::Remove(id),
+                _ => LessonOp::Off(id, req.get("value").and_then(Value::as_bool).unwrap_or(true)),
+            };
+            shelf.lesson(click, op).map_err(|e| e.to_string()).map(|_| json!({"id": id.to_string()}))
         }
         _ => {
             let at = bound_for(app).ok_or(NOT_BOUND)?;
@@ -388,6 +430,7 @@ impl WordApp {
             && c.case != at
         {
             c.assistant.end();
+            self.assist.cases.lesson_cards.clear();
         }
         match at {
             Some(at) => {
@@ -504,6 +547,7 @@ fn turn_rows(ui: &mut Ui, t: &Tokens, recalled: &RecallSent) {
             (Place::SameClient, Some(title)) => fmt(tl!("{title}, the same client's case"), &[("title", title)]),
             (Place::SameClient, None) => tl!("the same client's case").to_string(),
             (Place::ThisCase, _) => tl!("this case").to_string(),
+            (Place::Lesson, _) => tl!("a lesson you kept").to_string(),
         };
         ui.scope(|ui| {
             // Rows of text, not of controls: a wrapped row takes its height from this as it starts.
@@ -591,6 +635,10 @@ pub(crate) fn written_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, what: Writ
 /// case and, while it waits, the buttons. Nothing is stored until Use or Keep, which are the
 /// person's commands; Not this stores nothing either.
 pub(crate) fn card(app: &mut WordApp, ui: &mut Ui, t: &Tokens, id: u64, card: &Card, answer: Option<ProposalAnswer>) {
+    if let Card::Lesson(proposal) = card {
+        lesson::transcript_card(app, ui, t, id, proposal, answer);
+        return;
+    }
     let waiting = answer.is_none();
     let stroke = if waiting { egui::Stroke::new(1.5, t.accent) } else { egui::Stroke::new(1.0, t.border_strong) };
     egui::Frame::NONE.stroke(stroke).corner_radius(6).inner_margin(6).show(ui, |ui| {
@@ -617,7 +665,7 @@ pub(crate) fn card(app: &mut WordApp, ui: &mut Ui, t: &Tokens, id: u64, card: &C
             }
             if ui.button(tl!("Edit")).clicked() {
                 match card {
-                    Card::Facts(_) => app.assist.view = super::PaneView::Details,
+                    Card::Facts(_) | Card::Lesson(_) => app.assist.view = super::PaneView::Details,
                     Card::Write(ModelWrite::Note(draft)) => page::draft_note(app, draft),
                     Card::Write(ModelWrite::Plan(plan)) => page::draft_plan(app, plan),
                     Card::Write(ModelWrite::Balance(draft)) => page::draft_balance(app, draft),
@@ -650,6 +698,7 @@ fn card_words(card: &Card) -> (&'static str, Vec<String>, &'static str) {
             say(tl!("Language"), facts.language.map(|v| page::word(&page::LANGS, v).to_string()));
             (tl!("The assistant suggests these facts for this case."), lines, tl!("Use these"))
         }
+        Card::Lesson(p) => (tl!("Keep this as a lesson?"), vec![p.text.for_person().to_string()], tl!("Keep")),
         Card::Write(ModelWrite::Note(draft)) => {
             let mut lines: Vec<String> = draft.body.texts().map(|q| q.for_person().to_string()).collect();
             if let Some(how) = &draft.how {
@@ -690,7 +739,8 @@ fn use_card(app: &mut WordApp, card: &Card) -> bool {
         Card::Write(ModelWrite::Note(draft)) => run(app, "assist.memory.case.note", json!({"note": draft.body, "how": draft.how})),
         Card::Write(ModelWrite::Plan(plan)) => run(app, "assist.memory.case.plan", json!({"goal": plan.goal, "next": plan.next})),
         Card::Write(ModelWrite::Balance(draft)) => run(app, "assist.memory.case.balance", json!({"stance": draft.stance, "factors": draft.factors})),
-        Card::Write(ModelWrite::Used(_)) => false,
+        // A lesson's Keep is its own card's ([`lesson::transcript_card`]).
+        Card::Write(ModelWrite::Used(_)) | Card::Lesson(_) => false,
     }
 }
 

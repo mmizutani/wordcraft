@@ -1,7 +1,8 @@
 //! The person's cases (#107): `assist.memory.case.*` binds the shown document to a case of a
 //! client, sets its facts and its power balance, keeps its plan and notes, and deletes it;
-//! `assist.memory.wall.*` makes and deletes a client. Each checks the shape of what it is given
-//! and hands the window a `memory.case.<verb>` or `memory.wall.<verb>` request, so every guard
+//! `assist.memory.wall.*` makes and deletes a client; `assist.memory.lesson.*` keeps, edits, turns
+//! off and removes a lesson, which every client's cases recall. Each checks the shape of what it is
+//! given and hands the window a `memory.case.<verb>`, `memory.wall.<verb>` or `memory.lesson.<verb>` request, so every guard
 //! that keys on the `assist.memory.` and `memory.` prefixes applies ([`super::person_only`], the
 //! macro guard, the control channel's): a case outlasts the document, and a document could
 //! otherwise plant one. The typed record lives above the engine (`wordcraft-assist`), so the
@@ -78,14 +79,66 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             .params(r#"{"card": number} → the conversation's card (facts or a plan the assistant proposed) goes, and nothing is stored. Yours alone, as `assist.memory.add` is"#)
             .when(memory_here)
             .pure(),
-        CommandSpec::new("assist.memory.case.delete", "Delete the Case", "Home › Assistant", |s, _| {
-            s.push_ui_request(json!({"assist": "memory.case.delete"}));
+        CommandSpec::new("assist.memory.case.delete", "Delete the Case", "Home › Assistant", |s, v| {
+            let keep_lessons = v.get("keepLessons") == Some(&Value::Bool(true));
+            s.push_ui_request(json!({"assist": "memory.case.delete", "keepLessons": keep_lessons}));
             Ok(json!({"deleted": true}))
         })
-        .params(r#"{} → the bound case's folder and every note in it go, and can't be brought back; what a model provider or an agent already holds isn't reached. Yours alone, as `assist.memory.add` is"#)
+        .params(r#"{"keepLessons"?: bool} → the bound case's folder and every note in it go, and can't be brought back, with the lessons kept from it unless `keepLessons`, which leaves them without the link; what a model provider or an agent already holds isn't reached. Yours alone, as `assist.memory.add` is"#)
+        .when(memory_here)
+        .pure(),
+        CommandSpec::new("assist.memory.lesson.keep", "Keep a Lesson", "Home › Assistant", lesson_keep)
+            .params(r#"{"text": string (at most 400 characters), "applies"?: {"kind"?, "side"?, "paper"?, "theirs"?, "law"?, "stance"?, "year"?}, "from"?: string (the case's id)} → a lesson every client's cases can recall: this text and these facts, nothing else. Yours alone, as `assist.memory.add` is"#)
+            .when(memory_here)
+            .pure(),
+        CommandSpec::new("assist.memory.lesson.edit", "Edit a Lesson", "Home › Assistant", |s, v| {
+            let id = lesson_id(v)?;
+            let text = text(v, "text")?;
+            s.push_ui_request(json!({"assist": "memory.lesson.edit", "id": id, "text": text}));
+            Ok(json!({"id": id}))
+        })
+        .params(r#"{"id": string (l3), "text": string (at most 400 characters)} → the lesson's text replaced. Yours alone, as `assist.memory.add` is"#)
+        .when(memory_here)
+        .pure(),
+        CommandSpec::new("assist.memory.lesson.remove", "Remove a Lesson", "Home › Assistant", |s, v| {
+            let id = lesson_id(v)?;
+            s.push_ui_request(json!({"assist": "memory.lesson.remove", "id": id}));
+            Ok(json!({"id": id}))
+        })
+        .params(r#"{"id": string (l3)} → the lesson goes. Yours alone, as `assist.memory.add` is"#)
+        .when(memory_here)
+        .pure(),
+        CommandSpec::new("assist.memory.lesson.off", "Turn a Lesson Off", "Home › Assistant", |s, v| {
+            let id = lesson_id(v)?;
+            let off = v.get("value").and_then(Value::as_bool).ok_or_else(|| CmdError::Params("`value`: true for off, false for on".into()))?;
+            s.push_ui_request(json!({"assist": "memory.lesson.off", "id": id, "value": off}));
+            Ok(json!({"id": id, "off": off}))
+        })
+        .params(r#"{"id": string (l3), "value": bool} → off, the lesson is kept but no turn recalls it. Yours alone, as `assist.memory.add` is"#)
         .when(memory_here)
         .pure(),
     ]
+}
+
+/// A lesson's id in `v["id"]`: `l` and up to 16 digits.
+fn lesson_id(v: &Value) -> Result<String, CmdError> {
+    v.get("id")
+        .and_then(Value::as_str)
+        .filter(|id| id.strip_prefix('l').is_some_and(|n| !n.is_empty() && n.len() <= 16 && n.bytes().all(|b| b.is_ascii_digit())))
+        .map(str::to_string)
+        .ok_or_else(|| CmdError::Params("`id`: a lesson's, such as l3".into()))
+}
+
+/// `assist.memory.lesson.keep`: the text, the facts that travel with it, and the case it came from.
+fn lesson_keep(s: &mut Session, v: &Value) -> CmdResult {
+    let text = text(v, "text")?;
+    let applies = match v.get("applies") {
+        None | Some(Value::Null) => json!({}),
+        Some(_) => object(v, "applies")?,
+    };
+    let from = if v.get("from").is_some_and(|f| !f.is_null()) { Some(hex_id(v, "from")?) } else { None };
+    s.push_ui_request(json!({"assist": "memory.lesson.keep", "text": text, "applies": applies, "from": from}));
+    Ok(json!({"kept": true}))
 }
 
 /// The text in `v[key]`: trimmed, not empty, at most [`MAX_CASE_TEXT`] characters.
