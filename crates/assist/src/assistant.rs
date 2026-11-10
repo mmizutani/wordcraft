@@ -94,7 +94,7 @@ enum Job {
     /// A turn, how its permission requests are answered when not as the conversation's
     /// ([`Assistant::ask_with_policy`]), and what it recalls from the person's cases
     /// ([`Assistant::set_recall`]), which rides beside the turn because a proof is used once.
-    Turn(Box<Turn>, Option<PermissionPolicy>, Option<RecallAsk>),
+    Turn(Box<Turn>, Option<PermissionPolicy>, Option<Box<RecallAsk>>),
     End,
 }
 
@@ -261,6 +261,12 @@ impl Assistant {
         self.transcript.take_case_markers()
     }
 
+    /// The turn that just ended, once, as one line for this conversation's case record
+    /// ([`crate::cases::log`]); `None` while a turn runs or when the last one was taken.
+    pub fn take_finished_turn(&mut self) -> Option<crate::cases::Record> {
+        self.transcript.take_finished_turn()
+    }
+
     /// A marker's write landed in the conversation's case: the pane shows a quiet row.
     pub fn case_written(&mut self, what: crate::transcript::Written, note: Option<crate::cases::NoteId>, text: &str) {
         self.transcript.case_written(what, note, text);
@@ -370,7 +376,7 @@ impl Assistant {
         // Cleared before the turn is sent: a Stop from now on ends this turn, even one the
         // thread hasn't started yet.
         self.cancel.clear();
-        let recall = self.recall.take().map(|r| r.with_room(self.transcript.recall_room()));
+        let recall = self.recall.take().map(|r| Box::new(r.with_room(self.transcript.recall_room())));
         // From here the thread may read case notes at any moment, so the conversation counts as
         // having recalled before the event says what it found: the guard fails closed.
         self.recalled |= recall.is_some();
@@ -582,7 +588,7 @@ impl Work {
         }
         while let Ok(job) = self.jobs.recv() {
             let (mut turn, policy, recall) = match job {
-                Job::Turn(t, policy, recall) => (*t, policy.unwrap_or(self.policy), recall),
+                Job::Turn(t, policy, recall) => (*t, policy.unwrap_or(self.policy), recall.map(|r| *r)),
                 Job::End => break,
             };
             // Reading the person's cases is file work, so it runs here, off the frame; what it

@@ -134,6 +134,7 @@ fn read_again(app: &mut WordApp, say: bool) {
             }
             if say {
                 app.assist.feedback.record_edit(&w.text, &text);
+                super::cases::record::edited(app, &w.text, &text);
             }
         } else if !names.is_some_and(|names| names.iter().all(|who| *who == person || *who == name)) {
             // It reads the same as far as it is compared, but someone else changed the document,

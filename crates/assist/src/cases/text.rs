@@ -19,6 +19,10 @@ impl Token {
     pub fn for_test(&self) -> String {
         self.0.clone()
     }
+
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
 }
 
 /// Full-width ASCII (U+FF01..=U+FF5E) folded to ASCII, lowercased. Japanese contracts write 第１条.

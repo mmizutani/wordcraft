@@ -8,9 +8,10 @@ use std::hash::{DefaultHasher, Hasher};
 use serde::Serialize;
 
 use crate::backend::{Answer, Event, PermissionRequest, PlanEntry, PlanStatus, Source, SourceKind, StopReason, ToolCall, ToolStatus, Usage, label};
+use crate::cases::log::{Record, ToolLine};
 use crate::cases::marker::{Card, CaseMarker, MAX_PER_TURN};
 use crate::cases::recall::RecallSent;
-use crate::cases::record::NoteId;
+use crate::cases::record::{NoteId, Quoted};
 use crate::context::Sent;
 use crate::markers::{Markers, Piece};
 use crate::output::{Action, OutputRow};
@@ -432,6 +433,13 @@ pub struct Transcript {
     /// What the conversation recalled, as windows, for [`Transcript::quotes_recalled`].
     #[serde(skip)]
     sent_windows: SentWindows,
+    /// How many turns were asked, trimmed or not.
+    #[serde(skip)]
+    turns: u32,
+    /// The turn that just ended, as one record for the case's log, until the window takes it
+    /// ([`Transcript::take_finished_turn`]).
+    #[serde(skip)]
+    finished: Option<Record>,
 }
 
 impl Transcript {
@@ -634,7 +642,47 @@ impl Transcript {
         self.turn_start = self.entries.len();
         self.proposed = 0;
         self.case_marked = 0;
+        self.turns = self.turns.saturating_add(1);
         self.push(Entry::Asked { text: text.to_string() });
+    }
+
+    /// The turn that just ended as one line for the case's record ([`crate::cases::log`]), once:
+    /// what was asked, the answer with its markers taken out (the pieces never held them), the
+    /// tool calls as they stand, the model, how it stopped, and the ids recalled and used.
+    pub fn take_finished_turn(&mut self) -> Option<Record> {
+        self.finished.take()
+    }
+
+    fn finish_turn(&mut self, stop: StopReason) {
+        let mut asked = None;
+        let mut tools = Vec::new();
+        let mut model = None;
+        let mut recalled = Vec::new();
+        let mut used = Vec::new();
+        for entry in self.entries.iter().skip(self.turn_start) {
+            match entry {
+                Entry::Asked { text } => asked = Some(Quoted::parse(text)),
+                Entry::Tool(call) => {
+                    tools.push(ToolLine { title: Quoted::parse(&call.title), status: call.status, detail: Quoted::parse(&call.detail) });
+                }
+                Entry::Model { name, .. } => model = Some(name.clone()),
+                Entry::Recalled(sent) => recalled.extend(sent.items.iter().map(|i| i.id.to_string())),
+                Entry::Used { id } => used.push(id.clone()),
+                _ => {}
+            }
+        }
+        // A turn whose ask was trimmed away still ended: it is recorded as asked nothing.
+        self.finished = Some(Record::Turn {
+            at: wordcraft_engine::cmd::now_iso(),
+            n: self.turns,
+            asked: asked.unwrap_or_else(|| Quoted::parse("")),
+            answer: self.last_answer().map(|a| Quoted::parse(&a)),
+            tools,
+            model,
+            stop: Some(stop),
+            recalled,
+            used,
+        });
     }
 
     /// Add what `event` says.
@@ -706,6 +754,7 @@ impl Transcript {
                 if *stop != StopReason::EndTurn {
                     self.push(Entry::Stopped { stop: *stop });
                 }
+                self.finish_turn(*stop);
             }
             Event::Error { message } => self.push(Entry::Error { message: message.clone() }),
         }

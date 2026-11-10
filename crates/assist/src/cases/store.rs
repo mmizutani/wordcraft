@@ -7,6 +7,7 @@
 //!     wall.json             its name
 //!     <case id>.lock        beside the folder, not in it, so a delete can rename the folder while holding it
 //!     <case id>/case.json   the typed record, at most 1 MiB, mode 0600
+//!     <case id>/log/        the case's record, one conversation a file, opt-in ([`super::log`])
 //! ```
 //!
 //! A wall is a folder, so recall can open one wall and nothing else. There is no index, so a
@@ -24,6 +25,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::lessons::{LessonId, LessonOp, Lessons};
 use super::record::{Applied, Case, CaseError, Click, Day, ModelWrite, PersonOp, Quoted, VERSION};
 use crate::atomic::{self, Lock, LockError};
 
@@ -135,15 +137,50 @@ struct WallFile {
     name: Quoted,
 }
 
-/// The cases in a settings folder.
+/// The cases in a settings folder, and the lessons file beside them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shelf {
     root: PathBuf,
+    lessons: PathBuf,
 }
 
 impl Shelf {
     pub fn at(settings: &Path) -> Shelf {
-        Shelf { root: settings.join(FOLDER) }
+        Shelf { root: settings.join(FOLDER), lessons: settings.join(super::lessons::FILE) }
+    }
+
+    /// The lessons as the file holds them: damaged when it can't be read whole. A file of at most
+    /// 1 MiB, read where a case is.
+    pub fn lessons(&self) -> Lessons {
+        if fs::symlink_metadata(&self.lessons).is_err() {
+            return Lessons::default();
+        }
+        Lessons::read(read_whole(&self.lessons, super::lessons::MAX_FILE).as_deref())
+    }
+
+    /// What the person did to the lessons, with their click: the id of a kept one. Lock, read
+    /// fresh, apply, write; a damaged file is moved aside as `.damaged` first, never replaced in
+    /// silence; a write that would pass [`super::lessons::MAX_FILE`] is refused before the file changes.
+    pub fn lesson(&self, _click: Click, op: LessonOp) -> Result<Option<LessonId>, CaseError> {
+        let _lock = Lock::take(&self.lessons.with_extension("json.lock")).map_err(|e| match e {
+            LockError::Busy => CaseError::Busy,
+            LockError::Io(e) => CaseError::Io(e),
+        })?;
+        let mut lessons = self.lessons();
+        let damaged = std::mem::take(&mut lessons.damaged);
+        if damaged {
+            lessons = Lessons::default();
+        }
+        let r = lessons.apply(op)?;
+        let bytes = lessons.to_bytes().map_err(CaseError::Io)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > super::lessons::MAX_FILE {
+            return Err(CaseError::Full("file"));
+        }
+        if damaged {
+            atomic::rename_if_there(&self.lessons, &self.lessons.with_extension(format!("json{DAMAGED_SUFFIX}"))).map_err(CaseError::Io)?;
+        }
+        atomic::write(&self.lessons, &bytes).map_err(CaseError::Io)?;
+        Ok(r)
     }
 
     fn wall_dir(&self, wall: &WallId) -> PathBuf {
@@ -156,6 +193,11 @@ impl Shelf {
 
     fn lock_path(&self, at: &CaseRef) -> PathBuf {
         self.wall_dir(&at.wall).join(format!("{}.lock", at.case.0))
+    }
+
+    /// Where the case's record lives ([`super::log`]), whether or not it has one.
+    pub(crate) fn log_dir(&self, at: &CaseRef) -> PathBuf {
+        self.case_dir(at).join(super::log::FOLDER)
     }
 
     /// Walls and cases, swept first of `.trash-*` folders an interrupted delete left. A scan,
@@ -183,7 +225,7 @@ impl Shelf {
         }
         walls.sort();
         for (id, dir) in walls {
-            let name = read_whole(&dir.join(WALL_FILE))
+            let name = read_whole(&dir.join(WALL_FILE), MAX_FILE)
                 .and_then(|bytes| serde_json::from_slice::<WallFile>(&bytes).ok())
                 .filter(|w| w.version == VERSION)
                 .map_or_else(|| Quoted::parse(""), |w| w.name);
@@ -224,7 +266,7 @@ impl Shelf {
     }
 
     /// The case's folder, if it and its wall are folders and not links to one.
-    fn real_case_dir(&self, at: &CaseRef) -> Result<PathBuf, CaseError> {
+    pub(crate) fn real_case_dir(&self, at: &CaseRef) -> Result<PathBuf, CaseError> {
         let dir = self.real_wall_dir(&at.wall)?.join(&at.case.0);
         real_dir(&dir).then_some(dir).ok_or(CaseError::Gone)
     }
@@ -368,7 +410,7 @@ impl Shelf {
 
     /// Rename `dir` to a trash folder under the root, then remove it. Safe to run twice, and a
     /// crash between the two is finished by the next [`Shelf::list`].
-    fn trash(&self, dir: &Path, id: &str) -> Result<(), CaseError> {
+    pub(crate) fn trash(&self, dir: &Path, id: &str) -> Result<(), CaseError> {
         let trash = self.root.join(format!("{TRASH}{id}"));
         match fs::rename(dir, &trash) {
             Ok(()) => {}
@@ -383,7 +425,11 @@ impl Shelf {
     }
 
     /// The case goes, under its lock, so a write racing it finds it gone rather than half there.
-    pub fn delete_case(&self, _click: Click, at: &CaseRef) -> Result<(), CaseError> {
+    /// Under that lock, first its lessons go too, or stay and lose the link to it, under the
+    /// lessons lock: a busy case changes no lesson, a crash between the two leaves the case
+    /// present, and deleting again converges. The order is the case's lock, then the lessons';
+    /// nothing takes them the other way round.
+    pub fn delete_case(&self, click: Click, at: &CaseRef, keep_lessons: bool) -> Result<(), CaseError> {
         let dir = self.real_case_dir(at)?;
         let lock_path = self.lock_path(at);
         {
@@ -391,6 +437,9 @@ impl Shelf {
                 LockError::Busy => CaseError::Busy,
                 LockError::Io(e) => CaseError::Io(e),
             })?;
+            if self.lessons().from_case(&at.case).next().is_some() {
+                self.lesson(click, LessonOp::CaseDeleted { case: at.case.clone(), delete: !keep_lessons })?;
+            }
             self.trash(&dir, at.case.as_str())?;
         }
         let _ = fs::remove_file(&lock_path);
@@ -416,7 +465,7 @@ impl Shelf {
 }
 
 /// A folder only its owner can enter. `recursive` makes missing parents and accepts one that exists.
-fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
+pub(crate) fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(recursive);
     #[cfg(unix)]
@@ -425,7 +474,7 @@ fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
 }
 
 /// A folder, and not a link to one.
-fn real_dir(path: &Path) -> bool {
+pub(crate) fn real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
@@ -437,19 +486,19 @@ fn is_real_dir(entry: &fs::DirEntry) -> bool {
 /// At most [`MAX_FILE`] bytes of `path`; `None` when there are more, it can't be read, or it
 /// isn't a plain file. A link is refused rather than followed: one left in a case folder could
 /// point at another wall's case, and the folder is the ethical wall.
-fn read_whole(path: &Path) -> Option<Vec<u8>> {
+fn read_whole(path: &Path, max: u64) -> Option<Vec<u8>> {
     if !fs::symlink_metadata(path).ok()?.is_file() {
         return None;
     }
     let file = fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
-    file.take(MAX_FILE.saturating_add(1)).read_to_end(&mut bytes).ok()?;
-    (u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_FILE).then_some(bytes)
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes).ok()?;
+    (u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= max).then_some(bytes)
 }
 
 /// The case at `path`: damaged when it can't be read whole or holds more than this build reads.
 fn read_case(path: &Path) -> Case {
-    match read_whole(path) {
+    match read_whole(path, MAX_FILE) {
         Some(bytes) => Case::read(&bytes),
         None => {
             let mut case = Case::new("");
