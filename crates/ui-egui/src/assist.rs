@@ -932,12 +932,15 @@ pub(crate) fn before_command(app: &mut WordApp, id: &str) {
 /// through [`WordApp::execute`], and a macro's step has an id of its own.
 pub(crate) fn review_ended(app: &mut WordApp, id: &str, before: cases::record::Reviewing) {
     let (Some(decision), Some(name)) = (decision(id), app.conversation().map(|a| a.name().to_string())) else { return };
-    let Some(after) = changes_of(&app.session, &name) else { return };
-    let gone = resolved(before.mine, after);
-    for change in &gone {
-        app.assist.feedback.record(decision, change.kind, &change.text);
+    // The conversation's own list unknown, before or after, is no feedback, not feedback on
+    // nothing; the record of anyone else's decision doesn't wait on it.
+    if let (Some(mine), Some(after)) = (before.mine, changes_of(&app.session, &name)) {
+        let gone = resolved(mine, after);
+        for change in &gone {
+            app.assist.feedback.record(decision, change.kind, &change.text);
+        }
+        memory::decided(app, decision, &gone);
     }
-    memory::decided(app, decision, &gone);
     cases::record::decided(app, decision, before.anyone);
 }
 

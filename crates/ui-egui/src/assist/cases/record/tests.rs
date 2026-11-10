@@ -243,12 +243,21 @@ fn delete_the_record_removes_it_and_deleting_the_case_runs_off_the_frame() {
     ask(&mut a, Fake::new().then(vec![Step::Say("Noted.".into())]), "Read it");
     settle(&mut a);
     frames_until(&mut a, "a line", |_| !records(&folder, &c.a).is_empty());
+    let shelf = Shelf::at(&folder.0);
+    assert_eq!(wordcraft_assist::cases::search_log(&shelf, &c.a, "Read it", 10).unwrap().hits.len(), 1);
     a.run("assist.memory.case.recordDelete", json!({})).unwrap();
     frames_until(&mut a, "the record delete", |a| a.assist.cases.record.deleting.is_none());
-    assert!(Shelf::at(&folder.0).exists(&c.a), "the case went with its record");
-    // The live conversation opened a new file, so later turns are still recorded.
-    frames_until(&mut a, "a new file", |a| a.assist.conversation.as_ref().unwrap().log.is_some());
+    assert!(shelf.exists(&c.a), "the case went with its record");
     assert!(a.assist.notice.is_none(), "{:?}", a.assist.notice);
+    // The old record is gone whole: nothing of it is found, and what is on disk is only the file
+    // the live conversation opened again at once, holding its redlines snapshot, so later turns
+    // are still recorded.
+    let found = wordcraft_assist::cases::search_log(&shelf, &c.a, "Read it", 10).unwrap();
+    assert!(found.hits.is_empty() && found.skipped == 0, "{found:?}");
+    assert!(a.assist.conversation.as_ref().unwrap().log.is_some());
+    let left = records(&folder, &c.a);
+    assert!(matches!(left.as_slice(), [Record::Redlines { .. }]), "more than the new file's snapshot is left: {left:?}");
+    assert_eq!(std::fs::read_dir(log_dir(&folder, &c.a)).unwrap().count(), 1, "the old file is still there");
     a.run("assist.memory.case.delete", json!({})).unwrap();
     assert!(a.assist.cases.record.deleting.is_some(), "the delete ran on the frame");
     assert!(crate::assist::cases::bound_for(&a).is_none());
@@ -257,4 +266,146 @@ fn delete_the_record_removes_it_and_deleting_the_case_runs_off_the_frame() {
     assert!(!case_dir.exists(), "the case's folder is left");
     assert!(a.assist.notice.is_none(), "{:?}", a.assist.notice);
     assert_eq!(Shelf::at(&folder.0).list().walls[0].cases.len(), 1, "the other case stays");
+}
+
+/// The second turn of a conversation: the same `Fake`'s next script, the same conversation.
+fn ask_again(a: &mut WordApp, prompt: &str) {
+    a.execute("assist.ask", json!({"prompt": prompt})).unwrap();
+}
+
+/// A conversation's record deleted while the window shows another document, another client's
+/// maybe: the file opened again for it holds nothing of what that document shows. Its snapshot
+/// is the conversation's document's or none.
+#[test]
+fn a_record_opened_again_after_a_delete_holds_nothing_of_another_document() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    record_on(&folder, &c.a);
+    let mut a = window(&folder);
+    other_sides_insertion(&mut a, " Supplier may raise fees at any time.");
+    a.bind_case(Some(c.a.clone()));
+    ask(&mut a, Fake::new().then(vec![Step::Say("Noted.".into())]), "Read it");
+    settle(&mut a);
+    frames_until(&mut a, "a line", |_| !records(&folder, &c.a).is_empty());
+    a.run("assist.memory.case.recordDelete", json!({})).unwrap();
+    // Before the delete ends, the window shows another document, with another client's redlines.
+    a.execute("file.new", json!({})).unwrap();
+    other_sides_insertion(&mut a, " Bluefin canary: the licence is perpetual.");
+    frames_until(&mut a, "the record delete", |a| a.assist.cases.record.deleting.is_none());
+    assert!(a.assist.notice.is_none(), "{:?}", a.assist.notice);
+    assert!(a.assist.conversation.as_ref().unwrap().log.is_some(), "the conversation's record stays open");
+    let found = wordcraft_assist::cases::search_log(&Shelf::at(&folder.0), &c.a, "canary", 10).unwrap();
+    assert!(found.hits.is_empty(), "another document's redlines in A's record: {found:?}");
+    assert!(records(&folder, &c.a).iter().all(|r| !matches!(r, Record::Redlines { .. })), "a snapshot of a document that isn't the conversation's");
+}
+
+/// A search of one case's record is shown on that case's page alone: another case's Record
+/// section shows nothing of it.
+#[test]
+fn a_search_of_one_cases_record_shows_nothing_on_another_case() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    record_on(&folder, &c.a);
+    let mut a = window(&folder);
+    a.bind_case(Some(c.a.clone()));
+    ask(&mut a, Fake::new().then(vec![Step::Say("Keep the Kestrel cap at twelve months.".into())]), "What about the cap?");
+    settle(&mut a);
+    frames_until(&mut a, "a line", |_| records(&folder, &c.a).iter().any(|r| matches!(r, Record::Turn { .. })));
+    a.assist.cases.record.query = "Kestrel".into();
+    super::search_on_worker(&mut a, &c.a);
+    frames_until(&mut a, "the search", |a| a.assist.cases.record.results(&c.a).is_some());
+    let on_a = a.assist.cases.record.results(&c.a).unwrap().as_ref().unwrap();
+    assert_eq!(on_a.hits.len(), 1, "{on_a:?}");
+    assert!(a.assist.cases.record.results(&c.b).is_none(), "A's hits on B's page");
+}
+
+/// The record turned off in another window (or process) while a conversation here keeps one: it
+/// stops writing at its next line, and lets its file go.
+#[test]
+fn the_record_turned_off_elsewhere_stops_the_conversation_writing() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    record_on(&folder, &c.a);
+    let mut a = window(&folder);
+    a.bind_case(Some(c.a.clone()));
+    ask(&mut a, Fake::new().then(vec![Step::Say("Noted.".into())]).then(vec![Step::Say("Still here.".into())]), "Read it");
+    settle(&mut a);
+    frames_until(&mut a, "a line", |_| records(&folder, &c.a).iter().any(|r| matches!(r, Record::Turn { .. })));
+    // Another window's click, not this one's: nothing here hears it.
+    Shelf::at(&folder.0).person(click(), &c.a, PersonOp::Record(false), Day::parse(TODAY).unwrap()).unwrap();
+    ask_again(&mut a, "And the indemnity?");
+    settle(&mut a);
+    for _ in 0..3 {
+        crate::assist::tick(&mut a);
+    }
+    assert!(a.assist.conversation.as_ref().unwrap().log.is_none(), "the log stayed open with the record off");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let all = records(&folder, &c.a);
+    assert!(!all.iter().any(|r| matches!(r, Record::Turn { asked, .. } if asked.for_person().contains("indemnity"))), "{all:?}");
+}
+
+/// Nobody's list is invented. The conversation's own changes past the cap are unknown, not none:
+/// its feedback is skipped, and the other side's decision is still recorded.
+#[test]
+fn the_assistants_changes_past_the_cap_leave_the_other_sides_decision_recorded() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    record_on(&folder, &c.a);
+    let mut a = window(&folder);
+    other_sides_insertion(&mut a, " Supplier may raise fees at any time.");
+    a.bind_case(Some(c.a.clone()));
+    ask(&mut a, Fake::new().then(vec![Step::Say("Noted.".into())]), "Read it");
+    settle(&mut a);
+    let seat = a.conversation().unwrap().name().to_string();
+    // One more of the assistant's insertions than the window can list, one character each, in a
+    // paragraph of their own.
+    let most = wordcraft_engine::cmd::review::MOST_AUTHORED_CHANGES + 1;
+    a.session.doc.revisions.push(wordcraft_doc::Revision::new(wordcraft_doc::RevisionKind::Insert, &seat, "2026-11-10T00:00:00Z"));
+    let rev = (a.session.doc.revisions.len() - 1) as u32;
+    let para = a.session.doc.para_mut(wordcraft_doc::StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
+    let props = para.runs[0].props.clone();
+    let mut runs = para.runs.clone();
+    runs.extend((0..most).flat_map(|_| {
+        let inserted = wordcraft_doc::CharProps { ins: Some(rev), ..props.clone() };
+        [wordcraft_doc::Run { len: 1, props: inserted }, wordcraft_doc::Run { len: 1, props: props.clone() }]
+    }));
+    para.text.push_str(&"ab".repeat(most));
+    para.runs = runs;
+    assert_eq!(wordcraft_engine::cmd::review::changes_of(&a.session, &seat), None, "the assistant's list is unknown");
+    a.run("review.rejectAll", json!({"author": OTHER_SIDE})).unwrap();
+    let all = records_held(&folder, &c.a);
+    let decided: Vec<&Record> = all.iter().filter(|r| matches!(r, Record::Decided { .. })).collect();
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    let Record::Decided { author, text, .. } = decided[0] else { panic!("{decided:?}") };
+    assert_eq!(author.for_person(), OTHER_SIDE);
+    assert!(text.for_person().contains("raise fees"), "{text:?}");
+}
+
+/// A record delete that fails (the folder can't be renamed) is a notice, and the conversation
+/// goes on recording: its file is opened again whether the delete succeeded or not.
+#[test]
+#[cfg(unix)]
+fn a_failed_record_delete_leaves_the_conversation_recording() {
+    use std::os::unix::fs::PermissionsExt;
+    let folder = Folder::new();
+    let c = cases(&folder);
+    record_on(&folder, &c.a);
+    let mut a = window(&folder);
+    a.bind_case(Some(c.a.clone()));
+    ask(&mut a, Fake::new().then(vec![Step::Say("Noted.".into())]).then(vec![Step::Say("Still here.".into())]), "Read it");
+    settle(&mut a);
+    frames_until(&mut a, "a line", |_| records(&folder, &c.a).iter().any(|r| matches!(r, Record::Turn { .. })));
+    // The case's folder can't be written: `log/` can't be renamed out of it, while files inside
+    // `log/` can still be made.
+    let case_dir = log_dir(&folder, &c.a).parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&case_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    a.run("assist.memory.case.recordDelete", json!({})).unwrap();
+    frames_until(&mut a, "the record delete", |a| a.assist.cases.record.deleting.is_none());
+    std::fs::set_permissions(&case_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(a.assist.notice.is_some(), "the failed delete said nothing");
+    ask_again(&mut a, "And the indemnity?");
+    settle(&mut a);
+    frames_until(&mut a, "the turn after the failed delete", |_| {
+        records(&folder, &c.a).iter().any(|r| matches!(r, Record::Turn { asked, .. } if asked.for_person().contains("indemnity")))
+    });
 }
