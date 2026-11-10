@@ -14,6 +14,7 @@
 use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -37,7 +38,8 @@ pub const MAX_FILE_BYTES: u64 = 16 << 20;
 /// conversations' files first until a whole new file has room.
 pub const MAX_CASE_BYTES: u64 = 64 << 20;
 
-/// Most bytes of one line the reader takes; a longer one is skipped and counted.
+/// Most bytes of one line: the writer never writes a longer one, and the reader skips and counts
+/// one it finds.
 pub const MAX_LINE_BYTES: usize = 1 << 20;
 
 /// Most records waiting for the writer. A frame writes at most a handful; a writer stuck this far
@@ -196,6 +198,9 @@ pub struct CaseLog {
     thread: Option<JoinHandle<()>>,
     /// Records the queue had no room for, not yet written as a [`Record::Dropped`].
     dropped: u32,
+    /// What `dropped` still held when the log was dropped with the queue full: the writer adds
+    /// it to its last `Dropped` line, since no record can carry it then.
+    lost: Arc<AtomicU32>,
 }
 
 impl CaseLog {
@@ -248,11 +253,13 @@ impl CaseLog {
         }
         let file = file.ok_or_else(|| CaseError::Io("the record's file can't be named".into()))?;
         let (tx, rx) = sync_channel::<Record>(queue.max(1));
+        let lost = Arc::new(AtomicU32::new(0));
+        let counted = lost.clone();
         let thread = std::thread::Builder::new()
             .name("case record".into())
-            .spawn(move || writer(file, rx, gate))
+            .spawn(move || writer(file, rx, gate, &counted))
             .map_err(|e| CaseError::Io(format!("the record's writer can't start: {e}")))?;
-        Ok(CaseLog { tx: Some(tx), thread: Some(thread), dropped: 0 })
+        Ok(CaseLog { tx: Some(tx), thread: Some(thread), dropped: 0, lost })
     }
 
     /// Queue `record` for the writer. Never waits: a full queue counts it, and the count goes in
@@ -299,20 +306,24 @@ impl CaseLog {
 }
 
 impl Drop for CaseLog {
-    /// Dropped on the frame, so it doesn't wait: the writer finishes what is queued on its own.
+    /// Dropped on the frame, so it doesn't wait: the writer finishes what is queued on its own,
+    /// and a count the full queue can't take goes to it through `lost`.
     fn drop(&mut self) {
-        if let (Some(tx), true) = (&self.tx, self.dropped > 0) {
-            let _ = tx.try_send(Record::Dropped { n: self.dropped });
+        if let (Some(tx), true) = (&self.tx, self.dropped > 0)
+            && tx.try_send(Record::Dropped { n: self.dropped }).is_err()
+        {
+            self.lost.fetch_add(self.dropped, Ordering::Release);
         }
     }
 }
 
-/// The writer thread: one line a record, up to [`MAX_FILE_BYTES`]; what didn't fit is one
-/// `Dropped` line at the end.
-fn writer(mut file: fs::File, rx: std::sync::mpsc::Receiver<Record>, gate: Option<Gate>) {
+/// The writer thread: one line a record, each within [`MAX_LINE_BYTES`] so the reader takes it,
+/// up to [`MAX_FILE_BYTES`]; what didn't fit, and what `lost` counts, is one `Dropped` line at
+/// the end.
+fn writer(mut file: fs::File, rx: std::sync::mpsc::Receiver<Record>, gate: Option<Gate>, lost: &AtomicU32) {
     let mut written = 0u64;
     let mut over = 0u32;
-    for record in rx {
+    for mut record in rx {
         if let Some(gate) = &gate {
             let (open, wake) = &**gate;
             if let Ok(mut guard) = open.lock() {
@@ -324,7 +335,10 @@ fn writer(mut file: fs::File, rx: std::sync::mpsc::Receiver<Record>, gate: Optio
                 }
             }
         }
-        let Ok(mut line) = serde_json::to_vec(&record) else { continue };
+        let Some(mut line) = line_within_cap(&mut record) else {
+            over = over.saturating_add(1);
+            continue;
+        };
         line.push(b'\n');
         let len = u64::try_from(line.len()).unwrap_or(u64::MAX);
         if written.saturating_add(len) > MAX_FILE_BYTES {
@@ -336,11 +350,31 @@ fn writer(mut file: fs::File, rx: std::sync::mpsc::Receiver<Record>, gate: Optio
         }
         written = written.saturating_add(len);
     }
+    // The sender is gone, so `lost` has its final count.
+    let over = over.saturating_add(lost.load(Ordering::Acquire));
     if over > 0
         && let Ok(mut line) = serde_json::to_vec(&Record::Dropped { n: over })
     {
         line.push(b'\n');
         let _ = file.write_all(&line);
+    }
+}
+
+/// `record` as a line of at most [`MAX_LINE_BYTES`] (the end of line apart), or `None` when it
+/// can't be one. A `Redlines` snapshot is shrunk to fit, its last comments first and then its
+/// last changes going into `more`: every text is within its own cap, but 64 comments of 2 Ki
+/// four-byte characters each pass the line cap together.
+fn line_within_cap(record: &mut Record) -> Option<Vec<u8>> {
+    loop {
+        let line = serde_json::to_vec(record).ok()?;
+        if line.len() < MAX_LINE_BYTES {
+            return Some(line);
+        }
+        let Record::Redlines { changes, comments, more, .. } = record else { return None };
+        if comments.pop().is_none() && changes.pop().is_none() {
+            return None;
+        }
+        *more = more.saturating_add(1);
     }
 }
 

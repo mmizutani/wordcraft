@@ -771,25 +771,35 @@ pub fn redlines(s: &Session, except: &[&str], most: usize) -> (Vec<Redline>, usi
     let mut out: Vec<Redline> = Vec::new();
     let mut more = 0usize;
     for story in stories {
-        let mut last: Option<(u32, Pos)> = None;
-        let first = out.len();
+        // The run before: its revision and kind, where it ends, and whether it was kept. A run
+        // past the cap is remembered too, so the rest of its change is counted with it and not
+        // again, but nothing joins text onto an entry it isn't part of: that entry would lend
+        // another revision's words its author and date.
+        let mut last: Option<(u32, &'static str, Pos, bool)> = None;
         for c in changes_in(s, story) {
             let Some(rev) = c.rev else { continue };
             let Some(r) = s.doc.revisions.get(rev as usize).filter(|r| !except.contains(&r.author.as_str())) else { continue };
-            let joins = last.as_ref().is_some_and(|(l, end)| *l == rev && *end == c.a) && out.len() > first;
-            let joined = joins && out.last().is_some_and(|l| l.kind == c.kind);
-            if joined {
-                if let Some(l) = out.last_mut() {
-                    add_text(s, &c, &mut l.text);
+            let joins = last.as_ref().filter(|(l, kind, end, _)| *l == rev && *kind == c.kind && *end == c.a).map(|(_, _, _, kept)| *kept);
+            let kept = match joins {
+                Some(true) => {
+                    if let Some(l) = out.last_mut() {
+                        add_text(s, &c, &mut l.text);
+                    }
+                    true
                 }
-            } else if out.len() >= most {
-                more = more.saturating_add(1);
-            } else {
-                let mut text = String::new();
-                add_text(s, &c, &mut text);
-                out.push(Redline { kind: c.kind, author: r.author.clone(), date: r.date.clone(), text, at: c.a.clone() });
-            }
-            last = Some((rev, c.b));
+                Some(false) => false,
+                None if out.len() >= most => {
+                    more = more.saturating_add(1);
+                    false
+                }
+                None => {
+                    let mut text = String::new();
+                    add_text(s, &c, &mut text);
+                    out.push(Redline { kind: c.kind, author: r.author.clone(), date: r.date.clone(), text, at: c.a.clone() });
+                    true
+                }
+            };
+            last = Some((rev, c.kind, c.b, kept));
         }
     }
     (out, more)

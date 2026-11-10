@@ -1224,6 +1224,30 @@ fn changes_of_one_author_are_bounded() {
     assert_eq!(super::changes_of(&many_changes(super::MOST_AUTHORED_CHANGES + 1), "Bot"), None);
 }
 
+/// Past the cap, a run that isn't kept joins nothing: a later run of the same revision never
+/// lengthens an earlier author's entry, which would give its text that author and date.
+#[test]
+fn redlines_past_the_cap_never_extend_an_earlier_authors_entry() {
+    let mut s = Session::new(Document::from_text("abc"));
+    s.doc.revisions.push(wordcraft_doc::Revision::new(wordcraft_doc::RevisionKind::Insert, "Ana", "2026-11-09T00:00:00Z"));
+    s.doc.revisions.push(wordcraft_doc::Revision::new(wordcraft_doc::RevisionKind::Insert, "Bluefin Systems Ltd", "2026-11-10T00:00:00Z"));
+    let para = s.doc.para_mut(wordcraft_doc::StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap();
+    let props = para.runs[0].props.clone();
+    let by = |rev, bold| wordcraft_doc::CharProps { ins: Some(rev), bold, ..props.clone() };
+    // "a" is Ana's; "b" and "c" are one insertion of Bluefin's, split into two runs by bold.
+    para.runs = vec![
+        wordcraft_doc::Run { len: 1, props: by(0, None) },
+        wordcraft_doc::Run { len: 1, props: by(1, None) },
+        wordcraft_doc::Run { len: 1, props: by(1, Some(true)) },
+    ];
+    let (all, more) = super::redlines(&s, &[], 10);
+    assert_eq!(all.iter().map(|r| (r.author.as_str(), r.text.as_str())).collect::<Vec<_>>(), [("Ana", "a"), ("Bluefin Systems Ltd", "bc")]);
+    assert_eq!(more, 0);
+    let (capped, more) = super::redlines(&s, &[], 1);
+    assert_eq!(capped.iter().map(|r| (r.author.as_str(), r.text.as_str())).collect::<Vec<_>>(), [("Ana", "a")]);
+    assert_eq!(more, 1, "Bluefin's one insertion is counted once, and joined onto nothing of Ana's");
+}
+
 /// One paragraph holding `n` of Bot's insertions, one character each, with text of no one's between.
 fn many_changes(n: usize) -> Session {
     let mut s = Session::new(Document::from_text(&"ab".repeat(n)));

@@ -125,6 +125,74 @@ fn a_full_queue_never_blocks_and_becomes_a_dropped_record() {
     assert!(matches!(records.last(), Some(Record::Decided { text, .. }) if text.for_person() == "after"), "{records:?}");
 }
 
+/// The log dropped on the frame with the queue full (the record turned off, the window closing):
+/// the writer still ends the file with a `Dropped` counting every record that never fit.
+#[test]
+fn a_dropped_log_still_counts_what_the_queue_had_no_room_for() {
+    let (shelf, at) = shelf_with_case("dropped-log");
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let mut log = CaseLog::open_gated(&shelf, &at, "20261110T090000-1", 2, gate.clone()).unwrap();
+    for n in 0..8 {
+        log.write(decided(&format!("change {n}")));
+    }
+    assert!(log.dropped() >= 4, "{}", log.dropped());
+    drop(log);
+    {
+        let (open, wake) = &*gate;
+        *open.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let records = loop {
+        let records: Vec<Record> = lines(&shelf, &at).iter().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        if matches!(records.last(), Some(Record::Dropped { .. })) {
+            break records;
+        }
+        assert!(std::time::Instant::now() < deadline, "the writer never wrote the count: {records:?}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let dropped: u32 = records.iter().filter_map(|r| if let Record::Dropped { n } = r { Some(*n) } else { None }).sum();
+    let kept = records.iter().filter(|r| matches!(r, Record::Decided { .. })).count();
+    assert_eq!(dropped as usize + kept, 8, "every record is written or counted: {records:?}");
+}
+
+/// A `Redlines` snapshot whose texts are each within their cap can still pass the reader's line
+/// cap together: the writer drops its last comments and changes into `more` until the line
+/// fits, so the search reads it.
+#[test]
+fn a_snapshot_too_long_for_a_line_is_shrunk_into_more() {
+    let (shelf, at) = shelf_with_case("long-snapshot");
+    let wide = "𝒜".repeat(2048);
+    let comments: Vec<super::CommentLine> = (0..64)
+        .map(|_| super::CommentLine { author: Quoted::parse(&wide), date: TODAY.into(), text: Quoted::parse(&wide), at: None, resolved: false })
+        .collect();
+    let changes: Vec<super::RedlineLine> = (0..4)
+        .map(|n| super::RedlineLine {
+            kind: "insert".into(),
+            author: Quoted::parse("Bluefin Systems Ltd"),
+            date: TODAY.into(),
+            text: Quoted::parse(&format!("change {n}")),
+            at: None,
+        })
+        .collect();
+    let snapshot = Record::Redlines { at: TODAY.into(), draft: Quoted::parse("Kestrel MSA"), changes, comments, more: 3 };
+    assert!(serde_json::to_vec(&snapshot).unwrap().len() > super::MAX_LINE_BYTES, "the fixture is within every text cap yet over the line cap");
+    let mut log = CaseLog::open(&shelf, &at, "20261110T090000-1").unwrap();
+    log.write(snapshot);
+    log.write(decided("after"));
+    log.close();
+    let lines = lines(&shelf, &at);
+    assert_eq!(lines.len(), 2, "{}", lines.len());
+    assert!(lines[0].len() <= super::MAX_LINE_BYTES, "{}", lines[0].len());
+    let found = search(&shelf, &at, "");
+    assert_eq!(found.skipped, 0, "{found:?}");
+    assert_eq!(found.hits.len(), 2);
+    let Record::Redlines { changes, comments, more, .. } = &found.hits[0].record else { panic!("{:?}", found.hits[0]) };
+    assert_eq!(changes.len(), 4, "the changes stay while the comments make room");
+    assert!(comments.len() < 64 && !comments.is_empty(), "{}", comments.len());
+    assert_eq!(*more as usize, 3 + (64 - comments.len()), "what went is counted");
+}
+
 /// A file past its cap takes no more records and counts them; a case past its cap loses its
 /// oldest conversation's file when the next one opens.
 #[test]
@@ -191,7 +259,23 @@ fn hostile_lines_are_skipped_and_counted() {
     let file = std::fs::read_dir(shelf.log_dir(&at)).unwrap().next().unwrap().unwrap().path();
     let mut text = std::fs::read_to_string(&file).unwrap();
     text.push_str("not json\n");
-    text.push_str(&format!("{{\"t\":\"turn\",\"x\":\"{}\"}}\n", "y".repeat(super::MAX_LINE_BYTES)));
+    // A whole `Turn`, valid but for its length: only the line guard can refuse it.
+    let long = Record::Turn {
+        at: TODAY.into(),
+        n: 2,
+        asked: Quoted::parse(&"y".repeat(super::MAX_LINE_BYTES)),
+        answer: None,
+        tools: Vec::new(),
+        model: None,
+        stop: None,
+        recalled: Vec::new(),
+        used: Vec::new(),
+    };
+    let long = serde_json::to_string(&long).unwrap();
+    assert!(long.len() > super::MAX_LINE_BYTES);
+    assert!(serde_json::from_str::<Record>(&long).is_ok(), "the fixture parses");
+    text.push_str(&long);
+    text.push('\n');
     text.push_str("{\"t\":\"unknownKind\"}\n");
     text.push_str("[1,2,3]\n");
     std::fs::write(&file, text).unwrap();
