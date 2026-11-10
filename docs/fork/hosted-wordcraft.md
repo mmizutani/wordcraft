@@ -48,6 +48,10 @@ The same-source static package loaded under `/editor/` in headless Chrome. Openi
 
 The local gzip package passed Wrangler's dry run and initialized the editor in Chrome. Its 22,736,873-byte response decoded to the original 62,364,711-byte WASM, with a matching SHA-256 digest.
 
+Sites published the full editor from `cdb382ed0ebfe76f7cbcc753072d78feb2ceb1dc`. The hosted 22,736,872-byte gzip asset decoded to 62,364,711 bytes with the same SHA-256 as that release build (`589d760682d25a877b1e90b6ff3cb95d01a18d1f90d75078e7ba9e59c13cad6f`). The live Site denied signed-out traffic, and the full editor version returned 404 for the temporary probe route.
+
+In signed-in Chrome, the hosted editor loaded that asset, opened the same multilingual fixture as the static build, accepted an edit, and saved through the browser download fallback. The downloaded DOCX contained both original lines and the new edit. Both builds showed the same missing Japanese glyphs with the fixture's default font.
+
 ## Boundaries for later phases
 
 - **Document authority and collaboration.** The storage service owns stable document IDs, access, and committed revisions. An active room will persist accepted changes before acknowledgment, and explicit Save will publish a DOCX through that room. This separation follows the public [WOPI coauthoring precedent](https://learn.microsoft.com/en-us/microsoft-365/cloud-storage-partner-program/online/scenarios/coauth) and the repository's [network-room design](../collaboration.md). The browser-only rollout precedes desktop and offline participation. Their design will account for base revisions, pending edits, replay, and conflict handling. A separate HTTPS room service is an option if Sites cannot provide the necessary coordination.
