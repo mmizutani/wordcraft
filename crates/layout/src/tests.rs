@@ -55,7 +55,7 @@ pub(super) fn assert_pagination_fixture_font(layout: &DocLayout) {
                     assert_eq!(style.rc.font, WRAP_TEST_FONT, "the fixture requests its bundled face");
                     assert_eq!(style.face.family, WRAP_TEST_FONT, "the fixture must not silently substitute another family");
                     assert_eq!(style.face.style, "Regular", "the fixture must resolve the intended regular face");
-                    assert_eq!(style.size, 12.0, "the fixture keeps its explicit point size");
+                    assert_eq!(style.rc.size, 12.0, "the fixture keeps its explicit point size");
                     assert!(
                         style.face.data() == include_bytes!("../../../assets/fonts/SourceSans3-Regular.ttf").as_slice(),
                         "the selected face must be the exact already-bundled regular font bytes"
@@ -6203,13 +6203,19 @@ fn a_float_anchored_two_pages_into_its_paragraph_is_drawn_on_that_page() {
     assert_eq!(per_page.iter().sum::<usize>(), 1);
 }
 
+fn pagination_fixture_note(text: &str) -> Vec<Arc<Block>> {
+    let mut note = wordcraft_doc::Paragraph::with_text(text, Default::default());
+    note.props.line_spacing = Some(wordcraft_doc::props::LineSpacing::Exactly(14.0));
+    note.props.space_before = Some(0.0);
+    note.props.space_after = Some(0.0);
+    vec![wordcraft_doc::para_block(note)]
+}
+
 /// A long paragraph with a long footnote on page one, and a page-placed square float anchored at
 /// line `k` of page two as laid out without it.
 fn footnoted_float(k: usize) -> DocLayout {
-    let mut d = Document::from_text(&"The quick brown fox jumps over the lazy dog. ".repeat(400));
-    let mut note = wordcraft_doc::Paragraph::with_text(&"The note text runs on for a while. ".repeat(30), Default::default()).styled("FootnoteText");
-    note.props.space_after = Some(0.0);
-    let id = d.add_part(wordcraft_doc::PartKind::Footnote, vec![wordcraft_doc::para_block(note)]);
+    let mut d = pagination_fixture_document(&"The quick brown fox jumps over the lazy dog. ".repeat(400));
+    let id = d.add_part(wordcraft_doc::PartKind::Footnote, pagination_fixture_note(&"The note text runs on for a while. ".repeat(30)));
     d.insert_object(
         &Pos::body(0, 4),
         InlineObject::NoteRef { kind: wordcraft_doc::para::NoteKind::Footnote, id, custom: String::new() },
@@ -6219,7 +6225,9 @@ fn footnoted_float(k: usize) -> DocLayout {
     let anchor = lines_on(&lay(&d), 1)[k].2;
     let f = wordcraft_doc::para::Float { wrap: wordcraft_doc::para::Wrap::Square, ..page_float(72.0, 300.0) };
     d.insert_object(&Pos::body(0, anchor), rect_shape(100.0, 50.0, f), &Default::default()).unwrap();
-    lay(&d)
+    let l = lay(&d);
+    assert_pagination_fixture_font(&l);
+    l
 }
 
 /// #4250: a footnote on page one leaves less room there than its lines alone suggest; a float
@@ -6245,22 +6253,22 @@ fn a_float_whose_anchor_comes_back_to_page_one_stays_there_with_the_text_around_
 /// back to page two; the note goes with it, once, not left on page one as well.
 #[test]
 fn a_footnote_pushed_on_by_a_float_coming_back_is_on_its_reference_s_page_only() {
-    let mut d = Document::from_text(&"The quick brown fox jumps over the lazy dog. ".repeat(400));
-    let note = |text: &str| {
-        let mut p = wordcraft_doc::Paragraph::with_text(text, Default::default()).styled("FootnoteText");
-        p.props.space_after = Some(0.0);
-        vec![wordcraft_doc::para_block(p)]
-    };
+    let mut d = pagination_fixture_document(&"The quick brown fox jumps over the lazy dog. ".repeat(400));
     let noteref = |id| InlineObject::NoteRef { kind: wordcraft_doc::para::NoteKind::Footnote, id, custom: String::new() };
-    let long = d.add_part(wordcraft_doc::PartKind::Footnote, note(&"The note text runs on for a while. ".repeat(30)));
+    let long = d.add_part(wordcraft_doc::PartKind::Footnote, pagination_fixture_note(&"The note text runs on for a while. ".repeat(30)));
     d.insert_object(&Pos::body(0, 4), noteref(long), &Default::default()).unwrap();
-    let anchor = lines_on(&lay(&d), 1)[0].2;
-    let short = d.add_part(wordcraft_doc::PartKind::Footnote, note("A short note."));
+    // The last line that fits with only the long note is where the short reference can be
+    // pulled back during the retry, before restoring the float changes the wrap again.
+    let anchor = lines_on(&lay(&d), 0).last().unwrap().2;
+    let short = d.add_part(wordcraft_doc::PartKind::Footnote, pagination_fixture_note("A short note."));
     d.insert_object(&Pos::body(0, anchor), noteref(short), &Default::default()).unwrap();
     let f = wordcraft_doc::para::Float { wrap: wordcraft_doc::para::Wrap::Square, ..page_float(72.0, 300.0) };
     d.insert_object(&Pos::body(0, anchor), rect_shape(100.0, 50.0, f), &Default::default()).unwrap();
     let l = lay(&d);
-    assert_eq!(shapes(&l.pages[0].items).len(), 1, "the float stays on page one");
+    assert_pagination_fixture_font(&l);
+    let floats = l.pages.iter().map(|p| shapes(&p.items).len()).collect::<Vec<_>>();
+    assert_eq!(floats[0], 1, "the float stays on page one");
+    assert_eq!(floats.iter().sum::<usize>(), 1, "the float is drawn once");
     let at = anchor + wordcraft_doc::para::OBJ.len_utf8();
     let ref_page = (0..l.pages.len()).rfind(|&pi| lines_on(&l, pi).first().is_some_and(|f| f.2 <= at));
     assert_eq!(ref_page, Some(1), "the reference is pushed on to page two");
@@ -6269,7 +6277,8 @@ fn a_footnote_pushed_on_by_a_float_coming_back_is_on_its_reference_s_page_only()
         .iter()
         .map(|pg| pg.items.iter().filter(|i| matches!(i, Placed::Lines { story: StoryRef::Part(p), .. } if *p == short)).count())
         .collect();
-    assert_eq!(notes[..2], [0, 1], "the note is on its reference's page, once");
+    assert_eq!(notes[1], 1, "the note is on its reference's page");
+    assert_eq!(notes.iter().sum::<usize>(), 1, "the note is placed once");
 }
 
 /// #4250: of two floats held back for page two, the one whose anchor comes back to page one stays
@@ -6319,16 +6328,18 @@ fn a_float_anchored_on_a_line_a_footnote_pushes_on_is_drawn_on_the_next_page() {
 /// float anchored there is drawn on that page.
 #[test]
 fn a_float_anchored_on_a_line_widow_control_takes_on_is_drawn_on_the_next_page() {
-    // A paragraph of three pages whose last two lines are on the third only by widow control.
-    let (mut d, l) = (150..300)
-        .map(|k| Document::from_text(&"The quick brown fox jumps over the lazy dog. ".repeat(k)))
-        .map(|d| {
-            let l = lay(&d);
-            (d, l)
-        })
-        .find(|(_, l)| l.pages.len() == 3 && lines_on(l, 2).len() == 2 && lines_on(l, 1).len() < lines_on(l, 0).len())
-        .expect("a paragraph ending in a widow");
-    let anchor = lines_on(&l, 2)[0].2 + "The ".len();
+    // At 14 pt per line, the default text area holds 46 lines per page.
+    let text = std::iter::repeat_n("A line of text.", 93).collect::<Vec<_>>().join(&wordcraft_doc::para::LINE_BREAK.to_string());
+    let mut d = pagination_fixture_document("");
+    d.para_mut(StoryRef::Body, &Path::top(0)).unwrap().insert_text(0, &text, &Default::default()).unwrap();
+    let line_counts = |l: &DocLayout| (0..l.pages.len()).map(|pi| lines_on(l, pi).len()).collect::<Vec<_>>();
+    d.para_mut(StoryRef::Body, &Path::top(0)).unwrap().props.widow_control = Some(false);
+    assert_eq!(line_counts(&lay(&d)), [46, 46, 1], "the last line would be a widow");
+    d.para_mut(StoryRef::Body, &Path::top(0)).unwrap().props.widow_control = Some(true);
+    let l = lay(&d);
+    assert_pagination_fixture_font(&l);
+    assert_eq!(line_counts(&l), [46, 45, 2], "widow control carries the preceding line forward");
+    let anchor = lines_on(&l, 2)[0].2 + "A ".len();
     d.insert_object(&Pos::body(0, anchor), rect_shape(100.0, 50.0, page_float(72.0, 300.0)), &Default::default()).unwrap();
     let per_page: Vec<usize> = lay(&d).pages.iter().map(|p| shapes(&p.items).len()).collect();
     assert_eq!(per_page, [0, 0, 1]);
