@@ -28,7 +28,7 @@ mod store;
 pub use auth::{
     AuthError, CALLBACK_PATH, DEFAULT_PORT, PLAN_SCOPE, SCOPES, SIGN_IN_WAIT, SignIn, SignInOptions, SignOut, SignedOut, sign_out, sign_out_with,
 };
-pub use backend::{ChatGpt, MAX_ROUNDS};
+pub use backend::{ChatGpt, MAX_ROUNDS, request_for_eval};
 pub use models::{Resolved, models, models_with, resolve};
 pub use store::{Account, CLIENT_FILE, CREDENTIALS_FILE, account};
 

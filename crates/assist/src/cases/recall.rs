@@ -515,6 +515,17 @@ impl Recalled {
     }
 }
 
+/// For the evaluation harness (`examples/case_eval.rs`): what a turn bound to `at` would carry
+/// of `shelf`, by the same composer a turn uses. The harness has no room, so the [`Alone`] proof
+/// can't be made there and isn't checked; nothing in the app calls this.
+#[doc(hidden)]
+pub fn compose_for_eval(shelf: &Shelf, at: &CaseRef, about: &str, today: Day) -> Result<(RecallSent, Vec<TurnSource>), CaseError> {
+    let pool = Pool::load(shelf, at)?;
+    let query = Query::new(about, pool.here.applies(today), today);
+    let recalled = compose(&pool, &query);
+    Ok((recalled.sent(), recalled.into_sources()))
+}
+
 /// What a backend's session has been sent of the person's cases, by item id, while the session
 /// stays the same ([`crate::Backend::retains`]). An ACP agent keeps what it read, so re-sending
 /// 6 KiB a turn would spend the person's plan for nothing.

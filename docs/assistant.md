@@ -248,6 +248,15 @@ where it came from (this case or which of the client's cases), whether it is unc
 balance then against now, how many more scored but didn't fit, and why nothing was recalled when
 nothing was.
 
+**Measuring it against a real model.** `WORDCRAFT_OPENAI_API_KEY=… cargo run -p wordcraft-assist
+--example case_eval -- --runs 3` builds four turns the way the app does (a synthetic contract, a
+synthetic client's cases, a saved preference) and sends them to the OpenAI Responses API with the
+ChatGPT backend's own request builder, then prints how often the model drew on a recalled note,
+followed an instruction hidden in one, quoted notes into a comment a poisoned document asked for,
+and hedged on a concession won under a different power balance. It spends credits on the key you
+give it (one request per run per scenario), runs only when you run it, and `--show` prints the
+requests without sending them.
+
 **When recall is off.** Nothing is recalled with no case bound, on the web (no settings folder),
 or while anyone besides you and this conversation's assistant can read the document: another
 participant, or an invite not yet used. Details › Recalled says which. Once a conversation has

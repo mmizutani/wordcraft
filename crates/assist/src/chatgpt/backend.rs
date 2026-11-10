@@ -394,6 +394,23 @@ impl Backend for ChatGpt {
     }
 }
 
+/// For the evaluation harness (`examples/case_eval.rs`): the request a conversation's first turn
+/// makes, built by the same functions as [`Backend::turn`], so the wording can't drift from what
+/// the app sends. Not streamed, with no tools and no encrypted reasoning, so a plain `POST` reads
+/// it back whole. Nothing in the app calls this.
+#[doc(hidden)]
+pub fn request_for_eval(turn: &Turn, model: &str, effort: Option<&str>) -> Value {
+    let mut backend = ChatGpt::new(Path::new(""));
+    if let Some(note) = turn.note.as_deref().filter(|n| !n.trim().is_empty()) {
+        backend.instructions = instructions(note);
+    }
+    backend.memory.clone_from(&turn.memory);
+    let mut body = backend.body(model, effort, &[], &[user_message(turn)]);
+    body["stream"] = json!(false);
+    leave_out(&mut body, "include");
+    body
+}
+
 /// The instructions every request carries.
 fn instructions(note: &str) -> String {
     format!(
