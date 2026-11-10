@@ -41,8 +41,9 @@ pub const CLIENT_FILE: &str = "chatgpt-client.json";
 /// new one.
 pub(crate) const LOCK_FILE: &str = "chatgpt-credentials.lock";
 
-/// Most bytes either file may have; a bigger one reads as damaged.
-const MAX_FILE: u64 = 256 << 10;
+/// Most bytes either JSON file may have; a bigger one reads as damaged. The sealed file's limit
+/// adds what sealing adds (`vault::MAX_SEALED`).
+pub(super) const MAX_FILE: u64 = 256 << 10;
 
 /// The credentials' format.
 pub(super) const VERSION: u32 = 1;
@@ -193,12 +194,12 @@ fn valid_host_id(id: &str) -> bool {
     id.strip_prefix("urn:uuid:").is_some_and(|u| u.len() == 36 && u.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
 }
 
-/// A file of at most [`MAX_FILE`] bytes, or None when it's missing or too big.
-pub(super) fn read_capped(path: &Path) -> Option<Vec<u8>> {
+/// A file of at most `limit` bytes, or None when it's missing or too big.
+pub(super) fn read_capped(path: &Path, limit: u64) -> Option<Vec<u8>> {
     let file = fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
-    file.take(MAX_FILE.saturating_add(1)).read_to_end(&mut bytes).ok()?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_FILE {
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes).ok()?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
         log::warn!("{} is too big: ignored", path.display());
         return None;
     }
@@ -207,7 +208,7 @@ pub(super) fn read_capped(path: &Path) -> Option<Vec<u8>> {
 
 /// A JSON file of at most [`MAX_FILE`] bytes, or None when it's missing, too big or damaged.
 pub(super) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
-    let bytes = read_capped(path)?;
+    let bytes = read_capped(path, MAX_FILE)?;
     match serde_json::from_slice(&bytes) {
         Ok(v) => Some(v),
         Err(_) => {

@@ -75,7 +75,7 @@ const REFRESH_MARGIN: u64 = 5 * 60;
 const SKEW: u64 = 60;
 
 /// Most bytes of a token taken from the token endpoint.
-const MAX_TOKEN: usize = 64 << 10;
+pub(super) const MAX_TOKEN: usize = 64 << 10;
 
 /// The refresh errors that mean the person signs in again.
 const SIGN_IN_AGAIN: [&str; 6] =

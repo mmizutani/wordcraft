@@ -1046,7 +1046,7 @@ fn a_sealed_file_cut_short_garbled_of_another_version_or_key_reads_as_signed_out
         ("a field it doesn't know", with("extra", json!(1))),
         ("bound to another version", reseal(b"wordcraft.chatgpt-credentials/2/AES-256-GCM")),
         ("bound to another purpose", reseal(b"wordcraft.something-else/1/AES-256-GCM")),
-        ("too big", vec![b' '; (256 << 10) + 1]),
+        ("too big", vec![b' '; usize::try_from(vault::MAX_SEALED).unwrap() + 1]),
     ];
     for (what, bytes) in damaged {
         std::fs::write(&path, &bytes).unwrap();
@@ -1083,6 +1083,25 @@ fn a_sign_in_another_wordcraft_sealed_with_a_new_key_is_read() {
     // This one still has the old key: it asks the keychain again, and reads the new sign-in.
     eventually("the new sign-in shows", || super::account(folder.path()).is_some());
     assert_eq!(store::read_credentials(folder.path()).unwrap().access_token, "access-1");
+}
+
+/// The biggest sign-in the token endpoint is accepted with (each token at `auth::MAX_TOKEN`) seals
+/// into a file the next read takes; one too big for the reader is kept in memory rather than
+/// written where no read would take it.
+#[test]
+fn the_biggest_sign_in_accepted_seals_into_a_file_that_reads_back() {
+    let (folder, _script, _server, _endpoints) = signed_in_with(Some(Arc::new(vault::Fake::default())));
+    let mut c = store::read_credentials(folder.path()).unwrap();
+    let token = |n: &str| n.repeat(super::auth::MAX_TOKEN);
+    (c.access_token, c.refresh_token, c.id_token) = (token("a"), token("r"), token("i"));
+    assert_eq!(store::write_credentials(folder.path(), &c), Ok(Kept::Keychain));
+    let back = store::read_credentials(folder.path()).expect("the sealed file reads back");
+    assert_eq!((back.access_token, back.refresh_token, back.id_token), (c.access_token.clone(), c.refresh_token.clone(), c.id_token.clone()));
+
+    c.name = Some("n".repeat(1 << 20));
+    assert_eq!(store::write_credentials(folder.path(), &c), Ok(Kept::Session));
+    assert!(!folder.path().join(CREDENTIALS_FILE).exists());
+    assert_eq!(store::read_credentials(folder.path()).and_then(|c| c.name).map(|n| n.len()), Some(1 << 20));
 }
 
 #[test]

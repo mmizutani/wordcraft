@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::http::{b64url, from_b64url, now};
-use super::store::{CREDENTIALS_FILE, Credentials, Kept, Lock, PLAINTEXT_FILE, VERSION, read_capped, read_json, write_private};
+use super::store::{CREDENTIALS_FILE, Credentials, Kept, Lock, MAX_FILE, PLAINTEXT_FILE, VERSION, read_capped, read_json, write_private};
 
 /// The keychain service the keys are kept under; the account names the settings folder.
 const SERVICE: &str = "WordCraft";
@@ -51,6 +51,12 @@ const ALGORITHM: &str = "AES-256-GCM";
 /// The data the ciphertext is bound to: it opens only as ChatGPT credentials in this format's
 /// first version, so nothing else sealed with the key, now or in a later format, passes for them.
 const AAD: &[u8] = b"wordcraft.chatgpt-credentials/1/AES-256-GCM";
+
+/// Most bytes the sealed file may have: credentials as big as the JSON files may be
+/// ([`MAX_FILE`]), with the tag, in base64url, and the envelope around them. Sealing makes the
+/// credentials a third bigger, so a sign-in whose tokens are each as long as the token endpoint
+/// may send (`auth::MAX_TOKEN`) seals past `MAX_FILE`.
+pub(super) const MAX_SEALED: u64 = (MAX_FILE + 16).div_ceil(3) * 4 + 1024;
 
 /// An AES-256 key.
 type Key = [u8; 32];
@@ -232,7 +238,7 @@ pub(crate) fn peek(settings: &Path) -> Option<(Credentials, Kept)> {
         }
     };
     let older = settings.join(PLAINTEXT_FILE).exists();
-    let sealed = read_capped(&settings.join(CREDENTIALS_FILE));
+    let sealed = read_capped(&settings.join(CREDENTIALS_FILE), MAX_SEALED);
     // Nothing to read and nothing to seal: no reason to ask the keychain.
     if !older && sealed.is_none() {
         return None;
@@ -399,7 +405,7 @@ fn read(settings: &Path, vault: &Vault) -> Option<Credentials> {
         Mode::Unknown => return None,
     };
     let path = settings.join(CREDENTIALS_FILE);
-    let bytes = read_capped(&path)?;
+    let bytes = read_capped(&path, MAX_SEALED)?;
     if let Some(c) = key.and_then(|k| unseal(&k, &bytes)) {
         return Some(c);
     }
@@ -432,14 +438,20 @@ fn read(settings: &Path, vault: &Vault) -> Option<Credentials> {
 }
 
 /// Keep `c`: sealed in the settings folder with the keychain's key (made the first time), or in
-/// memory when there is no keychain or it fails. In memory, a sealed file from before is
-/// deleted: `c` replaces it, and left on disk it would come back the next time the keychain
-/// answers, with a refresh token ChatGPT may have rotated since.
+/// memory when there is no keychain, it fails, or the sealed file would be past [`MAX_SEALED`].
+/// In memory, a sealed file from before is deleted: `c` replaces it, and left on disk it would
+/// come back the next time the keychain answers, with a refresh token ChatGPT may have rotated
+/// since.
 fn keep(settings: &Path, vault: &Vault, c: Credentials) -> Result<Kept, String> {
     let path = settings.join(CREDENTIALS_FILE);
     if let Some(key) = sealing_key(settings, vault) {
-        write_private(&path, &seal(&key, &c)?)?;
-        return Ok(Kept::Keychain);
+        let sealed = seal(&key, &c)?;
+        // A file the next read refuses would lose the sign-in as soon as it is written.
+        if u64::try_from(sealed.len()).unwrap_or(u64::MAX) <= MAX_SEALED {
+            write_private(&path, &sealed)?;
+            return Ok(Kept::Keychain);
+        }
+        log::warn!("ChatGPT sign-in: too big to seal in a file WordCraft reads back; it is kept for this session only");
     }
     guard(&vault.state).mode = Mode::Memory(Some(Box::new(c)));
     match fs::remove_file(&path) {
