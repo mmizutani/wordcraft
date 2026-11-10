@@ -728,7 +728,7 @@ impl Recalled {
     pub(crate) fn sent(&self) -> RecallSent {
         let mut sent_text = Vec::new();
         for json in self.fresh() {
-            strings(json, 0, &mut sent_text);
+            strings(json, &mut sent_text);
         }
         RecallSent { sent_text, ..self.sent.clone() }
     }
@@ -806,16 +806,19 @@ pub fn compose_for_eval_without_room_check(shelf: &Shelf, at: &CaseRef, about: &
     Ok((recalled.sent(), recalled.into_sources()))
 }
 
-/// Every string in `json`, however deep: a review item carries record lines whose tool details
-/// sit four levels down, and a text the index misses is a quote the window can't flag. The depth
-/// guard only bounds the recursion; `serde_json` parses nothing deeper than 128 levels, so no
-/// string of a record line is beyond it.
-fn strings(json: &Value, depth: u8, out: &mut Vec<String>) {
-    match json {
-        Value::String(s) => out.push(s.clone()),
-        Value::Array(items) if depth < 128 => items.iter().for_each(|v| strings(v, depth.saturating_add(1), out)),
-        Value::Object(fields) if depth < 128 => fields.values().for_each(|v| strings(v, depth.saturating_add(1), out)),
-        _ => {}
+/// Every string in `json`, however deep, in order: a text the index misses is a quote the window
+/// can't flag. A stack and no depth limit, since a review item wraps a record line, which may nest
+/// as deep as `serde_json` reads, in more levels of its own; the work is bounded by the item's
+/// size, which is capped.
+fn strings(json: &Value, out: &mut Vec<String>) {
+    let mut stack = vec![json];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => stack.extend(items.iter().rev()),
+            Value::Object(fields) => stack.extend(fields.values().rev()),
+            _ => {}
+        }
     }
 }
 
@@ -1247,6 +1250,48 @@ mod tests {
         let (newest, skipped, cut) = crate::cases::log::recent_records(&shelf, &at, 400).unwrap();
         assert_eq!((newest.len(), skipped, cut), (1, 0, true));
         assert!(matches!(&newest[0], Record::Turn { n: 3, .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A redline's position is a JSON value a file can nest as deep as the parser reads a line,
+    /// and the review item wraps the line in more levels: its strings are in the quote index
+    /// however deep they land.
+    #[test]
+    fn a_string_nested_as_deep_as_a_record_line_parses_is_in_the_quote_index() {
+        use crate::cases::log::{CaseLog, Record, RedlineLine};
+        use crate::cases::record::Click;
+        let dir = std::env::temp_dir().join(format!("wordcraft-review-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Kestrel Freight KK", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Kestrel supply agreement", "2026-11-10", 2).unwrap();
+        // The line nests the record, its changes and a change, so 124 arrays more is the 127
+        // levels `serde_json` reads.
+        let mut position = json!(["Kestrel deep canary"]);
+        for _ in 1..124 {
+            position = json!([position]);
+        }
+        let mut log = CaseLog::open(&shelf, &at, "2026-11-10T10-00-00").unwrap();
+        log.write(Record::Redlines {
+            at: "2026-11-10T10:00:00".into(),
+            draft: Quoted::parse("Kestrel supply agreement"),
+            changes: vec![RedlineLine {
+                kind: "insert".into(),
+                author: Quoted::parse("Bluefin Systems Ltd"),
+                date: "2026-11-10".into(),
+                text: Quoted::parse("audit on ten days' notice"),
+                at: Some(position),
+            }],
+            comments: Vec::new(),
+            more: 0,
+        });
+        log.close();
+        let recalled = compose_review(&shelf, &at).unwrap();
+        assert!(recalled.json[0].to_string().contains("Kestrel deep canary"), "the line didn't parse, so the fixture proves nothing");
+        let sent = recalled.sent();
+        assert!(sent.sent_text.iter().any(|s| s == "Kestrel deep canary"), "sent to the model but not in the quote index: {:?}", sent.sent_text);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -12,7 +12,8 @@
 //! markers and is rewritten in place, and a record must read back the same in a later build.
 
 use std::fs;
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
@@ -41,6 +42,12 @@ pub const MAX_CASE_BYTES: u64 = 64 << 20;
 /// Most bytes of one line: the writer never writes a longer one, and the reader skips and counts
 /// one it finds.
 pub const MAX_LINE_BYTES: usize = 1 << 20;
+
+/// Most bytes of one file a read goes through: what the writer can write, [`MAX_FILE_BYTES`] of
+/// records and then one `Dropped` line. A longer file wasn't written by WordCraft, and reading on
+/// would cost time in proportion to whatever was put there: it is read that far, as if a crash had
+/// cut it there, and the rest is one more skipped line.
+const MAX_READ_BYTES: u64 = MAX_FILE_BYTES + 1024;
 
 /// Most records waiting for the writer. A frame writes at most a handful; a writer stuck this far
 /// behind is stuck on the disk.
@@ -458,20 +465,20 @@ pub struct LogSearch {
 
 /// The records of `at` whose texts hold `query`, folded, at most `limit` of them, newest file
 /// first. A line that can't be read, is longer than [`MAX_LINE_BYTES`], or was cut by a crash is
-/// skipped and counted. Reads every file: off the frame.
+/// skipped and counted, and so is the rest of a file past [`MAX_READ_BYTES`]. Reads every file and
+/// holds only the hits: off the frame.
 pub fn search_log(shelf: &Shelf, at: &CaseRef, query: &str, limit: usize) -> Result<LogSearch, CaseError> {
     let dir = shelf.real_case_dir(at)?.join(FOLDER);
     let query = query.trim().to_lowercase();
     let mut out = LogSearch::default();
     for (path, _) in files_in(&dir).into_iter().rev() {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let (lines, skipped) = records_in(&path);
-        out.skipped = out.skipped.saturating_add(skipped);
-        for (line, record, _) in lines {
-            if record.matches(&query) && out.hits.len() < limit {
+        let skipped = each_record(&path, |line, record| {
+            if out.hits.len() < limit && record.matches(&query) {
                 out.hits.push(LogHit { file: name.clone(), line, record });
             }
-        }
+        });
+        out.skipped = out.skipped.saturating_add(skipped);
     }
     Ok(out)
 }
@@ -480,46 +487,115 @@ pub fn search_log(shelf: &Shelf, at: &CaseRef, query: &str, limit: usize) -> Res
 pub const REVIEW_RECORD_BYTES: usize = 96 << 10;
 
 /// The most recent records of `at`, oldest first, as many of the newest as fit `max_bytes` of
-/// their lines; how many lines couldn't be read; and whether older records were left out. A case
-/// with no record gives none, which is not an error: a review works without one. Reads whole
-/// files from the newest back until the budget is spent: off the frame.
+/// their lines; how many of the lines it went through couldn't be read; and whether older records
+/// were left out. A case with no record gives none, which is not an error: a review works without
+/// one. Reads each file back from its newest line, the newest file first, and stops once the
+/// budget is spent, so what it reads and holds is about the budget whatever the files hold: off
+/// the frame.
 pub fn recent_records(shelf: &Shelf, at: &CaseRef, max_bytes: usize) -> Result<(Vec<Record>, u32, bool), CaseError> {
     let dir = shelf.real_case_dir(at)?.join(FOLDER);
     let mut newest_first: Vec<Record> = Vec::new();
     let mut skipped = 0u32;
     let mut left = max_bytes;
     let mut more = false;
-    'files: for (path, _) in files_in(&dir).into_iter().rev() {
-        let (lines, bad) = records_in(&path);
-        skipped = skipped.saturating_add(bad);
-        for (_, record, bytes) in lines.into_iter().rev() {
-            if bytes > left {
-                more = true;
-                break 'files;
+    for (path, _) in files_in(&dir).into_iter().rev() {
+        // Listed as a plain file a moment ago; a link put there since is refused here too.
+        let Ok((mut file, len)) = open_plain(&path) else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        skipped = skipped.saturating_add(u32::from(len > MAX_READ_BYTES));
+        lines_back(&mut file, len.min(MAX_READ_BYTES), |line| {
+            match line.and_then(|l| Some((serde_json::from_slice::<Record>(l).ok()?, l.len()))) {
+                None => skipped = skipped.saturating_add(1),
+                Some((_, bytes)) if bytes > left => {
+                    more = true;
+                    return ControlFlow::Break(());
+                }
+                Some((record, bytes)) => {
+                    left = left.saturating_sub(bytes);
+                    newest_first.push(record);
+                }
             }
-            left = left.saturating_sub(bytes);
-            newest_first.push(record);
+            ControlFlow::Continue(())
+        });
+        if more {
+            break;
         }
     }
     newest_first.reverse();
     Ok((newest_first, skipped, more))
 }
 
-/// Every record in the file at `path`, with its line number and the line's bytes, and how many
-/// lines were skipped: one that can't be read, is longer than [`MAX_LINE_BYTES`], or was cut by a
-/// crash. A file that can't be opened as a plain file is one skipped line.
-fn records_in(path: &std::path::Path) -> (Vec<(u32, Record, usize)>, u32) {
-    let mut out = Vec::new();
-    let mut skipped = 0u32;
+/// Each line of `file`'s first `len` bytes, the last first, to `f` until it breaks: `Some` with the
+/// line and its end of line, or `None` for one longer than [`MAX_LINE_BYTES`] or cut by a crash
+/// (what follows the last end of line). Holds one block and one line, so a review costs what it
+/// reads and not what the file holds. A read that fails, or a file shorter than `len`, ends it.
+fn lines_back(file: &mut fs::File, len: u64, mut f: impl FnMut(Option<&[u8]>) -> ControlFlow<()>) {
+    const BLOCK: u64 = 64 << 10;
+    let mut block = Vec::new();
+    // The line being read, from its last byte back; whether it has an end of line (all but what
+    // follows the last one do); and whether it passed the cap, its bytes then let go.
+    let mut line = Vec::new();
+    let mut ended = false;
+    let mut long = false;
+    let mut end = len;
+    while end > 0 {
+        let start = end.saturating_sub(BLOCK);
+        let want = end.saturating_sub(start);
+        block.clear();
+        let read = file.seek(SeekFrom::Start(start)).and_then(|_| (&mut *file).take(want).read_to_end(&mut block));
+        if read.ok().and_then(|n| u64::try_from(n).ok()) != Some(want) {
+            return;
+        }
+        for &byte in block.iter().rev() {
+            if byte == b'\n' {
+                if give_line(&mut f, &mut line, ended, long).is_break() {
+                    return;
+                }
+                line.clear();
+                line.push(b'\n');
+                (ended, long) = (true, false);
+            } else if !long {
+                line.push(byte);
+                if line.len() > MAX_LINE_BYTES.saturating_add(1) {
+                    (line, long) = (Vec::new(), true);
+                }
+            }
+        }
+        end = start;
+    }
+    let _ = give_line(&mut f, &mut line, ended, long);
+}
+
+/// [`lines_back`]'s line, read from its last byte back, to `f`; nothing when there is none.
+fn give_line(f: &mut impl FnMut(Option<&[u8]>) -> ControlFlow<()>, line: &mut [u8], ended: bool, long: bool) -> ControlFlow<()> {
+    if !ended && !long && line.is_empty() {
+        return ControlFlow::Continue(());
+    }
+    if !ended || long {
+        return f(None);
+    }
+    line.reverse();
+    f(Some(line))
+}
+
+/// Each record in the file at `path`, in order, to `f` with its line number; and how many lines
+/// were skipped: one that can't be read, is longer than [`MAX_LINE_BYTES`], or was cut by a crash,
+/// and the rest of a file past [`MAX_READ_BYTES`]. A file that can't be opened as a plain file is
+/// one skipped line. Holds one line at a time.
+fn each_record(path: &std::path::Path, mut f: impl FnMut(u32, Record)) -> u32 {
     // Listed as a plain file a moment ago; a link put there since is refused here too.
-    let Ok(file) = open_plain(path) else {
-        return (out, 1);
+    let Ok((file, len)) = open_plain(path) else {
+        return 1;
     };
-    let mut reader = std::io::BufReader::new(file);
+    let mut skipped = u32::from(len > MAX_READ_BYTES);
+    let mut reader = std::io::BufReader::new(file.take(MAX_READ_BYTES));
     let mut line_no = 0u32;
+    let mut buf = Vec::new();
     loop {
         line_no = line_no.saturating_add(1);
-        let mut buf = Vec::new();
+        buf.clear();
         let n = match (&mut reader).take(MAX_LINE_BYTES as u64 + 1).read_until(b'\n', &mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
@@ -537,16 +613,17 @@ fn records_in(path: &std::path::Path) -> (Vec<(u32, Record, usize)>, u32) {
             continue;
         }
         match serde_json::from_slice::<Record>(&buf) {
-            Ok(record) => out.push((line_no, record, n)),
+            Ok(record) => f(line_no, record),
             Err(_) => skipped = skipped.saturating_add(1),
         }
     }
-    (out, skipped)
+    skipped
 }
 
-/// `path` open for reading, if it is a plain file and not a link: checked first, and on Unix the
-/// open itself refuses a link too (`O_NOFOLLOW`), so nothing swapped in between is followed.
-fn open_plain(path: &std::path::Path) -> std::io::Result<fs::File> {
+/// `path` open for reading, and its length, if it is a plain file and not a link: checked first,
+/// and on Unix the open itself refuses a link too (`O_NOFOLLOW`), so nothing swapped in between
+/// is followed. The length is the open file's.
+fn open_plain(path: &std::path::Path) -> std::io::Result<(fs::File, u64)> {
     if !fs::symlink_metadata(path)?.is_file() {
         return Err(std::io::Error::other("not a plain file"));
     }
@@ -554,7 +631,9 @@ fn open_plain(path: &std::path::Path) -> std::io::Result<fs::File> {
     open.read(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, rustix::fs::OFlags::NOFOLLOW.bits() as i32);
-    open.open(path)
+    let file = open.open(path)?;
+    let len = file.metadata()?.len();
+    Ok((file, len))
 }
 
 /// Read past the rest of an over-long line; whether a line end was found.

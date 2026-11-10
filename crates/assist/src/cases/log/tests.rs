@@ -4,7 +4,10 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 
-use super::{CaseLog, Decision, LogSearch, MAX_CASE_BYTES, MAX_FILE_BYTES, Record, delete_log, log_size, search_log};
+use super::{
+    CaseLog, Decision, LogSearch, MAX_CASE_BYTES, MAX_FILE_BYTES, MAX_READ_BYTES, REVIEW_RECORD_BYTES, Record, delete_log, log_size, recent_records,
+    search_log,
+};
 use crate::cases::record::{Click, Quoted};
 use crate::cases::store::{CaseRef, Shelf};
 
@@ -81,6 +84,8 @@ fn a_truncated_last_line_is_skipped_and_counted() {
     let found = search(&shelf, &at, "second");
     assert!(found.hits.is_empty());
     assert_eq!(found.skipped, 1, "a line that can't be read is counted on every search");
+    let (records, skipped, more) = recent_records(&shelf, &at, REVIEW_RECORD_BYTES).unwrap();
+    assert_eq!((records, skipped, more), (vec![decided("first")], 1, false), "a review reading back counts it too");
 }
 
 /// The writer stuck on the disk, the queue fills: every write still returns at once, and what
@@ -351,6 +356,66 @@ fn hostile_lines_are_skipped_and_counted() {
     assert_eq!(found.hits.len(), 1);
     assert_eq!(found.skipped, 4);
     assert_eq!(search_log(&shelf, &at, "kept", 0).unwrap().hits.len(), 0, "a limit of none");
+    let (records, skipped, _) = recent_records(&shelf, &at, REVIEW_RECORD_BYTES).unwrap();
+    assert_eq!((records, skipped), (vec![decided("kept")], 4), "a review reading back skips and counts the same lines");
+}
+
+fn line_of(record: &Record) -> Vec<u8> {
+    let mut line = serde_json::to_vec(record).unwrap();
+    line.push(b'\n');
+    line
+}
+
+/// A review reads a file back from its newest line and stops once its budget is spent, so a file
+/// of short records far past the budget is never read whole: a junk first line, which would be
+/// counted if it were reached, isn't, and what comes back is the newest records within the budget.
+#[test]
+fn a_review_reads_the_newest_lines_and_stops_at_its_budget() {
+    let (shelf, at) = shelf_with_case("review-budget");
+    let dir = shelf.log_dir(&at);
+    std::fs::create_dir_all(&dir).unwrap();
+    let short = line_of(&Record::Dropped { n: 1 });
+    let mut bytes = b"not json\n".to_vec();
+    bytes.extend(short.repeat(8 * REVIEW_RECORD_BYTES / short.len()));
+    bytes.extend(line_of(&decided("newest")));
+    std::fs::write(dir.join("c-0001.jsonl"), &bytes).unwrap();
+    let (records, skipped, more) = recent_records(&shelf, &at, REVIEW_RECORD_BYTES).unwrap();
+    assert_eq!(skipped, 0, "the read went past the budget to the file's first line");
+    assert!(more, "older records were left out");
+    assert_eq!(records.last(), Some(&decided("newest")), "the newest record comes last");
+    let carried: usize = records.iter().map(|r| line_of(r).len()).sum();
+    assert!(carried <= REVIEW_RECORD_BYTES, "{carried}");
+    assert!(carried + short.len() > REVIEW_RECORD_BYTES, "the budget wasn't filled: {carried}");
+}
+
+/// A file longer than the writer can make wasn't written by WordCraft: a read goes only as far as
+/// the writer could have written, and the rest is one skipped line. A search keeps at most its
+/// limit of hits.
+#[test]
+fn a_file_past_what_the_writer_makes_is_read_only_that_far() {
+    let (shelf, at) = shelf_with_case("past-the-read-cap");
+    let dir = shelf.log_dir(&at);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cap = MAX_READ_BYTES as usize;
+    let filler = line_of(&decided(&"f".repeat(1000)));
+    let mut bytes = filler.repeat((cap - 4096) / filler.len());
+    // A line ends exactly where a read stops, and one more starts past it.
+    let pad = cap - bytes.len() - line_of(&decided("")).len();
+    bytes.extend(line_of(&decided(&"x".repeat(pad))));
+    assert_eq!(bytes.len(), cap, "the fixture's last line before the cap ends on it");
+    bytes.extend(line_of(&decided("beyond the cap")));
+    std::fs::write(dir.join("c-0001.jsonl"), &bytes).unwrap();
+
+    let found = search_log(&shelf, &at, "beyond", 10).unwrap();
+    assert!(found.hits.is_empty(), "the search read past the cap: {:?}", found.hits.len());
+    assert_eq!(found.skipped, 1, "the rest is one skipped line");
+    let found = search_log(&shelf, &at, "", 5).unwrap();
+    assert_eq!((found.hits.len(), found.skipped), (5, 1));
+
+    let (records, skipped, more) = recent_records(&shelf, &at, REVIEW_RECORD_BYTES).unwrap();
+    assert_eq!(skipped, 1, "the rest is one skipped line");
+    assert!(more);
+    assert_eq!(records.last(), Some(&decided(&"x".repeat(pad))), "the newest record a review reads is the last one before the cap");
 }
 
 /// A link where `log/` should be, or a `.jsonl` link inside it, points at another client's files:
