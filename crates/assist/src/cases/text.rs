@@ -32,10 +32,24 @@ fn fold(c: char) -> char {
     }
 }
 
-/// `text` as the tokenizer folds it ([`fold`]), with `\r` left out so a line break is `\n` whichever
-/// way it was written.
+/// `text` with each character folded as the tokenizer folds it ([`fold`]) and each run of
+/// whitespace (spaces, tabs, line breaks, U+00A0, U+3000) one space, so a quote reads the same
+/// however it was broken across lines or paragraphs.
 pub fn folded(text: &str) -> String {
-    text.chars().filter(|c| *c != '\r').map(fold).collect()
+    let mut out = String::with_capacity(text.len());
+    let mut space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            space = !out.is_empty();
+        } else {
+            if space {
+                out.push(' ');
+                space = false;
+            }
+            out.push(fold(c));
+        }
+    }
+    out
 }
 
 /// The windows of `folded`: from each character boundary to the first boundary at or past `min`

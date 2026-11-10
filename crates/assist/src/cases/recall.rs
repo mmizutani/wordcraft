@@ -294,6 +294,9 @@ pub struct RecallAsk {
     alone: Alone,
     /// Run once the files are read, before the proof is checked again ([`RecallAsk::after_reading`]).
     after_reading: Option<Box<dyn FnOnce() + Send>>,
+    /// Windows of recalled text the conversation's transcript can still take
+    /// ([`crate::Transcript::recall_room`]): a recall with more is withheld.
+    room: usize,
 }
 
 impl std::fmt::Debug for RecallAsk {
@@ -304,7 +307,21 @@ impl std::fmt::Debug for RecallAsk {
 
 impl RecallAsk {
     pub fn new(shelf: Shelf, at: CaseRef, about: &str, today: Day, alone: Alone) -> RecallAsk {
-        RecallAsk { shelf, at, about: cut(shown(about.to_string()), MAX_ABOUT), today, alone, after_reading: None }
+        RecallAsk {
+            shelf,
+            at,
+            about: cut(shown(about.to_string()), MAX_ABOUT),
+            today,
+            alone,
+            after_reading: None,
+            room: crate::transcript::MAX_WINDOWS,
+        }
+    }
+
+    /// With `room` windows left in the conversation's transcript, set as the turn is sent.
+    pub(crate) fn with_room(mut self, room: usize) -> RecallAsk {
+        self.room = room;
+        self
     }
 
     /// For tests: `f` runs between reading the files and the second check of the proof, where
@@ -342,6 +359,11 @@ impl RecallAsk {
             return others(o);
         }
         told.filter(&mut recalled, retains);
+        // Fail closed: text that can't be checked for quotes afterwards isn't sent. Nothing in
+        // the set leaves to make room, since a retaining session still holds what it was sent.
+        if crate::transcript::recall_windows(recalled.sent().sent_text.iter().map(String::as_str)) > self.room {
+            return Recalled::nothing(crate::transcript::RECALL_WITHHELD.into());
+        }
         recalled
     }
 }
@@ -939,6 +961,60 @@ mod tests {
         assert!(!t.quotes_recalled_for_test(rule), "nothing was sent, so nothing is indexed");
         t.record(&crate::Event::Recalled(first.sent()));
         assert!(t.quotes_recalled_for_test(rule));
+    }
+
+    /// The set of recalled windows has a cap and nothing leaves it: a recall that would pass the
+    /// cap is withheld, the turn says so, and what was recalled before is checked still.
+    #[test]
+    fn a_recall_past_what_can_be_checked_is_withheld_and_earlier_ones_stay_checked() {
+        use crate::cases::record::{Click, NoteDraft, PersonOp};
+        use crate::{Fake, Options};
+        use wordcraft_engine::room::Room;
+        let dir = std::env::temp_dir().join(format!("wordcraft-recall-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Acme", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Acme MSA", "2026-11-10", 2).unwrap();
+        let rule = "Cap liability at twelve months of the fees paid in the year before the claim was first made.";
+        let draft = NoteDraft { body: Body::Pattern { rule: Quoted::parse(rule), traps: None }, how: None, topics: Topics::default() };
+        shelf.person(click, &at, PersonOp::AddNote(draft), day("2026-11-10")).unwrap();
+        let mut session = wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("one"));
+        let (room, own) = Room::host(&mut session, "Minoru").unwrap();
+        let fake = Fake::new();
+        let seen = fake.seen();
+        let mut a = crate::Assistant::start(&room, Box::new(fake), Options::default()).unwrap();
+        // 384 KB of six-digit counters, each window distinct: the set is full but for a few windows.
+        let filler: String = (0..65_536u32).map(|n| format!("{n:06x}")).collect();
+        let item = RecalledItem {
+            id: ItemId::Here { note: NoteId::parse("n9").unwrap() },
+            place: Place::ThisCase,
+            title: None,
+            kind: None,
+            text: "filler".into(),
+            balance: None,
+            confirmed: true,
+            again: false,
+        };
+        a.transcript_mut().record(&crate::Event::Recalled(RecallSent {
+            items: vec![item],
+            sent_text: vec![filler.clone()],
+            ..RecallSent::default()
+        }));
+        assert!(a.transcript().recall_room() < 40, "{}", a.transcript().recall_room());
+        let alone = Alone::check(&room, own.id(), a.name()).unwrap();
+        a.set_recall(Some(RecallAsk::new(shelf, at, "the liability cap", day("2026-11-10"), alone)));
+        a.ask("What about the liability cap?", None).unwrap();
+        assert!(a.wait_idle(std::time::Duration::from_secs(30)));
+        a.poll();
+        let turns = seen.lock().unwrap().turns.clone();
+        assert!(turns[0].knowledge.is_empty(), "{:?}", turns[0].knowledge);
+        let problem = a.transcript().entries().rev().find_map(|e| if let crate::Entry::Recalled(sent) = e { sent.problem.clone() } else { None });
+        assert_eq!(problem.as_deref(), Some(crate::transcript::RECALL_WITHHELD));
+        assert!(!a.transcript().quotes_recalled_for_test(rule), "the withheld text is not indexed either");
+        assert!(a.transcript().quotes_recalled_for_test(&filler[..40]), "the first recall is checked still");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

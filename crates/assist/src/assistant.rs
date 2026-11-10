@@ -344,7 +344,7 @@ impl Assistant {
         // Cleared before the turn is sent: a Stop from now on ends this turn, even one the
         // thread hasn't started yet.
         self.cancel.clear();
-        let recall = self.recall.take();
+        let recall = self.recall.take().map(|r| r.with_room(self.transcript.recall_room()));
         // From here the thread may read case notes at any moment, so the conversation counts as
         // having recalled before the event says what it found: the guard fails closed.
         self.recalled |= recall.is_some();

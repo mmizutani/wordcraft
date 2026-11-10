@@ -33,12 +33,28 @@ const QUOTE_BYTES: usize = 36;
 /// Most windows of recalled text [`SentWindows`] keeps: 64 turns of [`crate::cases::recall::BUDGET`]
 /// of ASCII, which has a window at every byte. Full, it holds about 12 MiB: 16 bytes a count in
 /// the map, 8 a hash in its batch.
-const MAX_WINDOWS: usize = 64 * crate::cases::recall::BUDGET;
+pub(crate) const MAX_WINDOWS: usize = 64 * crate::cases::recall::BUDGET;
+
+/// Why a turn recalled nothing once the conversation's set of windows is full.
+pub(crate) const RECALL_WITHHELD: &str = "this conversation has recalled as much as can be checked; start a new one";
+
+/// The windows of `text` ([`crate::cases::text::windows`]), folded, as the set keeps and looks them up.
+fn windows_of(text: &str) -> Vec<u64> {
+    let folded = crate::cases::text::folded(text);
+    crate::cases::text::windows(&folded, QUOTE_BYTES).map(hash).collect()
+}
+
+/// How many windows a recall that sent `texts` puts in the set: what [`Transcript::recall_room`]
+/// is measured against before the text goes to a turn.
+pub(crate) fn recall_windows<'a>(texts: impl Iterator<Item = &'a str>) -> usize {
+    texts.map(|t| windows_of(t).len()).sum()
+}
 
 /// Every window ([`crate::cases::text::windows`]) of the folded text sent as recall in the
 /// conversation, hashed, apart from the entries, so trimming the conversation doesn't forget what
 /// the model was given. A row is checked with one lookup per window of its own text, whatever was
-/// sent. When full, the oldest recall goes first, and what went is counted.
+/// sent. Nothing leaves it: a retaining agent session still holds what it was sent, so a recall
+/// that wouldn't fit is withheld before it reaches a turn ([`crate::cases::recall::RecallAsk`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SentWindows {
     /// How many kept windows hash to each value: a window two recalls sent stays while either does.
@@ -46,8 +62,6 @@ struct SentWindows {
     /// Each recall's window hashes, oldest first.
     batches: VecDeque<Vec<u64>>,
     len: usize,
-    /// Windows dropped to stay within [`MAX_WINDOWS`].
-    dropped: u64,
     #[cfg(test)]
     lookups: std::cell::Cell<usize>,
 }
@@ -55,18 +69,11 @@ struct SentWindows {
 impl SentWindows {
     /// A recall sent `texts`.
     fn add<'a>(&mut self, texts: impl Iterator<Item = &'a str>) {
-        let mut batch = Vec::new();
-        for text in texts {
-            let folded = crate::cases::text::folded(text);
-            batch.extend(crate::cases::text::windows(&folded, QUOTE_BYTES).map(hash));
-        }
-        // A recall too short for one window would be a batch eviction never reaches.
-        if batch.is_empty() {
+        let batch: Vec<u64> = texts.flat_map(windows_of).collect();
+        // A recall too short for one window keeps no batch, and one past the cap keeps nothing
+        // either: the turn was withheld by the same count, so this only fails closed.
+        if batch.is_empty() || self.len.saturating_add(batch.len()) > MAX_WINDOWS {
             return;
-        }
-        if batch.len() > MAX_WINDOWS {
-            self.dropped = self.dropped.saturating_add(u64::try_from(batch.len().saturating_sub(MAX_WINDOWS)).unwrap_or(u64::MAX));
-            batch.truncate(MAX_WINDOWS);
         }
         for h in &batch {
             let n = self.counts.entry(*h).or_default();
@@ -74,19 +81,6 @@ impl SentWindows {
         }
         self.len = self.len.saturating_add(batch.len());
         self.batches.push_back(batch);
-        while self.len > MAX_WINDOWS && self.batches.len() > 1 {
-            let Some(oldest) = self.batches.pop_front() else { break };
-            for h in &oldest {
-                if let Some(n) = self.counts.get_mut(h) {
-                    *n = n.saturating_sub(1);
-                    if *n == 0 {
-                        self.counts.remove(h);
-                    }
-                }
-            }
-            self.len = self.len.saturating_sub(oldest.len());
-            self.dropped = self.dropped.saturating_add(u64::try_from(oldest.len()).unwrap_or(u64::MAX));
-        }
     }
 
     /// Whether a window of `text` was sent.
@@ -98,6 +92,12 @@ impl SentWindows {
             self.counts.contains_key(&hash(w))
         })
     }
+}
+
+/// Whether a row's full text stopped at [`wordcraft_engine::cmd::review::ROW_FULL_BYTES`]: the
+/// character that didn't fit is at most four bytes.
+fn cut_at_cap(full: &str) -> bool {
+    full.len().saturating_add(4) > wordcraft_engine::cmd::review::ROW_FULL_BYTES
 }
 
 fn hash(window: &str) -> u64 {
@@ -496,9 +496,11 @@ impl Transcript {
             match action {
                 Action::Write(i, mut row) => {
                     // Seen rows come without the flag: a row whose words are the same keeps it (only
-                    // its state changed), and one whose words changed is read again.
+                    // its state changed), and one whose words changed is read again. New words cut
+                    // at the cap may hold the quote past the cut, so they can't clear the flag.
                     row.quotes = match self.entries.get(i) {
                         Some(Entry::Output(k)) if k.full == row.full => k.quotes,
+                        Some(Entry::Output(k)) => (k.quotes && cut_at_cap(&row.full)) || self.quotes_recalled(&row.full),
                         _ => self.quotes_recalled(&row.full),
                     };
                     self.overwrite(i, Entry::Output(row));
@@ -527,10 +529,10 @@ impl Transcript {
         self.sent_windows.has(text)
     }
 
-    /// How many windows of recalled text were dropped to stay within [`MAX_WINDOWS`].
-    #[cfg(test)]
-    pub(crate) fn windows_dropped(&self) -> u64 {
-        self.sent_windows.dropped
+    /// How many windows of recalled text the conversation can still take before its recalls are
+    /// withheld.
+    pub(crate) fn recall_room(&self) -> usize {
+        MAX_WINDOWS.saturating_sub(self.sent_windows.len)
     }
 
     /// How many recalls' windows are kept.

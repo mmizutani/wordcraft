@@ -469,11 +469,11 @@ fn checking_a_row_costs_one_lookup_per_window_of_the_row_whatever_was_recalled()
     let mut few = Transcript::default();
     recalled(&mut few, "Fallback: accept a liability cap of twelve months of fees, no lower.");
     let mut full = Transcript::default();
-    // 420 KB of six-digit counters: every 36-byte window holds a full one, so each is distinct,
-    // and there are more of them than the cap holds.
-    let filler: String = (0..70_000u32).map(|n| format!("{n:06x}")).collect();
+    // 384 KB of six-digit counters: every 36-byte window holds a full one, so each is distinct,
+    // and together they all but fill the set.
+    let filler: String = (0..65_536u32).map(|n| format!("{n:06x}")).collect();
     recalled(&mut full, &filler);
-    assert!(full.windows_dropped() > 0, "the cap was reached");
+    assert!(full.recall_room() < 64, "the set is all but full: {}", full.recall_room());
     let lookups = |t: &Transcript| {
         let before = t.lookups_for_test();
         t.quotes_recalled_for_test(&longest);
@@ -535,6 +535,8 @@ fn a_recalled_note_of_two_lines_pasted_as_two_paragraphs_is_flagged() {
     assert!(t.details().turns[0].output.iter().any(|r| r.kind == OutputKind::Insert && r.quotes), "{:?}", listed(&t));
 }
 
+/// A paragraph break is a space, not nothing: two parts that read as the recalled text only with the
+/// break taken out share no run of 36 bytes with it.
 #[test]
 fn two_short_paragraphs_that_would_read_as_recalled_text_joined_are_not_flagged() {
     let notes = "Fallback: accept a liability cap of twelve months of fees, no lower.";
@@ -542,7 +544,7 @@ fn two_short_paragraphs_that_would_read_as_recalled_text_joined_are_not_flagged(
     let mut t = Transcript::default();
     t.asked("Rewrite");
     recalled(&mut t, notes);
-    two_paragraphs(&mut s, "accept a liability cap ", "of twelve months of fees");
+    two_paragraphs(&mut s, "accept a liability ca", "p of twelve months of fees");
     note(&mut t, &s);
     assert!(t.details().turns[0].output.iter().all(|r| !r.quotes), "{:?}", listed(&t));
 }
@@ -572,4 +574,38 @@ fn recalls_too_short_to_quote_keep_no_batch() {
         recalled(&mut t, &format!("short {n}"));
     }
     assert_eq!(t.batches_for_test(), 0);
+}
+
+#[test]
+fn a_recalled_sentence_pasted_as_two_paragraphs_split_mid_sentence_is_flagged() {
+    let notes = "Cap at twelve months of fees paid before the claim";
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Rewrite");
+    recalled(&mut t, notes);
+    two_paragraphs(&mut s, "Cap at twelve months of", "fees paid before the claim");
+    note(&mut t, &s);
+    assert!(t.details().turns[0].output.iter().any(|r| r.kind == OutputKind::Insert && r.quotes), "{:?}", listed(&t));
+}
+
+/// A flag can't be cleared by words the check didn't see: new text cut at the cap may hold the
+/// quote past the cut, so the flag stays; short new text was all seen, so it goes.
+#[test]
+fn a_flag_stays_when_the_new_text_is_cut_at_the_cap_and_clears_when_it_is_all_seen() {
+    let notes = "Fallback: accept a liability cap of twelve months of fees, no lower.";
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Comment");
+    recalled(&mut t, notes);
+    s.run("select.text", &json!({"text": "two"})).unwrap();
+    let id = s.run("review.newComment", &json!({"text": "They may accept a liability cap of twelve months of fees."})).unwrap()["id"].clone();
+    note(&mut t, &s);
+    assert!(t.details().turns[0].output[0].quotes);
+    let long = "renewal ".repeat(wordcraft_engine::cmd::review::ROW_FULL_BYTES / 4);
+    s.run("review.editComment", &json!({"id": id, "text": long})).unwrap();
+    note(&mut t, &s);
+    assert!(t.details().turns[0].output[0].quotes, "cut at the cap: the quote may be past it");
+    s.run("review.editComment", &json!({"id": id, "text": "Consider the renewal term instead."})).unwrap();
+    note(&mut t, &s);
+    assert!(!t.details().turns[0].output[0].quotes);
 }
