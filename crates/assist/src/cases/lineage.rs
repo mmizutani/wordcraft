@@ -54,8 +54,7 @@ impl DraftPrint {
             let Some(hash) = hash_of(&text) else { continue };
             if smallest.len() < MAX_HASHES {
                 smallest.insert(hash);
-            } else if smallest.last().is_some_and(|last| hash < *last) {
-                smallest.insert(hash);
+            } else if smallest.last().is_some_and(|last| hash < *last) && smallest.insert(hash) {
                 smallest.pop_last();
             }
         }
@@ -76,39 +75,15 @@ impl DraftPrint {
     /// The share of `self`'s paragraphs that `old` has: containment of the new document in the
     /// old draft, not Jaccard, since a later draft adds and drops clauses and what matters is how
     /// much of what is on screen was there before. Exact while neither print was cut at
-    /// [`MAX_HASHES`]; past that, the bottom-k estimate over the k smallest hashes of the union
-    /// (k the smaller print's size): the share of those from `self` that `old` has too. Zero when
-    /// either is empty.
+    /// [`MAX_HASHES`]. A cut print holds every hash of its document up to its largest one, so past
+    /// that both are compared over the hashes at or below the smallest such cutoff: the share of
+    /// `self`'s hashes in that range that `old` has too, which samples the paragraphs evenly since
+    /// the hashes are. Zero when `self` has none in range or either is empty.
     pub fn overlap(&self, old: &DraftPrint) -> f32 {
-        let (a, b) = (&self.hashes, &old.hashes);
-        if a.is_empty() || b.is_empty() {
-            return 0.0;
-        }
-        // Whole prints: the k smallest of the union is the union, and the estimate is exact.
-        let k = if a.len() < MAX_HASHES && b.len() < MAX_HASHES { a.len().saturating_add(b.len()) } else { a.len().min(b.len()) };
-        let (mut i, mut j, mut taken, mut from_new, mut in_both) = (0usize, 0usize, 0usize, 0u32, 0u32);
-        while taken < k {
-            match (a.get(i), b.get(j)) {
-                (Some(x), Some(y)) if x == y => {
-                    from_new += 1;
-                    in_both += 1;
-                    i += 1;
-                    j += 1;
-                }
-                (Some(x), Some(y)) if x < y => {
-                    from_new += 1;
-                    i += 1;
-                }
-                (Some(_), None) => {
-                    from_new += 1;
-                    i += 1;
-                }
-                (None, Some(_)) | (Some(_), Some(_)) => j += 1,
-                (None, None) => break,
-            }
-            taken += 1;
-        }
-        if from_new == 0 { 0.0 } else { in_both as f32 / from_new as f32 }
+        let cutoff = [self, old].into_iter().filter(|p| p.len() >= MAX_HASHES).filter_map(|p| p.hashes.last()).min();
+        let in_range: Vec<u32> = self.hashes.iter().copied().take_while(|h| cutoff.is_none_or(|c| h <= c)).collect();
+        let common = in_range.iter().filter(|h| old.hashes.binary_search(h).is_ok()).count();
+        if in_range.is_empty() { 0.0 } else { common as f32 / in_range.len() as f32 }
     }
 
     /// Hold the hashes to the limit, sorted and distinct, as a file may not: whether anything went.
@@ -247,6 +222,62 @@ mod tests {
         assert!((half.overlap(&big) - 1.0).abs() < 0.01, "{}", half.overlap(&big));
         let share = big.overlap(&half);
         assert!((0.4..=0.6).contains(&share), "{share}");
+    }
+
+    fn lot(i: usize) -> String {
+        format!("Clause {i}. Kestrel Freight KK shall deliver lot {i} to the Yokohama warehouse by noon.")
+    }
+
+    /// Every paragraph's hash, distinct and sorted, with nothing cut.
+    fn all_hashes(paragraphs: &[String]) -> BTreeSet<u32> {
+        paragraphs.iter().filter_map(|p| hash_of(p)).collect()
+    }
+
+    #[test]
+    fn a_whole_extract_of_a_cut_print_matches_it_completely() {
+        let contract: Vec<String> = (0..1000).map(lot).collect();
+        let old = print(&contract);
+        assert_eq!(old.len(), MAX_HASHES);
+        let wanted = &old.hashes()[100..108];
+        let extract: Vec<String> = contract.iter().filter(|p| hash_of(p).is_some_and(|h| wanted.contains(&h))).cloned().collect();
+        let new = print(&extract);
+        assert_eq!(new.hashes(), wanted, "the extract is positions 100 to 107 of the old print");
+        assert_eq!(new.overlap(&old), 1.0);
+    }
+
+    #[test]
+    fn a_cut_and_a_whole_print_compare_over_the_range_the_cut_one_holds_in_full() {
+        let old: Vec<String> = (0..1000).map(lot).collect();
+        let annex = |i: usize| format!("Annex {i}. Bluefin Systems Ltd may audit the records for lot {i} on thirty days' notice.");
+        let new: Vec<String> = (0..120).map(|i| lot(i * 7)).chain((0..80).map(annex)).collect();
+        let (old_print, new_print) = (print(&old), print(&new));
+        assert_eq!(old_print.len(), MAX_HASHES);
+        assert_eq!(new_print.len(), 200);
+        // The cut print holds every hash of its document up to its 256th smallest, so both are
+        // known in full up to there.
+        let old_all = all_hashes(&old);
+        let cutoff = *old_all.iter().nth(MAX_HASHES - 1).unwrap();
+        let in_range: Vec<u32> = all_hashes(&new).into_iter().filter(|h| *h <= cutoff).collect();
+        let common = in_range.iter().filter(|h| old_all.contains(h)).count();
+        assert!(in_range.len() >= 20 && common > 0 && common < in_range.len(), "{common} of {}", in_range.len());
+        let expected = common as f32 / in_range.len() as f32;
+        let share = new_print.overlap(&old_print);
+        assert!((share - expected).abs() < 1e-6, "{share} against {common} of {}", in_range.len());
+        assert!((share - 0.6).abs() < 0.2, "near the whole share, 120 of 200: {share}");
+    }
+
+    #[test]
+    fn a_repeated_paragraph_never_costs_the_print_a_hash_whatever_the_order() {
+        let distinct: Vec<String> = (0..600).map(lot).collect();
+        // In the print when it repeats at the end, with nothing after it to refill the print.
+        let smallest = distinct.iter().min_by_key(|p| hash_of(p)).unwrap().clone();
+        let repeats = || std::iter::repeat_n(smallest.clone(), 5);
+        let last: Vec<String> = distinct.iter().cloned().chain(repeats()).collect();
+        let first: Vec<String> = repeats().chain(distinct.iter().cloned()).collect();
+        let expected: Vec<u32> = all_hashes(&distinct).into_iter().take(MAX_HASHES).collect();
+        assert_eq!(print(&last).len(), MAX_HASHES);
+        assert_eq!(print(&last).hashes(), expected);
+        assert_eq!(print(&first).hashes(), expected);
     }
 
     #[test]
