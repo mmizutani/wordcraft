@@ -227,8 +227,8 @@ steps, and the notes grouped by kind, each with **Edit** and **Remove**. A note 
 shows dimmed as unconfirmed with **Confirm**; what you wrote or confirmed is confirmed on the day
 you set it. The commands are
 `assist.memory.case.new`, `.bind`, `.unbind`, `.facts`, `.balance`, `.plan`, `.note`, `.noteEdit`,
-`.noteConfirm`, `.noteRemove` and `.delete`, and `assist.memory.wall.new` and `.delete` for a
-client. They are yours alone, as [Memory](#memory)'s are, and refuse a script, an agent, a click or
+`.noteConfirm`, `.noteRemove`, `.cardDismiss` and `.delete`, and `assist.memory.wall.new` and
+`.delete` for a client. They are yours alone, as [Memory](#memory)'s are, and refuse a script, an agent, a click or
 key the control channel made and a macro's step. There is no command that reads a case: the pane
 reads the file itself, so holding the window's key doesn't list every client's cases.
 
@@ -258,21 +258,26 @@ document (rules learned about the other side, positions and trades, traps, how t
 and why), say how it knows each one, and say so when it came from the other side's text. It writes
 them as `[[case]]{…}[[/case]]` markers in its answer, at most five in a turn, each a JSON object
 with an `op`: `note` (a note of any kind, with `how`), `plan`, `balance` or `facts`. The marker is
-taken out of what the pane shows, even while it streams and even when the JSON holds `]]`; one past
-8 KiB, one left unclosed when the answer ends, a sixth in a turn, or one this build doesn't read
-(an unknown `op`, a field a record doesn't have, a `standing`) is dropped and counted in Details ›
-Recalled, never shown as text.
+taken out of what the pane shows, even while it streams and even when the JSON holds `]]` or
+`[[/case]]` inside a string, since the close counts only outside the JSON's strings; one whose body
+passes 8 KiB (however the stream splits around its close), one left unclosed when the answer ends,
+one opened inside another, a sixth in a turn, or one this build doesn't read (an unknown `op`, a
+field a record doesn't have, a `standing`) is dropped and counted in Details › Recalled, never shown
+as text. A marker inside code, fenced or inline, is an example the answer explains: it is shown as
+written and nothing is written from it, and the same goes for `[[remember:` and `[[used:` there.
 
 Each marker goes one way, by the conversation's own case and never the document's current binding,
 so a note written during a turn lands in the case the conversation started with even if you rebind
-meanwhile. A `note` or a `balance` is stored in that case, unconfirmed: a quiet row appears under
-the answer, "Noted for this case: …", with **Confirm**, **Edit** and **Remove**, which are the same
-commands as the page's and refuse the control channel's click. A `plan` replaces the plan only when
-the assistant wrote the current one; over a plan you wrote it becomes a card. `facts` is always a
-card, since you decide what a case is. A card shows the whole proposal with **Use these** (or **Use
-this plan**, **Keep**, **Reassess**), **Edit** and **Not this**, as a preference's card does, and
-stores nothing until your click; Use these fills only the facts the card names and leaves the
-parties and the stage as they are. A case holds at most 64 unconfirmed notes; past that a new one
+meanwhile, and a case another WordCraft is saving holds the write for a later frame without
+stalling this one. A `note` or a `balance` is stored in that case, unconfirmed: a quiet row appears
+under the answer, "Noted for this case: …", showing the whole note as the case holds it now, every
+field, since Confirm approves all of them, with **Confirm**, **Edit** and **Remove**, which are the
+same commands as the page's and refuse the control channel's click. A `plan` replaces the plan only
+when the assistant wrote the current one; over a plan you wrote it becomes a card. `facts` is always
+a card, since you decide what a case is. A card shows the whole proposal with **Use these** (or
+**Use this plan**, **Keep**, **Reassess**), **Edit** and **Not this**, as a preference's card does,
+and stores nothing until your click; every button, Not this included, is a command of yours alone,
+and Use these fills only the facts the card names and leaves the parties and the stage as they are. A case holds at most 64 unconfirmed notes; past that a new one
 replaces the oldest never used. A note the model writes that a note already says, or that you
 removed before, is dropped without a row.
 

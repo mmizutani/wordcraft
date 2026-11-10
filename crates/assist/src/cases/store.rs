@@ -38,6 +38,13 @@ pub const DAMAGED_SUFFIX: &str = ".damaged";
 
 const CASE_FILE: &str = "case.json";
 const WALL_FILE: &str = "wall.json";
+
+/// How many times a case lock has slept waiting for another WordCraft, in this process. A window
+/// test reads it twice around frames that must not wait.
+#[doc(hidden)]
+pub fn lock_sleeps() -> u64 {
+    atomic::LOCK_SLEEPS.load(std::sync::atomic::Ordering::Relaxed)
+}
 const TRASH: &str = ".trash-";
 
 /// Most times a new id is tried before giving up: a collision is one in 2^64.
@@ -308,9 +315,15 @@ impl Shelf {
     /// Lock, read fresh, `change`, write. Never creates a folder. `move_damaged` says whether a
     /// file that can't be read whole is copied aside first (a person's write) or left for the
     /// person (a model's). A write that would pass [`MAX_FILE`] is refused before the file changes.
-    fn update<T>(&self, at: &CaseRef, move_damaged: bool, change: impl FnOnce(&mut Case) -> Result<T, CaseError>) -> Result<T, CaseError> {
+    fn update<T>(
+        &self,
+        at: &CaseRef,
+        move_damaged: bool,
+        lock: fn(&Path) -> Result<Lock, LockError>,
+        change: impl FnOnce(&mut Case) -> Result<T, CaseError>,
+    ) -> Result<T, CaseError> {
         let dir = self.real_case_dir(at)?;
-        let _lock = Lock::take(&self.lock_path(at)).map_err(|e| match e {
+        let _lock = lock(&self.lock_path(at)).map_err(|e| match e {
             LockError::Busy => CaseError::Busy,
             LockError::Io(e) => CaseError::Io(e),
         })?;
@@ -340,15 +353,17 @@ impl Shelf {
 
     /// What the person did, with their click: the case as written.
     pub fn person(&self, _click: Click, at: &CaseRef, op: PersonOp, today: Day) -> Result<Case, CaseError> {
-        self.update(at, true, |case| {
+        self.update(at, true, Lock::take, |case| {
             case.apply_person(op, today)?;
             Ok(case.clone())
         })
     }
 
-    /// What a model wrote. A damaged file is left for the person's next change to move aside.
+    /// What a model wrote. A damaged file is left for the person's next change to move aside, and
+    /// a lock another WordCraft holds is [`CaseError::Busy`] at once: the window keeps the write
+    /// for a later frame rather than waiting in this one.
     pub fn model(&self, at: &CaseRef, write: ModelWrite, today: Day) -> Result<Applied, CaseError> {
-        self.update(at, false, |case| case.apply_model(write, today))
+        self.update(at, false, Lock::try_take, |case| case.apply_model(write, today))
     }
 
     /// Rename `dir` to a trash folder under the root, then remove it. Safe to run twice, and a

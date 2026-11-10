@@ -748,8 +748,9 @@ fn note_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, n: &Note) {
     });
 }
 
-/// A note in one line of the person's words, with the typed parts named.
-fn note_words(n: &Note) -> String {
+/// A note in one line of the person's words, with the typed parts named. The quiet row under an
+/// answer shows a note with this too, so Confirm there approves what the page would show.
+pub(super) fn note_words(n: &Note) -> String {
     let mut texts = n.body.texts().map(|q| q.for_person());
     let main = texts.next().unwrap_or_default().to_string();
     let more = texts.next().map(|s| format!(" ({s})")).unwrap_or_default();

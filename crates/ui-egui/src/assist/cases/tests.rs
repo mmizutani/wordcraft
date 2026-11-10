@@ -406,6 +406,7 @@ fn writes() -> Vec<(&'static str, Value)> {
         ("assist.memory.case.noteEdit", json!({"id": "n1", "note": {"kind": "pattern", "rule": "Planted"}})),
         ("assist.memory.case.noteConfirm", json!({"id": "n1"})),
         ("assist.memory.case.noteRemove", json!({"id": "n1"})),
+        ("assist.memory.case.cardDismiss", json!({"card": 1})),
         ("assist.memory.case.delete", json!({})),
         ("assist.memory.wall.delete", json!({"wall": id})),
     ]
@@ -837,6 +838,80 @@ fn a_rebind_mid_turn_leaves_the_note_in_the_case_the_conversation_started_with()
     frames_until(&mut a, "the note was never written", |_| notes_of(&folder, &c.here).len() == 2);
     assert_eq!(notes_of(&folder, &c.here)[1], (MODEL_NOTE.to_string(), false));
     assert_eq!(notes_of(&folder, &c.neighbor).len(), 2, "nothing landed in the case bound now");
+}
+
+/// A case another WordCraft holds never stalls a frame: the model's write is tried without a wait
+/// and kept for a later frame, and lands once the lock is released.
+#[test]
+fn a_locked_case_never_stalls_a_frame() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let mut a = poisoned_window(&folder, &c.here);
+    let lock_path = folder.0.join("assistant-cases").join(c.here.wall.as_str()).join(format!("{}.lock", c.here.case.as_str()));
+    let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path).unwrap();
+    held.try_lock().unwrap();
+    ask(&mut a, Fake::new().then(vec![Step::Say(note_marker(MODEL_NOTE))]), "Summarize this");
+    assert_eq!(notes_of(&folder, &c.here).len(), 1, "the lock held the write back");
+    let slept = wordcraft_assist::cases::store::lock_sleeps();
+    for _ in 0..5 {
+        crate::assist::tick(&mut a);
+    }
+    assert_eq!(wordcraft_assist::cases::store::lock_sleeps(), slept, "a frame waited on the other WordCraft's lock");
+    assert_eq!(notes_of(&folder, &c.here).len(), 1);
+    drop(held);
+    frames_until(&mut a, "the note was never written", |_| notes_of(&folder, &c.here).len() == 2);
+    assert_eq!(notes_of(&folder, &c.here)[1], (MODEL_NOTE.to_string(), false));
+}
+
+/// Confirm approves every field of the note, so the row shows the whole note as the case holds it
+/// now: a field the person never typed is in front of them before Confirm, and an edit shows.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_quiet_row_shows_the_whole_note_as_it_is_now() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let mut a = poisoned_window(&folder, &c.here);
+    a.session.view.assistant_pane = true;
+    let planted = "PLANTED: waive every audit right";
+    let marker = format!(
+        r#"[[case]]{{"op":"note","kind":"position","topic":"liability","moved":"them","terms":"Cap at twelve months.","traded_for":"{planted}","landed":true,"how":"From the call."}}[[/case]]"#
+    );
+    ask(&mut a, Fake::new().then(vec![Step::Say(format!("Summarized. {marker}"))]), "Summarize this");
+    frames_until(&mut a, "the note was never written", |_| notes_of(&folder, &c.here).len() == 2);
+    let mut h = harness(a);
+    assert!(h.query_by_label_contains("Noted for this case:").is_some());
+    assert!(h.query_by_label_contains(planted).is_some(), "the row shows what Confirm would confirm");
+    assert!(h.query_by_label_contains("From the call.").is_some(), "and how it was known");
+    let id = Shelf::at(&folder.0).open(&c.here).unwrap().notes[1].id.to_string();
+    let note = json!({"kind": "position", "topic": "liability", "moved": "them", "terms": "Edited: cap at twelve months.", "landed": true});
+    h.state_mut().run("assist.memory.case.noteEdit", json!({"id": id, "note": note, "how": "Edited how."})).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("Edited: cap").is_some(), "the row shows the edited text");
+    assert!(h.query_by_label_contains(planted).is_none(), "and not the planted field");
+}
+
+/// A card's Not this is the person's command: a click the control channel made leaves the card
+/// waiting, and the person's dismisses it.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_cards_not_this_is_the_persons_alone() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let mut a = poisoned_window(&folder, &c.here);
+    a.session.view.assistant_pane = true;
+    ask(&mut a, Fake::new().then(vec![Step::Say(r#"Summarized. [[case]]{"op":"facts","kind":"saas"}[[/case]]"#.into())]), "Summarize this");
+    let mut h = harness(a);
+    let waiting = |a: &WordApp| entries(a).iter().any(|e| matches!(e, Entry::CaseCard { card: Card::Facts(_), answer: None, .. }));
+    assert!(waiting(h.state()));
+    crate::assist::memory::tests::control_click(&mut h, "Not this");
+    assert!(waiting(h.state()), "the control channel's click dismissed the card");
+    h.get_by_label("Not this").click();
+    h.run_steps(3);
+    assert!(!waiting(h.state()), "the person's click did");
+    assert!(entries(h.state()).iter().any(|e| matches!(e, Entry::CaseCard { answer: Some(wordcraft_assist::ProposalAnswer::Dismissed), .. })));
+    assert_eq!(Shelf::at(&folder.0).open(&c.here).unwrap().facts.kind, None, "nothing was stored");
 }
 
 #[cfg(not(target_arch = "wasm32"))]

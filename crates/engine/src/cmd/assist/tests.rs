@@ -545,7 +545,7 @@ fn yours_alone_in_the_params_doc_and_person_only_agree() {
             cases += 1;
         }
     }
-    assert_eq!(cases, 13, "the case and wall commands are registered");
+    assert_eq!(cases, 14, "the case and wall commands are registered");
 }
 
 /// The case commands check the shape of what they are given and hand the window a request; the

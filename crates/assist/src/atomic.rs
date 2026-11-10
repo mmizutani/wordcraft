@@ -14,6 +14,11 @@ const LOCK_WAIT: Duration = Duration::from_millis(500);
 /// What the person is told when the lock is held past [`LOCK_WAIT`].
 pub(crate) const BUSY: &str = "another WordCraft is saving what the assistant remembers: try again";
 
+/// How many times a lock has slept waiting for another WordCraft, in this process: a frame that
+/// must not wait shows as a count that doesn't move.
+#[doc(hidden)]
+pub static LOCK_SLEEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The lock file, held by the operating system until this is dropped, so a WordCraft that crashed
 /// holds nothing.
 pub(crate) struct Lock(fs::File);
@@ -36,14 +41,26 @@ impl From<LockError> for String {
 }
 
 impl Lock {
+    /// The lock, waiting up to [`LOCK_WAIT`] for another WordCraft: the person's write, whose
+    /// click is worth a frame.
     pub(crate) fn take(path: &Path) -> Result<Lock, LockError> {
+        Lock::wait(path, Some(LOCK_WAIT))
+    }
+
+    /// The lock now or [`LockError::Busy`] at once: a model's write, which a later frame can
+    /// try again, never stalls this one.
+    pub(crate) fn try_take(path: &Path) -> Result<Lock, LockError> {
+        Lock::wait(path, None)
+    }
+
+    fn wait(path: &Path, at_most: Option<Duration>) -> Result<Lock, LockError> {
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(path)
             .map_err(|e| LockError::Io(format!("{}: {e}", path.display())))?;
-        let until = Instant::now().checked_add(LOCK_WAIT);
+        let until = at_most.and_then(|wait| Instant::now().checked_add(wait));
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(Lock(file)),
@@ -51,6 +68,7 @@ impl Lock {
                     if until.is_none_or(|until| Instant::now() >= until) {
                         return Err(LockError::Busy);
                     }
+                    LOCK_SLEEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 // A file system without locks: the fresh read before the write still narrows the race.

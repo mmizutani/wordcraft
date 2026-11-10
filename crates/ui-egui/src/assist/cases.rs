@@ -271,6 +271,12 @@ pub(crate) fn write(app: &mut WordApp, dir: &std::path::Path, what: &str, req: &
             app.bind_case(None);
             Ok(json!({"unbound": true}))
         }
+        "memory.case.cardDismiss" => {
+            let id = req.get("card").and_then(Value::as_u64).unwrap_or(0);
+            let a = app.conversation_mut().filter(|a| a.pending_case_card(id).is_some()).ok_or("that card isn't waiting for an answer")?;
+            a.answer_case_card(id, ProposalAnswer::Dismissed);
+            Ok(json!({"dismissed": id}))
+        }
         "memory.case.delete" => {
             let at = bound_for(app).ok_or(NOT_BOUND)?;
             // The conversation holds the case's notes: it ends first, with its transcript.
@@ -536,8 +542,10 @@ fn rows_act(app: &WordApp) -> bool {
 }
 
 /// The quiet row under an answer for what a marker wrote ([`wordcraft_assist::Entry::CaseWritten`]).
-/// A note's standing is read from the case as it is now, so the row says when it was confirmed or
-/// removed, in Details › Case or here. Confirm, Edit and Remove are the person's commands.
+/// A note is read from the case as it is now and shown whole, every field, as the page shows it:
+/// Confirm approves all of them, and the marker may have filled one the person never saw. So the
+/// row says when the note was edited, confirmed or removed, in Details › Case or here. Confirm,
+/// Edit and Remove are the person's commands.
 pub(crate) fn written_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, what: Written, note: Option<NoteId>, text: &str) {
     let live = rows_act(app).then(|| open_case(app, false)).flatten().map(|(_, case)| case);
     let lead = match what {
@@ -545,10 +553,14 @@ pub(crate) fn written_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, what: Writ
         Written::Plan => tl!("Plan for this case, unconfirmed:"),
         Written::Balance => tl!("Balance for this case, unconfirmed:"),
     };
+    let now = match (what, note, &live) {
+        (Written::Note, Some(id), Some(case)) => case.notes.iter().find(|n| n.id == id).map(page::note_words),
+        _ => None,
+    };
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         ui.label(RichText::new(lead).small().color(t.text_dim));
-        ui.label(RichText::new(text).small().color(t.text));
+        ui.label(RichText::new(now.as_deref().unwrap_or(text)).small().color(t.text));
         let (Written::Note, Some(id)) = (what, note) else { return };
         let Some(case) = &live else { return };
         match case.notes.iter().find(|n| n.id == id) {
@@ -612,10 +624,8 @@ pub(crate) fn card(app: &mut WordApp, ui: &mut Ui, t: &Tokens, id: u64, card: &C
                     Card::Write(ModelWrite::Used(_)) => {}
                 }
             }
-            if ui.button(tl!("Not this")).clicked()
-                && let Some(a) = app.conversation_mut()
-            {
-                a.answer_case_card(id, ProposalAnswer::Dismissed);
+            if ui.button(tl!("Not this")).clicked() {
+                run(app, "assist.memory.case.cardDismiss", json!({"card": id}));
             }
         });
     });

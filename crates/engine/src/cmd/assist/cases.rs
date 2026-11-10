@@ -74,6 +74,10 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             .params(r#"{"id": string (n12)} → the note goes; a hash of its text stays so a model doesn't note it again. Yours alone, as `assist.memory.add` is"#)
             .when(memory_here)
             .pure(),
+        CommandSpec::new("assist.memory.case.cardDismiss", "Not This Case Card", "Home › Assistant", card_dismiss)
+            .params(r#"{"card": number} → the conversation's card (facts or a plan the assistant proposed) goes, and nothing is stored. Yours alone, as `assist.memory.add` is"#)
+            .when(memory_here)
+            .pure(),
         CommandSpec::new("assist.memory.case.delete", "Delete the Case", "Home › Assistant", |s, _| {
             s.push_ui_request(json!({"assist": "memory.case.delete"}));
             Ok(json!({"deleted": true}))
@@ -212,6 +216,17 @@ fn note(s: &mut Session, v: &Value, what: &str, with_id: bool) -> CmdResult {
     };
     s.push_ui_request(json!({"assist": what, "id": id, "note": note, "how": how}));
     Ok(json!({"noted": true}))
+}
+
+/// The card in `v["card"]`: a number from 1, as the conversation gives it.
+fn card_dismiss(s: &mut Session, v: &Value) -> CmdResult {
+    let card = v
+        .get("card")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+        .ok_or_else(|| CmdError::Params("`card`: the conversation's, a whole number from 1".into()))?;
+    s.push_ui_request(json!({"assist": "memory.case.cardDismiss", "card": card}));
+    Ok(json!({"dismissed": true}))
 }
 
 fn note_id_only(s: &mut Session, v: &Value, what: &str) -> CmdResult {
