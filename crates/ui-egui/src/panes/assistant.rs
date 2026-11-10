@@ -207,6 +207,7 @@ fn transcript(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
     let area = egui::ScrollArea::vertical().id_salt("assistant_transcript").max_height(height).auto_shrink([false, false]).stick_to_bottom(true);
     area.show(ui, |ui| {
         ui.set_width(ui.available_width());
+        crate::assist::cases::offer_line(app, ui, t);
         if entries.is_empty() {
             ui.label(RichText::new(tl!("Ask the assistant to draft, rewrite or check your writing. It works in the document like a collaborator: with the Suggester role, every edit is a tracked change for you to accept or reject.")).color(t.text_dim));
         }

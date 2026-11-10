@@ -237,11 +237,21 @@ lesson. They are yours alone, as [Memory](#memory)'s are, and refuse a script, a
 key the control channel made and a macro's step. There is no command that reads a case: the pane
 reads the file itself, so holding the window's key doesn't list every client's cases.
 
-**Binding.** You bind a document to a case; nothing in the file says which, so a document can't
-name a case and a saved file carries no id. A binding lasts while the document is open in this
-window: after a restart or a reopen you bind again. A conversation belongs to the case its document
-was bound to when it started. Binding the document to another case, or unbinding it, ends the
-conversation, stopping a running turn, since the model holds what that case's notes said and the
+**Binding.** You bind a document to a case; nothing in the file says which, so a document can't name
+a case and a saved file carries no case's id. WordCraft remembers your binding for the file, by its
+full path, in your settings folder: when you open that file again, after a restart too, the pane
+says "When you last had this file open, it was bound to <case>" with **Bind again** and **Not now**,
+above the conversation and on Details › Case. It isn't bound until you click **Bind again**, and
+until then no turn recalls from it: a path doesn't say which document is there, and another client's
+document saved over it, or one made from the same template, would otherwise recall the first
+client's case. **Not now** leaves it unbound while it is open, and it is offered again the next
+time. Unbind, or a binding to another case, changes what the file is offered next time, and deleting
+a case forgets every file bound to it; a binding whose case is gone is dropped quietly when its file
+opens. The binding belongs to that path: a copy saved under another name is offered nothing until
+you bind it, and a document you bind before it is first saved is bound while it is open in this
+window, so bind it again once it has a file to keep it. A conversation belongs to the case its
+document was bound to when it started. Binding the document to another case, or unbinding it, ends
+the conversation, stopping a running turn, since the model holds what that case's notes said and the
 next turn would run under another case.
 
 **What a turn recalls.** With a case bound, each turn carries what ranks highest for the prompt and
@@ -400,14 +410,20 @@ them. A file is at most 1 MiB, and one that can't be read whole shows as damaged
 as `case.json.damaged` (or `assistant-lessons.json.damaged`) by your next change, never replaced in
 silence; while the lessons file is damaged a turn recalls no lesson and Details › Recalled says so.
 Two WordCrafts keep each other's changes: each write
-takes the case's lock, or the lessons file's, and reads the file again. Nothing of a case goes in a document, a recovery
+takes the case's lock, or the lessons file's, and reads the file again. Which files are bound to
+which case is `assistant-cases/bindings.json`: each file's path and the ids of its client and case,
+at most 200 files (binding a 201st forgets the one bound longest ago) and 1 MiB. Only your bind and
+unbind add or change a binding; a delete, and a file whose case is gone, only remove one. Each write
+takes the file's own lock, and one that can't be read whole binds nothing and is moved aside as
+`bindings.json.damaged` by your next bind or unbind. Nothing of a case goes in a document, a recovery
 copy or the log, and it never crosses a room.
 
 **Delete.** Delete case asks in place, says it can't be undone, and removes the case's folder with
-every note and its record in it, on a worker: the document's conversation ends first and its
-record's file is closed there before the folder is renamed, so the frame never waits, and a
-delete another WordCraft refuses (its lock, a file in use) comes back as a notice and loses
-nothing. It lists the lessons kept from the case with **Delete these too** ticked, and
+every note and its record in it, and forgets the files bound to it, on a worker: the document's
+conversation ends first and its record's file is closed there before the folder is renamed, so the
+frame never waits, and a delete another WordCraft refuses (its lock, a file in use) comes back as a
+notice and loses nothing. Deleting only the record leaves the files bound. It lists the lessons kept
+from the case with **Delete these too** ticked, and
 unticked they stay and lose the link to the case. A client with no cases left can be deleted from
 the list, its cases' lessons having been asked about case by case. What WordCraft can't
 reach: what a turn already sent to a model provider under your account, an agent's own record of a
