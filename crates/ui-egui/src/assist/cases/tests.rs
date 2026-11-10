@@ -1160,3 +1160,44 @@ fn a_lesson_card_belongs_to_its_conversations_case_and_a_later_conversation_gets
     assert!(h.query_by_label_contains("harbourline").is_none(), "the old case's party is not");
     assert!(h.query_by_label("Contract: NDA").is_some() && h.query_by_label("Contract: SaaS").is_none(), "the new case's facts");
 }
+
+/// With two lessons kept, Edit on the second opens its editor and Save changes it alone: the rows
+/// before it leave its draft where it is.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_second_of_two_lessons_can_be_edited_from_the_list() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::cases::{LessonDraft, LessonOp};
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let shelf = Shelf::at(&folder.0);
+    let keep = |text: &str| {
+        let draft = LessonDraft { text: Quoted::parse(text), applies: Default::default(), topics: Default::default(), from: None };
+        shelf.lesson(click(), LessonOp::Keep(draft)).unwrap().unwrap()
+    };
+    keep("First lesson.");
+    let second = keep("Second lesson.");
+    let mut a = window(&folder);
+    a.session.view.assistant_pane = true;
+    a.assist.view = crate::assist::PaneView::Details;
+    a.bind_case(Some(c.here.clone()));
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 3000.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    // The lessons list ends the page: its last Edit is the second lesson's.
+    h.get_all_by_label("Edit").last().unwrap().click();
+    h.run_steps(3);
+    assert!(h.query_by_label("Save").is_some(), "the second lesson's editor is open");
+    h.state_mut().assist.cases.drafts.lesson_edit = Some((second, "Second lesson, reworded.".into()));
+    h.run_steps(2);
+    h.get_by_label("Save").click();
+    h.run_steps(3);
+    let texts: Vec<String> = shelf.lessons().lessons.iter().map(|l| l.text.for_person().to_string()).collect();
+    assert_eq!(texts, ["First lesson.", "Second lesson, reworded."]);
+}

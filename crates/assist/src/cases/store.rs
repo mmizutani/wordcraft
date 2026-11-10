@@ -419,19 +419,21 @@ impl Shelf {
     }
 
     /// The case goes, under its lock, so a write racing it finds it gone rather than half there.
-    /// First its lessons go too, or stay and lose the link to it, under the lessons lock: a crash
-    /// between the two leaves the case present, and deleting again converges.
+    /// Under that lock, first its lessons go too, or stay and lose the link to it, under the
+    /// lessons lock: a busy case changes no lesson, a crash between the two leaves the case
+    /// present, and deleting again converges. The order is the case's lock, then the lessons';
+    /// nothing takes them the other way round.
     pub fn delete_case(&self, click: Click, at: &CaseRef, keep_lessons: bool) -> Result<(), CaseError> {
         let dir = self.real_case_dir(at)?;
-        if self.lessons().from_case(&at.case).next().is_some() {
-            self.lesson(click, LessonOp::CaseDeleted { case: at.case.clone(), delete: !keep_lessons })?;
-        }
         let lock_path = self.lock_path(at);
         {
             let _lock = Lock::take(&lock_path).map_err(|e| match e {
                 LockError::Busy => CaseError::Busy,
                 LockError::Io(e) => CaseError::Io(e),
             })?;
+            if self.lessons().from_case(&at.case).next().is_some() {
+                self.lesson(click, LessonOp::CaseDeleted { case: at.case.clone(), delete: !keep_lessons })?;
+            }
             self.trash(&dir, at.case.as_str())?;
         }
         let _ = fs::remove_file(&lock_path);

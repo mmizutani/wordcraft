@@ -907,6 +907,41 @@ mod tests {
         CaseId::parse(&format!("{n:016x}")).unwrap()
     }
 
+    /// What the loader reads from the lessons file on disk: the lessons that are on, and none at
+    /// all from a file that parsed but had to be cut to the limits, since a damaged file is
+    /// withheld whole rather than sent in part.
+    #[test]
+    fn the_pool_reads_only_lessons_that_are_on_and_none_from_a_damaged_file() {
+        use crate::cases::lessons::{FILE, LessonDraft, LessonOp};
+        use crate::cases::record::{Click, MAX_TEXT, VERSION};
+        let dir = std::env::temp_dir().join(format!("wordcraft-recall-{}-pool-lessons", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = || Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click(), "Acme", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click(), &wall, "Acme MSA", "2026-11-10", 2).unwrap();
+        let keep = |text: &str| {
+            let draft = LessonDraft { text: Quoted::parse(text), applies: Applies::default(), topics: Topics::default(), from: None };
+            shelf.lesson(click(), LessonOp::Keep(draft)).unwrap().unwrap()
+        };
+        keep("On: ask for the SLA credit before the cap.");
+        let off = keep("Off: the cap moves last.");
+        shelf.lesson(click(), LessonOp::Off(off, true)).unwrap();
+        let pool = Pool::load(&shelf, &at).unwrap();
+        let texts: Vec<&str> = pool.lessons.iter().map(|l| l.text.raw()).collect();
+        assert_eq!(texts, ["On: ask for the SLA credit before the cap."]);
+        assert!(!pool.lessons_damaged);
+        let long = "x".repeat(MAX_TEXT + 1);
+        let cut =
+            format!(r#"{{"version":{VERSION},"lessons":[{{"id":"l1","text":"Parsed, kept whole."}},{{"id":"l2","text":"{long}"}}],"lastId":2}}"#);
+        std::fs::write(dir.join(FILE), cut).unwrap();
+        assert!(!shelf.lessons().lessons.is_empty(), "the file parsed: its lessons are there, flagged damaged");
+        let pool = Pool::load(&shelf, &at).unwrap();
+        assert!(pool.lessons.is_empty() && pool.lessons_damaged, "{:?}", pool.lessons);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A kept lesson is an item of its own kind, with its text, its coarse facts and the balance
     /// gap, and nothing that names the case it came from; one that is off isn't read, and a
     /// damaged lessons file sends none and says so.

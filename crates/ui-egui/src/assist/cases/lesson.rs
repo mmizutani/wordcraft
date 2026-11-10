@@ -215,8 +215,9 @@ pub(crate) fn list(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
 
 fn row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, l: &KeptLesson) {
     let id = l.id.to_string();
-    if let Some((editing, mut text)) = app.assist.cases.drafts.lesson_edit.take()
-        && editing == l.id
+    // Only this lesson's row takes the draft: a row before it would drop another lesson's.
+    if app.assist.cases.drafts.lesson_edit.as_ref().is_some_and(|(editing, _)| *editing == l.id)
+        && let Some((editing, mut text)) = app.assist.cases.drafts.lesson_edit.take()
     {
         ui.add(egui::TextEdit::multiline(&mut text).char_limit(MAX_TEXT).desired_rows(2).desired_width(f32::INFINITY));
         let mut open = true;

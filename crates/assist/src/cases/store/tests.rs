@@ -484,6 +484,23 @@ fn a_deleted_case_s_lessons_go_with_it_or_stay_unlinked() {
     assert!(!shelf.exists(&at));
 }
 
+/// A delete refused because another window holds the case's lock leaves its lessons as they were:
+/// the person may not try again, so nothing of the delete happens until the case can go.
+#[test]
+fn a_delete_refused_as_busy_leaves_the_case_s_lessons_alone() {
+    use crate::cases::LessonOp;
+    let (shelf, at) = shelf_with_case("lessons-busy");
+    shelf.lesson(click(), LessonOp::Keep(lesson_draft("From the MSA.", Some(&at)))).unwrap();
+    {
+        let _held = crate::atomic::Lock::take(&shelf.lock_path(&at)).unwrap();
+        assert_eq!(shelf.delete_case(click(), &at, false), Err(CaseError::Busy));
+        assert_eq!(shelf.lessons().from_case(&at.case).count(), 1, "still there and still linked");
+        assert!(shelf.exists(&at));
+    }
+    shelf.delete_case(click(), &at, false).unwrap();
+    assert!(shelf.lessons().lessons.is_empty());
+}
+
 /// A damaged lessons file is moved aside on the person's next write, never replaced in silence,
 /// and until then is read as damaged with no lesson in it.
 #[test]
