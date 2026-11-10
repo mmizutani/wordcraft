@@ -745,7 +745,7 @@ pub fn authors(s: &Session) -> Vec<String> {
         if out.len() >= MOST_AUTHORS {
             break;
         }
-        if !out.iter().any(|a| *a == r.author) {
+        if !out.contains(&r.author) {
             out.push(r.author.clone());
         }
     }

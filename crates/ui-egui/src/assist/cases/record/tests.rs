@@ -139,7 +139,7 @@ fn rejecting_or_accepting_the_other_sides_insertion_is_a_decided_record_naming_t
         let all = records_held(&folder, &c.a);
         let decided: Vec<&Record> = all.iter().filter(|r| matches!(r, Record::Decided { .. })).collect();
         assert_eq!(decided.len(), 1, "{decided:?}");
-        let Record::Decided { decision, kind, author, text, .. } = decided[0] else { unreachable!() };
+        let Record::Decided { decision, kind, author, text, .. } = decided[0] else { panic!("{decided:?}") };
         let expected = if accept { wordcraft_assist::Decision::Accepted } else { wordcraft_assist::Decision::Rejected };
         assert_eq!(*decision, expected);
         assert_eq!(kind, "insert");
@@ -160,7 +160,9 @@ fn records_held(folder: &Folder, at: &CaseRef) -> Vec<Record> {
     }
 }
 
-/// A click the control channel made on Reject is a program's, not the person's: no line.
+/// A Reject the control channel's click made, or a script ran, is a program's, not the person's:
+/// no line. The window tells the two apart by where the input came from, as it does for the
+/// feedback digest.
 #[test]
 fn a_scripts_reject_is_no_decided_record() {
     let folder = Folder::new();
@@ -172,6 +174,11 @@ fn a_scripts_reject_is_no_decided_record() {
     ask(&mut a, Fake::new().then(vec![Step::Say("Noted.".into())]), "Read it");
     settle(&mut a);
     a.execute("review.rejectAll", json!({"author": OTHER_SIDE})).unwrap();
+    other_sides_insertion(&mut a, " Supplier may also raise fees later.");
+    // The control channel's click: the window's own command path, with the input not the person's.
+    a.synthetic_pending = true;
+    a.run("review.rejectAll", json!({"author": OTHER_SIDE})).unwrap();
+    a.synthetic_pending = false;
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert!(!records(&folder, &c.a).iter().any(|r| matches!(r, Record::Decided { .. })));
 }

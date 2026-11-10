@@ -94,7 +94,8 @@ fn a_full_queue_never_blocks_and_becomes_a_dropped_record() {
     for n in 0..8 {
         log.write(decided(&format!("change {n}")));
     }
-    assert!(started.elapsed() < std::time::Duration::from_millis(500), "a write waited for the writer");
+    // A write that waited for the writer would wait for the gate, which stays shut: forever.
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "a write waited for the writer");
     // The writer took one record off the queue before the gate, so two of the eight waited there.
     assert!(log.dropped() >= 4, "{}", log.dropped());
     {
@@ -130,7 +131,10 @@ fn a_full_queue_never_blocks_and_becomes_a_dropped_record() {
 fn the_caps_hold_and_the_oldest_conversation_goes_first() {
     let (shelf, at) = shelf_with_case("caps");
     let big = "x".repeat(60 << 10);
-    let mut log = CaseLog::open(&shelf, &at, "20261110T090000-1").unwrap();
+    // A queue nothing drops from, so every count here is the file cap's: a loaded machine
+    // schedules the writer late.
+    let open_gate = Arc::new((Mutex::new(true), Condvar::new()));
+    let mut log = CaseLog::open_gated(&shelf, &at, "20261110T090000-1", 1 << 16, open_gate).unwrap();
     let mut clamped = decided(&big);
     clamped.clamp();
     let per_line = serde_json::to_string(&clamped).unwrap().len() + 1;
@@ -217,7 +221,7 @@ fn a_link_in_or_as_the_record_folder_is_never_followed() {
 
     // `log/` is a link to the other client's record.
     std::os::unix::fs::symlink(&other_dir, shelf.log_dir(&here)).unwrap();
-    assert!(matches!(CaseLog::open(&shelf, &here, "20261110T100000-2"), Err(_)), "opened through a link");
+    assert!(CaseLog::open(&shelf, &here, "20261110T100000-2").is_err(), "opened through a link");
     assert!(search(&shelf, &here, "").hits.is_empty(), "read through a link");
     assert_eq!(log_size(&shelf, &here), 0);
     assert_eq!(std::fs::read_dir(&other_dir).unwrap().count(), 1, "the other client's record changed");

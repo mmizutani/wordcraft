@@ -660,6 +660,7 @@ fn delete_removes_the_case_and_its_notes_and_a_later_turn_recalls_nothing() {
     let seen = ask(&mut a, Fake::new(), "Review the liability cap");
     assert_eq!(recalled_json(&seen.lock().unwrap().turns[0]).len(), 1);
     a.run("assist.memory.case.delete", json!({})).unwrap();
+    frames_until(&mut a, "the delete worker", |a| a.assist.cases.record.deleting.is_none());
     assert!(!case_dir.exists(), "the folder is gone");
     assert!(a.conversation().unwrap().has_ended(), "the conversation that read the notes ended");
     let listing = Shelf::at(&folder.0).list();
@@ -1110,6 +1111,7 @@ fn a_kept_lesson_reaches_another_clients_turn_and_nothing_else_of_its_case_does(
 
     a.bind_case(Some(c.here.clone()));
     a.run("assist.memory.case.delete", json!({"keepLessons": true})).unwrap();
+    frames_until(&mut a, "the delete worker", |a| a.assist.cases.record.deleting.is_none());
     let left = kept(&folder);
     assert_eq!(left.len(), 1, "kept, unlinked");
     assert!(!left[0].is_from(&c.here.case));
