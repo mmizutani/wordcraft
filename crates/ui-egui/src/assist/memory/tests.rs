@@ -246,7 +246,7 @@ fn poisoned(folder: &Folder) -> egui_kittest::Harness<'static, WordApp> {
 
 /// One frame with the control channel's input queued, as the app's has.
 #[cfg(not(target_arch = "wasm32"))]
-fn control_click(h: &mut egui_kittest::Harness<'_, WordApp>, label: &str) {
+pub(crate) fn control_click(h: &mut egui_kittest::Harness<'_, WordApp>, label: &str) {
     use egui_kittest::kittest::Queryable;
     let pos = h.get_by_label(label).rect().center();
     let (req, _rx) = crate::control::ControlRequest::new("ui.click", json!({"x": pos.x, "y": pos.y}));

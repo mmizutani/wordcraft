@@ -35,7 +35,8 @@
 //! `.remove`, `.clear` and `.enabled` change it from the Assistant pane's Details › Memory, and `.keep`
 //! and `.dismiss` answer what the model proposes there, `.keep` what the pane asks about a preference
 //! whose changes keep being rejected. Documents are untrusted and a
-//! kept preference outlasts them, so these writes are [`person_only`] too.
+//! kept preference outlasts them, so these writes are [`person_only`] too. The person's cases
+//! (#107) are [`cases`]: `assist.memory.case.*` and `assist.memory.wall.*`, under the same guard.
 //!
 //! A writing action is a prompt of ours ([`prompts`]) asked like any other, so its edits are the
 //! assistant's: tracked changes in its name while it is a suggester. The window gives the
@@ -123,7 +124,7 @@ const MAX_PATH_CHARS: usize = 4096;
 const MAX_TONE_CHARS: usize = 40;
 
 pub fn specs() -> Vec<CommandSpec> {
-    vec![
+    let mut specs = vec![
         CommandSpec::new("assist.pane", "Assistant", "Home › Assistant", pane)
             .params(r#"{"value"?: bool (omit to toggle)}"#)
             .key("Mod+Alt+Shift+A")
@@ -257,7 +258,9 @@ pub fn specs() -> Vec<CommandSpec> {
             .params(r#"{"insert"?: bool (write the summary after the selection instead of in a comment on it)} → a summary of the selected text, or of the document when nothing is selected"#)
             .when(can_ask)
             .pure(),
-    ]
+    ];
+    specs.extend(cases::specs());
+    specs
 }
 
 fn in_window(s: &Session) -> Option<&'static str> {
@@ -654,6 +657,8 @@ pub mod prompts {
     /// … and with nothing selected.
     pub const THE_DOCUMENT: &str = "the document";
 }
+
+pub mod cases;
 
 #[cfg(test)]
 mod tests;

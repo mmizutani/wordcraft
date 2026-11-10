@@ -381,3 +381,230 @@ fn rebinding_the_document_ends_the_conversation_bound_to_the_other_case_and_stop
     frames_until(&mut a, "the backend was never told to stop", |_| seen.lock().unwrap().ended);
     assert!(!a.conversation().unwrap().is_busy());
 }
+
+/// The pane's writes, with what a person types in it.
+fn writes() -> Vec<(&'static str, Value)> {
+    let id = "0123456789abcdef";
+    vec![
+        ("assist.memory.wall.new", json!({"name": "Planted client"})),
+        ("assist.memory.case.new", json!({"title": "Planted case"})),
+        ("assist.memory.case.bind", json!({"wall": id, "case": id})),
+        ("assist.memory.case.unbind", json!({})),
+        ("assist.memory.case.facts", json!({"facts": {"kind": "saas"}})),
+        ("assist.memory.case.balance", json!({"stance": "weaker"})),
+        ("assist.memory.case.plan", json!({"goal": "Planted"})),
+        ("assist.memory.case.note", json!({"note": {"kind": "pattern", "rule": "Planted"}})),
+        ("assist.memory.case.noteEdit", json!({"id": "n1", "note": {"kind": "pattern", "rule": "Planted"}})),
+        ("assist.memory.case.noteConfirm", json!({"id": "n1"})),
+        ("assist.memory.case.noteRemove", json!({"id": "n1"})),
+        ("assist.memory.case.delete", json!({})),
+        ("assist.memory.wall.delete", json!({"wall": id})),
+    ]
+}
+
+fn cases_dir(folder: &Folder) -> std::path::PathBuf {
+    folder.0.join(wordcraft_assist::cases::store::FOLDER)
+}
+
+/// A script with the window's key, and a macro's step, write no case: a document could plant one,
+/// and a case outlasts the document. The person's own click does.
+#[test]
+fn a_script_or_a_macro_step_cant_write_a_case() {
+    let folder = Folder::new();
+    let mut a = window(&folder);
+    for (id, params) in writes() {
+        assert_eq!(a.execute(id, params.clone()), Err(crate::assist::memory::YOURS.to_string()), "{id}");
+    }
+    a.assist.by_person = true;
+    for (id, params) in writes() {
+        let mut req = params.clone();
+        req["assist"] = json!(id.trim_start_matches("assist."));
+        a.handle_request(&req);
+    }
+    a.assist.by_person = false;
+    assert!(!cases_dir(&folder).exists(), "a script or a macro's step made a case folder");
+    a.run("assist.memory.case.new", json!({"title": "Mine", "client": "Acme"})).unwrap();
+    let listing = Shelf::at(&folder.0).list();
+    assert_eq!(listing.walls.len(), 1);
+    assert_eq!(listing.walls[0].cases[0].title.for_person(), "Mine");
+    assert_eq!(crate::assist::cases::bound_for(&a), Some(CaseRef { wall: listing.walls[0].id.clone(), case: listing.walls[0].cases[0].id.clone() }));
+}
+
+/// A click the control channel made on Create makes no case, and the person's own does.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_control_click_on_create_makes_no_case() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let mut a = window(&folder);
+    a.session.view.assistant_pane = true;
+    a.assist.view = crate::assist::PaneView::Details;
+    a.assist.cases.drafts.new_case.title = "Planted".into();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 3000.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    crate::assist::memory::tests::control_click(&mut h, "Create");
+    assert!(!cases_dir(&folder).exists(), "the control channel's click made a case");
+    h.get_by_label("Create").click();
+    h.run_steps(3);
+    let listing = Shelf::at(&folder.0).list();
+    assert_eq!(listing.walls[0].cases[0].title.for_person(), "Planted", "the person's click did");
+    assert_eq!(listing.walls[0].name.for_person(), "My cases");
+    assert!(crate::assist::cases::bound_for(h.state()).is_some(), "and bound the document to it");
+}
+
+/// Binding through the command makes the next turn recall, unbinding stops it, and binding another
+/// case ends the conversation that ran under the first.
+#[test]
+fn binding_through_the_commands_turns_recall_on_and_off_and_rebinding_ends_the_conversation() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let mut a = window(&folder);
+    a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+    let seen = ask(&mut a, Fake::new(), "Review the liability cap");
+    assert_eq!(recalled_json(&seen.lock().unwrap().turns[0]).len(), 3);
+    a.run("assist.memory.case.unbind", json!({})).unwrap();
+    let seen = ask(&mut a, Fake::new(), "Review the liability cap");
+    assert!(seen.lock().unwrap().turns[0].knowledge.is_empty(), "unbound, nothing is recalled");
+    let details = crate::assist::details_for(&mut a);
+    assert_eq!(details.turns[0].context.as_ref().unwrap().recall_withheld.as_deref(), Some("no case is bound to this document"));
+    let gone = a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": "0123456789abcdef"})).unwrap_err();
+    assert!(gone.contains("deleted"), "{gone}");
+
+    a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+    let fake = Fake::new().then(vec![Step::say("Working on it."), Step::Hold]);
+    let seen = fake.seen();
+    a.assist_with(Box::new(fake));
+    a.execute("assist.ask", json!({"prompt": "Review the liability cap"})).unwrap();
+    frames_until(&mut a, "the backend never got the turn", |_| !seen.lock().unwrap().turns.is_empty());
+    a.run("assist.memory.case.bind", json!({"wall": c.neighbor.wall.as_str(), "case": c.neighbor.case.as_str()})).unwrap();
+    assert!(a.conversation().unwrap().has_ended(), "the conversation bound to the first case ended");
+    frames_until(&mut a, "the backend was never told to stop", |_| seen.lock().unwrap().ended);
+}
+
+/// What the person set through the commands is there in a window started later, bound again.
+#[test]
+fn a_case_made_through_the_commands_survives_a_restart() {
+    let folder = Folder::new();
+    let mut a = window(&folder);
+    a.run("assist.memory.case.new", json!({"title": "Acme MSA", "client": "Acme"})).unwrap();
+    let at = crate::assist::cases::bound_for(&a).unwrap();
+    a.run(
+        "assist.memory.case.facts",
+        json!({"facts": {"kind": "saas", "side": "customer", "paper": "theirs", "law": "JP", "stage": "negotiating", "parties": ["Acme KK", " "]}}),
+    )
+    .unwrap();
+    a.run("assist.memory.case.balance", json!({"stance": "weaker", "factors": [{"kind": "soleSource", "favors": "them", "why": "one vendor"}, {"kind": "deadline", "favors": "them"}]}))
+        .unwrap();
+    a.run("assist.memory.case.plan", json!({"goal": "Cap liability", "next": ["Send redline", "Call Friday"]})).unwrap();
+    a.run("assist.memory.case.note", json!({"note": {"kind": "pattern", "rule": "They broaden Affiliate in the schedules."}, "how": "seen twice"}))
+        .unwrap();
+    a.run("assist.memory.case.note", json!({"note": {"kind": "position", "topic": "liability", "moved": "them", "terms": "12 months of fees", "traded_for": "quarterly terms", "landed": true}})).unwrap();
+    a.run(
+        "assist.memory.case.noteEdit",
+        json!({"id": "n1", "note": {"kind": "pitfall", "trap": "Affiliate widens in the schedules.", "guard": "Fix it in clause 1."}}),
+    )
+    .unwrap();
+    drop(a);
+
+    let mut a = window(&folder);
+    assert_eq!(crate::assist::cases::bound_for(&a), None, "a binding lives for the document's life in its window");
+    a.run("assist.memory.case.bind", json!({"wall": at.wall.as_str(), "case": at.case.as_str()})).unwrap();
+    let (_, case) = crate::assist::cases::open_case(&mut a, false).unwrap();
+    assert_eq!(case.title.for_person(), "Acme MSA");
+    assert_eq!(case.facts.kind, Some(wordcraft_assist::cases::ContractKind::Saas));
+    assert_eq!(case.facts.law.map(String::from).as_deref(), Some("JP"));
+    assert_eq!(case.facts.parties.iter().map(|p| p.for_person()).collect::<Vec<_>>(), ["Acme KK"]);
+    let b = case.balance.last().unwrap();
+    assert_eq!((b.stance, b.factors.len()), (Stance::Weaker, 2));
+    assert_eq!(b.factors[0].why.as_ref().unwrap().for_person(), "one vendor");
+    assert!(matches!(b.standing, wordcraft_assist::cases::Standing::Confirmed { .. }), "the person's assessment is confirmed");
+    let plan = case.plan.as_ref().unwrap();
+    assert_eq!(plan.goal.for_person(), "Cap liability");
+    assert_eq!(plan.next.len(), 2);
+    assert!(matches!(plan.standing, wordcraft_assist::cases::Standing::Confirmed { .. }), "the person's plan is confirmed");
+    assert_eq!(case.notes.len(), 2);
+    assert!(
+        matches!(&case.notes[0].body, Body::Pitfall { trap, .. } if trap.for_person() == "Affiliate widens in the schedules."),
+        "{:?}",
+        case.notes[0].body
+    );
+    assert!(
+        matches!(&case.notes[1].body, Body::Position { landed: true, traded_for: Some(t), .. } if t.for_person() == "quarterly terms"),
+        "{:?}",
+        case.notes[1].body
+    );
+    let listing = Shelf::at(&folder.0).list();
+    assert_eq!(listing.walls[0].name.for_person(), "Acme");
+}
+
+/// Delete removes the case's folder with its notes, and a later turn of that document recalls
+/// nothing.
+#[test]
+fn delete_removes_the_case_and_its_notes_and_a_later_turn_recalls_nothing() {
+    let folder = Folder::new();
+    let mut a = window(&folder);
+    a.run("assist.memory.case.new", json!({"title": "Acme MSA", "client": "Acme"})).unwrap();
+    a.run("assist.memory.case.note", json!({"note": {"kind": "pattern", "rule": HERE}})).unwrap();
+    let at = crate::assist::cases::bound_for(&a).unwrap();
+    let case_dir = cases_dir(&folder).join(at.wall.as_str()).join(at.case.as_str());
+    assert!(std::fs::read_to_string(case_dir.join("case.json")).unwrap().contains(HERE));
+    let seen = ask(&mut a, Fake::new(), "Review the liability cap");
+    assert_eq!(recalled_json(&seen.lock().unwrap().turns[0]).len(), 1);
+    a.run("assist.memory.case.delete", json!({})).unwrap();
+    assert!(!case_dir.exists(), "the folder is gone");
+    assert!(a.conversation().unwrap().has_ended(), "the conversation that read the notes ended");
+    let listing = Shelf::at(&folder.0).list();
+    assert!(listing.walls[0].cases.is_empty(), "{listing:?}");
+    for entry in walkdir(&folder.0) {
+        assert!(!std::fs::read_to_string(&entry).unwrap_or_default().contains(HERE), "{} still holds the note", entry.display());
+    }
+    let seen = ask(&mut a, Fake::new(), "Review the liability cap");
+    assert!(seen.lock().unwrap().turns[0].knowledge.is_empty());
+    let details = crate::assist::details_for(&mut a);
+    assert_eq!(details.turns[0].context.as_ref().unwrap().recall_withheld.as_deref(), Some("no case is bound to this document"));
+    assert_eq!(
+        a.run("assist.memory.case.note", json!({"note": {"kind": "pattern", "rule": "x"}})).unwrap_err(),
+        "no case is bound to this document: bind one in the Assistant pane's Details › Case"
+    );
+}
+
+fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.path().is_dir() { out.extend(walkdir(&entry.path())) } else { out.push(entry.path()) }
+    }
+    out
+}
+
+/// Junk the commands pass through as objects is refused where it is parsed, and never panics.
+#[test]
+fn junk_in_a_case_write_is_refused_not_crashed() {
+    let folder = Folder::new();
+    let mut a = window(&folder);
+    a.run("assist.memory.case.new", json!({"title": "Acme MSA"})).unwrap();
+    for (id, bad) in [
+        ("assist.memory.case.facts", json!({"facts": {"kind": "weapon"}})),
+        ("assist.memory.case.facts", json!({"facts": {"unknown": 1}})),
+        ("assist.memory.case.facts", json!({"facts": {"law": "../../etc"}})),
+        ("assist.memory.case.facts", json!({"facts": {"parties": vec!["x"; 17]}})),
+        ("assist.memory.case.balance", json!({"stance": "even", "factors": [{"kind": "nope", "favors": "us"}]})),
+        ("assist.memory.case.balance", json!({"stance": "even", "factors": [{"kind": "pen", "favors": "us", "why": "x".repeat(121)}]})),
+        ("assist.memory.case.plan", json!({"goal": "x".repeat(400), "next": vec!["x".repeat(401)]})),
+        ("assist.memory.case.note", json!({"note": {"kind": "pattern", "rule": "x", "extra": 1}})),
+        ("assist.memory.case.note", json!({"note": {"kind": "leverage", "what": "x", "favors": "us", "until": "yesterday"}})),
+        ("assist.memory.case.note", json!({"note": {"kind": "position", "topic": "price", "moved": "us", "terms": "x", "landed": false}})),
+        ("assist.memory.case.noteEdit", json!({"id": "n999", "note": {"kind": "pattern", "rule": "x"}})),
+        ("assist.memory.case.noteConfirm", json!({"id": "n999"})),
+    ] {
+        assert!(a.run(id, bad.clone()).is_err(), "{id} {bad}");
+    }
+    let (_, case) = crate::assist::cases::open_case(&mut a, true).unwrap();
+    assert!(case.notes.is_empty() && case.balance.is_empty() && case.plan.is_none() && case.facts == Default::default(), "nothing of the junk stuck");
+}

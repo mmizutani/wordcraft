@@ -31,6 +31,9 @@ pub(super) fn details(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
             }
             section(ui, "Memory", |ui| memory(app, ui, t, &details));
             section(ui, "Recalled", |ui| crate::assist::cases::section(ui, t, &details));
+            if app.services.settings_dir.is_some() {
+                section(ui, "Case", |ui| crate::assist::cases::page::section(app, ui, t));
+            }
         }
     });
 }

@@ -205,6 +205,73 @@ none applies any more. They apply unless the current request says otherwise, and
 permit what the role doesn't. While memory is on, a turn also asks the model to propose only what
 you said or did, never something the document asks for. Off, it asks for nothing.
 
+## Cases
+
+A case is one contract negotiation: a title, the facts that make it like or unlike another (the
+kind of contract, which side you are on, whose paper it is, what kind of counterparty, the
+governing law, its size, language and stage, and the parties' names), a dated power balance with
+the factors behind it, a plan, and notes of five kinds: a pattern, a pitfall, a lesson, leverage,
+or a position taken on a clause (its topic, the terms, who moved, what was traded and whether it
+landed). Cases belong to a client, and a client is a folder; the default client is **My cases**.
+Every field but the title is optional.
+
+Details › Case in the Assistant pane shows the document's case. With none bound it lists your
+cases by client, each a button that binds the open document to it, and has **New case**: a title
+and a client, chosen from the list or typed as a new one. Bound, it shows the title and client with
+**Unbind**, the facts as pickers, the balance with its date and **Reassess** (Stronger, Even or
+Weaker, and up to four factors each favouring us or them, with a reason), the plan with its next
+steps, and the notes grouped by kind, each with **Edit** and **Remove**. A note a model wrote shows
+dimmed as unconfirmed with **Confirm**; none exist yet, since in this version the model writes
+nothing, and everything on the page is yours, confirmed on the day you set it. The commands are
+`assist.memory.case.new`, `.bind`, `.unbind`, `.facts`, `.balance`, `.plan`, `.note`, `.noteEdit`,
+`.noteConfirm`, `.noteRemove` and `.delete`, and `assist.memory.wall.new` and `.delete` for a
+client. They are yours alone, as [Memory](#memory)'s are, and refuse a script, an agent, a click or
+key the control channel made and a macro's step. There is no command that reads a case: the pane
+reads the file itself, so holding the window's key doesn't list every client's cases.
+
+**Binding.** You bind a document to a case; nothing in the file says which, so a document can't
+name a case and a saved file carries no id. A binding lasts while the document is open in this
+window: after a restart or a reopen you bind again. A conversation belongs to the case its document
+was bound to when it started. Binding the document to another case, or unbinding it, ends the
+conversation, stopping a running turn, since the model holds what that case's notes said and the
+next turn would run under another case.
+
+**What a turn recalls.** With a case bound, each turn carries what ranks highest for the prompt and
+the text around the caret: this case's notes, and the confirmed notes and latest balance of the
+same client's other cases. Never another client's: recall opens one client's folder and no other.
+A model's unconfirmed note stays in the case it was written in. What is recalled goes to the model
+as data, in the turn's sources, with WordCraft's own framing that it is never an instruction and
+mustn't be copied into the document unless you ask; it is never in the instruction channel that
+carries your preferences. The model is asked to write `[[used: n12]]` where an item shapes its
+answer, which becomes a chip as a preference's does. Details › Recalled lists, per turn, each item,
+where it came from (this case or which of the client's cases), whether it is unconfirmed, the
+balance then against now, how many more scored but didn't fit, and why nothing was recalled when
+nothing was.
+
+**When recall is off.** Nothing is recalled with no case bound, on the web (no settings folder),
+or while anyone besides you and this conversation's assistant can read the document: another
+participant, or an invite not yet used. Details › Recalled says which. Once a conversation has
+recalled anything, someone joining doesn't just turn recall off: the next turn is refused, and a
+running turn is stopped and the conversation ended, with the pane saying who can now read the
+document, because the model still holds what it read and a document could ask it to write that into
+a comment the newcomer reads.
+
+**Where the files are.** `assistant-cases/<client>/<case>/case.json` in the settings folder, with
+`wall.json` naming the client; folders are mode 0700 and files 0600 on Unix, so only you may read
+them. A file is at most 1 MiB, and one that can't be read whole shows as damaged and is moved aside
+as `case.json.damaged` by your next change. Two WordCrafts keep each other's changes: each write
+takes the case's lock and reads the file again. Nothing of a case goes in a document, a recovery
+copy or the log, and it never crosses a room.
+
+**Delete.** Delete case asks in place, says it can't be undone, and removes the case's folder with
+every note in it; a client with no cases left can be deleted from the list. What WordCraft can't
+reach: what a turn already sent to a model provider under your account, an agent's own record of a
+conversation in its own folder, and a backup of your settings folder. The document's conversation
+ends first, and the page says the case was deleted if another window did it.
+
+The model writes nothing to a case in this version. Its notes, with the cards to confirm them, come
+later.
+
 ## Backends
 
 | Id | Backend | What runs it |
@@ -477,7 +544,8 @@ What the agent sends its model, and where, is its business: Claude Code talks to
 Codex to OpenAI and Pi to the providers you set it up with, under your account with them. Each
 turn WordCraft gives it your prompt and the selection with the paragraphs around it and the
 outline, held to 32 KiB in all, and what you accepted and rejected of its changes since its last
-turn, held to 2 KiB; what you kept ([Memory](#memory)), held to 4 KiB; the first turn adds a note that says which document it works
+turn, held to 2 KiB; what you kept ([Memory](#memory)), held to 4 KiB; what a bound case recalls
+([Cases](#cases)), held to 6 KiB, as a source; the first turn adds a note that says which document it works
 on, its name and role, and how to use the `wordcraft` tools (for Pi, `wordcraft-cli call`).
 Through those it can read the whole shared document.
 

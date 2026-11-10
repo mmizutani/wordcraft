@@ -143,6 +143,8 @@ fn junk_params_never_panic() {
         json!({"about": "\u{202e}\u{0}", "tone": "\u{0}formal", "insert": 1}),
         json!({"about": "é".repeat(MAX_PROMPT), "tone": "é".repeat(10_000), "insert": [true]}),
         json!({"about": "x".repeat(MAX_PROMPT), "tone": "\u{200b}", "insert": false}),
+        json!({"title": "é".repeat(10_000), "wall": "../..", "case": 7, "client": [], "name": null, "stance": "é", "factors": [1], "goal": {}, "next": [null], "note": "x", "how": [], "facts": [[]], "clear": "yes"}),
+        json!({"title": "t", "wall": "0123456789abcdef", "case": "0123456789abcdef", "id": "n99999999999999999999", "note": {"kind": "\u{0}", "rule": "é".repeat(10_000)}, "facts": {"law": "../x", "parties": ["é".repeat(10_000)]}, "next": ["é".repeat(10_000)]}),
     ];
     let mut s = in_window();
     let ids: Vec<&str> = s.registry.all().iter().map(|c| c.id).filter(|id| id.starts_with("assist.")).collect();
@@ -527,4 +529,69 @@ fn the_memory_is_the_person_s_alone() {
     // A session without a window has none of it.
     let mut alone = Session::new(Document::from_text("one"));
     assert!(matches!(alone.run("assist.memory.add", &json!({"text": "x"})), Err(CmdError::Disabled(_))));
+}
+
+/// Every write that says "Yours alone" in its params is one [`super::person_only`] refuses a key,
+/// a ribbon place, a macro's step and the control channel's click, and every command it refuses
+/// says so: the guard keys on a prefix, and a command named outside it would silently run anywhere.
+#[test]
+fn yours_alone_in_the_params_doc_and_person_only_agree() {
+    let reg = crate::cmd::registry();
+    let mut cases = 0;
+    for c in reg.all() {
+        let says = c.params.contains("Yours alone");
+        assert_eq!(says, super::person_only(c.id), "{}: params say \"Yours alone\" = {says}, person_only = {}", c.id, !says);
+        if c.id.starts_with("assist.memory.case.") || c.id.starts_with("assist.memory.wall.") {
+            cases += 1;
+        }
+    }
+    assert_eq!(cases, 13, "the case and wall commands are registered");
+}
+
+/// The case commands check the shape of what they are given and hand the window a request; the
+/// typed record above the engine parses the objects passed through.
+#[test]
+fn the_case_commands_check_what_they_are_given() {
+    let mut s = in_window();
+    let wall = "0123456789abcdef";
+    s.run("assist.memory.case.new", &json!({"title": " Acme MSA ", "client": "Acme"})).unwrap();
+    assert_eq!(requests(&mut s), [json!({"assist": "memory.case.new", "title": "Acme MSA", "wall": null, "client": "Acme"})]);
+    s.run("assist.memory.case.bind", &json!({"wall": wall, "case": wall})).unwrap();
+    assert_eq!(requests(&mut s), [json!({"assist": "memory.case.bind", "wall": wall, "case": wall})]);
+    s.run("assist.memory.case.balance", &json!({"stance": "weaker", "factors": [{"kind": "soleSource", "favors": "them"}]})).unwrap();
+    assert_eq!(
+        requests(&mut s),
+        [json!({"assist": "memory.case.balance", "stance": "weaker", "factors": [{"kind": "soleSource", "favors": "them"}]})]
+    );
+    s.run("assist.memory.case.plan", &json!({"goal": "Sign by March", "next": ["Send redline", " ", "Call"]})).unwrap();
+    assert_eq!(requests(&mut s), [json!({"assist": "memory.case.plan", "goal": "Sign by March", "next": ["Send redline", "Call"]})]);
+    s.run("assist.memory.case.noteEdit", &json!({"id": "n12", "note": {"kind": "pattern", "rule": "x"}, "how": " seen "})).unwrap();
+    assert_eq!(requests(&mut s), [json!({"assist": "memory.case.noteEdit", "id": "n12", "note": {"kind": "pattern", "rule": "x"}, "how": "seen"})]);
+    for (id, bad) in [
+        ("assist.memory.wall.new", json!({})),
+        ("assist.memory.wall.new", json!({"name": "x".repeat(401)})),
+        ("assist.memory.wall.delete", json!({"wall": "../../etc"})),
+        ("assist.memory.wall.delete", json!({"wall": "0123456789ABCDEF"})),
+        ("assist.memory.case.new", json!({"title": ""})),
+        ("assist.memory.case.new", json!({"title": "x", "wall": wall, "client": "both"})),
+        ("assist.memory.case.new", json!({"title": "x", "wall": "short"})),
+        ("assist.memory.case.bind", json!({"wall": wall})),
+        ("assist.memory.case.facts", json!({"facts": []})),
+        ("assist.memory.case.facts", json!({"facts": {"parties": ["x".repeat(20_000)]}})),
+        ("assist.memory.case.balance", json!({"stance": "winning"})),
+        ("assist.memory.case.balance", json!({"stance": "even", "factors": [{}, {}, {}, {}, {}]})),
+        ("assist.memory.case.plan", json!({"next": ["no goal"]})),
+        ("assist.memory.case.plan", json!({"goal": "g", "next": "one"})),
+        ("assist.memory.case.plan", json!({"goal": "g", "next": vec!["s"; 17]})),
+        ("assist.memory.case.note", json!({"note": "text"})),
+        ("assist.memory.case.note", json!({"note": {"kind": "pattern"}, "how": "x".repeat(401)})),
+        ("assist.memory.case.noteEdit", json!({"note": {"kind": "pattern"}})),
+        ("assist.memory.case.noteConfirm", json!({"id": "m1"})),
+        ("assist.memory.case.noteRemove", json!({"id": "n"})),
+        ("assist.memory.case.noteRemove", json!({"id": "n12345678901234567"})),
+    ] {
+        assert!(matches!(s.run(id, &bad), Err(CmdError::Params(_))), "{id} {bad}");
+        assert!(requests(&mut s).is_empty(), "{id} {bad}");
+    }
+    assert!(!s.can_undo() && !s.dirty);
 }

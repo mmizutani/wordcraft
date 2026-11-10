@@ -136,12 +136,15 @@ pub(crate) fn read(app: &mut WordApp) -> Result<Value, String> {
 }
 
 /// One of the `assist.memory.*` writes, whose params the command checked. Only the person's: the
-/// one guard every write passes.
+/// one guard every write passes, the person's cases (`memory.case.*`, `memory.wall.*`) included.
 pub(crate) fn write(app: &mut WordApp, what: &str, req: &Value) -> Result<Value, String> {
     if !app.assist.by_person {
         return Err(YOURS.into());
     }
     let dir = app.services.settings_dir.clone().ok_or(NO_FOLDER)?;
+    if what.starts_with("memory.case.") || what.starts_with("memory.wall.") {
+        return super::cases::write(app, &dir, what, req);
+    }
     let text = req.get("text").and_then(Value::as_str);
     let id = req.get("id").and_then(Value::as_str).unwrap_or("");
     let keeps_item = what == "memory.keep" && req.get("id").is_some();
