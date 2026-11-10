@@ -519,7 +519,7 @@ impl Recalled {
 /// of `shelf`, by the same composer a turn uses. The harness has no room, so the [`Alone`] proof
 /// can't be made there and isn't checked; nothing in the app calls this.
 #[doc(hidden)]
-pub fn compose_for_eval(shelf: &Shelf, at: &CaseRef, about: &str, today: Day) -> Result<(RecallSent, Vec<TurnSource>), CaseError> {
+pub fn compose_for_eval_without_room_check(shelf: &Shelf, at: &CaseRef, about: &str, today: Day) -> Result<(RecallSent, Vec<TurnSource>), CaseError> {
     let pool = Pool::load(shelf, at)?;
     let query = Query::new(about, pool.here.applies(today), today);
     let recalled = compose(&pool, &query);
