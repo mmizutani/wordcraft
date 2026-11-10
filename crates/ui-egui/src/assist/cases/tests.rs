@@ -736,11 +736,12 @@ fn an_output_row_that_quotes_recalled_notes_says_so() {
 }
 
 /// Three positions on the liability cap go to the turn as one ladder item, and Details › Recalled
-/// shows it as a positions table built from what was sent: each rung's date, where it is from,
-/// who moved, the terms, what was traded, whether it landed, and the balance then and now.
+/// shows its rungs, built from what was sent and wrapped inside the narrow pane: each rung's date,
+/// where it is from, who moved, the terms, what was traded, whether it landed, and the balance
+/// then and now.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
-fn details_shows_a_ladder_as_a_positions_table() {
+fn details_shows_a_ladders_rungs_inside_the_pane() {
     use egui_kittest::kittest::Queryable;
     use wordcraft_assist::cases::{Side, Topic};
     let folder = Folder::new();
@@ -780,7 +781,12 @@ fn details_shows_a_ladder_as_a_positions_table() {
     ] {
         assert!(h.query_all_by_label_contains(shown).next().is_some(), "{shown} is not in the table");
     }
-    assert!(h.query_by_label("Traded for").is_some() && h.query_by_label("Landed").is_some(), "the table has its headers");
+    // The pane is narrow: every rung's terms and trade are inside the window, not cut off past
+    // its right edge.
+    for inside in ["Cap at six months of fees paid, which landed.", "A three-year initial term.", "Cap at nine months of fees paid, refused."] {
+        let right = h.query_all_by_label_contains(inside).next().unwrap().rect().right();
+        assert!(right <= 1440.0, "{inside} ends at {right}, past the window's right edge");
+    }
 }
 
 /// What the poisoned document tells the model to record as the person's standing position.

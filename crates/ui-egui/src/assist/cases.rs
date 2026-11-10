@@ -550,7 +550,9 @@ fn from_words(place: &Place, title: Option<&String>) -> String {
     }
 }
 
-/// A ladder item: its id and line, then its rungs as a table, from what was sent and nothing else.
+/// A ladder item: its id and line, then each rung, from what was sent and nothing else. A rung is
+/// three wrapped lines (when, where, who moved, landed and the balance; the terms; the trade)
+/// rather than a table row, since the pane is too narrow for seven columns.
 fn ladder_rows(ui: &mut Ui, t: &Tokens, item: &RecalledItem) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(item.id.to_string()).small().color(t.accent));
@@ -559,26 +561,27 @@ fn ladder_rows(ui: &mut Ui, t: &Tokens, item: &RecalledItem) {
             ui.label(RichText::new(tl!("sent earlier")).small().color(t.text_dim));
         }
     });
-    egui::Grid::new(("ladder", item.id.to_string())).striped(true).min_col_width(40.0).max_col_width(320.0).show(ui, |ui| {
-        for head in [tl!("Date"), tl!("Where"), tl!("Moved"), tl!("Terms"), tl!("Traded for"), tl!("Landed"), tl!("Balance then, now")] {
-            ui.label(RichText::new(head).small().color(t.text_dim));
+    for r in &item.rungs {
+        let mut from = from_words(&r.place, r.title.as_ref());
+        if !r.confirmed {
+            from = format!("{from}, {}", tl!("unconfirmed"));
         }
-        ui.end_row();
-        for r in &item.rungs {
-            let mut from = from_words(&r.place, r.title.as_ref());
-            if !r.confirmed {
-                from = format!("{from}, {}", tl!("unconfirmed"));
-            }
-            ui.label(RichText::new(String::from(r.on)).small().color(t.text));
-            ui.add(egui::Label::new(RichText::new(from).small().color(if r.confirmed { t.text_dim } else { t.orange })).wrap());
-            ui.label(RichText::new(page::word(&page::FAVORS, r.moved)).small().color(t.text));
-            ui.add(egui::Label::new(RichText::new(&r.terms).small().color(t.text)).wrap());
-            ui.add(egui::Label::new(RichText::new(r.traded_for.as_deref().unwrap_or("")).small().color(t.text)).wrap());
-            ui.label(RichText::new(if r.landed { tl!("landed") } else { tl!("open") }).small().color(t.text));
-            ui.label(RichText::new(format!("{}, {}", stance_word(r.balance.then), stance_word(r.balance.now))).small().color(t.text_dim));
-            ui.end_row();
+        let landed = if r.landed { tl!("landed") } else { tl!("open") };
+        let balance = format!("{}, {}", stance_word(r.balance.then), stance_word(r.balance.now));
+        let line = format!(
+            "{} · {from} · {}: {} · {landed} · {}: {balance}",
+            String::from(r.on),
+            tl!("Moved"),
+            page::word(&page::FAVORS, r.moved),
+            tl!("Balance then, now")
+        );
+        ui.add(egui::Label::new(RichText::new(line).small().color(if r.confirmed { t.text_dim } else { t.orange })).wrap());
+        ui.add(egui::Label::new(RichText::new(&r.terms).small().color(t.text)).wrap());
+        if let Some(trade) = &r.traded_for {
+            ui.add(egui::Label::new(RichText::new(format!("{}: {trade}", tl!("Traded for"))).small().color(t.text)).wrap());
         }
-    });
+        ui.add_space(3.0);
+    }
 }
 
 fn turn_rows(ui: &mut Ui, t: &Tokens, recalled: &RecallSent) {

@@ -265,7 +265,7 @@ is ordered for the question "what did we concede, and when were we weaker": the 
 under the balance closest to now first, then landed before open, then newest; at most eight rungs
 go, and the rest are counted with what didn't fit. Lessons, patterns and pitfalls on the topic go
 as before and never enter a ladder, and another case's unconfirmed position never does either.
-Details › Recalled shows a ladder as a table of its rungs, and a change that pastes a rung's terms
+Details › Recalled lists a ladder's rungs, each on a few wrapped lines, and a change that pastes a rung's terms
 is flagged as quoting your case notes like any other recalled text.
 
 **What the assistant writes.** With a case bound, each turn's instructions also say what the
