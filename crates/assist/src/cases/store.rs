@@ -382,9 +382,21 @@ impl Shelf {
         Ok(())
     }
 
-    /// The wall and every case in it go.
-    pub fn delete_wall(&self, _click: Click, wall: &WallId) -> Result<(), CaseError> {
-        self.trash(&self.real_wall_dir(wall)?, wall.as_str())
+    /// The wall goes if it holds no case. The page offers this when its listing shows none, but
+    /// another window may have added one since, so the folder is checked here, where the delete is.
+    /// ponytail: a case made between the check and the rename goes with the folder; a wall has no
+    /// lock to close that window.
+    pub fn delete_empty_wall(&self, _click: Click, wall: &WallId) -> Result<(), CaseError> {
+        let dir = self.real_wall_dir(wall)?;
+        let has_case = fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| entry.file_name().to_str().and_then(CaseId::parse).is_some() && is_real_dir(&entry));
+        if has_case {
+            return Err(CaseError::NotEmpty);
+        }
+        self.trash(&dir, wall.as_str())
     }
 }
 

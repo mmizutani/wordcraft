@@ -83,6 +83,20 @@ fn a_deleted_case_does_not_come_back() {
     assert_eq!(shelf.list().walls[0].cases, vec![]);
 }
 
+/// Delete client in one window while another window adds a case: the client's folder goes only
+/// when it holds no case.
+#[test]
+fn a_client_with_a_case_is_never_deleted_and_an_empty_one_is() {
+    let (shelf, at) = shelf_with_case("delete-wall");
+    assert_eq!(shelf.delete_empty_wall(click(), &at.wall), Err(CaseError::NotEmpty));
+    assert!(shelf.exists(&at), "the case is still there");
+    assert_eq!(shelf.list().walls.len(), 1);
+    shelf.delete_case(click(), &at).unwrap();
+    shelf.delete_empty_wall(click(), &at.wall).unwrap();
+    assert!(!shelf.wall_dir(&at.wall).exists());
+    assert!(shelf.list().walls.is_empty());
+}
+
 #[test]
 fn a_crash_after_the_rename_is_swept() {
     let (shelf, at) = shelf_with_case("crash");
@@ -378,7 +392,7 @@ fn a_case_behind_a_symlinked_wall_is_gone() {
     assert_eq!(shelf.person(click(), &at, PersonOp::AddNote(pitfall("through a link")), today()), Err(CaseError::Gone));
     assert_eq!(shelf.open(&at), Err(CaseError::Gone));
     assert_eq!(shelf.delete_case(click(), &at), Err(CaseError::Gone));
-    assert_eq!(shelf.delete_wall(click(), &at.wall), Err(CaseError::Gone));
+    assert_eq!(shelf.delete_empty_wall(click(), &at.wall), Err(CaseError::Gone));
     assert_eq!(std::fs::read(&path).unwrap(), before, "the target is untouched");
     assert!(other.exists(&at));
 }

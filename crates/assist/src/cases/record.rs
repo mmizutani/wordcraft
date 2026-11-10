@@ -1036,6 +1036,9 @@ pub enum CaseError {
     Busy,
     #[error("the case holds the most {0} it can: remove one first")]
     Full(&'static str),
+    /// A client still holds a case, perhaps one another window added since this one listed.
+    #[error("this client still has a case: delete its cases first")]
+    NotEmpty,
     #[error("a text is longer than a case keeps")]
     TooLong,
     #[error("{0}: no such note")]

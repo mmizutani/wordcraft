@@ -160,7 +160,7 @@ pub(crate) fn write(app: &mut WordApp, dir: &std::path::Path, what: &str, req: &
             if bound_for(app).is_some_and(|at| at.wall == wall) {
                 app.bind_case(None);
             }
-            shelf.delete_wall(click, &wall).map_err(|e| e.to_string()).map(|()| json!({"deleted": wall.as_str()}))
+            shelf.delete_empty_wall(click, &wall).map_err(|e| e.to_string()).map(|()| json!({"deleted": wall.as_str()}))
         }
         "memory.case.new" => new_case(app, &shelf, click, req),
         "memory.case.bind" => {
