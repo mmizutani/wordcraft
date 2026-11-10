@@ -73,6 +73,11 @@ pub struct Sent {
     pub memory: Vec<crate::memory::SentPreference>,
     /// How many more are on but didn't fit.
     pub memory_left_out: u32,
+    /// Why the turn recalled nothing from the person's cases, when that is so and the window knows
+    /// before the turn runs: no case is bound to the document, or someone else can read it (the
+    /// names). `None`: a case is bound and the conversation's thread looked ([`crate::Entry::Recalled`]).
+    #[serde(default)]
+    pub recall_withheld: Option<String>,
 }
 
 /// The document around the selection, as text.
@@ -208,6 +213,7 @@ impl Context {
             at: String::new(),
             memory: Vec::new(),
             memory_left_out: 0,
+            recall_withheld: None,
         };
         (out, sent)
     }

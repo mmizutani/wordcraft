@@ -32,6 +32,47 @@ fn fold(c: char) -> char {
     }
 }
 
+/// `text` with each character folded as the tokenizer folds it ([`fold`]) and each run of
+/// whitespace (spaces, tabs, line breaks, U+00A0, U+3000) one space, so a quote reads the same
+/// however it was broken across lines or paragraphs.
+pub fn folded(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            space = !out.is_empty();
+        } else {
+            if space {
+                out.push(' ');
+                space = false;
+            }
+            out.push(fold(c));
+        }
+    }
+    out
+}
+
+/// The windows of `folded`: from each character boundary to the first boundary at or past `min`
+/// bytes on. A run of `min` bytes two texts share starts at a boundary of each, so they share the
+/// window that starts there, byte for byte.
+pub fn windows(folded: &str, min: usize) -> impl Iterator<Item = &str> {
+    folded.char_indices().filter_map(move |(from, _)| {
+        let mut to = from.saturating_add(min);
+        while to < folded.len() && !folded.is_char_boundary(to) {
+            to = to.saturating_add(1);
+        }
+        folded.get(from..to)
+    })
+}
+
+/// Whether `a` and `b` share a run of at least `min` bytes, compared as the tokenizer folds them:
+/// the oracle the transcript's hashed windows are checked against.
+#[cfg(test)]
+pub fn shares_run(a: &str, b: &str, min: usize) -> bool {
+    let (a, b) = (folded(a), folded(b));
+    windows(&a, min).any(|w| b.contains(w))
+}
+
 fn is_hiragana(c: char) -> bool {
     matches!(c, '\u{3040}'..='\u{309F}')
 }

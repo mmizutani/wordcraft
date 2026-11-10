@@ -3,10 +3,10 @@
 
 use super::recall::{Candidate, Place, Query, Ranked, rank, rank_by_text};
 use super::record::{
-    Applies, Balance, Body, Case, ContractKind, CounterpartyKind, Day, Facts, Kind, Law, Note, OurSide, Paper, Quoted, Side, Stance, Standing, Topic,
-    Topics,
+    Applies, Balance, Body, Case, ContractKind, CounterpartyKind, Day, Facts, Kind, Law, Note, NoteId, OurSide, Paper, Quoted, Side, Stance,
+    Standing, Topic, Topics,
 };
-use super::text::{TERMS, tokens, topics_in};
+use super::text::{TERMS, shares_run, tokens, topics_in};
 
 fn day(s: &str) -> Day {
     Day::parse(s).unwrap()
@@ -23,7 +23,16 @@ fn confirmed(on: &str) -> Standing {
 }
 
 fn note(on: &str, body: Body) -> Note {
-    Note { at: day(on), body, how: None, standing: confirmed(on), stated_topics: Topics::default() }
+    Note {
+        id: NoteId::parse("n1").unwrap(),
+        at: day(on),
+        body,
+        how: None,
+        standing: confirmed(on),
+        stated_topics: Topics::default(),
+        used: 0,
+        last_used: None,
+    }
 }
 
 fn pitfall(on: &str, trap: &str) -> Note {
@@ -51,16 +60,16 @@ fn law(s: &str) -> Option<Law> {
 }
 
 fn facts(kind: ContractKind, side: OurSide, paper: Paper, theirs: CounterpartyKind, law_: &str) -> Facts {
-    Facts { kind: Some(kind), side: Some(side), paper: Some(paper), theirs: Some(theirs), law: law(law_) }
+    Facts { kind: Some(kind), side: Some(side), paper: Some(paper), theirs: Some(theirs), law: law(law_), ..Facts::default() }
 }
 
 fn case(title: &str, facts: Facts, balance: &[(&str, Stance)], notes: Vec<Note>) -> Case {
-    Case {
-        title: q(title),
-        facts,
-        balance: balance.iter().map(|(on, stance)| Balance { on: day(on), stance: *stance, standing: confirmed(on) }).collect(),
-        notes,
-    }
+    let mut case = Case::new(title);
+    case.facts = facts;
+    case.balance =
+        balance.iter().map(|(on, stance)| Balance { on: day(on), stance: *stance, factors: Vec::new(), standing: confirmed(on) }).collect();
+    case.notes = notes;
+    case
 }
 
 use ContractKind::*;
@@ -282,7 +291,7 @@ fn a_pitfall_ranks_the_same_whatever_the_stance() {
     let scores: Vec<f32> = [Stronger, Even, Weaker]
         .into_iter()
         .map(|now| {
-            cases[0].balance = vec![Balance { on: day("2026-10-01"), stance: now, standing: confirmed("2026-10-01") }];
+            cases[0].balance = vec![Balance { on: day("2026-10-01"), stance: now, factors: Vec::new(), standing: confirmed("2026-10-01") }];
             let pool = pool(&cases);
             let ranked = rank(&query(&cases, "a silent edit broadened Affiliate in the schedules"), &pool);
             ranked[rank_of(&ranked, "broadened Affiliate")].score
@@ -316,7 +325,8 @@ fn a_query_of_only_hiragana_matches_nothing() {
 #[test]
 fn similar_facts_with_no_topic_or_word_in_common_recall_nothing() {
     let cases = corpus();
-    let twin = Case { notes: vec![pattern("2026-06-01", "Quarterly business reviews happen every third Tuesday.")], ..cases[0].clone() };
+    let mut twin = cases[0].clone();
+    twin.notes = vec![pattern("2026-06-01", "Quarterly business reviews happen every third Tuesday.")];
     let pool = vec![Candidate { note: &twin.notes[0], case: &twin, place: Place::SameClient }];
     let q = Query::new("governing law and jurisdiction", cases[0].applies(day(TODAY)), day(TODAY));
     assert!(rank(&q, &pool).is_empty());
@@ -410,4 +420,12 @@ fn applies_holds_no_text() {
     fn is_copy<T: Copy>() {}
     is_copy::<Applies>();
     assert_eq!(Kind::ALL.len(), 5);
+}
+
+#[test]
+fn a_paste_that_differs_only_in_case_or_full_width_letters_still_shares_a_run() {
+    let note = "Liability capped at twelve months of fees paid before the claim.";
+    assert!(shares_run("LIABILITY CAPPED AT TWELVE MONTHS OF FEES PAID", note, 36));
+    assert!(shares_run("ＬＩＡＢＩＬＩＴＹ ＣＡＰＰＥＤ ＡＴ ＴＷＥＬＶＥ ＭＯＮＴＨＳ ＯＦ ＦＥＥＳ", note, 36));
+    assert!(!shares_run("Liability capped at six months", note, 36));
 }

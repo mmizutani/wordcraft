@@ -355,15 +355,24 @@ fn load_system_fonts(ctx: egui::Context, messages: Rc<RefCell<Vec<String>>>) {
             }
         };
         let font_list = js_sys::Array::from(&fonts_val);
-        let len = font_list.length();
+        let mut candidates: Vec<_> = (0..font_list.length().min(MAX_SYSTEM_FONTS_TRIED))
+            .map(|i| {
+                let font_data = font_list.get(i);
+                let ps_name = js_sys::Reflect::get(&font_data, &wasm_bindgen::JsValue::from_str("postscriptName"))
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_else(|| format!("local-font-{i}"));
+                (font_data, ps_name)
+            })
+            .collect();
+        candidates.sort_by_key(|(_, name)| !crate::system_fonts::is_macos_japanese(name));
         let mut loaded = 0usize;
         let mut total_bytes = 0usize;
-        for i in 0..len.min(MAX_SYSTEM_FONTS_TRIED) {
+        for (font_data, ps_name) in candidates {
             if loaded >= MAX_SYSTEM_FONTS || total_bytes >= MAX_SYSTEM_FONT_BYTES {
                 log::warn!("local fonts: stopped after {loaded} fonts ({total_bytes} bytes)");
                 break;
             }
-            let font_data = font_list.get(i);
             let Ok(blob_fn) = js_sys::Reflect::get(&font_data, &wasm_bindgen::JsValue::from_str("blob")) else {
                 continue;
             };
@@ -392,10 +401,6 @@ fn load_system_fonts(ctx: egui::Context, messages: Rc<RefCell<Vec<String>>>) {
                 continue;
             }
             total_bytes = total_bytes.saturating_add(bytes.len());
-            let ps_name = js_sys::Reflect::get(&font_data, &wasm_bindgen::JsValue::from_str("postscriptName"))
-                .ok()
-                .and_then(|v| v.as_string())
-                .unwrap_or_else(|| format!("local-font-{i}"));
             let name = format!("{ps_name}.ttf");
             match wordcraft_fonts::FontDb::global().install_font(&name, &bytes) {
                 Ok(_) => loaded += 1,

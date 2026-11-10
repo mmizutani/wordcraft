@@ -30,6 +30,10 @@ pub(super) fn details(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
                 ui.scroll_to_cursor(Some(egui::Align::TOP));
             }
             section(ui, "Memory", |ui| memory(app, ui, t, &details));
+            section(ui, "Recalled", |ui| crate::assist::cases::section(ui, t, &details));
+            if app.services.settings_dir.is_some() {
+                section(ui, "Case", |ui| crate::assist::cases::page::section(app, ui, t));
+            }
         }
     });
 }
@@ -266,21 +270,30 @@ fn output_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, row: &OutputRow) {
     });
     let open = row.state == OutputState::Open;
     let there = open || (row.kind == OutputKind::Comment && row.state == OutputState::Resolved);
-    let Some(range) = row.range().filter(|_| there) else { return };
+    let range = row.range().filter(|_| there);
+    if range.is_none() && !row.quotes {
+        return;
+    }
     let name = app.conversation().map(|a| a.name().to_string()).unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
-        if ui.small_button(tl!("Show")).clicked() {
-            show(app, &range, row.kind != OutputKind::Comment);
-        }
-        if open && row.kind != OutputKind::Comment {
-            let can = crate::widgets::enabled(app, "review.accept");
-            for (label, id) in [("Accept", "review.accept"), ("Reject", "review.reject")] {
-                let button = ui.add_enabled(can, egui::Button::new(RichText::new(tl!(label)).small()));
-                // The assistant's change alone, though someone else's overlaps it.
-                if button.clicked() && select(app, &range) {
-                    let _ = app.run(id, row.resolve_params(&name));
+        if let Some(range) = &range {
+            if ui.small_button(tl!("Show")).clicked() {
+                show(app, range, row.kind != OutputKind::Comment);
+            }
+            if open && row.kind != OutputKind::Comment {
+                let can = crate::widgets::enabled(app, "review.accept");
+                for (label, id) in [("Accept", "review.accept"), ("Reject", "review.reject")] {
+                    let button = ui.add_enabled(can, egui::Button::new(RichText::new(tl!(label)).small()));
+                    // The assistant's change alone, though someone else's overlaps it.
+                    if button.clicked() && select(app, range) {
+                        let _ = app.run(id, row.resolve_params(&name));
+                    }
                 }
             }
+        }
+        // An accepted insertion's words are in the document: the warning outlives the buttons.
+        if row.quotes {
+            ui.label(RichText::new(tl!("This quotes your case notes")).small().color(t.orange));
         }
     });
 }

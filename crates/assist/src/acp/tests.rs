@@ -321,14 +321,14 @@ fn the_prompt_carries_the_note_then_the_context_then_the_prompt() {
 fn what_the_person_kept_reaches_a_new_session_and_again_when_it_changes() {
     let mut c = Chat::with(&turns(vec![vec![Step::Report], vec![Step::Report], vec![Step::Report], vec![Step::Report], vec![Step::Report]]));
     let blocks = |c: &Chat| c.report()["prompt"].as_array().unwrap().iter().map(|b| b.as_str().unwrap().to_string()).collect::<Vec<_>>();
-    c.a.set_memory(Some("Saved: one.".into()));
+    c.a.set_memory(Some(crate::memory::Instructions::test("Saved: one.")));
     c.ask("First");
     let first = blocks(&c);
     assert!(first[0].contains("You are Fake Agent"), "{first:?}");
     assert_eq!(first[1..], ["Saved: one.", "First"]);
     c.ask("Same");
     assert_eq!(blocks(&c), ["Same"]);
-    c.a.set_memory(Some("Saved: two.".into()));
+    c.a.set_memory(Some(crate::memory::Instructions::test("Saved: two.")));
     c.ask("Changed");
     assert_eq!(blocks(&c), ["Saved: two.", "Changed"]);
     c.a.set_memory(None);
@@ -338,13 +338,111 @@ fn what_the_person_kept_reaches_a_new_session_and_again_when_it_changes() {
     assert_eq!(blocks(&c), ["Still gone"]);
 }
 
+/// A shelf with one case holding one note, and what a turn of `c` asks to recall from it.
+struct Recalls {
+    dir: PathBuf,
+    shelf: crate::cases::Shelf,
+    at: crate::cases::CaseRef,
+}
+
+const RECALLED_NOTE: &str = "Cap liability at twelve months.";
+
+impl Recalls {
+    fn new(name: &str) -> Recalls {
+        use crate::cases::{Body, Click, NoteDraft, PersonOp, Quoted, Shelf, Topics};
+        let dir = std::env::temp_dir().join(format!("wordcraft-acp-recall-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Acme", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Acme MSA", "2026-11-10", 2).unwrap();
+        let draft = NoteDraft { body: Body::Pattern { rule: Quoted::parse(RECALLED_NOTE), traps: None }, how: None, topics: Topics::default() };
+        shelf.person(click, &at, PersonOp::AddNote(draft), crate::cases::Day::parse("2026-11-10").unwrap()).unwrap();
+        Recalls { dir, shelf, at }
+    }
+
+    fn ask(&self, c: &Chat) -> crate::cases::RecallAsk {
+        use crate::cases::{Alone, Day, RecallAsk};
+        let alone = Alone::check(&c._room, c._own.id(), c.a.name()).unwrap();
+        RecallAsk::new(self.shelf.clone(), self.at.clone(), "the liability cap", Day::parse("2026-11-10").unwrap(), alone)
+    }
+}
+
+impl Drop for Recalls {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Whether the agent's report shows the recalled note in the prompt.
+fn report_recalled(report: &Value) -> bool {
+    report["prompt"].as_array().unwrap().iter().any(|b| b.as_str().is_some_and(|t| t.contains(RECALLED_NOTE)))
+}
+
+/// An item is remembered as told only once the agent took the prompt: a prompt that failed may
+/// never have reached its model, so the next turn carries the item again.
+#[test]
+fn a_recalled_item_is_said_again_after_a_failed_prompt() {
+    let recalls = Recalls::new("failed");
+    let mut script = Script::default();
+    script.replies.insert("Report".into(), vec![Step::Report]);
+    script.replies.insert("Fails".into(), vec![Step::Fail { code: -32000, message: "not now".into() }]);
+    let mut c = Chat::with(&script);
+    c.a.set_recall(Some(recalls.ask(&c)));
+    c.ask("Fails");
+    assert!(c.error().is_some(), "the prompt failed");
+    c.a.set_recall(Some(recalls.ask(&c)));
+    c.ask("Report");
+    assert!(report_recalled(&c.report()), "the item was lost with the failed prompt: {}", c.report());
+    c.a.set_recall(Some(recalls.ask(&c)));
+    c.ask("Report");
+    assert!(!report_recalled(&c.report()), "the session had it: {}", c.report());
+}
+
+/// An agent that exited between turns takes nothing into the next session: the item goes to the
+/// new session's first prompt, and only once.
+#[cfg(unix)]
+#[test]
+fn a_recalled_item_is_said_again_to_the_session_started_after_the_agent_exited() {
+    let recalls = Recalls::new("exited");
+    let mut script = Script::default();
+    script.replies.insert("Report".into(), vec![Step::Report]);
+    script.replies.insert("Report then exit".into(), vec![Step::Report, Step::ExitAfter { code: 0 }]);
+    let mut c = Chat::with(&script);
+    c.a.set_recall(Some(recalls.ask(&c)));
+    c.ask("Report then exit");
+    let report = c.report();
+    assert!(report_recalled(&report), "{report}");
+    // The agent exits once it has answered: wait until it has (it is this process's child, left
+    // unreaped for the backend), so the next turn finds it exited rather than dying.
+    let pid = rustix::process::Pid::from_raw(i32::try_from(report["pid"].as_u64().unwrap()).unwrap()).unwrap();
+    let until = Instant::now() + WAIT;
+    loop {
+        use rustix::process::{WaitId, WaitIdOptions, waitid};
+        if matches!(waitid(WaitId::Pid(pid), WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT), Ok(Some(_))) {
+            break;
+        }
+        assert!(Instant::now() < until, "the agent is still running");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    c.a.set_recall(Some(recalls.ask(&c)));
+    c.ask("Report");
+    let report = c.report();
+    assert!(c.error().is_none(), "{:?}", c.turn());
+    assert!(report_recalled(&report), "the new session wasn't told: {report}");
+    c.a.set_recall(Some(recalls.ask(&c)));
+    c.ask("Report");
+    assert!(!report_recalled(&c.report()), "the new session had it: {}", c.report());
+}
+
 /// A prompt the agent refused may never have reached its model: the next turn says it again.
 #[test]
 fn what_the_person_kept_is_said_again_after_a_failed_prompt() {
     let fail = Step::Fail { code: -32000, message: "not now".into() };
     let mut c = Chat::with(&turns(vec![vec![Step::Report], vec![fail], vec![Step::Report]]));
     c.ask("First");
-    c.a.set_memory(Some("Saved: one.".into()));
+    c.a.set_memory(Some(crate::memory::Instructions::test("Saved: one.")));
     c.ask("Fails");
     assert!(c.a.transcript().entries().any(|e| matches!(e, Entry::Error { .. })), "the prompt failed");
     c.ask("Again");
@@ -360,7 +458,7 @@ fn a_new_session_s_failed_first_prompt_is_said_again() {
     script.replies.insert("Crash".into(), vec![Step::Crash { code: 3, stderr: "gone".into() }]);
     script.replies.insert("Fails".into(), vec![Step::Fail { code: -32000, message: "not now".into() }]);
     let mut c = Chat::with(&script);
-    c.a.set_memory(Some("Saved: one.".into()));
+    c.a.set_memory(Some(crate::memory::Instructions::test("Saved: one.")));
     c.ask("Report");
     assert!(c.report()["prompt"].as_array().unwrap().iter().any(|b| b == "Saved: one."));
     c.ask("Crash");
@@ -1092,7 +1190,7 @@ fn what_the_person_kept_reaches_an_agent_whose_choices_are_set_first() {
     let script = Script { set_ms: 300, ..configured(vec![vec![Step::Report], vec![Step::Report]]) };
     let mut c = Chat::with(&script);
     let blocks = |c: &Chat| c.report()["prompt"].as_array().unwrap().iter().map(|b| b.as_str().unwrap().to_string()).collect::<Vec<_>>();
-    c.a.set_memory(Some("Saved: one.".into()));
+    c.a.set_memory(Some(crate::memory::Instructions::test("Saved: one.")));
     c.a.choose(Some("deep".into()), None);
     c.a.ask("Hello", None).unwrap();
     c.until("the agent started", |c| c.tool(START_ROW).is_some_and(|t| t.status == ToolStatus::Completed));
@@ -1104,7 +1202,7 @@ fn what_the_person_kept_reaches_an_agent_whose_choices_are_set_first() {
     let first = blocks(&c);
     assert!(first[0].contains("writing assistant inside WordCraft"), "{first:?}");
     assert_eq!(first[1..], ["Saved: one.", "Again"]);
-    c.a.set_memory(Some("Saved: two.".into()));
+    c.a.set_memory(Some(crate::memory::Instructions::test("Saved: two.")));
     c.a.choose(Some("fast".into()), None);
     c.ask("Changed");
     assert_eq!(blocks(&c), ["Saved: two.", "Changed"]);
@@ -1226,7 +1324,7 @@ fn an_agent_s_locations_and_fetches_reach_sources_and_junk_is_ignored() {
 #[test]
 fn a_source_goes_as_a_resource_when_the_agent_takes_them_else_as_text() {
     use crate::knowledge::TurnSource;
-    let source = || vec![TurnSource { name: "notes one.txt".into(), text: "Source words.".into() }];
+    let source = || vec![TurnSource { name: "notes one.txt".into(), text: "Source words.".into(), ..TurnSource::default() }];
     let report = |embedded: bool| {
         let script = Script { embedded_context: embedded, turns: vec![vec![Step::Report]], ..Script::default() };
         let mut c = Chat::with(&script);

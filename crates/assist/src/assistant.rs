@@ -24,7 +24,9 @@ use crate::backend::{
     Answer, Backend, BackendInfo, Cancel, Event, Events, MAX_QUEUED_EVENTS, NoTools, Offered, PermissionPolicy, PermissionRequest, Permissions, Seat,
     StopReason, ToolHost, Turn, TurnCtx, Waker,
 };
+use crate::cases::recall::{RecallAsk, Told};
 use crate::context::Sent;
+use crate::memory::Instructions;
 use crate::tools::CopyTools;
 use crate::transcript::{Details, Entry, Properties, Transcript};
 
@@ -89,9 +91,10 @@ pub struct Options {
 
 /// What the conversation's thread is asked to do.
 enum Job {
-    /// A turn, and how its permission requests are answered when not as the conversation's
-    /// ([`Assistant::ask_with_policy`]).
-    Turn(Box<Turn>, Option<PermissionPolicy>),
+    /// A turn, how its permission requests are answered when not as the conversation's
+    /// ([`Assistant::ask_with_policy`]), and what it recalls from the person's cases
+    /// ([`Assistant::set_recall`]), which rides beside the turn because a proof is used once.
+    Turn(Box<Turn>, Option<PermissionPolicy>, Option<RecallAsk>),
     End,
 }
 
@@ -110,13 +113,18 @@ pub struct Assistant {
     /// Whether the next turn is the conversation's first, which carries the note.
     first: bool,
     /// What each turn from now on carries of what the person kept ([`Assistant::set_memory`]).
-    memory: Option<String>,
+    memory: Option<Instructions>,
+    /// What the next turn recalls from the person's cases ([`Assistant::set_recall`]): one turn's.
+    recall: Option<RecallAsk>,
     /// What the next turns carry of the sources the person attached.
     knowledge: Vec<crate::knowledge::TurnSource>,
     /// The model and reasoning effort each turn carries ([`Assistant::choose`]).
     choice: (Option<String>, Option<String>),
     /// What the backend last said it offers, once it has.
     offered: Option<Offered>,
+    /// Whether any turn was sent with something to recall, or recalled anything: from then on
+    /// the model may hold case text, whoever can read the document later.
+    recalled: bool,
     ended: bool,
 }
 
@@ -143,6 +151,7 @@ impl Assistant {
             cancel: cancel.clone(),
             permissions: permissions.clone(),
             policy: options.permissions,
+            told: Told::default(),
         };
         // A thread's name can't hold a NUL (spawning would panic): the id, as a short label.
         let thread = format!("assistant {}", info.id.chars().filter(|c| !c.is_control()).take(40).collect::<String>());
@@ -164,9 +173,11 @@ impl Assistant {
             busy: false,
             first: true,
             memory: None,
+            recall: None,
             knowledge: Vec::new(),
             choice: (None, None),
             offered: None,
+            recalled: false,
             ended: false,
         })
     }
@@ -201,6 +212,12 @@ impl Assistant {
         &self.transcript
     }
 
+    /// For tests: a window's test records what a backend can't send ([`Event::Recalled`]).
+    #[doc(hidden)]
+    pub fn transcript_mut(&mut self) -> &mut Transcript {
+        &mut self.transcript
+    }
+
     /// The conversation in summary, with what runs it: what the pane's Details shows and
     /// `assist.details` answers.
     pub fn details(&self) -> Details {
@@ -226,14 +243,54 @@ impl Assistant {
         self.ended
     }
 
+    /// Whether any turn was sent with something to recall from the person's cases
+    /// ([`Assistant::set_recall`]), or recalled anything: set as the turn is sent and again from
+    /// the event as it is polled, so it can't miss one and never lags the thread.
+    pub fn recalled(&self) -> bool {
+        self.recalled
+    }
+
     /// The preferences the conversation's answers marked since the last call.
     pub fn take_used(&mut self) -> Vec<String> {
         self.transcript.take_used()
     }
 
+    /// The case markers the conversation's answers carried since the last call
+    /// ([`crate::cases::marker`]), for the window to route to this conversation's case.
+    pub fn take_case_markers(&mut self) -> Vec<crate::cases::CaseMarker> {
+        self.transcript.take_case_markers()
+    }
+
+    /// A marker's write landed in the conversation's case: the pane shows a quiet row.
+    pub fn case_written(&mut self, what: crate::transcript::Written, note: Option<crate::cases::NoteId>, text: &str) {
+        self.transcript.case_written(what, note, text);
+    }
+
+    /// A marker became a card for the person: its number.
+    pub fn case_card(&mut self, card: crate::cases::Card) -> u64 {
+        self.transcript.case_card(card)
+    }
+
+    /// Card `id`, while the person hasn't answered it.
+    pub fn pending_case_card(&self, id: u64) -> Option<&crate::cases::Card> {
+        self.transcript.pending_case_card(id)
+    }
+
+    /// The person answered card `id`.
+    pub fn answer_case_card(&mut self, id: u64, answer: crate::transcript::ProposalAnswer) {
+        self.transcript.answer_case_card(id, answer);
+    }
+
     /// What the next turns carry of what the person kept ([`crate::memory::Memory::for_model`]).
-    pub fn set_memory(&mut self, memory: Option<String>) {
+    pub fn set_memory(&mut self, memory: Option<Instructions>) {
         self.memory = memory;
+    }
+
+    /// What the next turn recalls from the person's cases, run on the conversation's thread just
+    /// before the backend's turn and given to it as data ([`crate::cases::recall`]). One turn's:
+    /// the window builds it for each turn, with the proof that no one else reads the document.
+    pub fn set_recall(&mut self, recall: Option<RecallAsk>) {
+        self.recall = recall;
     }
 
     /// The model and reasoning effort the next turns carry: what the person chose for this
@@ -313,7 +370,11 @@ impl Assistant {
         // Cleared before the turn is sent: a Stop from now on ends this turn, even one the
         // thread hasn't started yet.
         self.cancel.clear();
-        if self.jobs.send(Job::Turn(Box::new(turn), policy)).is_err() {
+        let recall = self.recall.take().map(|r| r.with_room(self.transcript.recall_room()));
+        // From here the thread may read case notes at any moment, so the conversation counts as
+        // having recalled before the event says what it found: the guard fails closed.
+        self.recalled |= recall.is_some();
+        if self.jobs.send(Job::Turn(Box::new(turn), policy, recall)).is_err() {
             self.ended = true;
             return Err(AssistError::Ended);
         }
@@ -363,6 +424,11 @@ impl Assistant {
                     }
                     if let Event::Options(offered) = &e {
                         self.offered = Some(offered.clone());
+                    }
+                    if let Event::Recalled(sent) = &e
+                        && !sent.items.is_empty()
+                    {
+                        self.recalled = true;
                     }
                     self.transcript.record(&e);
                 }
@@ -486,6 +552,8 @@ struct Work {
     cancel: Cancel,
     permissions: Permissions,
     policy: PermissionPolicy,
+    /// What the backend's session has been sent of the person's cases, when it keeps it.
+    told: Told,
 }
 
 impl Work {
@@ -495,7 +563,10 @@ impl Work {
             match CopyTools::join(&self.room, &self.seat.key) {
                 Ok(t) => Box::new(t.stopped_by(self.cancel.clone())),
                 Err(e) => {
+                    // A conversation ended on the frame before this thread joined finds its key
+                    // revoked: the backend still hears that it ended.
                     self.fail_turns(&format!("the assistant couldn't join the shared document: {e}"));
+                    self.end_backend();
                     return;
                 }
             }
@@ -510,10 +581,20 @@ impl Work {
             return;
         }
         while let Ok(job) = self.jobs.recv() {
-            let (turn, policy) = match job {
-                Job::Turn(t, policy) => (*t, policy.unwrap_or(self.policy)),
+            let (mut turn, policy, recall) = match job {
+                Job::Turn(t, policy, recall) => (*t, policy.unwrap_or(self.policy), recall),
                 Job::End => break,
             };
+            // Reading the person's cases is file work, so it runs here, off the frame; what it
+            // finds joins the turn's sources, as data, on every backend alike. A case that can't
+            // be read makes it find nothing and say so: a memory failure never stops a turn.
+            let mut carried = Vec::new();
+            if let Some(ask) = recall {
+                let recalled = ask.run(&self.told, self.backend.retains());
+                self.events.send(Event::Recalled(recalled.sent()));
+                carried = recalled.fresh_ids();
+                turn.knowledge.extend(recalled.into_sources());
+            }
             // The person's selection, in the assistant's copy: WordCraft's own step, not a call
             // of the model's, so the pane doesn't show it. A copy that can't find it (its
             // paragraph is gone) keeps its own.
@@ -528,7 +609,15 @@ impl Work {
             let backend = &mut self.backend;
             let ended = guarded(|| backend.turn(&turn, &mut ctx));
             let stop = match ended {
-                Ok(stop) => stop,
+                Ok(stop) => {
+                    // The backend's session has the items only once it took the prompt, and the
+                    // session that took it is the one running now (an agent that exited was
+                    // replaced in the turn).
+                    if stop != StopReason::Cancelled {
+                        self.told.record(carried, self.backend.retains());
+                    }
+                    stop
+                }
                 Err(message) => {
                     self.events.send(Event::Error { message });
                     StopReason::EndTurn

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use super::{ASK, BUDGET, DAMAGED_SUFFIX, FILE, ForModel, MAX_ITEMS, MAX_TEXT, Memory, NO_LIST, PREFACE};
+use super::{ASK, BUDGET, DAMAGED_SUFFIX, FILE, ForModel, Instructions, MAX_ITEMS, MAX_TEXT, Memory, NO_LIST, PREFACE};
 
 const NOW: &str = "2026-11-08T10:00:00Z";
 
@@ -188,7 +188,11 @@ fn memory(texts: &[&str]) -> Memory {
 #[test]
 fn off_or_disabled_sends_nothing_and_most_recently_used_goes_first() {
     let empty = Memory::default().for_model();
-    assert_eq!(empty.text, Some(format!("{ASK}\n\n{NO_LIST}")), "on with nothing kept, it may still propose");
+    assert_eq!(
+        empty.text.as_ref().map(Instructions::as_str),
+        Some(format!("{ASK}\n\n{NO_LIST}").as_str()),
+        "on with nothing kept, it may still propose"
+    );
     let mut m = memory(&["One.", "Two.", "Three."]);
     m.edit("m2", None, Some(true)).unwrap();
     m.items[0].last_used = Some("2026-11-09T00:00:00Z".into());
@@ -196,6 +200,7 @@ fn off_or_disabled_sends_nothing_and_most_recently_used_goes_first() {
     assert_eq!(sent.sent, ["m1", "m3"]);
     assert_eq!(sent.left_out, Vec::<String>::new());
     let text = sent.text.unwrap();
+    let text = text.as_str();
     assert!(text.starts_with(ASK) && text.contains(PREFACE), "{text}");
     assert!(text.ends_with(r#"[{"id":"m1","text":"One."},{"id":"m3","text":"Three."}]"#), "{text}");
     m.enabled = false;
@@ -205,7 +210,7 @@ fn off_or_disabled_sends_nothing_and_most_recently_used_goes_first() {
         m.edit(id, None, Some(true)).unwrap();
     }
     assert_eq!(m.for_model().sent, Vec::<String>::new(), "every item off");
-    assert!(m.for_model().text.unwrap().ends_with(NO_LIST));
+    assert!(m.for_model().text.unwrap().as_str().ends_with(NO_LIST));
 }
 
 #[test]
@@ -227,6 +232,7 @@ fn what_is_sent_stays_within_the_budget() {
         }
         let sent = m.for_model();
         let text = sent.text.unwrap();
+        let text = text.as_str();
         assert!(text.len() <= BUDGET, "{one}: {}", text.len());
         assert!(!sent.left_out.is_empty(), "{one}: the rest didn't fit");
         assert_eq!(sent.sent.len() + sent.left_out.len(), MAX_ITEMS, "{one}");
@@ -366,6 +372,7 @@ fn counting_keeps_what_another_window_wrote() {
 #[test]
 fn the_model_is_asked_to_say_when_one_conflicts_and_to_mark_what_it_used() {
     let text = memory(&["First."]).for_model().text.unwrap();
+    let text = text.as_str();
     assert!(text.contains("conflicts with the current request") && text.contains("say so"), "{text}");
     assert!(text.contains("[[used:"), "{text}");
 }

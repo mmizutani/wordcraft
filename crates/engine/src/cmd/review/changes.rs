@@ -749,8 +749,11 @@ fn add_text(s: &Session, c: &Change, text: &mut String) {
     text.extend(piece.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(room));
 }
 
-/// Most characters of a change's or a comment's text [`change_rows`] and [`comment_rows`] keep.
+/// Most characters of a change's or a comment's text [`change_rows`] and [`comment_rows`] show.
 pub const ROW_TEXT_CHARS: usize = 120;
+
+/// Most bytes of a change's or a comment's whole text they keep ([`ChangeRow::full`]).
+pub const ROW_FULL_BYTES: usize = 8 << 10;
 
 /// One of an author's tracked changes in the document, for a list of them. Neighbouring runs of one
 /// change are one here.
@@ -762,6 +765,26 @@ pub struct ChangeRow {
     pub b: Pos,
     /// Its text, at most [`ROW_TEXT_CHARS`] characters, objects left out.
     pub text: String,
+    /// Its text as far as [`ROW_FULL_BYTES`], objects left out and a line break between paragraphs:
+    /// what is checked, where `text` is what is shown.
+    pub full: String,
+}
+
+/// Add `chars` to `text`, up to [`ROW_TEXT_CHARS`] characters, and to `full`, up to [`ROW_FULL_BYTES`].
+pub(super) fn add_row_text(text: &mut String, full: &mut String, chars: impl Iterator<Item = char> + Clone) {
+    let room = ROW_TEXT_CHARS.saturating_sub(text.chars().count());
+    text.extend(chars.clone().take(room));
+    add_full(full, chars);
+}
+
+/// Add `chars` to `full`, up to [`ROW_FULL_BYTES`].
+pub(super) fn add_full(full: &mut String, chars: impl Iterator<Item = char>) {
+    for ch in chars {
+        if full.len().saturating_add(ch.len_utf8()) > ROW_FULL_BYTES {
+            break;
+        }
+        full.push(ch);
+    }
 }
 
 /// The first `most` tracked changes `author` made across the document, in every story, and how many
@@ -794,7 +817,7 @@ pub fn change_rows(s: &Session, author: &str, most: usize) -> (Vec<ChangeRow>, u
                 if omitted {
                     more = more.saturating_add(1);
                 } else {
-                    rows.push(ChangeRow { kind: c.kind, a: c.a.clone(), b: c.a.clone(), text: String::new() });
+                    rows.push(ChangeRow { kind: c.kind, a: c.a.clone(), b: c.a.clone(), text: String::new(), full: String::new() });
                 }
             }
             if omitted {
@@ -802,10 +825,13 @@ pub fn change_rows(s: &Session, author: &str, most: usize) -> (Vec<ChangeRow>, u
             }
             let Some(row) = rows.last_mut() else { continue };
             row.b = c.b.clone();
+            // A paragraph mark: its paragraphs' words stay apart, as the recalled text's lines are.
+            if c.a.path != c.b.path && c.kind != "format" {
+                add_full(&mut row.full, std::iter::once('\n'));
+            }
             if c.a.path == c.b.path && !same_words {
                 let piece = s.doc.para(c.a.story, &c.a.path).and_then(|p| p.text.get(c.a.off..c.b.off)).unwrap_or_default();
-                let room = ROW_TEXT_CHARS.saturating_sub(row.text.chars().count());
-                row.text.extend(piece.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(room));
+                add_row_text(&mut row.text, &mut row.full, piece.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ));
             }
         }
         // Their deletion of someone's insertion shows in the list as the insertion: a change of
@@ -814,18 +840,19 @@ pub fn change_rows(s: &Session, author: &str, most: usize) -> (Vec<ChangeRow>, u
             let Some(p) = s.doc.para(story, &path) else { continue };
             let at = |off| Pos { story, path: path.clone(), off };
             let runs = p.run_ranges().filter(|(_, c)| c.ins.is_some() && c.del.is_some_and(theirs)).map(|(r, _)| {
-                let text =
-                    p.text.get(r.clone()).unwrap_or_default().chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(ROW_TEXT_CHARS).collect();
-                (at(r.start), at(r.end), text)
+                let (mut text, mut full) = (String::new(), String::new());
+                add_row_text(&mut text, &mut full, p.text.get(r.clone()).unwrap_or_default().chars().filter(|ch| *ch != wordcraft_doc::para::OBJ));
+                (at(r.start), at(r.end), text, full)
             });
             // A paragraph break of someone's that they took out.
-            let mark =
-                mark_change(s, story, &path).filter(|_| p.mark.ins.is_some() && p.mark.del.is_some_and(theirs)).map(|m| (m.a, m.b, String::new()));
-            for (a, b, text) in runs.chain(mark) {
+            let mark = mark_change(s, story, &path)
+                .filter(|_| p.mark.ins.is_some() && p.mark.del.is_some_and(theirs))
+                .map(|m| (m.a, m.b, String::new(), String::new()));
+            for (a, b, text, full) in runs.chain(mark) {
                 if rows.len() >= most {
                     more = more.saturating_add(1);
                 } else {
-                    rows.push(ChangeRow { kind: "delete", a, b, text });
+                    rows.push(ChangeRow { kind: "delete", a, b, text, full });
                 }
             }
         }
