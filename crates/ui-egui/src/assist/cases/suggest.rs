@@ -78,9 +78,12 @@ pub(crate) struct Suggestion {
 
 /// The suggestion for the shown document, if any: the worker's result is read, and a worker is
 /// started when the document shown has no result yet or has changed by [`RECHECK_EVERY`] since.
-/// Nothing while a case is bound or after Not this.
+/// Nothing, and no worker, while a case is bound, while a reopened file's own case is offered
+/// ([`super::offer`]), which binding it had printed this draft into, or after Not this.
 pub(crate) fn refresh(app: &mut WordApp) -> Option<Suggestion> {
-    if !app.has_document() || super::bound_for(app).is_some() {
+    let shown = app.session.document_id();
+    if !app.has_document() || super::bound_for(app).is_some() || super::offered(app).is_some() || app.assist.cases.suggest.dismissed.contains(&shown)
+    {
         return None;
     }
     let now = version(app);
@@ -103,11 +106,7 @@ pub(crate) fn refresh(app: &mut WordApp) -> Option<Suggestion> {
     if app.assist.cases.suggest.pending.is_none() && !fresh(app, now) {
         start(app, now);
     }
-    let state = &app.assist.cases.suggest;
-    if state.dismissed.contains(&now.0) {
-        return None;
-    }
-    state.found.as_ref().filter(|(document, _)| *document == now.0).map(|(_, s)| s.clone())
+    app.assist.cases.suggest.found.as_ref().filter(|(document, _)| *document == now.0).map(|(_, s)| s.clone())
 }
 
 fn version(app: &WordApp) -> Version {
@@ -281,7 +280,7 @@ mod tests {
     use wordcraft_assist::cases::Shelf;
     use wordcraft_doc::Document;
 
-    use super::super::tests::{Cases, TODAY, cases, click, frames_until, harness};
+    use super::super::tests::{Cases, TODAY, cases, click, frames_until, harness, reopened};
     use super::*;
     use crate::assist::cases::bound_for;
     use crate::assist::memory::tests::{Folder, control_click, window};
@@ -323,6 +322,36 @@ mod tests {
             settled(a)
         });
         refresh(a)
+    }
+
+    /// A reopened file whose case is offered gets that offer alone: binding it put this draft's
+    /// print in the case, so a card would name the same case a second time. No worker reads the
+    /// cases for it, and Not now hides both.
+    #[test]
+    fn a_reopened_file_whose_case_is_offered_gets_no_second_card() {
+        let folder = Folder::new();
+        let c = cases(&folder);
+        let file = folder.0.join("Acme MSA draft.docx");
+        let mut a = window_on(&folder, &clauses(30));
+        a.run("file.saveAs", json!({"path": file.to_string_lossy()})).unwrap();
+        a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+        let shelf = Shelf::at(&folder.0);
+        frames_until(&mut a, "the print never reached the case", |_| shelf.open(&c.here).unwrap().drafts.len() == 1);
+        drop(a);
+
+        let mut b = reopened(&folder, &file);
+        assert_eq!(crate::assist::cases::offered(&b).map(|(at, _)| at.clone()), Some(c.here.clone()));
+        for _ in 0..3 {
+            crate::assist::tick(&mut b);
+            assert_eq!(refresh(&mut b), None, "the offer names the case already");
+        }
+        assert_eq!(b.assist.cases.suggest.started, 0, "no worker reads every client's cases for it");
+        crate::assist::cases::not_now(&mut b);
+        for _ in 0..3 {
+            crate::assist::tick(&mut b);
+            assert_eq!(refresh(&mut b), None, "Not now: no card either");
+        }
+        assert_eq!(b.assist.cases.suggest.started, 0);
     }
 
     /// A blank document is too short to compare when the pane first shows it; a later draft

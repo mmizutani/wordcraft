@@ -269,6 +269,8 @@ only to your screen: never to a model, a log or a file. The percentage is shown 
 contracts from one template overlap too, so it informs you and decides nothing; nothing is bound
 until you click **Use it**, which runs `assist.memory.case.bind` and so refuses a click the control
 channel made. **Not this** hides the card for this document in this window and writes nothing.
+A reopened file whose own case is offered (**Bind again**) gets no card: binding it put this draft's
+print in that case, so the card would name it twice. **Not now** hides the card too.
 The print is taken once per document shown, and again after 64 more changes to it while it stays
 unbound, or at once when a document whose paragraphs are too few or too slight to compare (blank, or only numbering and headings) gains or loses one, so a draft
 pasted into a blank document is looked at as soon as it lands. A document that copies your paragraphs earns a suggestion, which still takes your click.

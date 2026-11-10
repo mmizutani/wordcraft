@@ -453,10 +453,12 @@ pub(crate) fn rebind(app: &mut WordApp) {
     run(app, "assist.memory.case.bind", json!({"wall": at.wall.as_str(), "case": at.case.as_str()}));
 }
 
-/// The person's Not now: no offer for this document while it is open. The file's binding stays,
-/// so it is offered again the next time the file is opened.
+/// The person's Not now: no offer for this document while it is open, and no lineage card, which
+/// would name the same case. The file's binding stays, so it is offered again the next time the
+/// file is opened.
 pub(crate) fn not_now(app: &mut WordApp) {
     app.assist.cases.offered.remove(&app.session.document_id());
+    suggest::dismiss(app);
 }
 
 /// What the pane says of a case offered to a file.

@@ -696,7 +696,7 @@ fn a_case_made_through_the_commands_survives_a_restart() {
 }
 
 /// A window started later on the same settings folder that opens `file`, past a frame.
-fn reopened(folder: &Folder, file: &std::path::Path) -> WordApp {
+pub(super) fn reopened(folder: &Folder, file: &std::path::Path) -> WordApp {
     let mut a = window(folder);
     a.run("file.open", json!({"path": file.to_string_lossy()})).unwrap();
     crate::assist::tick(&mut a);
