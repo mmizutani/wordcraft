@@ -24,7 +24,8 @@ use crate::fake::{FAKE_ID, Fake};
 /// What the app has, for the backends it offers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Host {
-    /// The settings folder, where sign-in credentials live (mode 0600, like the control key).
+    /// The settings folder, where sign-in credentials live, sealed with a key in the system's
+    /// keychain (mode 0600, like the control key).
     pub settings: Option<PathBuf>,
     /// Where an agent's MCP server reaches the window's room (127.0.0.1 and the control
     /// channel's port, or the room-only port), with the invite's key.
