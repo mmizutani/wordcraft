@@ -109,20 +109,20 @@ fn entry(account: &str) -> Result<keyring::Entry, String> {
 #[derive(Default)]
 pub(crate) struct Fake {
     pub(crate) entries: Mutex<HashMap<String, Vec<u8>>>,
-    /// Every call fails, as a locked or missing keychain does.
-    pub(crate) broken: bool,
+    /// Every call fails, as a locked or missing keychain does. A test may lock it mid-session.
+    pub(crate) broken: AtomicBool,
 }
 
 impl Keychain for Fake {
     fn get(&self, account: &str) -> Result<Option<Vec<u8>>, String> {
-        if self.broken {
+        if self.broken.load(Ordering::Relaxed) {
             return Err("no keychain".into());
         }
         Ok(guard(&self.entries).get(account).cloned())
     }
 
     fn set(&self, account: &str, secret: &[u8]) -> Result<(), String> {
-        if self.broken {
+        if self.broken.load(Ordering::Relaxed) {
             return Err("no keychain".into());
         }
         guard(&self.entries).insert(account.to_string(), secret.to_vec());
@@ -130,7 +130,7 @@ impl Keychain for Fake {
     }
 
     fn delete(&self, account: &str) -> Result<(), String> {
-        if self.broken {
+        if self.broken.load(Ordering::Relaxed) {
             return Err("no keychain".into());
         }
         guard(&self.entries).remove(account);
@@ -188,7 +188,7 @@ pub fn use_system_keychain() {
 #[doc(hidden)]
 pub fn fake_keychain(settings: &Path, working: bool) {
     static WORKING: LazyLock<Arc<Fake>> = LazyLock::new(Arc::default);
-    static BROKEN: LazyLock<Arc<Fake>> = LazyLock::new(|| Arc::new(Fake { broken: true, ..Fake::default() }));
+    static BROKEN: LazyLock<Arc<Fake>> = LazyLock::new(|| Arc::new(Fake { broken: AtomicBool::new(true), ..Fake::default() }));
     register(settings, Some(if working { WORKING.clone() } else { BROKEN.clone() }));
 }
 
@@ -432,13 +432,21 @@ fn read(settings: &Path, vault: &Vault) -> Option<Credentials> {
 }
 
 /// Keep `c`: sealed in the settings folder with the keychain's key (made the first time), or in
-/// memory when there is no keychain or it fails.
+/// memory when there is no keychain or it fails. In memory, a sealed file from before is
+/// deleted: `c` replaces it, and left on disk it would come back the next time the keychain
+/// answers, with a refresh token ChatGPT may have rotated since.
 fn keep(settings: &Path, vault: &Vault, c: Credentials) -> Result<Kept, String> {
+    let path = settings.join(CREDENTIALS_FILE);
     if let Some(key) = sealing_key(settings, vault) {
-        write_private(&settings.join(CREDENTIALS_FILE), &seal(&key, &c)?)?;
+        write_private(&path, &seal(&key, &c)?)?;
         return Ok(Kept::Keychain);
     }
     guard(&vault.state).mode = Mode::Memory(Some(Box::new(c)));
+    match fs::remove_file(&path) {
+        Ok(()) => log::info!("ChatGPT sign-in: the older sealed sign-in is deleted; this one is kept for this session only"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("ChatGPT sign-in: the older sealed sign-in, {}, couldn't be deleted: {e}", path.display()),
+    }
     Ok(Kept::Session)
 }
 

@@ -941,7 +941,7 @@ fn each_folder_s_key_is_in_the_keychain_and_signing_out_deletes_it_with_the_file
 
 #[test]
 fn with_no_keychain_a_sign_in_is_kept_for_the_session_only() {
-    let broken: Arc<dyn Keychain> = Arc::new(vault::Fake { broken: true, ..vault::Fake::default() });
+    let broken: Arc<dyn Keychain> = Arc::new(vault::Fake { broken: AtomicBool::new(true), ..vault::Fake::default() });
     for keychain in [Some(broken), None] {
         let (folder, _script, _server, endpoints) = signed_in_with(keychain);
         assert_eq!(super::account(folder.path()).map(|a| a.kept), Some(Kept::Session));
@@ -1083,6 +1083,24 @@ fn a_sign_in_another_wordcraft_sealed_with_a_new_key_is_read() {
     // This one still has the old key: it asks the keychain again, and reads the new sign-in.
     eventually("the new sign-in shows", || super::account(folder.path()).is_some());
     assert_eq!(store::read_credentials(folder.path()).unwrap().access_token, "access-1");
+}
+
+#[test]
+fn a_sign_in_kept_in_memory_after_the_keychain_fails_leaves_no_older_sealed_one_behind() {
+    let keychain = Arc::new(vault::Fake::default());
+    let (folder, _script, _server, endpoints) = signed_in_with(Some(keychain.clone()));
+    expire(folder.path());
+    // The keychain fails mid-session (a keyring locked again, or macOS refusing a rebuilt app):
+    // the refresh's new tokens are kept in memory, and the sealed file of the older ones goes.
+    keychain.broken.store(true, Ordering::Relaxed);
+    assert_eq!(access_token(folder.path(), &endpoints, None).unwrap().access_token, "access-1");
+    assert_eq!(super::account(folder.path()).map(|a| a.kept), Some(Kept::Session));
+    assert!(!folder.path().join(CREDENTIALS_FILE).exists());
+    // WordCraft opens again and the keychain answers: nobody is signed in, rather than the older
+    // tokens, whose refresh token ChatGPT may have rotated since.
+    keychain.broken.store(false, Ordering::Relaxed);
+    vault::register(folder.path(), Some(keychain.clone()));
+    assert!(store::read_credentials(folder.path()).is_none());
 }
 
 /// A keychain that answers only once it is let go, as one waiting for the person to unlock it
