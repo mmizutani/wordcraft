@@ -262,9 +262,10 @@ the key from a file you keep outside the repository, for example `set -a; . ~/se
 history.
 
 **Quotes.** A tracked change or comment the assistant makes that repeats a run of 36 bytes (about
-six English words or twelve Japanese characters) from what the conversation recalled shows "This
-quotes your case notes" in Details › Output beside its buttons, so you see it before accepting a
-file you may send on. It is a flag, not a wall: a paraphrase passes.
+six English words or twelve Japanese characters) from anything the conversation recalled, in any
+turn and any field of an item, shows "This quotes your case notes" in Details › Output, beside its
+buttons while it is open and on the row after it is accepted, so you see it before sending on a file
+that has it. It is a flag, not a wall: a paraphrase passes.
 
 **When recall is off.** Nothing is recalled with no case bound, on the web (no settings folder),
 or while anyone besides you and this conversation's assistant can read the document: another

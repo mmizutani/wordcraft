@@ -2,7 +2,8 @@
 //! tool calls, plans and permission requests, and how each turn ended. Held to a size: the
 //! oldest entries go first.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hasher};
 
 use serde::Serialize;
 
@@ -28,6 +29,78 @@ pub const MAX_PROPOSALS: u8 = 3;
 /// The shared run, in bytes, that makes a change a quote of recalled notes: about six English words
 /// or twelve Japanese characters. Shorter runs are phrases any contract has.
 const QUOTE_BYTES: usize = 36;
+
+/// Most windows of recalled text [`SentWindows`] keeps: 64 turns of [`crate::cases::recall::BUDGET`]
+/// of ASCII, which has a window at every byte. Full, it holds about 12 MiB: 16 bytes a count in
+/// the map, 8 a hash in its batch.
+const MAX_WINDOWS: usize = 64 * crate::cases::recall::BUDGET;
+
+/// Every window ([`crate::cases::text::windows`]) of the folded text sent as recall in the
+/// conversation, hashed, apart from the entries, so trimming the conversation doesn't forget what
+/// the model was given. A row is checked with one lookup per window of its own text, whatever was
+/// sent. When full, the oldest recall goes first, and what went is counted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SentWindows {
+    /// How many kept windows hash to each value: a window two recalls sent stays while either does.
+    counts: HashMap<u64, u32>,
+    /// Each recall's window hashes, oldest first.
+    batches: VecDeque<Vec<u64>>,
+    len: usize,
+    /// Windows dropped to stay within [`MAX_WINDOWS`].
+    dropped: u64,
+    #[cfg(test)]
+    lookups: std::cell::Cell<usize>,
+}
+
+impl SentWindows {
+    /// A recall sent `texts`.
+    fn add<'a>(&mut self, texts: impl Iterator<Item = &'a str>) {
+        let mut batch = Vec::new();
+        for text in texts {
+            let folded = crate::cases::text::folded(text);
+            batch.extend(crate::cases::text::windows(&folded, QUOTE_BYTES).map(hash));
+        }
+        if batch.len() > MAX_WINDOWS {
+            self.dropped = self.dropped.saturating_add(u64::try_from(batch.len().saturating_sub(MAX_WINDOWS)).unwrap_or(u64::MAX));
+            batch.truncate(MAX_WINDOWS);
+        }
+        for h in &batch {
+            let n = self.counts.entry(*h).or_default();
+            *n = n.saturating_add(1);
+        }
+        self.len = self.len.saturating_add(batch.len());
+        self.batches.push_back(batch);
+        while self.len > MAX_WINDOWS && self.batches.len() > 1 {
+            let Some(oldest) = self.batches.pop_front() else { break };
+            for h in &oldest {
+                if let Some(n) = self.counts.get_mut(h) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        self.counts.remove(h);
+                    }
+                }
+            }
+            self.len = self.len.saturating_sub(oldest.len());
+            self.dropped = self.dropped.saturating_add(u64::try_from(oldest.len()).unwrap_or(u64::MAX));
+        }
+    }
+
+    /// Whether a window of `text` was sent.
+    fn has(&self, text: &str) -> bool {
+        let folded = crate::cases::text::folded(text);
+        crate::cases::text::windows(&folded, QUOTE_BYTES).any(|w| {
+            #[cfg(test)]
+            self.lookups.set(self.lookups.get() + 1);
+            self.counts.contains_key(&hash(w))
+        })
+    }
+}
+
+fn hash(window: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    h.write(window.as_bytes());
+    h.finish()
+}
 
 /// What the person said to a proposal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -111,7 +184,7 @@ impl Entry {
                 let memory = sent.memory.iter().map(|p| p.id.len() + p.text.len()).sum::<usize>();
                 sent.document.len() + sent.at.len() + memory + sent.knowledge.iter().map(|s| s.name.len()).sum::<usize>()
             }
-            Entry::Output(row) => row.text.len(),
+            Entry::Output(row) => row.text.len().saturating_add(row.full.len()),
             Entry::Recalled(sent) => sent.bytes(),
             Entry::Stopped { .. } => 0,
         }
@@ -306,6 +379,9 @@ pub struct Transcript {
     /// How many more changes the document has than the entries list ([`crate::output::MAX_ROWS`]).
     #[serde(skip)]
     more_output: usize,
+    /// What the conversation recalled, as windows, for [`Transcript::quotes_recalled`].
+    #[serde(skip)]
+    sent_windows: SentWindows,
 }
 
 impl Transcript {
@@ -417,19 +493,19 @@ impl Transcript {
                 Action::Write(i, mut row) => {
                     // Seen rows come without the flag: keep it, and look again only at words that grew.
                     let before = match self.entries.get(i) {
-                        Some(Entry::Output(k)) => Some((k.quotes, k.text == row.text)),
+                        Some(Entry::Output(k)) => Some((k.quotes, k.full == row.full)),
                         _ => None,
                     };
                     row.quotes = match before {
                         Some((quotes, true)) => quotes,
-                        Some((quotes, false)) => quotes || self.quotes_recalled(&row.text),
-                        None => self.quotes_recalled(&row.text),
+                        Some((quotes, false)) => quotes || self.quotes_recalled(&row.full),
+                        None => self.quotes_recalled(&row.full),
                     };
                     self.overwrite(i, Entry::Output(row));
                 }
                 Action::Drop(i) => dropped.push(i),
                 Action::New(mut row) => {
-                    row.quotes = self.quotes_recalled(&row.text);
+                    row.quotes = self.quotes_recalled(&row.full);
                     new.push(row);
                 }
             }
@@ -445,13 +521,27 @@ impl Transcript {
         self.prune_output();
     }
 
-    /// Whether `text` shares [`QUOTE_BYTES`] with what any turn of the conversation recalled. A row's
-    /// text is cut to a few lines, so this is one short text against each recalled item.
+    /// Whether `text` shares [`QUOTE_BYTES`] with what any turn of the conversation recalled, trimmed
+    /// from the entries or not.
     fn quotes_recalled(&self, text: &str) -> bool {
-        self.entries.iter().any(|e| match e {
-            Entry::Recalled(sent) => sent.items.iter().any(|i| crate::cases::text::shares_run(text, &i.text, QUOTE_BYTES)),
-            _ => false,
-        })
+        self.sent_windows.has(text)
+    }
+
+    /// How many windows of recalled text were dropped to stay within [`MAX_WINDOWS`].
+    #[cfg(test)]
+    pub(crate) fn windows_dropped(&self) -> u64 {
+        self.sent_windows.dropped
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quotes_recalled_for_test(&self, text: &str) -> bool {
+        self.quotes_recalled(text)
+    }
+
+    /// How many window lookups the quote checks have made.
+    #[cfg(test)]
+    pub(crate) fn lookups_for_test(&self) -> usize {
+        self.sent_windows.lookups.get()
     }
 
     /// Take the entry at `i` away.
@@ -552,7 +642,12 @@ impl Transcript {
             Event::Note { text } => self.push(Entry::Note { text: text.clone() }),
             // What is offered isn't part of the conversation: [`crate::Assistant::offered`].
             Event::Options(_) => {}
-            Event::Recalled(sent) => self.push(Entry::Recalled(sent.clone())),
+            Event::Recalled(sent) => {
+                let mut sent = sent.clone();
+                let texts = std::mem::take(&mut sent.sent_text);
+                self.sent_windows.add(texts.iter().map(String::as_str));
+                self.push(Entry::Recalled(sent));
+            }
             Event::Done { stop } => {
                 if *stop != StopReason::EndTurn {
                     self.push(Entry::Stopped { stop: *stop });

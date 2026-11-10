@@ -372,12 +372,18 @@ fn a_change_across_paragraphs_says_only_that_it_was_resolved() {
     assert!(listed(&t).iter().all(|r| r.2 == OutputState::Resolved), "{:?}", listed(&t));
 }
 
-fn recalled(t: &mut Transcript, text: &str) {
+/// The turn recalled one item whose shown text is `text`, and which carried `more` to the model too.
+fn recalled_with(t: &mut Transcript, text: &str, more: &[&str]) {
     use crate::cases::recall::{ItemId, Place, RecallSent, RecalledItem};
     use crate::cases::record::NoteId;
     let id = ItemId::Here { note: NoteId::parse("n1").unwrap() };
     let item = RecalledItem { id, place: Place::ThisCase, title: None, kind: None, text: text.into(), balance: None, confirmed: true, again: false };
-    t.record(&crate::Event::Recalled(RecallSent { items: vec![item], ..RecallSent::default() }));
+    let sent_text = std::iter::once(text).chain(more.iter().copied()).map(str::to_string).collect();
+    t.record(&crate::Event::Recalled(RecallSent { items: vec![item], sent_text, ..RecallSent::default() }));
+}
+
+fn recalled(t: &mut Transcript, text: &str) {
+    recalled_with(t, text, &[]);
 }
 
 /// Whether the one change the assistant types over "one two three" is flagged, when the turn recalled `pasted`.
@@ -406,6 +412,76 @@ fn a_short_shared_phrase_or_no_recall_is_not_flagged() {
     let notes = "Fallback: accept a liability cap of twelve months of fees, no lower.";
     assert!(!flagged(Some(notes), "a liability cap of"));
     assert!(!flagged(None, "accept a liability cap of twelve months of fees"));
+}
+
+#[test]
+fn a_paste_past_the_rows_shown_text_is_flagged() {
+    let notes = "Fallback: accept a liability cap of twelve months of fees, no lower.";
+    let typed = format!("{} accept a liability cap of twelve months of fees", "ordinary words ".repeat(10));
+    assert!(typed.chars().count() > 150);
+    assert!(flagged(Some(notes), &typed));
+    let row = {
+        let mut s = session();
+        let mut t = Transcript::default();
+        t.asked("Rewrite");
+        rewrite(&mut s, "two", &typed);
+        note(&mut t, &s);
+        t.details().turns[0].output[0].clone()
+    };
+    assert_eq!(row.text.chars().count(), 120, "the shown text is still the preview");
+}
+
+#[test]
+fn a_comment_pasting_what_a_position_was_traded_for_is_flagged() {
+    let terms = "Liability capped at twelve months of fees paid.";
+    let traded_for = "A two-year initial term with no termination for convenience.";
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Comment");
+    recalled_with(&mut t, terms, &[traded_for]);
+    s.run("select.text", &json!({"text": "two"})).unwrap();
+    s.run("review.newComment", &json!({"text": "They may take a two-year initial term with no termination for convenience"})).unwrap();
+    note(&mut t, &s);
+    let row = t.details().turns[0].output[0].clone();
+    assert_eq!(row.kind, OutputKind::Comment);
+    assert!(row.quotes);
+}
+
+#[test]
+fn a_paste_is_flagged_after_the_recall_was_trimmed_from_the_conversation() {
+    let notes = "Fallback: accept a liability cap of twelve months of fees, no lower.";
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Rewrite");
+    recalled(&mut t, notes);
+    for n in 0..crate::transcript::MAX_ENTRIES + 8 {
+        t.asked(&format!("Question {n}"));
+    }
+    assert!(!t.entries().any(|e| matches!(e, Entry::Recalled(_))), "the recall was trimmed");
+    rewrite(&mut s, "two", "accept a liability cap of twelve months of fees");
+    note(&mut t, &s);
+    assert!(t.details().turns.iter().flat_map(|turn| turn.output.iter()).any(|r| r.quotes));
+}
+
+#[test]
+fn checking_a_row_costs_one_lookup_per_window_of_the_row_whatever_was_recalled() {
+    let longest = "x".repeat(wordcraft_engine::cmd::review::ROW_FULL_BYTES);
+    let mut few = Transcript::default();
+    recalled(&mut few, "Fallback: accept a liability cap of twelve months of fees, no lower.");
+    let mut full = Transcript::default();
+    // 420 KB of six-digit counters: every 36-byte window holds a full one, so each is distinct,
+    // and there are more of them than the cap holds.
+    let filler: String = (0..70_000u32).map(|n| format!("{n:06x}")).collect();
+    recalled(&mut full, &filler);
+    assert!(full.windows_dropped() > 0, "the cap was reached");
+    let lookups = |t: &Transcript| {
+        let before = t.lookups_for_test();
+        t.quotes_recalled_for_test(&longest);
+        t.lookups_for_test() - before
+    };
+    let (a, b) = (lookups(&few), lookups(&full));
+    assert_eq!(a, b);
+    assert!(a <= longest.len() && a > 0, "{a}");
 }
 
 #[test]

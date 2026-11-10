@@ -212,6 +212,12 @@ impl Assistant {
         &self.transcript
     }
 
+    /// For tests: a window's test records what a backend can't send ([`Event::Recalled`]).
+    #[doc(hidden)]
+    pub fn transcript_mut(&mut self) -> &mut Transcript {
+        &mut self.transcript
+    }
+
     /// The conversation in summary, with what runs it: what the pane's Details shows and
     /// `assist.details` answers.
     pub fn details(&self) -> Details {

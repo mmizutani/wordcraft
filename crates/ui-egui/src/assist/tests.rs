@@ -1945,6 +1945,44 @@ fn accepting_a_row_of_output_changes_only_that_change() {
 
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
+fn a_row_that_quotes_case_notes_says_so_after_it_is_accepted() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::cases::{ItemId, NoteId, Place, RecallSent, RecalledItem};
+    let notes = "Fallback: accept a liability cap of twelve months of fees, no lower.";
+    let pasted = "accept a liability cap of twelve months of fees";
+    let mut app = window("one two three\nsecond paragraph");
+    let steps = vec![
+        Step::tool("select_text", json!({"text": "two"})),
+        Step::tool("type_text", json!({"text": pasted})),
+        Step::say("End of the script."),
+        Step::Hold,
+    ];
+    app.assist_with(Box::new(Fake::new().then(steps)));
+    let mut h = harness(app);
+    h.state_mut().run("assist.ask", json!({"prompt": "Do the thing"})).unwrap();
+    // What the turn recalled, as the conversation's own thread would record it before the model types.
+    let id = ItemId::Here { note: NoteId::parse("n1").unwrap() };
+    let item = RecalledItem { id, place: Place::ThisCase, title: None, kind: None, text: notes.into(), balance: None, confirmed: true, again: false };
+    let sent = RecallSent { items: vec![item], sent_text: vec![notes.to_string()], ..RecallSent::default() };
+    h.state_mut().conversation_mut().unwrap().transcript_mut().record(&wordcraft_assist::Event::Recalled(sent));
+    until(&mut h, |a| {
+        a.conversation().is_some_and(|c| c.transcript().entries().any(|e| matches!(e, Entry::Answer { text } if text == "End of the script.")))
+    });
+    caught_up(&mut h);
+    h.get_by_label("Details").click();
+    h.run_steps(2);
+    h.get_by_label("Steps").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("This quotes your case notes").is_some(), "flagged while open");
+    h.get_all_by_label("Accept").next().unwrap().click();
+    h.run_steps(3);
+    assert!(h.query_by_label("Accepted").is_some());
+    assert!(h.query_by_label("This quotes your case notes").is_some(), "still flagged once accepted");
+    h.state_mut().run("assist.cancel", json!({})).unwrap();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn a_change_another_participant_resolved_updates_its_row() {
     use egui_kittest::kittest::Queryable;
     use wordcraft_engine::room::Role;

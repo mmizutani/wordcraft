@@ -63,8 +63,12 @@ pub struct OutputRow {
     /// `None` when the paragraph was too long to look through each time the document changes.
     #[serde(skip)]
     pub in_paragraph: Option<u32>,
-    /// Its words share a run with case notes this conversation recalled: see [`crate::cases::text::shares_run`].
+    /// Its words share a run with case notes this conversation recalled ([`crate::Transcript`]).
     pub quotes: bool,
+    /// Its whole text, as far as [`wordcraft_engine::cmd::review::ROW_FULL_BYTES`]: what `quotes` is
+    /// read from, where `text` is what is shown.
+    #[serde(skip)]
+    pub full: String,
 }
 
 impl OutputRow {
@@ -105,6 +109,7 @@ pub(crate) fn rows(session: &Session, name: &str) -> (Vec<OutputRow>, usize) {
         start: doc.anchor_at(&c.a),
         end: doc.anchor_at(&c.b),
         text: c.text,
+        full: c.full,
         state: OutputState::Open,
         quotes: false,
     });
@@ -114,6 +119,7 @@ pub(crate) fn rows(session: &Session, name: &str) -> (Vec<OutputRow>, usize) {
         OutputRow {
             kind: OutputKind::Comment,
             text: c.text,
+            full: c.full,
             state: if c.resolved { OutputState::Resolved } else { OutputState::Open },
             start: at,
             end: at,

@@ -242,6 +242,8 @@ pub struct CommentRow {
     pub at: Option<Pos>,
     /// Its text, at most [`super::changes::ROW_TEXT_CHARS`] characters.
     pub text: String,
+    /// Its first paragraph as far as [`super::changes::ROW_FULL_BYTES`].
+    pub full: String,
     pub resolved: bool,
 }
 
@@ -268,8 +270,9 @@ pub fn comment_rows(s: &Session, author: &str, most: usize) -> (Vec<CommentRow>,
         .filter_map(|id| {
             let c = s.doc.comments.get(&id)?;
             let first = s.doc.para(StoryRef::Part(c.part), &wordcraft_doc::Path::top(0)).map(|p| p.text.as_str()).unwrap_or_default();
-            let text = first.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ).take(super::changes::ROW_TEXT_CHARS).collect();
-            Some(CommentRow { id, at: place(id), text, resolved: c.resolved })
+            let (mut text, mut full) = (String::new(), String::new());
+            super::changes::add_row_text(&mut text, &mut full, first.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ));
+            Some(CommentRow { id, at: place(id), text, full, resolved: c.resolved })
         })
         .collect();
     (rows, more)

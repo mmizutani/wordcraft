@@ -458,6 +458,11 @@ pub struct RecallSent {
     pub bytes: u32,
     /// Why less than expected was recalled, when the person should know.
     pub problem: Option<String>,
+    /// Every text the items carried to the model, field by field (terms, what was traded for, traps,
+    /// guards, how, a balance's factors): what [`crate::Transcript`] checks an output row against.
+    /// It keeps them apart from the entry, so this isn't shown or sent on.
+    #[serde(skip)]
+    pub sent_text: Vec<String>,
 }
 
 impl RecallSent {
@@ -492,7 +497,11 @@ impl Recalled {
     }
 
     pub(crate) fn sent(&self) -> RecallSent {
-        self.sent.clone()
+        let mut sent_text = Vec::new();
+        for json in &self.json {
+            strings(json, 0, &mut sent_text);
+        }
+        RecallSent { sent_text, ..self.sent.clone() }
     }
 
     /// The ids of the items this turn carries, for [`Told::record`] once the prompt was taken.
@@ -524,6 +533,16 @@ pub fn compose_for_eval_without_room_check(shelf: &Shelf, at: &CaseRef, about: &
     let query = Query::new(about, pool.here.applies(today), today);
     let recalled = compose(&pool, &query);
     Ok((recalled.sent(), recalled.into_sources()))
+}
+
+/// Every string in `json`, as [`note_item`] and [`balance_item`] build it: three levels deep at most.
+fn strings(json: &Value, depth: u8, out: &mut Vec<String>) {
+    match json {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(items) if depth < 4 => items.iter().for_each(|v| strings(v, depth.saturating_add(1), out)),
+        Value::Object(fields) if depth < 4 => fields.values().for_each(|v| strings(v, depth.saturating_add(1), out)),
+        _ => {}
+    }
 }
 
 /// What a backend's session has been sent of the person's cases, by item id, while the session
@@ -727,7 +746,7 @@ fn balance_item(nb: &Neighbor, balance: &super::record::Balance, now: Option<Sta
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cases::record::{Balance, NoteId};
+    use crate::cases::record::{Balance, NoteId, Side, Topic};
 
     fn day(s: &str) -> Day {
         Day::parse(s).unwrap()
@@ -775,6 +794,41 @@ mod tests {
         assert_eq!(out.sent.left_out, 30 - 9);
         assert!(out.sent.bytes as usize <= BUDGET);
         assert_eq!(out.into_sources().len(), 1);
+    }
+
+    /// What the transcript checks a change against is every field the model got, not the one the
+    /// pane shows.
+    #[test]
+    fn what_was_sent_carries_every_field_of_an_item() {
+        let confirmed = Standing::Confirmed { on: day("2026-01-01") };
+        let mut here = Case::new("here");
+        here.notes.push(Note {
+            id: NoteId::parse("n1").unwrap(),
+            at: day("2026-01-01"),
+            body: Body::Position {
+                topic: Topic::Liability,
+                moved: Side::Us,
+                terms: Quoted::parse("Liability capped at twelve months of fees paid."),
+                traded_for: Some(Quoted::parse("A two-year initial term with no termination for convenience.")),
+                landed: true,
+            },
+            how: Some(Quoted::parse("Offered late on the last call.")),
+            standing: confirmed,
+            stated_topics: Topics::default(),
+            used: 0,
+            last_used: None,
+        });
+        let pool = Pool { here, neighbors: Vec::new(), damaged: false, skipped: 0 };
+        let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
+        let sent = compose(&pool, &query).sent();
+        assert_eq!(sent.items.len(), 1);
+        for field in [
+            "Liability capped at twelve months of fees paid.",
+            "A two-year initial term with no termination for convenience.",
+            "Offered late on the last call.",
+        ] {
+            assert!(sent.sent_text.iter().any(|t| t == field), "{field}: {:?}", sent.sent_text);
+        }
     }
 
     #[test]
