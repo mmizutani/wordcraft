@@ -382,6 +382,11 @@ impl RecallAsk {
         RecallAsk { review: true, ..RecallAsk::new(shelf, at, "", today, alone) }
     }
 
+    /// Whether this is a review's ask: one that is no use without its case.
+    pub(crate) fn is_review(&self) -> bool {
+        self.review
+    }
+
     /// With `room` windows left in the conversation's transcript, set as the turn is sent.
     pub(crate) fn with_room(mut self, room: usize) -> RecallAsk {
         self.room = room;
@@ -723,6 +728,12 @@ pub struct Recalled {
 impl Recalled {
     fn nothing(problem: String) -> Recalled {
         Recalled { sent: RecallSent { problem: Some(problem), ..RecallSent::default() }, json: Vec::new() }
+    }
+
+    /// Why nothing was recalled, when nothing was. A review can't go without its case, so the
+    /// conversation's thread asks this before it sends one.
+    pub(crate) fn none_because(&self) -> Option<String> {
+        self.sent.items.is_empty().then(|| self.sent.problem.clone().unwrap_or_else(|| "nothing of the case could be read".into()))
     }
 
     pub(crate) fn sent(&self) -> RecallSent {
@@ -1470,6 +1481,55 @@ mod tests {
         assert!(turns[0].knowledge.is_empty(), "{:?}", turns[0].knowledge);
         let problem = a.transcript().entries().find_map(|e| if let crate::Entry::Recalled(sent) = e { sent.problem.clone() } else { None });
         assert_eq!(problem.as_deref(), Some("Bob can read this document"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A review without its case to check is no review: when the case can't be sent (someone
+    /// else can read the document by the time the turn runs, or the case file is damaged), no
+    /// request is made and the turn says why, rather than reviewing from what the model holds.
+    #[test]
+    fn a_review_whose_case_cant_be_sent_makes_no_request() {
+        use crate::cases::record::{Click, NoteDraft, PersonOp};
+        use crate::{Fake, Options};
+        use wordcraft_engine::room::{Role, Room};
+        let dir = std::env::temp_dir().join(format!("wordcraft-review-withheld-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Kestrel Freight", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Kestrel MSA", "2026-11-10", 2).unwrap();
+        let draft = NoteDraft {
+            body: Body::Pattern { rule: Quoted::parse("Cap liability at twelve months."), traps: None },
+            how: None,
+            topics: Topics::default(),
+        };
+        shelf.person(click, &at, PersonOp::AddNote(draft), day("2026-11-10")).unwrap();
+        let review = |shelf: Shelf, damage: bool| {
+            let mut session = wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("one"));
+            let (room, own) = Room::host(&mut session, "Minoru").unwrap();
+            let fake = Fake::new();
+            let seen = fake.seen();
+            let mut a = crate::Assistant::start(&room, Box::new(fake), Options::default()).unwrap();
+            let alone = Alone::check(&room, own.id(), a.name()).unwrap();
+            a.set_recall(Some(RecallAsk::review(shelf, at.clone(), day("2026-11-10"), alone)));
+            if !damage {
+                let _key = room.invite("Bob", Role::Viewer).unwrap();
+            }
+            a.ask("Review this case.", None).unwrap();
+            assert!(a.wait_idle(std::time::Duration::from_secs(30)));
+            let turns = seen.lock().unwrap().turns.len();
+            let error = a.transcript().entries().find_map(|e| if let crate::Entry::Error { message } = e { Some(message.clone()) } else { None });
+            (turns, error)
+        };
+        let (turns, error) = review(shelf.clone(), false);
+        assert_eq!(turns, 0, "no request is made for a review that can't see its case");
+        assert!(error.as_deref().is_some_and(|e| e.contains("Bob can read this document")), "{error:?}");
+        let file = dir.join("assistant-cases").join(at.wall.as_str()).join(at.case.as_str()).join("case.json");
+        std::fs::write(&file, "{ not a case").unwrap();
+        let (turns, error) = review(shelf, true);
+        assert_eq!(turns, 0);
+        assert!(error.as_deref().is_some_and(|e| e.contains("damaged")), "{error:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

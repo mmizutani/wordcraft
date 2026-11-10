@@ -610,8 +610,17 @@ impl Work {
             // be read makes it find nothing and say so: a memory failure never stops a turn.
             let mut carried = Vec::new();
             if let Some(ask) = recall {
+                let review = ask.is_review();
                 let recalled = ask.run(&self.told, self.backend.retains());
                 self.events.send(Event::Recalled(recalled.sent()));
+                // A review is of its case. Without the case (someone else can read the document
+                // now, the file is damaged, no room is left to check quotes) the model would
+                // review from what it holds, so no request is made and the turn says why.
+                if review && let Some(why) = recalled.none_because() {
+                    self.events.send(Event::Error { message: format!("The review was withheld: {why}.") });
+                    self.events.send(Event::Done { stop: StopReason::EndTurn });
+                    continue;
+                }
                 carried = recalled.fresh_ids();
                 turn.knowledge.extend(recalled.into_sources());
             }
