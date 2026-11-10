@@ -898,6 +898,11 @@ fn assistant(app: &mut WordApp, ui: &mut Ui) {
     );
     ui.add_space(8.0);
     crate::assist::memory::options_section(app, ui);
+    // The lessons the person kept, with no document to show them in the pane (#107).
+    if !app.has_document() && app.services.settings_dir.is_some() {
+        let t = crate::theme::Tokens::get(ui.ctx());
+        crate::assist::cases::lesson::list(app, ui, &t);
+    }
     ui.add_space(8.0);
     // The agents and what each starts with (#24): desktop only, as agents are programs (#26).
     #[cfg(not(target_arch = "wasm32"))]

@@ -30,13 +30,19 @@ pub(crate) struct Drafts {
     plan: Option<(String, String)>,
     /// The note being written or edited.
     note: Option<NoteForm>,
+    /// The lesson card **Make a lesson** opened on a note of the bound case.
+    pub(crate) lesson: Option<super::lesson::LessonCard>,
+    /// A kept lesson being edited in the list: belongs to no case, so it outlives the forms.
+    pub(crate) lesson_edit: Option<(wordcraft_assist::cases::LessonId, String)>,
     /// Delete case was clicked: the page asks.
     deleting: bool,
+    /// On the delete prompt: the lessons kept from this case stay, without the link.
+    keep_lessons: bool,
 }
 
 impl Drafts {
     fn any_form(&self) -> bool {
-        self.facts.is_some() || self.reassess.is_some() || self.plan.is_some() || self.note.is_some() || self.deleting
+        self.facts.is_some() || self.reassess.is_some() || self.plan.is_some() || self.note.is_some() || self.lesson.is_some() || self.deleting
     }
 
     /// Every form of the bound case closes, unsaved. New case stays: it belongs to no case.
@@ -46,7 +52,9 @@ impl Drafts {
         self.reassess = None;
         self.plan = None;
         self.note = None;
+        self.lesson = None;
         self.deleting = false;
+        self.keep_lessons = false;
     }
 }
 
@@ -194,7 +202,7 @@ pub(super) const LANGS: [(Lang, &str); 3] = [(Lang::En, "English"), (Lang::Ja, "
 
 const STAGES: [(Stage, &str); 3] = [(Stage::Negotiating, "Negotiating"), (Stage::Signed, "Signed"), (Stage::Abandoned, "Abandoned")];
 
-const STANCES: [(Stance, &str); 3] = [(Stance::Stronger, "Stronger"), (Stance::Even, "Even"), (Stance::Weaker, "Weaker")];
+pub(super) const STANCES: [(Stance, &str); 3] = [(Stance::Stronger, "Stronger"), (Stance::Even, "Even"), (Stance::Weaker, "Weaker")];
 
 const FACTORS: [(FactorKind, &str); 7] = [
     (FactorKind::Dependence, "Dependence"),
@@ -206,7 +214,7 @@ const FACTORS: [(FactorKind, &str); 7] = [
     (FactorKind::Other, "Other"),
 ];
 
-const FAVORS: [(Side, &str); 3] = [(Side::Us, "Us"), (Side::Them, "Them"), (Side::Neither, "Neither")];
+pub(super) const FAVORS: [(Side, &str); 3] = [(Side::Us, "Us"), (Side::Them, "Them"), (Side::Neither, "Neither")];
 
 const NOTE_KINDS: [(Kind, &str); 5] =
     [(Kind::Pattern, "Pattern"), (Kind::Pitfall, "Pitfall"), (Kind::Lesson, "Lesson"), (Kind::Leverage, "Leverage"), (Kind::Position, "Position")];
@@ -332,6 +340,7 @@ pub(crate) fn section(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
         Some((at, case)) => bound(app, ui, t, &at, &case),
         None => unbound(app, ui, t),
     }
+    super::lesson::list(app, ui, t);
 }
 
 /// No case: the cases to bind to, by client, and New case.
@@ -444,9 +453,11 @@ fn bound(app: &mut WordApp, ui: &mut Ui, t: &Tokens, at: &CaseRef, case: &Case) 
     heading(ui, "Plan");
     plan(app, ui, t, case);
     heading(ui, "Notes");
-    notes(app, ui, t, case);
+    notes(app, ui, t, at, case);
+    heading(ui, "Record");
+    super::record::section(app, ui, t, at, case);
     ui.add_space(6.0);
-    delete(app, ui, t, case);
+    delete(app, ui, t, at, case);
     let drafts = &mut app.assist.cases.drafts;
     if !drafts.any_form() {
         drafts.on = None;
@@ -703,7 +714,7 @@ fn plan(app: &mut WordApp, ui: &mut Ui, t: &Tokens, case: &Case) {
 
 /// Notes grouped by kind, each with Edit and Remove, and Confirm on an unconfirmed one; then Add
 /// note, or the form.
-fn notes(app: &mut WordApp, ui: &mut Ui, t: &Tokens, case: &Case) {
+fn notes(app: &mut WordApp, ui: &mut Ui, t: &Tokens, at: &CaseRef, case: &Case) {
     if case.notes.is_empty() {
         ui.label(RichText::new(tl!("No notes yet.")).small().color(t.text_dim));
     }
@@ -714,10 +725,11 @@ fn notes(app: &mut WordApp, ui: &mut Ui, t: &Tokens, case: &Case) {
         }
         ui.label(RichText::new(tl!(w)).small().color(t.text_dim));
         for n in of_kind {
-            ui.push_id(("note", n.id.to_string()), |ui| note_row(app, ui, t, n));
+            ui.push_id(("note", n.id.to_string()), |ui| note_row(app, ui, t, n, at, case));
         }
     }
     ui.add_space(2.0);
+    super::lesson::page_card(app, ui, t);
     if let Some(mut form) = app.assist.cases.drafts.note.take() {
         if note_form(app, ui, &mut form) {
             app.assist.cases.drafts.note = Some(form);
@@ -727,7 +739,7 @@ fn notes(app: &mut WordApp, ui: &mut Ui, t: &Tokens, case: &Case) {
     }
 }
 
-fn note_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, n: &Note) {
+fn note_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, n: &Note, at: &CaseRef, case: &Case) {
     let confirmed = matches!(n.standing, Standing::Confirmed { .. });
     let color = if confirmed { t.text } else { t.text_dim };
     ui.add(egui::Label::new(RichText::new(note_words(n)).small().color(color)).wrap());
@@ -745,6 +757,14 @@ fn note_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, n: &Note) {
         }
         if ui.small_button(tl!("Remove")).clicked() {
             run(app, "assist.memory.case.noteRemove", json!({"id": id}));
+        }
+        if confirmed
+            && ui.small_button(tl!("Make a lesson")).on_hover_text(tl!("Every client's cases can use it, after you keep it on the card.")).clicked()
+        {
+            let text = n.body.texts().next().map(|q| q.for_person().to_string()).unwrap_or_default();
+            let proposal = wordcraft_assist::cases::LessonProposal { text: Quoted::parse(&text), notes: vec![n.id] };
+            let card = super::lesson::LessonCard::new(&proposal, Some(at), Some(case), n.at);
+            app.assist.cases.drafts.lesson = Some(card);
         }
     });
 }
@@ -819,26 +839,41 @@ fn note_form(app: &mut WordApp, ui: &mut Ui, form: &mut NoteForm) -> bool {
     open
 }
 
-/// Delete case asks in place, and names what goes and what WordCraft can't reach.
-fn delete(app: &mut WordApp, ui: &mut Ui, t: &Tokens, case: &Case) {
+/// Delete case asks in place, names what goes and what WordCraft can't reach, and lists the
+/// lessons kept from the case with **Delete these too** ticked: unticked, they stay and lose the
+/// link to it.
+fn delete(app: &mut WordApp, ui: &mut Ui, t: &Tokens, at: &CaseRef, case: &Case) {
     if !app.assist.cases.drafts.deleting {
         if ui.small_button(tl!("Delete case…")).clicked() {
             app.assist.cases.drafts.deleting = true;
+            app.assist.cases.drafts.keep_lessons = false;
         }
         return;
     }
+    let lessons: Vec<String> = super::lessons(app).from_case(&at.case).map(|l| l.text.for_person().to_string()).collect();
     egui::Frame::NONE.stroke(egui::Stroke::new(1.5, t.red)).corner_radius(6).inner_margin(6).show(ui, |ui| {
         ui.set_width(ui.available_width());
         let count = case.notes.len().to_string();
         let says = fmt(tl!("Delete this case and its {count} notes? It can't be undone."), &[("count", &count)]);
         ui.add(egui::Label::new(RichText::new(says).small().color(t.text)).wrap());
+        if !lessons.is_empty() {
+            let count = lessons.len().to_string();
+            ui.add(egui::Label::new(RichText::new(fmt(tl!("{count} lessons were kept from it:"), &[("count", &count)])).small().color(t.text)).wrap());
+            for l in &lessons {
+                ui.add(egui::Label::new(RichText::new(format!("• {l}")).small().color(t.text_dim)).wrap());
+            }
+            let mut delete_too = !app.assist.cases.drafts.keep_lessons;
+            ui.checkbox(&mut delete_too, tl!("Delete these too"));
+            app.assist.cases.drafts.keep_lessons = !delete_too;
+        }
         note(
             ui,
             "WordCraft can't reach what a turn already sent to a model provider, nor an agent's own record of a conversation in its own folder, nor a backup of your settings folder.",
         );
         ui.horizontal(|ui| {
             if ui.small_button(tl!("Delete")).clicked() {
-                save(app, "assist.memory.case.delete", json!({}));
+                let keep = !lessons.is_empty() && app.assist.cases.drafts.keep_lessons;
+                save(app, "assist.memory.case.delete", json!({"keepLessons": keep}));
                 app.assist.cases.drafts.deleting = false;
             }
             if ui.small_button(tl!("Cancel")).clicked() {

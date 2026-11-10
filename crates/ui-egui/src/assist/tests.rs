@@ -1962,7 +1962,17 @@ fn a_row_that_quotes_case_notes_says_so_after_it_is_accepted() {
     h.state_mut().run("assist.ask", json!({"prompt": "Do the thing"})).unwrap();
     // What the turn recalled, as the conversation's own thread would record it before the model types.
     let id = ItemId::Here { note: NoteId::parse("n1").unwrap() };
-    let item = RecalledItem { id, place: Place::ThisCase, title: None, kind: None, text: notes.into(), balance: None, confirmed: true, again: false };
+    let item = RecalledItem {
+        id,
+        place: Place::ThisCase,
+        title: None,
+        kind: None,
+        text: notes.into(),
+        balance: None,
+        confirmed: true,
+        again: false,
+        rungs: Vec::new(),
+    };
     let sent = RecallSent { items: vec![item], sent_text: vec![notes.to_string()], ..RecallSent::default() };
     h.state_mut().conversation_mut().unwrap().transcript_mut().record(&wordcraft_assist::Event::Recalled(sent));
     until(&mut h, |a| {
