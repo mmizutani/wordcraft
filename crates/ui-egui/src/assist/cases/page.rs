@@ -7,8 +7,8 @@ use egui::{RichText, Ui};
 use serde_json::{Value, json};
 use wordcraft_assist::cases::record::{MAX_FACTORS, MAX_SHORT, MAX_TEXT};
 use wordcraft_assist::cases::{
-    Body, Case, CaseRef, ContractKind, CounterpartyKind, FactorKind, Facts, Kind, Lang, Listing, Note, OurSide, Paper, Side, SizeBand, Stage, Stance,
-    Standing, Topic, WallId,
+    BalanceDraft, Body, Case, CaseRef, ContractKind, CounterpartyKind, FactorKind, Facts, Kind, Lang, Listing, Note, NoteDraft, OurSide, Paper, Plan,
+    Quoted, Side, SizeBand, Stage, Stance, Standing, Topic, WallId,
 };
 
 use crate::WordApp;
@@ -97,14 +97,20 @@ impl NoteForm {
     }
 
     fn of(note: &Note) -> NoteForm {
-        let mut form = NoteForm::empty();
+        let mut form = NoteForm::from_body(&note.body, note.how.as_ref());
         form.id = Some(note.id.to_string());
-        form.kind = note.kind();
-        form.how = note.how.as_ref().map(|q| q.for_person().to_string()).unwrap_or_default();
-        let mut texts = note.body.texts().map(|q| q.for_person().to_string());
+        form
+    }
+
+    /// A new note's form, filled from `body` and `how`.
+    fn from_body(body: &Body, how: Option<&Quoted>) -> NoteForm {
+        let mut form = NoteForm::empty();
+        form.kind = body.kind();
+        form.how = how.map(|q| q.for_person().to_string()).unwrap_or_default();
+        let mut texts = body.texts().map(|q| q.for_person().to_string());
         form.main = texts.next().unwrap_or_default();
         form.short = texts.next().unwrap_or_default();
-        match &note.body {
+        match body {
             Body::Leverage { favors, until, .. } => {
                 form.favors = *favors;
                 form.until = until.map(String::from).unwrap_or_default();
@@ -261,6 +267,41 @@ fn line(ui: &mut Ui, label: &str, text: &mut String, limit: usize) {
 fn lines(ui: &mut Ui, label: &str, text: &mut String, limit: usize) {
     let name = ui.label(RichText::new(tl!(label)).small());
     ui.add(egui::TextEdit::multiline(text).char_limit(limit).desired_rows(2).desired_width(f32::INFINITY)).labelled_by(name.id);
+}
+
+/// Open a form on the bound case, from a row or a card under an answer: Details shows it.
+fn open_form(app: &mut WordApp, fill: impl FnOnce(&mut Drafts)) {
+    let on = super::bound_for(app);
+    let drafts = &mut app.assist.cases.drafts;
+    drafts.close_forms();
+    fill(drafts);
+    drafts.on = on;
+    app.assist.view = crate::assist::PaneView::Details;
+}
+
+/// Edit note `n` of the bound case.
+pub(super) fn edit_note(app: &mut WordApp, n: &Note) {
+    let form = NoteForm::of(n);
+    open_form(app, |d| d.note = Some(form));
+}
+
+/// Write a note from a card's draft, as a new one.
+pub(super) fn draft_note(app: &mut WordApp, draft: &NoteDraft) {
+    let form = NoteForm::from_body(&draft.body, draft.how.as_ref());
+    open_form(app, |d| d.note = Some(form));
+}
+
+/// Edit a plan from a card.
+pub(super) fn draft_plan(app: &mut WordApp, plan: &Plan) {
+    let goal = plan.goal.for_person().to_string();
+    let next = plan.next.iter().map(|s| s.for_person()).collect::<Vec<_>>().join("\n");
+    open_form(app, |d| d.plan = Some((goal, next)));
+}
+
+/// Reassess from a card's balance.
+pub(super) fn draft_balance(app: &mut WordApp, draft: &BalanceDraft) {
+    let factors = draft.factors.iter().map(|f| (f.kind, f.favors, f.why.as_ref().map(|w| w.for_person().to_string()).unwrap_or_default())).collect();
+    open_form(app, |d| d.reassess = Some(Reassess { stance: draft.stance, factors }));
 }
 
 fn run(app: &mut WordApp, id: &str, params: Value) -> bool {

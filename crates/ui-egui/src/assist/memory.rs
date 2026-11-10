@@ -5,9 +5,11 @@
 //! under it keep being rejected.
 //!
 //! Only the person changes what it says. A model's marker raises `used` and the person's Accept and
-//! Reject raise `accepted` and `rejected`, and those counts only lead to a question. The window refuses a write from a script or an agent, a click or
-//! key the control channel made and a macro's step: a document can tell a model to keep something,
-//! and a kept preference acts on later documents.
+//! Reject raise `accepted` and `rejected`, and those counts only lead to a question. The window
+//! refuses a write from a script or an agent, a click or key the control channel made and a macro's
+//! step: a document can tell a model to keep something, and a kept preference acts on later
+//! documents. A model writes only inside a case the person bound, as unconfirmed notes that stay
+//! there ([`super::cases::tick`]); nothing it writes becomes a preference.
 
 use std::collections::BTreeMap;
 

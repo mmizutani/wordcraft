@@ -3,13 +3,16 @@
 //! function of closed types ([`record`]) over English and Japanese text ([`text`]), the power
 //! balance then against now is a table ([`recall`]), and every change to a case on disk is a typed
 //! operation under a lock ([`store`]). A turn bound to a case carries what ranks highest from it
-//! and the same client's other cases, as data ([`recall::RecallAsk`]).
+//! and the same client's other cases, as data ([`recall::RecallAsk`]), and a model writes working
+//! notes back into that case through a marker in its answer ([`marker`]), unconfirmed.
 
+pub mod marker;
 pub mod recall;
 pub mod record;
 pub mod store;
 pub mod text;
 
+pub use marker::{CASE_ASK, Card, CaseMarker, MODEL_WRITES, ModelWrites, Route};
 pub use recall::{Alone, BalanceGap, ItemId, Others, Place, RecallAsk, RecallSent, RecalledItem};
 pub use record::{
     Applied, Applies, Balance, BalanceDraft, Body, Case, CaseError, Click, ContractKind, CounterpartyKind, Day, Factor, FactorKind, Facts, Kind,

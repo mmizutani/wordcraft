@@ -1256,9 +1256,97 @@ fn a_citation_stays_in_the_answer_beside_a_proposal() {
     }
 }
 
+/// What a stream of answer pieces leaves of case markers: the answer shown, the markers taken,
+/// and how many Details says were dropped.
+fn case_streamed(pieces: &[&str]) -> (String, Vec<crate::cases::CaseMarker>, u32) {
+    let mut t = Transcript::default();
+    t.asked("Go");
+    let mut markers = Vec::new();
+    for piece in pieces {
+        t.record(&Event::Text { text: (*piece).to_string() });
+        markers.extend(t.take_case_markers());
+    }
+    t.record(&Event::Done { stop: StopReason::EndTurn });
+    markers.extend(t.take_case_markers());
+    let answer = t.entries().filter_map(|e| if let Entry::Answer { text } = e { Some(text.as_str()) } else { None }).collect();
+    let dropped = t.details().turns.first().map_or(0, |turn| turn.markers_dropped);
+    (answer, markers, dropped)
+}
+
+const CASE_NOTE: &str =
+    r#"[[case]]{"op":"note","kind":"pattern","rule":"They widen [[Affiliate]] in the schedules.","how":"Clause 1.2 of this draft."}[[/case]]"#;
+
+/// A case marker split at any byte is taken out of the answer and parsed once; `]]` inside its
+/// JSON doesn't end it.
+#[test]
+fn a_case_marker_split_across_pieces_is_parsed_once_and_a_close_inside_it_doesnt_end_it() {
+    let whole = format!("Done. {CASE_NOTE} Anything else?");
+    for at in 0..whole.len() {
+        if !whole.is_char_boundary(at) {
+            continue;
+        }
+        let (a, b) = whole.split_at(at);
+        let (answer, markers, dropped) = case_streamed(&[a, b]);
+        assert_eq!(answer.split_whitespace().collect::<Vec<_>>().join(" "), "Done. Anything else?", "split at {at}");
+        assert_eq!(markers.len(), 1, "split at {at}: {markers:?}");
+        assert_eq!(dropped, 0, "split at {at}");
+        match &markers[0] {
+            crate::cases::CaseMarker::Note(n) => {
+                assert_eq!(n.body.texts().next().unwrap().for_person(), "They widen [[Affiliate]] in the schedules.");
+                assert_eq!(n.how.as_ref().unwrap().for_person(), "Clause 1.2 of this draft.");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let chars: Vec<String> = whole.chars().map(String::from).collect();
+    let pieces: Vec<&str> = chars.iter().map(String::as_str).collect();
+    assert_eq!(case_streamed(&pieces).1.len(), 1);
+    // Nothing of it shows while it is under way.
+    let mut t = Transcript::default();
+    t.asked("Go");
+    t.record(&Event::Text { text: "Done. [[case]]{\"op\":\"no".into() });
+    assert_eq!(t.last_answer().as_deref(), Some("Done."));
+}
+
+/// A case marker past 8 KiB, closed or not, and one unclosed when the answer ends, is dropped and
+/// counted, and nothing of it is shown: half a note would read as text. So is one whose JSON
+/// isn't a marker this build reads, and the sixth of a turn.
+#[test]
+fn an_oversized_unclosed_or_unreadable_case_marker_is_dropped_counted_and_never_shown() {
+    let big = format!("[[case]]{{\"op\":\"note\",\"kind\":\"pattern\",\"rule\":\"{}\"}}[[/case]]", "x".repeat(9000));
+    let (answer, markers, dropped) = case_streamed(&[&format!("Before. {big} After.")]);
+    assert_eq!((answer.as_str(), markers.len(), dropped), ("Before.  After.", 0, 1));
+    // Streamed in pieces, the close arriving later, with text after it.
+    let (a, rest) = big.split_at(100);
+    let (b, c) = rest.split_at(5000);
+    let (answer, markers, dropped) = case_streamed(&["Before. ", a, b, c, " After."]);
+    assert_eq!((answer.as_str(), markers.len(), dropped), ("Before.  After.", 0, 1));
+    assert!(!answer.contains("xxx"));
+    // Never closed, past the cap: nothing of it shows, through to the end of the turn.
+    let (answer, markers, dropped) = case_streamed(&["Before. ", a, b, " and more"]);
+    assert_eq!((answer.as_str(), markers.len(), dropped), ("Before. ", 0, 1));
+    // Never closed, under the cap: dropped at the end of the turn, not shown as text.
+    let (answer, markers, dropped) = case_streamed(&["Before. [[case]]{\"op\":\"note\""]);
+    assert_eq!((answer.as_str(), markers.len(), dropped), ("Before. ", 0, 1));
+    // Not a marker this build reads.
+    let (answer, markers, dropped) = case_streamed(&["Before. [[case]]{\"op\":\"confirm\",\"note\":\"n1\"}[[/case]] After."]);
+    assert_eq!((answer.as_str(), markers.len(), dropped), ("Before.  After.", 0, 1));
+    // The sixth in a turn.
+    let six = std::iter::repeat_n(CASE_NOTE, 6).collect::<Vec<_>>().join(" ");
+    let (_, markers, dropped) = case_streamed(&[&six]);
+    assert_eq!((markers.len(), dropped), (5, 1));
+    // A new turn counts afresh.
+    let mut t = Transcript::default();
+    t.asked("One");
+    t.record(&Event::Text { text: six.clone() });
+    t.asked("Two");
+    t.record(&Event::Text { text: CASE_NOTE.into() });
+    assert_eq!(t.take_case_markers().len(), 6);
+}
+
 #[test]
 fn what_only_looks_like_a_marker_stays_text() {
-    for text in ["[[link]] and [x] and [", "a [[rem", "[[remember: never closed", "[[used: m1", "[[", "]]"] {
+    for text in ["[[link]] and [x] and [", "a [[rem", "[[remember: never closed", "[[used: m1", "[[", "]]", "[[cas", "[[/case]] alone"] {
         assert_eq!(streamed(&[text]), (text.to_string(), vec![]), "{text}");
     }
     let long = format!("[[remember: {}]] after", "x".repeat(5000));

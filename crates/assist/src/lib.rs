@@ -24,8 +24,11 @@
 //!   turn, which the next turn's context starts with. Nothing of it is stored.
 //! - [`memory`]: what the person keeps for every later conversation with every backend, which
 //!   only their own click writes.
-//! - [`cases`]: typed records of past contract cases and the ranker that recalls their notes for
-//!   a similar one, in English and Japanese (#107). Pure for now: no files, no window.
+//! - [`cases`]: typed records of past contract cases, the shelf that keeps them, and the ranker
+//!   that recalls their notes for a similar one, in English and Japanese (#107). Inside a case
+//!   the person bound, a model writes working notes, marked unconfirmed, which stay in that case;
+//!   confirming one, setting a case's facts, replacing the person's plan, binding and deleting
+//!   take the person's click.
 //! - [`offers`]: the backends the pane offers on this host, and how one is made by its id.
 //! - `acp` (desktop only): ACP agents (Claude Code, Codex, Pi…) as backends, each a process
 //!   WordCraft starts and speaks the Agent Client Protocol with.
@@ -67,7 +70,7 @@ pub use feedback::{Decision, Feedback};
 pub use knowledge::{Knowledge, SentSource, TurnSource};
 pub use offers::{Host, Offer, Readiness};
 pub use output::{OutputKind, OutputRow, OutputState};
-pub use transcript::{Citation, Details, Entry, Properties, ProposalAnswer, Step as DetailStep, StepState, Transcript, TurnDetails};
+pub use transcript::{Citation, Details, Entry, Properties, ProposalAnswer, Step as DetailStep, StepState, Transcript, TurnDetails, Written};
 
 /// The note a conversation's first turn carries, which the backend gives its model before the
 /// person's prompt: which document, the assistant's name and role, whether its edits are

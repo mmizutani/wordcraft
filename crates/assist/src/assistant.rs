@@ -255,6 +255,32 @@ impl Assistant {
         self.transcript.take_used()
     }
 
+    /// The case markers the conversation's answers carried since the last call
+    /// ([`crate::cases::marker`]), for the window to route to this conversation's case.
+    pub fn take_case_markers(&mut self) -> Vec<crate::cases::CaseMarker> {
+        self.transcript.take_case_markers()
+    }
+
+    /// A marker's write landed in the conversation's case: the pane shows a quiet row.
+    pub fn case_written(&mut self, what: crate::transcript::Written, note: Option<crate::cases::NoteId>, text: &str) {
+        self.transcript.case_written(what, note, text);
+    }
+
+    /// A marker became a card for the person: its number.
+    pub fn case_card(&mut self, card: crate::cases::Card) -> u64 {
+        self.transcript.case_card(card)
+    }
+
+    /// Card `id`, while the person hasn't answered it.
+    pub fn pending_case_card(&self, id: u64) -> Option<&crate::cases::Card> {
+        self.transcript.pending_case_card(id)
+    }
+
+    /// The person answered card `id`.
+    pub fn answer_case_card(&mut self, id: u64, answer: crate::transcript::ProposalAnswer) {
+        self.transcript.answer_case_card(id, answer);
+    }
+
     /// What the next turns carry of what the person kept ([`crate::memory::Memory::for_model`]).
     pub fn set_memory(&mut self, memory: Option<Instructions>) {
         self.memory = memory;

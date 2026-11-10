@@ -946,11 +946,15 @@ fn truncate<T>(list: &mut Vec<T>, max: usize) -> bool {
 }
 
 /// A note as a marker or a command gives it, before the shelf adds the id, the date and the
-/// standing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// standing. Deserialized flat, so a marker's body is the note's fields beside `op`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NoteDraft {
+    #[serde(flatten)]
     pub body: Body,
+    #[serde(default)]
     pub how: Option<Quoted>,
+    #[serde(default)]
     pub topics: Topics,
 }
 
@@ -972,9 +976,11 @@ impl NoteDraft {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BalanceDraft {
     pub stance: Stance,
+    #[serde(default)]
     pub factors: Vec<Factor>,
 }
 
@@ -993,7 +999,8 @@ pub enum PersonOp {
 }
 
 /// Everything a model can do to a case. It has no Confirm, no Facts, no bind and no delete.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ModelWrite {
     Note(NoteDraft),
     Plan(Plan),

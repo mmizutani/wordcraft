@@ -274,6 +274,7 @@ pub(crate) fn tick(app: &mut WordApp) {
     }
     edits::tick(app);
     memory::tick(app);
+    cases::tick(app);
     cases::guard(app);
     // A permission request waits for the person: the pane opens to ask them. Closed while it
     // waits (Home › Assistant, the pane's close), the request is answered cancelled, so the
@@ -827,6 +828,8 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     sync_unattended(app);
     let policy = if app.assist.by_person { PermissionPolicy::Ask } else { unattended(app) };
     let kept = memory::for_turn(app, &mut sent);
+    // Bound, the turn also says what the case's notes are for ([`cases::marker::CASE_ASK`]).
+    let kept = if bound.is_some() { Some(wordcraft_assist::memory::Instructions::with_case_ask(kept)) } else { kept };
     let recall = cases::for_turn(app, prompt, &ctx, &mut sent);
     let saved = app.conversation().and_then(|a| app.session.prefs.assistant.models.get(&a.info().id)).cloned().unwrap_or_default();
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
@@ -1082,8 +1085,25 @@ pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
             sent.items.iter().flat_map(|i| std::iter::once(i.text.clone()).chain(i.title.clone())).chain(sent.problem.clone()).collect()
         }
         Entry::Output(row) => vec![row.text.clone()],
+        Entry::CaseWritten { text, .. } => vec![text.clone()],
+        Entry::CaseCard { card, .. } => {
+            let texts: Vec<String> = match card {
+                wordcraft_assist::cases::Card::Facts(_) => vec![],
+                wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Note(d)) => {
+                    d.body.texts().chain(d.how.iter()).map(|q| q.for_person().to_string()).collect()
+                }
+                wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Plan(p)) => {
+                    std::iter::once(&p.goal).chain(p.next.iter()).map(|q| q.for_person().to_string()).collect()
+                }
+                wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Balance(b)) => {
+                    b.factors.iter().filter_map(|f| f.why.as_ref()).map(|q| q.for_person().to_string()).collect()
+                }
+                wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Used(_)) => vec![],
+            };
+            texts
+        }
         Entry::Note { text } => vec![text.clone()],
-        Entry::Stopped { .. } => vec![],
+        Entry::Stopped { .. } | Entry::Markers { .. } => vec![],
         Entry::Error { message } => vec![message.clone()],
     }
 }

@@ -269,9 +269,17 @@ fn entry(app: &mut WordApp, ui: &mut Ui, t: &Tokens, i: usize, e: &Entry, waitin
         }
         Entry::Permission { request, answer } => permission(app, ui, t, request, answer.as_ref(), waiting == Some(request.id)),
         Entry::Proposal { id, text, answer } => crate::assist::memory::proposal_card(app, ui, t, *id, text, *answer),
+        Entry::CaseWritten { what, note, text } => crate::assist::cases::written_row(app, ui, t, *what, *note, text),
+        Entry::CaseCard { id, card, answer } => crate::assist::cases::card(app, ui, t, *id, card, *answer),
         Entry::Model { name, effort, asked } => model_line(ui, t, name, effort.as_deref(), *asked),
         Entry::Note { text } => wrapped(ui, RichText::new(text).small().italics().color(t.orange)),
-        Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) | Entry::Recalled(_) | Entry::Output(_) | Entry::Used { .. } => {}
+        Entry::Agent { .. }
+        | Entry::Usage(_)
+        | Entry::Context(_)
+        | Entry::Recalled(_)
+        | Entry::Output(_)
+        | Entry::Used { .. }
+        | Entry::Markers { .. } => {}
         Entry::Stopped { stop } => {
             if let Some(says) = stop.says() {
                 // Stopped by the person reads as a note; any other stop is news to them.

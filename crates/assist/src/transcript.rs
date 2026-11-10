@@ -8,7 +8,9 @@ use std::hash::{DefaultHasher, Hasher};
 use serde::Serialize;
 
 use crate::backend::{Answer, Event, PermissionRequest, PlanEntry, PlanStatus, Source, SourceKind, StopReason, ToolCall, ToolStatus, Usage, label};
+use crate::cases::marker::{Card, CaseMarker, MAX_PER_TURN};
 use crate::cases::recall::RecallSent;
+use crate::cases::record::NoteId;
 use crate::context::Sent;
 use crate::markers::{Markers, Piece};
 use crate::output::{Action, OutputRow};
@@ -148,6 +150,16 @@ pub enum Entry {
     /// What the turn recalled from the person's cases, as data ([`crate::cases::recall`]), or why
     /// nothing. Details shows it; the conversation doesn't.
     Recalled(RecallSent),
+    /// A model's marker wrote this into the conversation's case, unconfirmed
+    /// ([`crate::cases::marker`]): a quiet row under the answer. A note's row has Confirm, Edit and
+    /// Remove, which are the person's commands.
+    CaseWritten { what: Written, note: Option<NoteId>, text: String },
+    /// A model proposes facts, or a write the case didn't take without a click: a card. It carries
+    /// no authority: only the person's click on the card stores anything.
+    CaseCard { id: u64, card: Card, answer: Option<ProposalAnswer> },
+    /// How many case markers of the turn were dropped: too long, unclosed, over the turn's most, or
+    /// not one this build reads. Details shows it; the conversation doesn't.
+    Markers { dropped: u32 },
     /// A change or a comment the conversation made, as it last stood. Details shows it; the
     /// conversation doesn't.
     Output(OutputRow),
@@ -159,11 +171,29 @@ pub enum Entry {
     Error { message: String },
 }
 
+/// What a model's marker wrote into the case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Written {
+    Note,
+    Plan,
+    Balance,
+}
+
 impl Entry {
     /// Whether only Details shows it: the conversation goes on as if it weren't there, and an
     /// answer that arrives in pieces around it stays one answer.
     pub fn details_only(&self) -> bool {
-        matches!(self, Entry::Agent { .. } | Entry::Usage(_) | Entry::Context(_) | Entry::Recalled(_) | Entry::Output(_) | Entry::Used { .. })
+        matches!(
+            self,
+            Entry::Agent { .. }
+                | Entry::Usage(_)
+                | Entry::Context(_)
+                | Entry::Recalled(_)
+                | Entry::Output(_)
+                | Entry::Used { .. }
+                | Entry::Markers { .. }
+        )
     }
 
     fn bytes(&self) -> usize {
@@ -190,7 +220,10 @@ impl Entry {
             }
             Entry::Output(row) => row.text.len().saturating_add(row.full.len()),
             Entry::Recalled(sent) => sent.bytes(),
-            Entry::Stopped { .. } => 0,
+            Entry::CaseWritten { text, .. } => text.len(),
+            // A card is at most a few short texts; the marker that made it was held to 8 KiB.
+            Entry::CaseCard { .. } => crate::markers::MAX_CASE,
+            Entry::Stopped { .. } | Entry::Markers { .. } => 0,
         }
         .saturating_add(16)
     }
@@ -246,6 +279,8 @@ pub struct TurnDetails {
     /// How many citations' words the document and the sources don't have
     /// ([`crate::Assistant::details`] can't tell: the window looks, and leaves those out).
     pub unfound: u32,
+    /// How many case markers the turn's answer carried that were dropped ([`Entry::Markers`]).
+    pub markers_dropped: u32,
 }
 
 /// What an answer cites.
@@ -306,6 +341,7 @@ struct TurnBuilder<'a> {
     output: Vec<OutputRow>,
     citations: Vec<Citation>,
     used: Vec<String>,
+    markers_dropped: u32,
     /// The sources seen, listed or not, so each counts once.
     seen: HashSet<(SourceKind, &'a str, Option<&'a str>)>,
 }
@@ -313,10 +349,11 @@ struct TurnBuilder<'a> {
 impl<'a> TurnBuilder<'a> {
     /// Add the turn to `turns`, if it has anything to show, and start another.
     fn finish(&mut self, turns: &mut Vec<TurnDetails>) {
-        let TurnBuilder { asked, plan, calls, context, recalled, sources, more_sources, output, citations, used, .. } = std::mem::take(self);
+        let TurnBuilder { asked, plan, calls, context, recalled, sources, more_sources, output, citations, used, markers_dropped, .. } =
+            std::mem::take(self);
         let steps = plan.unwrap_or(calls);
         if asked.is_some() || !steps.is_empty() || context.is_some() || !sources.is_empty() || !output.is_empty() || !citations.is_empty() {
-            turns.push(TurnDetails { asked, steps, context, recalled, sources, more_sources, output, citations, used, unfound: 0 });
+            turns.push(TurnDetails { asked, steps, context, recalled, sources, more_sources, output, citations, used, unfound: 0, markers_dropped });
         }
     }
 
@@ -380,6 +417,15 @@ pub struct Transcript {
     /// The preferences marked that the window hasn't counted yet ([`Transcript::take_used`]).
     #[serde(skip)]
     uncounted: Vec<String>,
+    /// The case markers parsed that the window hasn't routed yet ([`Transcript::take_case_markers`]).
+    #[serde(skip)]
+    unrouted: Vec<CaseMarker>,
+    /// How many case markers the current turn has kept.
+    #[serde(skip)]
+    case_marked: u8,
+    /// The last card's number.
+    #[serde(skip)]
+    last_card: u64,
     /// How many more changes the document has than the entries list ([`crate::output::MAX_ROWS`]).
     #[serde(skip)]
     more_output: usize,
@@ -462,9 +508,12 @@ impl Transcript {
                 Entry::Output(row) => turn.output.push(row.shown()),
                 Entry::Answer { text } => turn.cite(text),
                 Entry::Used { id } => turn.used.push(id.clone()),
+                Entry::Markers { dropped } => turn.markers_dropped = *dropped,
                 Entry::Thought { .. }
                 | Entry::Permission { .. }
                 | Entry::Proposal { .. }
+                | Entry::CaseWritten { .. }
+                | Entry::CaseCard { .. }
                 | Entry::Note { .. }
                 | Entry::Stopped { .. }
                 | Entry::Error { .. } => {}
@@ -584,6 +633,7 @@ impl Transcript {
         self.flush_markers();
         self.turn_start = self.entries.len();
         self.proposed = 0;
+        self.case_marked = 0;
         self.push(Entry::Asked { text: text.to_string() });
     }
 
@@ -596,11 +646,7 @@ impl Transcript {
         match event {
             Event::Text { text } => {
                 for piece in self.markers.feed(text) {
-                    match piece {
-                        Piece::Text(t) => self.answer(&t),
-                        Piece::Remember(t) => self.propose(&t),
-                        Piece::Used(id) => self.mark_used(&id),
-                    }
+                    self.piece(piece);
                 }
             }
             Event::Thought { text } => self.append(text, |e| matches!(e, Entry::Thought { .. }), |t| Entry::Thought { text: t }),
@@ -690,6 +736,72 @@ impl Transcript {
         std::mem::take(&mut self.uncounted)
     }
 
+    /// The case markers parsed since the last call, at most [`MAX_PER_TURN`] a turn, for the
+    /// window to route to the conversation's case.
+    pub fn take_case_markers(&mut self) -> Vec<CaseMarker> {
+        std::mem::take(&mut self.unrouted)
+    }
+
+    /// A marker's write landed in the case: a quiet row under the answer.
+    pub fn case_written(&mut self, what: Written, note: Option<NoteId>, text: &str) {
+        self.push(Entry::CaseWritten { what, note, text: text.to_string() });
+    }
+
+    /// A marker became a card for the person: its number, through the conversation.
+    pub fn case_card(&mut self, card: Card) -> u64 {
+        self.last_card = self.last_card.saturating_add(1);
+        self.push(Entry::CaseCard { id: self.last_card, card, answer: None });
+        self.last_card
+    }
+
+    /// Card `id`, while the person hasn't answered it.
+    pub fn pending_case_card(&self, id: u64) -> Option<&Card> {
+        self.entries.iter().rev().find_map(|e| match e {
+            Entry::CaseCard { id: i, card, answer: None } if *i == id => Some(card),
+            _ => None,
+        })
+    }
+
+    /// The person answered card `id`.
+    pub fn answer_case_card(&mut self, id: u64, answer: ProposalAnswer) {
+        let found = self.entries.iter().enumerate().rev().find_map(|(i, e)| match e {
+            Entry::CaseCard { id: n, card, .. } if *n == id => Some((i, card.clone())),
+            _ => None,
+        });
+        if let Some((i, card)) = found {
+            self.replace(i, Entry::CaseCard { id, card, answer: Some(answer) });
+        }
+    }
+
+    /// One piece of the answer, by what it is.
+    fn piece(&mut self, piece: Piece) {
+        match piece {
+            Piece::Text(t) => self.answer(&t),
+            Piece::Remember(t) => self.propose(&t),
+            Piece::Used(id) => self.mark_used(&id),
+            Piece::Case(body) => match CaseMarker::parse(&body) {
+                Some(marker) if self.case_marked < MAX_PER_TURN => {
+                    self.case_marked = self.case_marked.saturating_add(1);
+                    self.unrouted.push(marker);
+                }
+                _ => self.dropped_marker(),
+            },
+            Piece::CaseDropped => self.dropped_marker(),
+        }
+    }
+
+    /// One more case marker of the turn was dropped: Details says how many.
+    fn dropped_marker(&mut self) {
+        let found = self.in_turn().find_map(|(i, e)| match e {
+            Entry::Markers { dropped } => Some((i, *dropped)),
+            _ => None,
+        });
+        match found {
+            Some((i, dropped)) => self.replace(i, Entry::Markers { dropped: dropped.saturating_add(1) }),
+            None => self.push(Entry::Markers { dropped: 1 }),
+        }
+    }
+
     /// The preferences marked in the turn a tracked change dated `date` was made in: the last one
     /// started at or before then. Dates are as `wordcraft_engine::cmd::now_iso` writes them, which
     /// sort as they read.
@@ -767,11 +879,11 @@ impl Transcript {
         self.push(Entry::Proposal { id: self.last_proposal, text, answer: None });
     }
 
-    /// What was held back as the start of a marker was only text.
+    /// What was held back as the start of a marker was only text, or an unclosed case marker,
+    /// which is dropped.
     fn flush_markers(&mut self) {
-        let held = self.markers.flush();
-        if !held.is_empty() {
-            self.answer(&held);
+        for piece in self.markers.flush() {
+            self.piece(piece);
         }
     }
 

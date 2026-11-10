@@ -6,18 +6,24 @@
 //! its document was bound to when it started ([`super::Conversation::case`]); a document bound to
 //! another case gets a new conversation. Recall runs only when a case is bound and no one but the
 //! person and this conversation's assistant can read the document ([`Alone`]); otherwise the turn
-//! runs as it does today, and Details says why. Only the person's own click writes a case:
-//! [`super::memory::write`] is the one guard, and the shelf's [`Click`] is its proof.
+//! runs as it does today, and Details says why.
+//!
+//! Two writers, two doors. The person's click goes through [`super::memory::write`], the one guard,
+//! and the shelf's [`Click`] is its proof: only that door confirms a note, sets facts, replaces the
+//! person's plan, binds or deletes. A model's `[[case]]` marker goes through [`tick`], the one
+//! route, into the conversation's own case ([`super::Conversation::case`]) and never the document's
+//! current binding: a note or a balance lands there unconfirmed, a plan replaces only a model's
+//! plan, and facts are always a card. The switch is [`ModelWrites`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use egui::{RichText, Ui};
 use serde_json::{Value, json};
 use wordcraft_assist::cases::{
-    Alone, BalanceDraft, Body, Case, CaseError, CaseId, CaseRef, Click, Day, Factor, Facts, Listing, NoteDraft, NoteId, PersonOp, Place, Plan,
-    Quoted, RecallAsk, RecallSent, Shelf, Stance, Topics, WallId,
+    Alone, Applied, BalanceDraft, Body, Card, Case, CaseError, CaseId, CaseRef, Click, Day, Factor, Facts, Listing, ModelWrite, ModelWrites,
+    NoteDraft, NoteId, PersonOp, Place, Plan, Quoted, RecallAsk, RecallSent, Route, Shelf, Stance, Standing, Topics, WallId,
 };
-use wordcraft_assist::{Context, Details, Sent};
+use wordcraft_assist::{Context, Details, ProposalAnswer, Sent, Written};
 
 use crate::WordApp;
 use crate::i18n::fmt;
@@ -38,6 +44,13 @@ pub(crate) const MY_CASES: &str = "My cases";
 /// shows: another WordCraft may have written.
 const READ_EVERY: f64 = 2000.0;
 
+/// Most writes waiting on a busy lock; more are dropped and logged.
+const MAX_UNWRITTEN: usize = 32;
+
+/// Frames a write waits on a busy lock before it is dropped: another WordCraft holding the lock
+/// that long is stuck, and the note is only a model's.
+const MAX_TRIES: u32 = 600;
+
 /// What the window holds of it.
 #[derive(Default)]
 pub(crate) struct CasesState {
@@ -51,6 +64,12 @@ pub(crate) struct CasesState {
     listed_at: Option<f64>,
     /// What the page is in the middle of.
     pub(crate) drafts: page::Drafts,
+    /// A model's writes, each for the case its conversation belongs to, waiting for the file:
+    /// a busy lock keeps one for the next frame.
+    unwritten: VecDeque<(CaseRef, ModelWrite, u32)>,
+    /// [`wordcraft_assist::cases::MODEL_WRITES`], which tests change to try the other setting.
+    #[doc(hidden)]
+    pub model_writes: ModelWrites,
 }
 
 /// The last listing read, kept while a newer one is read: a name lookup during the read must
@@ -137,6 +156,78 @@ fn list_on_worker(app: &mut WordApp) {
 fn changed(app: &mut WordApp) {
     app.assist.cases.read_at = None;
     app.assist.cases.listed_at = None;
+}
+
+/// Every frame: what the conversation's answers marked for its case goes there, by the one route.
+/// A marker with no case bound to the conversation is dropped, as a `[[used:]]` for nothing is.
+pub(crate) fn tick(app: &mut WordApp) {
+    let assist = &mut app.assist;
+    if let Some(c) = assist.conversation.as_mut() {
+        let marked = c.assistant.take_case_markers();
+        if let Some(at) = c.case.clone() {
+            for marker in marked {
+                match marker.route(assist.cases.model_writes) {
+                    Route::Write(write) if assist.cases.unwritten.len() < MAX_UNWRITTEN => assist.cases.unwritten.push_back((at.clone(), write, 0)),
+                    Route::Write(_) => log::warn!("a model's case note was dropped: too many wait for the file"),
+                    Route::Card(card) => {
+                        c.assistant.case_card(card);
+                    }
+                }
+            }
+        }
+    }
+    drain(app);
+}
+
+/// The writes waiting, in order, each into its own case. A busy lock stops the frame's draining;
+/// any other refusal drops the write, and nothing is retried.
+fn drain(app: &mut WordApp) {
+    if app.assist.cases.unwritten.is_empty() {
+        return;
+    }
+    let (Some(dir), Ok(today)) = (app.services.settings_dir.clone(), today()) else {
+        app.assist.cases.unwritten.clear();
+        return;
+    };
+    let shelf = Shelf::at(&dir);
+    while let Some((at, write, tries)) = app.assist.cases.unwritten.pop_front() {
+        let (what, text) = describe(&write);
+        match shelf.model(&at, write.clone(), today) {
+            Err(CaseError::Busy) => {
+                if tries < MAX_TRIES {
+                    app.assist.cases.unwritten.push_front((at, write, tries.saturating_add(1)));
+                } else {
+                    log::warn!("a model's case note was dropped: the case's file stayed busy");
+                }
+                return;
+            }
+            Err(e) => log::warn!("a model's case note wasn't kept: {e}"),
+            Ok(applied) => {
+                // The row and the card belong to the conversation that wrote the marker.
+                if let Some(c) = app.assist.conversation.as_mut().filter(|c| c.case.as_ref() == Some(&at)) {
+                    match applied {
+                        Applied::Added(id) | Applied::Replaced { added: id, .. } => c.assistant.case_written(what, Some(id), &text),
+                        Applied::Changed => c.assistant.case_written(what, None, &text),
+                        Applied::Card(write) => {
+                            c.assistant.case_card(Card::Write(write));
+                        }
+                        Applied::Known => {}
+                    }
+                }
+                changed(app);
+            }
+        }
+    }
+}
+
+/// What a write is, and its main text, for its row.
+fn describe(write: &ModelWrite) -> (Written, String) {
+    match write {
+        ModelWrite::Note(draft) => (Written::Note, draft.body.texts().next().map(|q| q.for_person().to_string()).unwrap_or_default()),
+        ModelWrite::Plan(plan) => (Written::Plan, plan.goal.for_person().to_string()),
+        ModelWrite::Balance(draft) => (Written::Balance, stance_word(Some(draft.stance)).to_string()),
+        ModelWrite::Used(_) => (Written::Note, String::new()),
+    }
 }
 
 /// One of the `memory.case.*` or `memory.wall.*` writes, whose params the command checked for
@@ -376,12 +467,17 @@ pub(crate) fn section(ui: &mut Ui, t: &Tokens, details: &Details) {
     let mut shown = false;
     for (n, turn) in details.turns.iter().enumerate().rev() {
         let withheld = turn.context.as_ref().and_then(|s| s.recall_withheld.as_deref());
-        if withheld.is_none() && turn.recalled.is_none() {
+        if withheld.is_none() && turn.recalled.is_none() && turn.markers_dropped == 0 {
             continue;
         }
         shown = true;
         if let Some(asked) = &turn.asked {
             ui.add(egui::Label::new(RichText::new(asked).small().color(t.text_dim)).wrap());
+        }
+        if turn.markers_dropped > 0 {
+            let says =
+                fmt(tl!("{count} case notes the answer carried couldn't be read and were dropped."), &[("count", &turn.markers_dropped.to_string())]);
+            ui.add(egui::Label::new(RichText::new(says).small().color(t.orange)).wrap());
         }
         if let Some(why) = withheld {
             ui.add(egui::Label::new(RichText::new(fmt(tl!("Recall was off: {why}."), &[("why", why)])).small().color(t.orange)).wrap());
@@ -429,6 +525,177 @@ fn turn_rows(ui: &mut Ui, t: &Tokens, recalled: &RecallSent) {
     }
     if let Some(problem) = &recalled.problem {
         ui.add(egui::Label::new(RichText::new(problem).small().color(t.orange)).wrap());
+    }
+}
+
+/// Whether the conversation's case is the one the page's commands write: the shown document's.
+/// Rebinding ends the conversation, so this is false only for an ended one's rows and cards.
+fn rows_act(app: &WordApp) -> bool {
+    let conversation = app.assist.conversation.as_ref().filter(|c| c.document == app.session.document_id()).and_then(|c| c.case.clone());
+    conversation.is_some() && conversation == bound_for(app)
+}
+
+/// The quiet row under an answer for what a marker wrote ([`wordcraft_assist::Entry::CaseWritten`]).
+/// A note's standing is read from the case as it is now, so the row says when it was confirmed or
+/// removed, in Details › Case or here. Confirm, Edit and Remove are the person's commands.
+pub(crate) fn written_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, what: Written, note: Option<NoteId>, text: &str) {
+    let live = rows_act(app).then(|| open_case(app, false)).flatten().map(|(_, case)| case);
+    let lead = match what {
+        Written::Note => tl!("Noted for this case:"),
+        Written::Plan => tl!("Plan for this case, unconfirmed:"),
+        Written::Balance => tl!("Balance for this case, unconfirmed:"),
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(RichText::new(lead).small().color(t.text_dim));
+        ui.label(RichText::new(text).small().color(t.text));
+        let (Written::Note, Some(id)) = (what, note) else { return };
+        let Some(case) = &live else { return };
+        match case.notes.iter().find(|n| n.id == id) {
+            None => {
+                ui.label(RichText::new(tl!("Removed")).small().color(t.text_dim));
+            }
+            Some(n) if matches!(n.standing, Standing::Confirmed { .. }) => {
+                ui.label(RichText::new(tl!("Confirmed")).small().color(t.text_dim));
+            }
+            Some(n) => {
+                let n = n.clone();
+                ui.label(RichText::new(tl!("unconfirmed")).small().color(t.orange));
+                if ui.small_button(tl!("Confirm")).on_hover_text(tl!("This client's other cases can use it.")).clicked() {
+                    run(app, "assist.memory.case.noteConfirm", json!({"id": id.to_string()}));
+                }
+                if ui.small_button(tl!("Edit")).clicked() {
+                    page::edit_note(app, &n);
+                }
+                if ui.small_button(tl!("Remove")).clicked() {
+                    run(app, "assist.memory.case.noteRemove", json!({"id": id.to_string()}));
+                }
+            }
+        }
+    });
+}
+
+/// A card under an answer ([`wordcraft_assist::Entry::CaseCard`]): what the model proposes for the
+/// case and, while it waits, the buttons. Nothing is stored until Use or Keep, which are the
+/// person's commands; Not this stores nothing either.
+pub(crate) fn card(app: &mut WordApp, ui: &mut Ui, t: &Tokens, id: u64, card: &Card, answer: Option<ProposalAnswer>) {
+    let waiting = answer.is_none();
+    let stroke = if waiting { egui::Stroke::new(1.5, t.accent) } else { egui::Stroke::new(1.0, t.border_strong) };
+    egui::Frame::NONE.stroke(stroke).corner_radius(6).inner_margin(6).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let (question, lines, keep) = card_words(card);
+        let said = match answer {
+            None => question,
+            Some(ProposalAnswer::Kept) => tl!("Used for this case"),
+            Some(ProposalAnswer::Dismissed) => tl!("Not used"),
+        };
+        ui.label(RichText::new(said).small().color(t.text_dim));
+        for line in &lines {
+            ui.add(egui::Label::new(RichText::new(line).font(crate::theme::semibold(12.0)).color(if waiting { t.text } else { t.text_dim })).wrap());
+        }
+        if !waiting || !rows_act(app) {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(keep).clicked()
+                && use_card(app, card)
+                && let Some(a) = app.conversation_mut()
+            {
+                a.answer_case_card(id, ProposalAnswer::Kept);
+            }
+            if ui.button(tl!("Edit")).clicked() {
+                match card {
+                    Card::Facts(_) => app.assist.view = super::PaneView::Details,
+                    Card::Write(ModelWrite::Note(draft)) => page::draft_note(app, draft),
+                    Card::Write(ModelWrite::Plan(plan)) => page::draft_plan(app, plan),
+                    Card::Write(ModelWrite::Balance(draft)) => page::draft_balance(app, draft),
+                    Card::Write(ModelWrite::Used(_)) => {}
+                }
+            }
+            if ui.button(tl!("Not this")).clicked()
+                && let Some(a) = app.conversation_mut()
+            {
+                a.answer_case_card(id, ProposalAnswer::Dismissed);
+            }
+        });
+    });
+}
+
+/// A card's question, the lines it shows, and what its first button says.
+fn card_words(card: &Card) -> (&'static str, Vec<String>, &'static str) {
+    match card {
+        Card::Facts(facts) => {
+            let mut lines = Vec::new();
+            let mut say = |name: &str, v: Option<String>| {
+                if let Some(v) = v {
+                    lines.push(format!("{name}: {v}"));
+                }
+            };
+            say(tl!("Contract"), facts.kind.map(word));
+            say(tl!("Our side"), facts.side.map(word));
+            say(tl!("Paper"), facts.paper.map(word));
+            say(tl!("Counterparty"), facts.theirs.map(word));
+            say(tl!("Law"), facts.law.map(String::from));
+            say(tl!("Size"), facts.size.map(word));
+            say(tl!("Language"), facts.language.map(word));
+            (tl!("The assistant suggests these facts for this case."), lines, tl!("Use these"))
+        }
+        Card::Write(ModelWrite::Note(draft)) => {
+            let mut lines: Vec<String> = draft.body.texts().map(|q| q.for_person().to_string()).collect();
+            if let Some(how) = &draft.how {
+                lines.push(how.for_person().to_string());
+            }
+            (tl!("Keep this note for this case?"), lines, tl!("Keep"))
+        }
+        Card::Write(ModelWrite::Plan(plan)) => {
+            let mut lines = vec![plan.goal.for_person().to_string()];
+            lines.extend(plan.next.iter().map(|s| s.for_person().to_string()));
+            (tl!("The assistant suggests this plan. Yours stays until you use it."), lines, tl!("Use this plan"))
+        }
+        Card::Write(ModelWrite::Balance(draft)) => {
+            let mut lines = vec![stance_word(Some(draft.stance)).to_string()];
+            lines.extend(draft.factors.iter().filter_map(|f| f.why.as_ref()).map(|w| w.for_person().to_string()));
+            (tl!("The assistant reads the balance as this. Reassess?"), lines, tl!("Reassess"))
+        }
+        Card::Write(ModelWrite::Used(_)) => ("", Vec::new(), ""),
+    }
+}
+
+/// A typed value's name, as its JSON reads.
+fn word<T: serde::Serialize>(v: T) -> String {
+    serde_json::to_value(v).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
+}
+
+/// The person's Use or Keep on a card: the command it runs, on the bound case. Facts proposed fill
+/// only what they name; the rest, names and stage included, stays as it is.
+fn use_card(app: &mut WordApp, card: &Card) -> bool {
+    match card {
+        Card::Facts(draft) => {
+            let Some((_, case)) = open_case(app, true) else { return false };
+            let mut facts = case.facts;
+            facts.kind = draft.kind.or(facts.kind);
+            facts.side = draft.side.or(facts.side);
+            facts.paper = draft.paper.or(facts.paper);
+            facts.theirs = draft.theirs.or(facts.theirs);
+            facts.law = draft.law.or(facts.law);
+            facts.size = draft.size.or(facts.size);
+            facts.language = draft.language.or(facts.language);
+            run(app, "assist.memory.case.facts", json!({"facts": facts}))
+        }
+        Card::Write(ModelWrite::Note(draft)) => run(app, "assist.memory.case.note", json!({"note": draft.body, "how": draft.how})),
+        Card::Write(ModelWrite::Plan(plan)) => run(app, "assist.memory.case.plan", json!({"goal": plan.goal, "next": plan.next})),
+        Card::Write(ModelWrite::Balance(draft)) => run(app, "assist.memory.case.balance", json!({"stance": draft.stance, "factors": draft.factors})),
+        Card::Write(ModelWrite::Used(_)) => false,
+    }
+}
+
+fn run(app: &mut WordApp, id: &str, params: Value) -> bool {
+    match app.run(id, params) {
+        Ok(_) => true,
+        Err(e) => {
+            app.assist.notice = Some(e);
+            false
+        }
     }
 }
 
