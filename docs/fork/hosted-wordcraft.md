@@ -40,6 +40,12 @@ Gate the probe at the Worker as well as at the Site. Requests without an authent
 | S3. Repeatable deployment and portability | Record the tested build and packaging commands, source revision, resource binding names, and live results. Keep configuration examples free of credentials. Mark each untested capability and the phase that will verify it. |
 | S4. Static compatibility | Build the existing web package and open it under a URL subpath. Verify the editor loads and the local open and save workflow still works. |
 
+### Capability probe results
+
+The first private version, built from `9c06e307d1a087b072669df397fe70580a1a53df`, ran the Rust-generated Worker and served the eight-byte browser WASM module as `application/wasm`. Managed D1 applied the probe migration. Signed-out requests were denied at the Site. The Worker returned 401 for a Site service request without visitor identity. In the signed-in owner's browser, the four storage requests returned `201`, `200`, `204`, and `404`. The Worker compares the exact R2 bytes before returning 200.
+
+The same-source static package loaded under `/editor/` in headless Chrome. Opening a multilingual text fixture and using the browser download fallback produced a DOCX that retained its text. The private capability probe and full editor use separate source revisions because Sites reused the saved version when given a different archive for the same commit.
+
 ## Boundaries for later phases
 
 - **Document authority and collaboration.** The storage service owns stable document IDs, access, and committed revisions. An active room will persist accepted changes before acknowledgment, and explicit Save will publish a DOCX through that room. This separation follows the public [WOPI coauthoring precedent](https://learn.microsoft.com/en-us/microsoft-365/cloud-storage-partner-program/online/scenarios/coauth) and the repository's [network-room design](../collaboration.md). The browser-only rollout precedes desktop and offline participation. Their design will account for base revisions, pending edits, replay, and conflict handling. A separate HTTPS room service is an option if Sites cannot provide the necessary coordination.
