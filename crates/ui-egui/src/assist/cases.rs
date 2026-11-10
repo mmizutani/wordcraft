@@ -53,12 +53,12 @@ pub(crate) struct CasesState {
     pub(crate) drafts: page::Drafts,
 }
 
+/// The last listing read, kept while a newer one is read: a name lookup during the read must
+/// still find the client, or Create would make a second one of that name.
 #[derive(Default)]
-enum ListState {
-    #[default]
-    Unread,
-    Reading(std::sync::mpsc::Receiver<Listing>),
-    Read(Listing),
+struct ListState {
+    last: Option<Listing>,
+    pending: Option<std::sync::mpsc::Receiver<Listing>>,
 }
 
 /// A stamp unique to this process for a new wall's or case's id ([`Shelf::new_wall`]): the process
@@ -101,20 +101,19 @@ pub(crate) fn open_case(app: &mut WordApp, force: bool) -> Option<(CaseRef, Case
 /// The listing as last read; `None` until the first read ends. Asks for a new one when stale, on a
 /// worker, since it scans every client's folder.
 pub(crate) fn listing(app: &mut WordApp) -> Option<Listing> {
-    if let ListState::Reading(rx) = &app.assist.cases.listing
+    let state = &mut app.assist.cases.listing;
+    if let Some(rx) = &state.pending
         && let Ok(listing) = rx.try_recv()
     {
-        app.assist.cases.listing = ListState::Read(listing);
+        state.last = Some(listing);
+        state.pending = None;
         app.assist.cases.listed_at = Some(crate::clock::now_ms());
     }
     let stale = app.assist.cases.listed_at.is_none_or(|t| crate::clock::now_ms() - t > READ_EVERY);
-    if stale && !matches!(app.assist.cases.listing, ListState::Reading(_)) {
+    if stale && app.assist.cases.listing.pending.is_none() {
         list_on_worker(app);
     }
-    match &app.assist.cases.listing {
-        ListState::Read(listing) => Some(listing.clone()),
-        _ => None,
-    }
+    app.assist.cases.listing.last.clone()
 }
 
 fn list_on_worker(app: &mut WordApp) {
@@ -128,7 +127,7 @@ fn list_on_worker(app: &mut WordApp) {
         }
     });
     if spawned.is_ok() {
-        app.assist.cases.listing = ListState::Reading(rx);
+        app.assist.cases.listing.pending = Some(rx);
         // Set now, so a failed send or a slow worker isn't asked again every frame.
         app.assist.cases.listed_at = Some(crate::clock::now_ms());
     }
@@ -138,9 +137,6 @@ fn list_on_worker(app: &mut WordApp) {
 fn changed(app: &mut WordApp) {
     app.assist.cases.read_at = None;
     app.assist.cases.listed_at = None;
-    if !matches!(app.assist.cases.listing, ListState::Reading(_)) {
-        app.assist.cases.listing = ListState::Unread;
-    }
 }
 
 /// One of the `memory.case.*` or `memory.wall.*` writes, whose params the command checked for
@@ -202,7 +198,9 @@ pub(crate) fn write(app: &mut WordApp, dir: &std::path::Path, what: &str, req: &
 }
 
 /// A case called `title`, in the wall named, the client named (made if no listed wall has that
-/// name), or "My cases" with neither; then bound to the document.
+/// name), or "My cases" with neither; then bound to the document. Before the first listing has
+/// come back the folder is listed here, on the frame: a lookup in no listing would make a second
+/// client of the name.
 fn new_case(app: &mut WordApp, shelf: &Shelf, click: Click, req: &Value) -> Result<Value, String> {
     if !app.has_document() {
         return Err(NO_DOCUMENT.into());
@@ -212,11 +210,11 @@ fn new_case(app: &mut WordApp, shelf: &Shelf, click: Click, req: &Value) -> Resu
         Some(id) => WallId::parse(id).ok_or("`wall`: not an id")?,
         None => {
             let name = req.get("client").and_then(Value::as_str).filter(|c| !c.trim().is_empty()).unwrap_or(MY_CASES);
-            let listed = match &app.assist.cases.listing {
-                ListState::Read(listing) => listing.walls.iter().find(|w| w.name.for_person() == name).map(|w| w.id.clone()),
-                _ => None,
+            let listing = match &app.assist.cases.listing.last {
+                Some(listing) => listing.clone(),
+                None => shelf.list(),
             };
-            match listed {
+            match listing.walls.iter().find(|w| w.name.for_person() == name).map(|w| w.id.clone()) {
                 Some(id) => id,
                 None => {
                     let (stamp, counter) = stamp();

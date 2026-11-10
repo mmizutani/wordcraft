@@ -459,6 +459,26 @@ fn a_control_click_on_create_makes_no_case() {
     assert!(crate::assist::cases::bound_for(h.state()).is_some(), "and bound the document to it");
 }
 
+/// Create by client name while the first listing is still being read finds the client in a
+/// listing made on the spot, so no second client of the name appears.
+#[test]
+fn creating_a_case_by_client_name_while_the_listing_is_read_makes_no_second_client() {
+    let folder = Folder::new();
+    let _ = cases(&folder);
+    let mut a = window(&folder);
+    let (_held, rx) = std::sync::mpsc::channel();
+    a.assist.cases.listing = super::ListState { last: None, pending: Some(rx) };
+    a.assist.cases.listed_at = Some(crate::clock::now_ms());
+    a.run("assist.memory.case.new", json!({"title": "Acme NDA", "client": "Client 1"})).unwrap();
+    let listing = Shelf::at(&folder.0).list();
+    assert_eq!(listing.walls.iter().filter(|w| w.name.for_person() == "Client 1").count(), 1, "{listing:?}");
+    assert_eq!(listing.walls.len(), 2);
+    let at = crate::assist::cases::bound_for(&a).unwrap();
+    let wall = listing.walls.iter().find(|w| w.id == at.wall).unwrap();
+    assert_eq!(wall.name.for_person(), "Client 1");
+    assert_eq!(wall.cases.len(), 3, "the new case joined the client's two");
+}
+
 /// Binding through the command makes the next turn recall, unbinding stops it, and binding another
 /// case ends the conversation that ran under the first.
 #[test]
