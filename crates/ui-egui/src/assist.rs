@@ -270,11 +270,12 @@ fn status(app: &WordApp) -> AssistantStatus {
 /// again what is offered now and then, and tell the session what the assistant can do.
 pub(crate) fn tick(app: &mut WordApp) {
     sync_unattended(app);
-    if let Some(c) = app.assist.conversation.as_mut() {
+    let closed = app.assist.conversation.as_mut().is_some_and(|c| {
         c.assistant.poll();
-        if c.assistant.room().is_closed() {
-            c.assistant.end();
-        }
+        c.assistant.room().is_closed()
+    });
+    if closed {
+        cases::record::end(app);
     }
     edits::tick(app);
     memory::tick(app);
@@ -747,11 +748,10 @@ pub(crate) fn sync_unattended(app: &WordApp) {
     }
 }
 
-/// End the conversation there is, if any (its transcript stays for the pane).
+/// End the conversation there is, if any (its transcript stays for the pane, and a cut turn goes
+/// to its record).
 fn end(app: &mut WordApp) {
-    if let Some(c) = app.assist.conversation.as_mut() {
-        c.assistant.end();
-    }
+    cases::record::end(app);
     app.assist.cases.lesson_cards.clear();
 }
 

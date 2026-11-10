@@ -159,16 +159,31 @@ fn snapshot(app: &WordApp) -> Record {
     }
 }
 
-/// Every frame: the turn that just ended goes to the conversation's record, and a worker that
-/// ended is heard.
-pub(crate) fn tick(app: &mut WordApp) {
-    // Taken whether or not there is a log, so a turn never waits for the next one.
+/// The turn that just ended, if any, goes to the conversation's record. Taken whether or not
+/// there is a log, so a turn never waits for the next one.
+fn write_finished_turn(app: &mut WordApp) {
     let finished = app.assist.conversation.as_mut().and_then(|c| c.assistant.take_finished_turn());
     if let Some(record) = finished
         && let Some(log) = live_log(app)
     {
         log.write(record);
     }
+}
+
+/// End the conversation there is, if any, and write the turn it cut off, as cancelled, to its
+/// record. Every place a conversation ends or is replaced comes here, while the conversation and
+/// its log are still held: dropped first, the cut turn would be lost.
+pub(crate) fn end(app: &mut WordApp) {
+    if let Some(c) = app.assist.conversation.as_mut() {
+        c.assistant.end();
+    }
+    write_finished_turn(app);
+}
+
+/// Every frame: the turn that just ended goes to the conversation's record, and a worker that
+/// ended is heard.
+pub(crate) fn tick(app: &mut WordApp) {
+    write_finished_turn(app);
     let state = &mut app.assist.cases.record;
     if let Some((of, rx)) = &state.search
         && let Ok(found) = rx.try_recv()
@@ -292,11 +307,11 @@ pub(crate) fn delete_case(
     if app.assist.cases.record.deleting.is_some() {
         return Err(tl!("A delete is still running: wait for it.").to_string());
     }
-    // The conversation held the case's notes: it ends first, with its transcript, and its log
-    // goes to the worker to be closed.
-    let log = app.assist.conversation.as_mut().filter(|c| c.case.as_ref() == Some(at)).and_then(|c| c.log.take());
+    // The conversation held the case's notes: it ends first, with its transcript (a cut turn
+    // goes to its log), then its log goes to the worker to be closed.
     app.bind_case(None);
     super::super::end(app);
+    let log = app.assist.conversation.as_mut().filter(|c| c.case.as_ref() == Some(at)).and_then(|c| c.log.take());
     let shelf = shelf.clone();
     let for_worker = at.clone();
     spawn_delete(app, log, After::Nothing, move || shelf.delete_case(click, &for_worker, keep_lessons))?;

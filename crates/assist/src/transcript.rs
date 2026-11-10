@@ -653,6 +653,14 @@ impl Transcript {
         self.finished.take()
     }
 
+    /// The conversation ended while a turn ran: the turn ends here as cancelled, with the answer
+    /// as far as it got, so the record keeps it. Its `Done` event will never be read.
+    pub(crate) fn cut_turn(&mut self) {
+        self.flush_markers();
+        self.push(Entry::Stopped { stop: StopReason::Cancelled });
+        self.finish_turn(StopReason::Cancelled);
+    }
+
     fn finish_turn(&mut self, stop: StopReason) {
         let mut asked = None;
         let mut tools = Vec::new();

@@ -46,8 +46,8 @@ pub const MAX_LINE_BYTES: usize = 1 << 20;
 /// behind is stuck on the disk.
 const QUEUE: usize = 256;
 
-/// Most files a search reads: a case has at most this many conversations' files before the oldest
-/// go (far fewer at [`MAX_CASE_BYTES`] unless each is tiny).
+/// Most conversations' files a case's record keeps: opening one past it removes the files written
+/// least recently first, as [`MAX_CASE_BYTES`] does (which holds far fewer unless each is tiny).
 const MAX_FILES: usize = 1024;
 
 /// Most characters of an answer a turn's record keeps.
@@ -378,41 +378,49 @@ fn line_within_cap(record: &mut Record) -> Option<Vec<u8>> {
     }
 }
 
-/// The record's plain `.jsonl` files in `dir`, oldest first by name (the stamp is a time), each
-/// with its size. `dir` must be a folder and not a link to one, and a link inside it is left out:
-/// one could point at another client's file, and everything here reads or removes what it lists.
+/// The record's plain `.jsonl` files in `dir`, the one written least recently first (its
+/// modification time; the name breaks a tie), each with its size. A name starts with the process
+/// id, so names would order files by process before time across restarts. `dir` must be a
+/// folder and not a link to one, and a link inside it is left out: one could point at another
+/// client's file, and everything here reads or removes what it lists. The listing stops at
+/// `16 * MAX_FILES` entries, far past what [`make_room`] lets grow, so a hostile folder can't
+/// exhaust memory.
 fn files_in(dir: &std::path::Path) -> Vec<(PathBuf, u64)> {
     if !super::store::real_dir(dir) {
         return Vec::new();
     }
-    let mut out: Vec<(PathBuf, u64)> = fs::read_dir(dir)
+    let mut out: Vec<(std::time::SystemTime, PathBuf, u64)> = fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
-        .take(MAX_FILES)
+        .take(16 * MAX_FILES)
         .filter_map(|e| {
             if !e.file_type().is_ok_and(|t| t.is_file()) {
                 return None;
             }
             let path = e.path();
             let meta = fs::symlink_metadata(&path).ok().filter(fs::Metadata::is_file)?;
-            (path.extension().is_some_and(|x| x == "jsonl")).then_some((path, meta.len()))
+            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            (path.extension().is_some_and(|x| x == "jsonl")).then_some((modified, path, meta.len()))
         })
         .collect();
     out.sort();
-    out
+    out.into_iter().map(|(_, path, len)| (path, len)).collect()
 }
 
-/// Remove the oldest files until a whole new file fits under [`MAX_CASE_BYTES`].
+/// Remove the files written least recently until a whole new file fits under [`MAX_CASE_BYTES`]
+/// and, with it, the case has at most [`MAX_FILES`] files.
 fn make_room(dir: &std::path::Path) {
     let files = files_in(dir);
     let mut total: u64 = files.iter().map(|(_, len)| *len).sum();
+    let mut count = files.len();
     for (path, len) in files {
-        if total.saturating_add(MAX_FILE_BYTES) <= MAX_CASE_BYTES {
+        if total.saturating_add(MAX_FILE_BYTES) <= MAX_CASE_BYTES && count < MAX_FILES {
             break;
         }
         if fs::remove_file(&path).is_ok() {
             total = total.saturating_sub(len);
+            count = count.saturating_sub(1);
         }
     }
 }

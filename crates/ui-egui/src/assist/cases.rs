@@ -427,11 +427,8 @@ impl WordApp {
             // The page's forms hold the old case's text.
             self.assist.cases.drafts.close_forms();
         }
-        if let Some(c) = self.assist.conversation.as_mut()
-            && c.document == document
-            && c.case != at
-        {
-            c.assistant.end();
+        if self.assist.conversation.as_ref().is_some_and(|c| c.document == document && c.case != at) {
+            record::end(self);
             self.assist.cases.lesson_cards.clear();
         }
         match at {
@@ -473,9 +470,7 @@ pub(crate) fn refuses(app: &WordApp) -> Option<String> {
 /// goes on (a turn may be running), ends it, stopping its turn, and the pane says why.
 pub(crate) fn guard(app: &mut WordApp) {
     let Some(names) = others_while_recalled(app) else { return };
-    if let Some(c) = app.assist.conversation.as_mut() {
-        c.assistant.end();
-    }
+    record::end(app);
     app.assist.notice = Some(fmt(
         tl!("{names} can now read this document, and this conversation had read your case notes, so it ended. Start a new one."),
         &[("names", &names)],

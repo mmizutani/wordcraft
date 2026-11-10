@@ -217,13 +217,15 @@ fn the_caps_hold_and_the_oldest_conversation_goes_first() {
     assert_eq!(records.iter().filter(|r| matches!(r, Record::Decided { .. })).count(), fits);
     assert!(records.iter().any(|r| matches!(r, Record::Dropped { n: 3 })), "{:?}", records.last());
 
-    // Older files, named to sort first, bring the case past its cap: opening a new conversation
+    // Older files (by modification time) bring the case past its cap: opening a new conversation
     // removes them oldest first until the new file has room.
     let dir = shelf.log_dir(&at);
     let filler = vec![b'{'; (MAX_FILE_BYTES / 2) as usize];
     let older = (MAX_CASE_BYTES / (MAX_FILE_BYTES / 2)) as usize;
     for n in 0..older {
-        std::fs::write(dir.join(format!("20261101T0000{n:02}-9.jsonl")), &filler).unwrap();
+        let path = dir.join(format!("20261101T0000{n:02}-9.jsonl"));
+        std::fs::write(&path, &filler).unwrap();
+        set_mtime(&path, (10_000 - n) as u64);
     }
     assert!(log_size(&shelf, &at) > MAX_CASE_BYTES);
     let log = CaseLog::open(&shelf, &at, "20261111T090000-2").unwrap();
@@ -232,6 +234,72 @@ fn the_caps_hold_and_the_oldest_conversation_goes_first() {
     assert!(left + MAX_FILE_BYTES <= MAX_CASE_BYTES, "{left}");
     assert!(dir.join("20261110T090000-1.jsonl").exists(), "the newest full file stays");
     assert!(!dir.join("20261101T000000-9.jsonl").exists(), "the oldest went first");
+}
+
+/// Set `path`'s modification time to `ago` seconds before now.
+fn set_mtime(path: &std::path::Path, ago: u64) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(ago)).unwrap();
+}
+
+/// Which conversation is older is its file's modification time, not its name: a name starts
+/// with the process id, so names order files by process before time across restarts. Retention
+/// removes the file written least recently, and a search reads the newest first.
+#[test]
+fn files_are_ordered_by_modification_time_not_name() {
+    let (shelf, at) = shelf_with_case("mtime-order");
+    let dir = shelf.log_dir(&at);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Each file is one record and then a line too long to read, so two of them pass the case cap.
+    let filler = vec![b'{'; 25 << 20];
+    for (name, text, ago) in [("a-newer.jsonl", "alpha", 10), ("z-older.jsonl", "zulu", 1000)] {
+        let mut bytes = serde_json::to_vec(&decided(text)).unwrap();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&filler);
+        std::fs::write(dir.join(name), bytes).unwrap();
+        set_mtime(&dir.join(name), ago);
+    }
+    let found = search(&shelf, &at, "");
+    let texts: Vec<&str> = found.hits.iter().map(|h| h.file.as_str()).collect();
+    assert_eq!(texts, ["a-newer.jsonl", "z-older.jsonl"], "the newest file's hit comes first");
+    assert!(log_size(&shelf, &at) + MAX_FILE_BYTES > MAX_CASE_BYTES, "the fixture is past the cap");
+    CaseLog::open(&shelf, &at, "20261111T090000-2").unwrap().close();
+    assert!(dir.join("a-newer.jsonl").exists(), "the file written last went");
+    assert!(!dir.join("z-older.jsonl").exists(), "the file written least recently stayed");
+}
+
+/// Past `MAX_FILES` conversations, the oldest files go when the next opens, and every file left
+/// is seen by the size line and the search: none vanishes from a listing.
+#[test]
+fn more_files_than_the_cap_lose_the_oldest_and_none_is_hidden() {
+    let (shelf, at) = shelf_with_case("file-count");
+    let dir = shelf.log_dir(&at);
+    std::fs::create_dir_all(&dir).unwrap();
+    let extra = super::MAX_FILES + 3;
+    let mut bytes = 0u64;
+    for n in 0..extra {
+        let path = dir.join(format!("c-{n:04}.jsonl"));
+        let mut line = serde_json::to_vec(&decided(&format!("file {n}"))).unwrap();
+        line.push(b'\n');
+        bytes += line.len() as u64;
+        std::fs::write(&path, line).unwrap();
+        set_mtime(&path, (extra - n) as u64 * 10);
+    }
+    assert_eq!(log_size(&shelf, &at), bytes, "every file counts before the cap holds");
+    let log = CaseLog::open(&shelf, &at, "20261111T090000-2").unwrap();
+    log.close();
+    let left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert!(left.len() <= super::MAX_FILES, "{} files are left", left.len());
+    assert_eq!(left.len(), super::MAX_FILES);
+    for n in 0..4 {
+        assert!(!left.contains(&format!("c-{n:04}.jsonl")), "c-{n:04} is the oldest and stayed");
+    }
+    assert!(left.contains(&format!("c-{:04}.jsonl", extra - 1)));
+    let on_disk: u64 = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
+    assert_eq!(log_size(&shelf, &at), on_disk, "the size line sees every file left");
+    let found = search_log(&shelf, &at, "file", usize::MAX).unwrap();
+    assert_eq!(found.hits.len(), super::MAX_FILES - 1, "the search sees every record left: {}", found.hits.len());
+    assert_eq!(found.skipped, 0);
 }
 
 #[test]

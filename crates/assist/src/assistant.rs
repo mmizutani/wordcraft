@@ -489,8 +489,9 @@ impl Assistant {
 
     /// End the conversation: stop the turn, take the invite back (every copy that joined with
     /// it is out of the room, so nothing more of the assistant's reaches the document), and let
-    /// the thread end its backend. Pending events are dropped; the transcript is kept.
-    /// Never waits for the thread. Ending twice does nothing.
+    /// the thread end its backend. Pending events are dropped; the transcript is kept, and a
+    /// turn that was running ends in it as cancelled, so [`Assistant::take_finished_turn`]
+    /// gives it once. Never waits for the thread. Ending twice does nothing.
     pub fn end(&mut self) {
         if self.ended {
             return;
@@ -500,6 +501,9 @@ impl Assistant {
         self.permissions.cancel();
         // Disconnect retained conversations so a full queue cannot block backend cleanup.
         self.events = None;
+        if self.busy {
+            self.transcript.cut_turn();
+        }
         self.busy = false;
         self.room.revoke(&self.seat.key);
         let _ = self.jobs.send(Job::End);
