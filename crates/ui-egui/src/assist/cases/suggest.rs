@@ -310,9 +310,15 @@ mod tests {
         }
         assert_eq!(refresh(&mut b), None, "hidden for this document");
         assert_eq!(std::fs::read(&file).unwrap(), before, "Not this writes nothing");
-        // Another document in the same window is suggested again.
+        // Another document in the same window is suggested again, and an unrelated one shown
+        // next gets no card, not the last document's, while its worker runs or after.
         b.session.set_document(document(&second));
         assert!(suggestion(&mut b).is_some());
+        let unrelated: Vec<String> =
+            (0..30).map(|i| format!("Section {i}. The tenant shall keep the premises at unit {i} in good repair and insured.")).collect();
+        b.session.set_document(document(&unrelated));
+        assert_eq!(refresh(&mut b), None, "the last document's card while this one's worker runs");
+        assert_eq!(suggestion(&mut b), None);
     }
 
     #[test]

@@ -246,6 +246,21 @@ was bound to when it started. Binding the document to another case, or unbinding
 conversation, stopping a running turn, since the model holds what that case's notes said and the
 next turn would run under another case.
 
+When you bind a document, the case keeps a print of it: the 256 smallest hashes of its folded
+paragraphs (headings, numbering and lines shorter than 24 letters left out), with the day and the
+document's title. No paragraph text is kept, a case holds the newest eight prints, and no turn
+carries one. When the pane shows a document bound to no case, the window compares the document's
+print with every case's prints, in every client's folder, on a worker thread, and the best match
+holding at least half of the document's paragraphs becomes a card at the top of the pane: "71% of
+this document's paragraphs match a draft of Kestrel MSA 2026 (Kestrel Freight KK)" with **Use it**,
+**Not this** and **New case**. This is the one thing that reads across clients, and its result goes
+only to your screen: never to a model, a log or a file. The percentage is shown because two
+contracts from one template overlap too, so it informs you and decides nothing; nothing is bound
+until you click **Use it**, which runs `assist.memory.case.bind` and so refuses a click the control
+channel made. **Not this** hides the card for this document in this window and writes nothing.
+The print is taken once per document shown, and again after 64 more changes to it while it stays
+unbound. A document that copies your paragraphs earns a suggestion, which still takes your click.
+
 **What a turn recalls.** With a case bound, each turn carries what ranks highest for the prompt and
 the text around the caret: this case's notes, the confirmed notes and latest balance of the
 same client's other cases, and the lessons you kept from any client. Never another client's notes
