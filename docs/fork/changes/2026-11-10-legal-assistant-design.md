@@ -5,7 +5,7 @@
 - **Not verified:** everything in it is design; nothing is built or run
 
 [`docs/legal-assistant.md`](../../legal-assistant.md) designs the Assistant pane's contract work on
-top of the assistant as built at `1ab82aff`. A new pure `crates/legal` computes the clause map and
+top of the assistant as built at `3073903c`. A new pure `crates/legal` computes the clause map and
 the checks. Findings quote the words they are about and are refused when the quote is not in the
 document. A review is a job WordCraft runs over the clause map in batches, so coverage does not
 depend on the backend. Playbooks, the clause library and templates are knowledge at the

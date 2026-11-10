@@ -5,7 +5,7 @@
 This is the design for turning WordCraft's built-in assistant into an assistant for contract work.
 It covers four kinds of work: reviewing a contract against the person's playbook, answering the
 other side's changes in a negotiation, drafting from a clause library and templates, and checking
-and extracting from the text. It builds on the assistant as it is on `main` at `1ab82aff`, not on
+and extracting from the text. It builds on the assistant as it is on `main` at `3073903c`, not on
 a new one: the pane, the room, the roles, the backends and AS8's cases stay as they are, and
 everything here is added to them. It is the reference the LA pull requests will cite. Nothing in it
 is built yet.
@@ -78,10 +78,10 @@ These rules of the assistant as built are kept, and each new piece is held to th
 | Markers | `crates/assist/src/markers.rs`, cards in `crates/ui-egui/src/panes/assistant.rs` | `[[finding]]`, `[[reviewed]]`, `[[respond]]`, `[[clause]]`, `[[term]]` |
 | Context | The selection, three paragraphs each side and the outline, at most 32 KiB; ChatGPT's reads are capped at 64 KiB (`crates/assist/src/tools.rs:22, 116`) | A clause-addressed read, so a long contract never has to fit one read |
 | ChatGPT's tools | `inspect_document`, `get_text`, `get_changes`, `list_commands`, `select_text`, `type_text`, `execute`, `batch` (`crates/assist/src/tools.rs:19`) | `read_clauses` |
-| Cases | Typed cases, notes, power balances, walls, recall (`crates/assist/src/cases/`); #107 PRs 1–6 built | Facts for picking positions; position notes and balance for negotiation |
-| Topics | `Topic` and `Topics(u16)`, 11 topics with English and Japanese terms, serialized as a list of names (`crates/assist/src/cases/record.rs:260, 294-297`); the classifier is in `crates/assist/src/cases/text.rs` | More topics than 16 bits hold, and the table one layer lower |
+| Cases | Typed cases, notes, power balances, walls, recall (`crates/assist/src/cases/`); #107's AS8.1–AS8.9 built, including lessons that cross clients (AS8.7), the clause ladder computed from position notes (AS8.8) and an opt-in record of a negotiation (AS8.9); Review this case and the draft suggestion are not | Facts for picking positions; position notes, the ladder and balance for negotiation; the record for decisions |
+| Topics | `Topic` and `Topics(u16)`, 11 topics with English and Japanese terms, serialized as a list of names (`crates/assist/src/cases/record.rs:265, 299-302`); the classifier is in `crates/assist/src/cases/text.rs` | More topics than 16 bits hold, and the table one layer lower |
 | The other side's markup | `get_changes` lists edits after a version the reader saw (`crates/mcp/src/tools.rs:155`), not markup already in an opened file | Revisions and comments read from the document itself |
-| Case binding | In the UI's memory (`crates/ui-egui/src/assist/cases.rs:58`), lost on restart; fixed on its own branch (below) | Survives a restart, since findings are kept with the case |
+| Case binding | In the UI's memory (`crates/ui-egui/src/assist/cases.rs:61`), lost on restart; fixed on its own branch (below) | Survives a restart, since findings are kept with the case |
 | Writing actions | Prompt constants for draft, rewrite, shorten, expand, proofread (`crates/engine/src/cmd/assist.rs:640-650`) | Review, respond, translate |
 | Hosted | A Rust Worker on ChatGPT Sites with D1 and R2 behind Sites identity (Phase 1 verified) | A knowledge API |
 
@@ -243,7 +243,8 @@ pub enum Anchor {
   suggestion.
 - **Posting a finding as a comment** is the person's click, and shows the leak flag (§9) first,
   because a comment travels with the file to the other side.
-- **Dismissing** records a reason, which goes into the case record when the record is on (#107 PR 9).
+- **Dismissing** records a reason, which goes into the case's record when the person turned it on
+  (AS8.9).
 
 ## 3. Knowledge: playbooks, the clause library and templates
 
@@ -449,9 +450,9 @@ sequenceDiagram
   would miss them, since it lists only edits made after a version the reader saw, not markup already
   in a file the other side sent.
 - **For each change**, WordCraft sends the clause before and after, the playbook's ladder for its
-  topic, and what AS8 recalls for it. That includes the ladder computed from past position notes
-  (#107 PR 8: what was conceded on this clause before, and from what balance) and the case's current
-  balance. The playbook says what is allowed; the history says what was actually given.
+  topic, and what AS8 recalls for it. That includes the clause ladder computed from past position
+  notes (AS8.8: what was conceded on this clause before, and from what balance) and the case's
+  current balance. The playbook says what is allowed; the history says what was actually given.
 - **The model answers** with `[[respond]]{change, action, rung, why, reply}`, where `action` is
   accept, reject, counter or ask. One card per change shows the recommendation, the rung and its
   reason.
@@ -460,8 +461,9 @@ sequenceDiagram
     tracked changes for someone else to accept or reject (`crates/engine/src/room/rules.rs:77`).
   - Counter runs WordCraft's fix for the chosen rung as a tracked change in the assistant's name.
   - A reply comment is drafted in the card and posted only on the person's click, after the leak flag.
-- **The record.** With the case record on (#107 PR 9), each decision is recorded with the rung and
-  the balance, so the next case's history ladder learns from it.
+- **The record.** With the case's record on (AS8.9, off by default), each decision is recorded with
+  the rung and the balance, beside the person's Accept and Reject the record already keeps, so the
+  next case's ladder learns from it.
 
 ## 7. Drafting from the library
 
@@ -549,7 +551,7 @@ Each is a pull request stacked on the last. Each passes `cargo xtask ci` and add
 | LA2 | Findings: the type and anchors, `[[finding]]`, quote verification, range mapping and Stale, the Review view with checks shown as findings, Apply as a suggester, Dismiss, keeping findings with a case | LA1, the binding fix | Invented quotes are refused; deleting an earlier copy of the quoted words makes a finding Stale; an editor conversation's Apply is still tracked; findings are back after a restart in a test |
 | LA3 | Client playbooks and library: types, the wall shelf, `person_only` extended, import and export, the Knowledge page; topics past 16 | LA2 | Existing case files read unchanged; the new prefixes are refused on the control channel, in macros and to participants |
 | LA4 | The review job: a viewer reviewer, batches, clause states and `[[reviewed]]`, the estimate, Stop and Resume, missing clauses, invalidation keys; `read_clauses` | LA3 | With fakes on both backends: every clause ends Acknowledged or Incomplete, a truncated batch leaves its clauses Incomplete, the reviewer's edit and comment are refused, and a new playbook version re-reviews only the clauses it covers |
-| LA5 | Answering the other side: the digest from the document's revisions and comments, `[[respond]]`, cards, accept and reject as the person, counters as a suggester | LA4, #107 PR 8, the case-summary fix | A .docx opened with the other side's markup lists every change before any local edit; a fake backend's counter lands as a tracked change at the chosen rung |
+| LA5 | Answering the other side: the digest from the document's revisions and comments, `[[respond]]`, cards, accept and reject as the person, counters as a suggester | LA4, the case-summary fix | A .docx opened with the other side's markup lists every change before any local edit; a fake backend's counter lands as a tracked change at the chosen rung |
 | LA6 | Drafting: templates with manifests, `[[clause]]` verbatim insertion, origin-aware quote flag | LA3 | Library text lands byte for byte; library inserts are not flagged as recalled quotes |
 | LA7 | Key terms, obligations, translation | LA2 | Term quotes are verified; a whole-document translation opens as a new document |
 | LA8 | Central knowledge: a probe that Sites admits a desktop's token, then the Worker's organisation model and knowledge API, device sign-in, sync, version pinning, promotion with approval | LA3, #112 phase 2 | The probe's result is recorded; on the hosted Site a reader downloads, a non-member is refused and a revoked token stops working; sync against a fake server verifies hashes and uploads nothing |
