@@ -92,36 +92,87 @@ impl Scan {
 }
 
 /// Whether the answer's text stands inside code, where a marker is an example.
-/// ponytail: any run of three or more backticks toggles a fence and a shorter run toggles inline
-/// code, without matching run lengths; a stray backtick hides markers until the next one, which
-/// only ever stops a write.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Code {
-    #[default]
+/// Which code the answer so far left open, as Markdown reads it (the renderer's `Fences` rule): a
+/// fence opens on a line starting with three or more backticks or tildes and closes only on a line
+/// of nothing but at least as many of the same character; inline code closes on a backtick run of
+/// its own length. A marker inside code is an example, never a write.
+/// ponytail: an indented code block isn't tracked, and a stray backtick keeps inline code open until
+/// a run of its length; both only ever stop a write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Code {
+    open: Open,
+    /// Nothing but spaces so far on this line, and how many.
+    at_start: bool,
+    indent: u8,
+    /// This line so far is a fence's closing run and spaces: it closes at the line's end.
+    closing: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Open {
     None,
-    Inline,
-    Fence,
+    Inline(usize),
+    Fence(char, usize),
+}
+
+impl Default for Code {
+    fn default() -> Code {
+        Code { open: Open::None, at_start: true, indent: 0, closing: false }
+    }
 }
 
 impl Code {
-    /// Take in shown text, whose backtick runs are whole: a run at the end of a piece is held back.
+    fn is_open(&self) -> bool {
+        self.open != Open::None
+    }
+
+    /// Take in shown text, whose backtick and tilde runs are whole: a run at the end of a piece is
+    /// held back.
     fn feed(&mut self, text: &str) {
-        let mut run = 0usize;
-        for c in text.chars().chain(std::iter::once(' ')) {
-            if c == '`' {
-                run = run.saturating_add(1);
-                continue;
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\n' => {
+                    if self.closing {
+                        self.open = Open::None;
+                    }
+                    *self = Code { open: self.open, ..Code::default() };
+                }
+                ' ' | '\t' => {
+                    if self.at_start {
+                        self.indent = self.indent.saturating_add(1);
+                    }
+                }
+                '`' | '~' => {
+                    let mut n = 1usize;
+                    while chars.peek() == Some(&c) {
+                        chars.next();
+                        n = n.saturating_add(1);
+                    }
+                    self.run(c, n);
+                }
+                _ => {
+                    self.at_start = false;
+                    self.closing = false;
+                }
             }
-            *self = match (*self, run) {
-                (code, 0) => code,
-                (Code::Fence, n) if n >= 3 => Code::None,
-                (Code::Fence, _) => Code::Fence,
-                (_, n) if n >= 3 => Code::Fence,
-                (Code::Inline, _) => Code::None,
-                (Code::None, _) => Code::Inline,
-            };
-            run = 0;
         }
+    }
+
+    fn run(&mut self, c: char, n: usize) {
+        let fence_line = self.at_start && self.indent < 4;
+        self.closing = false;
+        self.open = match self.open {
+            Open::None if fence_line && n >= 3 => Open::Fence(c, n),
+            Open::None if c == '`' => Open::Inline(n),
+            Open::Inline(k) if c == '`' && n == k => Open::None,
+            Open::Fence(f, m) if fence_line && f == c && n >= m => {
+                self.closing = true;
+                Open::Fence(f, m)
+            }
+            open => open,
+        };
+        self.at_start = false;
     }
 }
 
@@ -154,7 +205,7 @@ impl Markers {
             let (before, from) = rest.split_at(at);
             shown.push_str(before);
             self.code.feed(before);
-            if self.code != Code::None {
+            if self.code.is_open() {
                 shown.push('[');
                 rest = from.get(1..).unwrap_or_default();
                 continue;
@@ -221,8 +272,8 @@ impl Markers {
             rest = from.get(1..).unwrap_or_default();
         }
         if self.held.is_empty() {
-            // A run of backticks may go on in the next piece: it is read whole or not yet.
-            let kept = rest.len().saturating_sub(rest.trim_end_matches('`').len()).min(MAX_HELD);
+            // A run of backticks or tildes may go on in the next piece: it is read whole or not yet.
+            let kept = rest.len().saturating_sub(rest.trim_end_matches(['`', '~']).len()).min(MAX_HELD);
             let (now, later) = rest.split_at(rest.len().saturating_sub(kept));
             self.held = later.to_string();
             rest = now;
@@ -239,7 +290,7 @@ impl Markers {
     /// unclosed case marker, which is dropped and counted rather than shown as half a note.
     pub(crate) fn flush(&mut self) -> Vec<Piece> {
         let held = std::mem::take(&mut self.held);
-        self.code = Code::None;
+        self.code = Code::default();
         if self.dropping.take().is_some() || held.starts_with(CASE) {
             return vec![Piece::CaseDropped];
         }

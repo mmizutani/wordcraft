@@ -1372,6 +1372,22 @@ fn a_close_inside_a_json_string_doesnt_end_the_marker_and_a_nested_marker_is_one
 /// A marker inside code is an example, shown as written and never routed; one after the code
 /// closes is a marker again.
 #[test]
+fn a_marker_in_a_tilde_fence_or_inside_a_longer_fence_is_text() {
+    for fenced in [
+        format!("See:\n~~~json\n{CASE_NOTE}\n~~~\nThen {CASE_NOTE} done."),
+        format!("See:\n````\n```\n{CASE_NOTE}\n```\n````\nThen {CASE_NOTE} done."),
+    ] {
+        let expected = fenced.replacen(&format!("Then {CASE_NOTE} done."), "Then  done.", 1);
+        for at in 0..fenced.len() {
+            let (a, b) = fenced.split_at(at);
+            let (answer, markers, dropped) = case_streamed(&[a, b]);
+            assert_eq!(answer, expected, "split at {at}");
+            assert_eq!((markers.len(), dropped), (1, 0), "split at {at}");
+        }
+    }
+}
+
+#[test]
 fn a_marker_in_code_is_text_not_a_write() {
     let fenced = format!("Write it so:\n```\n{CASE_NOTE}\n```\nThen {CASE_NOTE} done.");
     for at in 0..fenced.len() {
