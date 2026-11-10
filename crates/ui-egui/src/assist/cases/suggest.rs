@@ -91,8 +91,8 @@ fn version(app: &WordApp) -> Version {
 }
 
 /// Whether the shown document's result is in: nothing pending and a result for its version.
-#[doc(hidden)]
-pub fn settled(app: &WordApp) -> bool {
+#[cfg(test)]
+pub(crate) fn settled(app: &WordApp) -> bool {
     let now = version(app);
     let state = &app.assist.cases.suggest;
     state.pending.is_none() && state.computed.is_some_and(|(document, changes)| document == now.0 && now.1.saturating_sub(changes) < RECHECK_EVERY)
