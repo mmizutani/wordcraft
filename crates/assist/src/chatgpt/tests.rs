@@ -968,8 +968,9 @@ fn an_older_plaintext_sign_in_is_sealed_or_kept_in_memory_and_its_file_deleted()
         let folder = Folder::new();
         fake_keychain(folder.path(), working);
         std::fs::write(folder.path().join(PLAINTEXT_FILE), &plaintext).unwrap();
-        // The window's read doesn't wait for the keychain: a thread of its own moves the file.
-        eventually("the older sign-in is read", || super::account(folder.path()).is_some());
+        // The window's read doesn't wait for the keychain: a thread of its own moves the file. The
+        // sign-in shows once it is kept, a moment before the older file is deleted.
+        eventually("the older sign-in is moved", || super::account(folder.path()).is_some() && !opening(folder.path()));
         let kept = if working { Kept::Keychain } else { Kept::Session };
         assert_eq!(super::account(folder.path()).unwrap().kept, kept);
         assert!(!folder.path().join(PLAINTEXT_FILE).exists(), "the plaintext file is deleted");
