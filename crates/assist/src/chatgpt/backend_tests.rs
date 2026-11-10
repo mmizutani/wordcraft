@@ -774,6 +774,30 @@ fn attached_sources_reach_the_model_as_marked_input_and_stop_when_removed() {
     assert!(bodies[0].contains("what is in the sources the person attaches"), "the note says so too: {}", bodies[0]);
 }
 
+/// The bound case's facts, balance and plan reach the model as marked input with the turn, never
+/// in its instructions.
+#[test]
+fn the_bound_cases_summary_reaches_the_model_as_marked_input_not_instructions() {
+    use crate::cases::{Alone, Click, Day, PersonOp, Plan, Quoted, RecallAsk, Shelf, Standing};
+    const GOAL: &str = "Hold the liability cap at twelve months of fees.";
+    let settings = Folder::new();
+    let shelf = Shelf::at(settings.path());
+    let click = Click::by_person(true).unwrap();
+    let today = Day::parse("2026-11-10").unwrap();
+    let wall = shelf.new_wall(click, "Acme", "2026-11-10", 1).unwrap();
+    let at = shelf.new_case(click, &wall, "Acme MSA", "2026-11-10", 2).unwrap();
+    let plan = Plan { goal: Quoted::parse(GOAL), next: Vec::new(), standing: Standing::Unconfirmed };
+    shelf.person(click, &at, PersonOp::Plan(Some(plan)), today).unwrap();
+    let mut c = chat("one two three", replies(vec![says("One.")]));
+    let alone = Alone::check(&c.window.room, c.window.own.id(), c.assistant.name()).unwrap();
+    c.assistant.set_recall(Some(RecallAsk::new(shelf, at, "the liability cap", today, alone)));
+    c.ask("Where do we stand?");
+    let body = c.bodies()[0].clone();
+    let input = body["input"].to_string();
+    assert!(input.contains(GOAL) && input.contains("The case this conversation is bound to"), "{input}");
+    assert!(!body["instructions"].as_str().unwrap().contains(GOAL), "never an instruction");
+}
+
 /// The two models the issue's list has, in its order: `gpt-6.1-sol` first.
 fn real_list() -> Reply {
     Reply::json(

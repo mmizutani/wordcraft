@@ -239,11 +239,21 @@ lesson. They are yours alone, as [Memory](#memory)'s are, and refuse a script, a
 key the control channel made and a macro's step. There is no command that reads a case: the pane
 reads the file itself, so holding the window's key doesn't list every client's cases.
 
-**Binding.** You bind a document to a case; nothing in the file says which, so a document can't
-name a case and a saved file carries no id. A binding lasts while the document is open in this
-window: after a restart or a reopen you bind again. A conversation belongs to the case its document
-was bound to when it started. Binding the document to another case, or unbinding it, ends the
-conversation, stopping a running turn, since the model holds what that case's notes said and the
+**Binding.** You bind a document to a case; nothing in the file says which, so a document can't name
+a case and a saved file carries no case's id. WordCraft remembers your binding for the file, by its
+full path, in your settings folder: when you open that file again, after a restart too, the pane
+says "When you last had this file open, it was bound to <case>" with **Bind again** and **Not now**,
+above the conversation and on Details › Case. It isn't bound until you click **Bind again**, and
+until then no turn recalls from it: a path doesn't say which document is there, and another client's
+document saved over it, or one made from the same template, would otherwise recall the first
+client's case. **Not now** leaves it unbound while it is open, and it is offered again the next
+time. Unbind, or a binding to another case, changes what the file is offered next time, and deleting
+a case forgets every file bound to it; a binding whose case is gone is dropped quietly when its file
+opens. The binding belongs to that path: a copy saved under another name is offered nothing until
+you bind it, and a document you bind before it is first saved is bound while it is open in this
+window, so bind it again once it has a file to keep it. A conversation belongs to the case its
+document was bound to when it started. Binding the document to another case, or unbinding it, ends
+the conversation, stopping a running turn, since the model holds what that case's notes said and the
 next turn would run under another case.
 
 When you bind a document, the case keeps a print of it: the 256 smallest hashes of its folded
@@ -288,6 +298,20 @@ go, and the rest are counted with what didn't fit. Lessons, patterns and pitfall
 as before and never enter a ladder, and another case's unconfirmed position never does either.
 Details › Recalled lists a ladder's rungs, each on a few wrapped lines, and a change that pastes a rung's terms
 is flagged as quoting your case notes like any other recalled text.
+
+Each turn of a bound conversation also carries the case itself as it stands: its facts as the
+pickers set them (the kind of contract, your side, whose paper, the counterparty's kind, the
+governing law and the stage), the balance now with its factors, and the plan with its next steps.
+The case's title and the parties' names never go. The plan is your own text and goes as you wrote
+it, each line up to the 400 characters a goal or a step keeps, so a name you write in the plan, or
+in a factor's reason, goes too; a plan or balance the assistant wrote goes marked unconfirmed. The
+facts, the balance and the goal always go, counted first against the 6 KiB a turn recalls. The
+steps go last, in order, with the room the ladders, lessons and notes left, and the summary takes
+at most half of the 6 KiB with them, so a long plan never pushes out what ranked for your question;
+a step that doesn't fit is left out whole, and Details says how many. It goes as data in a source
+of its own, under WordCraft's own words, on ChatGPT and to an ACP agent alike, and to an agent on
+every turn, since the balance and the plan change. Details › Recalled lists it first, as this
+case as it stands. It is off whenever recall is off.
 
 **What the assistant writes.** With a case bound, each turn's instructions also say what the
 case's notes are for: a later conversation about this negotiation will know only these notes and
@@ -424,14 +448,20 @@ them. A file is at most 1 MiB, and one that can't be read whole shows as damaged
 as `case.json.damaged` (or `assistant-lessons.json.damaged`) by your next change, never replaced in
 silence; while the lessons file is damaged a turn recalls no lesson and Details › Recalled says so.
 Two WordCrafts keep each other's changes: each write
-takes the case's lock, or the lessons file's, and reads the file again. Nothing of a case goes in a document, a recovery
+takes the case's lock, or the lessons file's, and reads the file again. Which files are bound to
+which case is `assistant-cases/bindings.json`: each file's path and the ids of its client and case,
+at most 200 files (binding a 201st forgets the one bound longest ago) and 1 MiB. Only your bind and
+unbind add or change a binding; a delete, and a file whose case is gone, only remove one. Each write
+takes the file's own lock, and one that can't be read whole binds nothing and is moved aside as
+`bindings.json.damaged` by your next bind or unbind. Nothing of a case goes in a document, a recovery
 copy or the log, and it never crosses a room.
 
 **Delete.** Delete case asks in place, says it can't be undone, and removes the case's folder with
-every note and its record in it, on a worker: the document's conversation ends first and its
-record's file is closed there before the folder is renamed, so the frame never waits, and a
-delete another WordCraft refuses (its lock, a file in use) comes back as a notice and loses
-nothing. It lists the lessons kept from the case with **Delete these too** ticked, and
+every note and its record in it, and forgets the files bound to it, on a worker: the document's
+conversation ends first and its record's file is closed there before the folder is renamed, so the
+frame never waits, and a delete another WordCraft refuses (its lock, a file in use) comes back as a
+notice and loses nothing. Deleting only the record leaves the files bound. It lists the lessons kept
+from the case with **Delete these too** ticked, and
 unticked they stay and lose the link to the case. A client with no cases left can be deleted from
 the list, its cases' lessons having been asked about case by case. What WordCraft can't
 reach: what a turn already sent to a model provider under your account, an agent's own record of a
@@ -474,9 +504,31 @@ Again** asks you again. **Sign Out** deletes the sign-in and asks ChatGPT to end
 can't be reached, the sign-in is deleted here anyway and the page says you can disconnect
 WordCraft in ChatGPT's settings.
 
-The sign-in is kept in `chatgpt-credentials.json` in the settings folder, which only you may
-read (mode 0600 on Unix), never in a document, a recovery copy or the log. Signing in and out
-are yours alone: `assist.chatgpt.signIn`, `assist.chatgpt.cancelSignIn` and
+Where the sign-in is kept depends on whether the computer has a keychain WordCraft can use: the
+macOS Keychain, the Windows Credential Manager, or the Secret Service (GNOME Keyring, KWallet) on
+Linux and the BSDs. The page under who is signed in, and the pane under its picker while ChatGPT
+is chosen, say which of the two it is:
+
+- **With a keychain**, the sign-in is sealed with AES-256-GCM in `chatgpt-credentials.sealed` in
+  the settings folder (mode 0600 on Unix), and the key, 256 random bits made at the first
+  sign-in, is the only thing in the keychain, under the service `WordCraft` and an account
+  `chatgpt-credentials-key:` followed by a short hash of the settings folder's path. Only the key
+  goes there because Windows keeps at most 2,560 bytes in one credential, and the tokens can be
+  more. The file alone opens nothing.
+- **Without one** (there is none, it is locked and you didn't unlock it, or it fails), the
+  sign-in is kept in memory while WordCraft runs, and nothing of it is written to disk: you sign
+  in again the next time you open WordCraft.
+
+A `chatgpt-credentials.json` an older WordCraft left, with the tokens readable, is sealed (or,
+without a keychain, taken into memory) and deleted the first time WordCraft opens. **Sign Out**
+deletes the sealed file, any such older file, the key in the keychain and the copy in memory.
+WordCraft asks the keychain on a thread of its own, never the window's: if the keychain waits for
+you to unlock it, the pane says to sign in until it answers, and then shows who is signed in. A
+sealed file that is cut short, changed, of another version, or doesn't open with the key reads
+as signed out, and the next sign-in replaces it. None of it reaches a document, a recovery copy
+or the log.
+
+Signing in and out are yours alone: `assist.chatgpt.signIn`, `assist.chatgpt.cancelSignIn` and
 `assist.chatgpt.signOut` run from the buttons or Search. From a script or an agent (the control
 channel, MCP, also addressed to another document) they are an error, as is a click or key the
 control channel made and a step of a macro, whoever wrote it; and they take no key and go on no
@@ -719,6 +771,13 @@ Sources you attach go to the assistant's provider with every turn of the convers
 ChatGPT, and to whatever the agent's model is for an agent. Attach only what you are willing to send
 there.
 
+Your ChatGPT sign-in, which lets WordCraft use your plan, is never on disk where another program
+or a copy of your settings folder can read it: it is sealed with a key kept in your computer's
+keychain, or, without a keychain, kept in memory for the session only (see
+[Signing in to ChatGPT](#signing-in-to-chatgpt)). An agent never sees it: agents sign in to their
+own accounts themselves. The web app keeps no ChatGPT sign-in at all, since it has no ChatGPT
+([On the web](#on-the-web)).
+
 ## On the web
 
 The web app has the Assistant pane and every `assist.*` command, but no assistant to run them.
@@ -821,8 +880,11 @@ own account the way it documents.
 
 1. In File › Options › Account, click Continue with ChatGPT: your browser opens ChatGPT's
    sign-in; sign in and allow WordCraft to use your plan. Back in WordCraft, the page shows who
-   is signed in and that WordCraft may use your plan, and the settings folder has
-   `chatgpt-credentials.json`, which on Unix only you may read.
+   is signed in, that WordCraft may use your plan and that the sign-in is kept in the computer's
+   keychain. The settings folder has `chatgpt-credentials.sealed`, which on Unix only you may
+   read, with no token readable in it, and the keychain (Keychain Access on macOS, Credential
+   Manager on Windows, Seahorse or KWalletManager on Linux) has a `WordCraft` item whose account
+   starts `chatgpt-credentials-key:`. Quit WordCraft and open it again: you are still signed in.
 2. In the assistant pane pick ChatGPT and ask it to rewrite the first sentence in a friendlier
    tone: the answer streams in, the rewrite is a tracked change by "ChatGPT", and its tool rows
    open to the change. The turn's line reads `GPT-6-Luna · Medium`. If it says `(requested)`, the
@@ -834,8 +896,8 @@ own account the way it documents.
    them, and the conversation goes on.
 3. Ask for something long, and press Stop while it answers: it stops at once and says so. Ask
    again: it answers.
-4. Sign Out on the same page: `chatgpt-credentials.json` is gone, and the pane says to sign in,
-   with Continue with ChatGPT under it.
+4. Sign Out on the same page: `chatgpt-credentials.sealed` and the keychain item are gone, and
+   the pane says to sign in, with Continue with ChatGPT under it.
 
 **Each agent** (Claude Code, Codex, Pi):
 

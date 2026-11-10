@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -14,9 +14,10 @@ use sha2::{Digest, Sha256};
 
 use super::auth::{Claims, access_token, check_id_token, valid_client_id};
 use super::fake_server::{Reply, Request, Server};
-use super::http::{b64url, now, parse_query};
+use super::http::{b64url, from_b64url, now, parse_query};
 use super::models::models_in;
 use super::store;
+use super::vault::{self, Keychain};
 use super::*;
 
 pub(super) const WAIT: Duration = Duration::from_secs(20);
@@ -33,6 +34,8 @@ impl Folder {
         let dir = std::env::temp_dir().join(format!("wordcraft-chatgpt-{}-{n}-{}", std::process::id(), now()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // Its key goes to a keychain in memory: tests never reach the system's.
+        fake_keychain(&dir, true);
         Folder(dir)
     }
 
@@ -287,8 +290,8 @@ fn assert_exchange(exchange: &Request, url: &str) {
     assert_eq!(exchange.header("content-type"), Some("application/x-www-form-urlencoded"));
 }
 
-/// What a sign-in keeps: the issued client id with the host id, and the tokens, in files only
-/// their owner reads, written whole.
+/// What a sign-in keeps: the issued client id with the host id, and the tokens, sealed, in files
+/// only their owner reads, written whole.
 fn assert_kept(folder: &Folder, host_id: &str) {
     let client = store::client(folder.path()).unwrap();
     assert_eq!((client.host_id.as_str(), client.client_id.as_deref()), (host_id, Some("oaiapp_issued-1")));
@@ -296,8 +299,13 @@ fn assert_kept(folder: &Folder, host_id: &str) {
     assert_eq!((saved.access_token.as_str(), saved.refresh_token.as_str()), ("access-0", "refresh-0"));
     assert_eq!((saved.subject.as_str(), saved.issuer.as_str()), ("user-123", ISSUER));
     assert!(saved.plan_usage() && saved.expires_at > now() + 3000 && saved.id_token.split('.').count() == 3);
+    // On disk the tokens, and who they are for, are sealed.
+    let sealed = std::fs::read_to_string(folder.path().join(CREDENTIALS_FILE)).unwrap();
+    for secret in ["access-0", "refresh-0", "writer@example.com", "oaiapp_issued-1", "eyJ"] {
+        assert!(!sealed.contains(secret), "{secret} is readable in {sealed}");
+    }
     // The lock the tokens were saved under stays: empty, and let go of.
-    assert_eq!(folder.files(), [CLIENT_FILE, CREDENTIALS_FILE, store::LOCK_FILE]);
+    assert_eq!(folder.files(), [CLIENT_FILE, store::LOCK_FILE, CREDENTIALS_FILE]);
     let lock = folder.path().join(store::LOCK_FILE);
     assert!(std::fs::metadata(&lock).unwrap().len() == 0 && !held(&lock));
     #[cfg(unix)]
@@ -334,7 +342,7 @@ fn signing_in_registers_wordcraft_exchanges_the_code_and_keeps_the_tokens_privat
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("signed in") && page.contains("Cache-Control: no-store"), "{page}");
     let account = sign_in.wait(WAIT).cloned().unwrap().unwrap();
-    assert_eq!(account, Account { email: "writer@example.com".into(), name: Some("A Writer".into()), plan_usage: true });
+    assert_eq!(account, Account { email: "writer@example.com".into(), name: Some("A Writer".into()), plan_usage: true, kept: Kept::Keychain });
     assert_exchange(&server.to("/oauth/token")[0], &url);
     assert_kept(&folder, &host_id);
     assert_eq!(super::account(folder.path()), Some(account.clone()));
@@ -894,6 +902,272 @@ fn a_damaged_missing_or_huge_file_reads_as_signed_out() {
     std::fs::write(&file, b"x").unwrap();
     assert!(matches!(SignIn::start(&file, options(&nowhere)), Err(AuthError::Storage(_))));
     assert_eq!(super::account(&file), None);
+}
+
+/// A folder of its own whose key goes to `keychain`, signed in at a fake server.
+fn signed_in_with(keychain: Option<Arc<dyn Keychain>>) -> (Folder, Arc<Script>, Server, Endpoints) {
+    let folder = Folder::new();
+    vault::register(folder.path(), keychain);
+    let script = Arc::new(Script::default());
+    let server = server(script.clone(), no_api);
+    let endpoints = Endpoints::local(server.base());
+    sign_in_with(folder.path(), &script, &endpoints, "code=the-code&client_id=oaiapp_issued-1").unwrap();
+    (folder, script, server, endpoints)
+}
+
+#[test]
+fn each_folder_s_key_is_in_the_keychain_and_signing_out_deletes_it_with_the_file() {
+    let keychain = Arc::new(vault::Fake::default());
+    let (a, script, _server, endpoints) = signed_in_with(Some(keychain.clone()));
+    let b = Folder::new();
+    vault::register(b.path(), Some(keychain.clone()));
+    sign_in_with(b.path(), &script, &endpoints, "code=c&client_id=oaiapp_issued-1").unwrap();
+    // One 256-bit key per settings folder, named after it.
+    let names: Vec<String> = keychain.entries.lock().unwrap().keys().cloned().collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    for name in &names {
+        let hash = name.strip_prefix("chatgpt-credentials-key:").unwrap();
+        assert!(hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        assert_eq!(keychain.entries.lock().unwrap()[name].len(), 32);
+    }
+    assert_eq!(super::account(a.path()).map(|x| x.kept), Some(Kept::Keychain));
+    // Signing out of one deletes its sealed file and its key; the other's stay.
+    assert_eq!(sign_out_with(a.path(), &endpoints), Ok(SignedOut { revoked: true }));
+    assert!(!a.path().join(CREDENTIALS_FILE).exists());
+    assert_eq!(keychain.entries.lock().unwrap().len(), 1);
+    assert_eq!(super::account(a.path()), None);
+    assert!(super::account(b.path()).is_some());
+}
+
+#[test]
+fn with_no_keychain_a_sign_in_is_kept_for_the_session_only() {
+    let broken: Arc<dyn Keychain> = Arc::new(vault::Fake { broken: AtomicBool::new(true), ..vault::Fake::default() });
+    for keychain in [Some(broken), None] {
+        let (folder, _script, _server, endpoints) = signed_in_with(keychain);
+        assert_eq!(super::account(folder.path()).map(|a| a.kept), Some(Kept::Session));
+        assert_eq!(readiness(Some(folder.path())), Readiness::Ready);
+        // Nothing readable, nor sealed, is on disk.
+        assert_eq!(folder.files(), [CLIENT_FILE, store::LOCK_FILE]);
+        // A refresh keeps its new tokens in memory too.
+        expire(folder.path());
+        assert_eq!(access_token(folder.path(), &endpoints, None).unwrap().access_token, "access-1");
+        assert_eq!(folder.files(), [CLIENT_FILE, store::LOCK_FILE]);
+        // Signing out forgets them.
+        assert_eq!(sign_out_with(folder.path(), &endpoints), Ok(SignedOut { revoked: true }));
+        assert_eq!(super::account(folder.path()), None);
+        assert!(store::read_credentials(folder.path()).is_none());
+    }
+}
+
+#[test]
+fn an_older_plaintext_sign_in_is_sealed_or_kept_in_memory_and_its_file_deleted() {
+    let (signed, _script, _server, _endpoints) = signed_in(no_api);
+    let old = store::read_credentials(signed.path()).unwrap();
+    let plaintext = serde_json::to_vec_pretty(&old).unwrap();
+    for working in [true, false] {
+        let folder = Folder::new();
+        fake_keychain(folder.path(), working);
+        std::fs::write(folder.path().join(PLAINTEXT_FILE), &plaintext).unwrap();
+        // The window's read doesn't wait for the keychain: a thread of its own moves the file. The
+        // sign-in shows once it is kept, a moment before the older file is deleted.
+        eventually("the older sign-in is moved", || super::account(folder.path()).is_some() && !opening(folder.path()));
+        let kept = if working { Kept::Keychain } else { Kept::Session };
+        assert_eq!(super::account(folder.path()).unwrap().kept, kept);
+        assert!(!folder.path().join(PLAINTEXT_FILE).exists(), "the plaintext file is deleted");
+        assert_eq!(folder.path().join(CREDENTIALS_FILE).exists(), working);
+        assert_eq!(store::read_credentials(folder.path()).unwrap().refresh_token, old.refresh_token);
+    }
+    // One that can't be read is deleted too, and nobody is signed in.
+    let folder = Folder::new();
+    std::fs::write(folder.path().join(PLAINTEXT_FILE), br#"{"version":1,"refreshToken":"half"#).unwrap();
+    assert!(store::read_credentials(folder.path()).is_none());
+    assert!(!folder.path().join(PLAINTEXT_FILE).exists());
+}
+
+/// The sign-out holds the credentials' lock when it finds the older file, so the file is moved
+/// under that lock: taking it again would wait for itself for ever.
+#[test]
+fn signing_out_right_after_an_upgrade_deletes_the_older_file_and_revokes_its_token() {
+    let (signed, _script, server, endpoints) = signed_in(no_api);
+    let old = store::read_credentials(signed.path()).unwrap();
+    let folder = Folder::new();
+    std::fs::write(folder.path().join(PLAINTEXT_FILE), serde_json::to_vec(&old).unwrap()).unwrap();
+    let (f, e) = (folder.path().to_path_buf(), endpoints.clone());
+    let out = std::thread::spawn(move || sign_out_with(&f, &e));
+    eventually("the sign-out ends", || out.is_finished());
+    assert_eq!(out.join().unwrap(), Ok(SignedOut { revoked: true }));
+    assert!(!folder.path().join(PLAINTEXT_FILE).exists() && !folder.path().join(CREDENTIALS_FILE).exists());
+    assert!(server.to("/oauth/revoke").iter().any(|r| r.field("token").as_deref() == Some("refresh-0")));
+}
+
+#[test]
+fn a_sealed_file_cut_short_garbled_of_another_version_or_key_reads_as_signed_out() {
+    let keychain = Arc::new(vault::Fake::default());
+    let (folder, script, _server, endpoints) = signed_in_with(Some(keychain.clone()));
+    let nowhere = Endpoints::local("http://127.0.0.1:9");
+    let path = folder.path().join(CREDENTIALS_FILE);
+    let good = std::fs::read(&path).unwrap();
+    let envelope: Value = serde_json::from_slice(&good).unwrap();
+    assert_eq!(
+        (envelope["format"].as_str(), envelope["version"].as_u64(), envelope["algorithm"].as_str()),
+        (Some("wordcraft.chatgpt-credentials"), Some(1), Some("AES-256-GCM"))
+    );
+    let with = |field: &str, value: Value| {
+        let mut e = envelope.clone();
+        e[field] = value;
+        serde_json::to_vec(&e).unwrap()
+    };
+    let mut flipped = from_b64url(envelope["ciphertext"].as_str().unwrap()).unwrap();
+    flipped[0] ^= 1;
+    // The same credentials sealed with the same key, bound to another purpose or version.
+    let key = keychain.entries.lock().unwrap().values().next().unwrap().clone();
+    let plain = serde_json::to_vec(&store::read_credentials(folder.path()).unwrap()).unwrap();
+    let reseal = |aad: &[u8]| {
+        use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+        let mut data = plain.clone();
+        let sealer = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).unwrap());
+        sealer.seal_in_place_append_tag(Nonce::assume_unique_for_key([7; 12]), Aad::from(aad), &mut data).unwrap();
+        let mut e = envelope.clone();
+        (e["nonce"], e["ciphertext"]) = (json!(b64url(&[7; 12])), json!(b64url(&data)));
+        serde_json::to_vec(&e).unwrap()
+    };
+    std::fs::write(&path, reseal(b"wordcraft.chatgpt-credentials/1/AES-256-GCM")).unwrap();
+    assert!(store::read_credentials(folder.path()).is_some(), "resealed as WordCraft seals, it opens");
+    let damaged = [
+        ("cut short", good[..good.len() / 2].to_vec()),
+        ("empty", Vec::new()),
+        ("not JSON", vec![0xff; 64]),
+        ("a flipped bit", with("ciphertext", json!(b64url(&flipped)))),
+        ("no tag", with("ciphertext", json!(""))),
+        ("a later version", with("version", json!(2))),
+        ("another algorithm", with("algorithm", json!("AES-128-GCM"))),
+        ("another format", with("format", json!("something-else"))),
+        ("a short nonce", with("nonce", json!(b64url(&[0; 8])))),
+        ("a nonce that isn't base64url", with("nonce", json!("!!!"))),
+        ("a field it doesn't know", with("extra", json!(1))),
+        ("bound to another version", reseal(b"wordcraft.chatgpt-credentials/2/AES-256-GCM")),
+        ("bound to another purpose", reseal(b"wordcraft.something-else/1/AES-256-GCM")),
+        ("too big", vec![b' '; usize::try_from(vault::MAX_SEALED).unwrap() + 1]),
+    ];
+    for (what, bytes) in damaged {
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(store::read_credentials(folder.path()).is_none(), "{what}");
+        assert_eq!(super::account(folder.path()), None, "{what}");
+        assert_eq!(access_token(folder.path(), &nowhere, None).unwrap_err(), AuthError::NotSignedIn, "{what}");
+    }
+    // WordCraft opens again, and the keychain holds another key, or one that isn't a key.
+    std::fs::write(&path, &good).unwrap();
+    for other in [vec![9; 32], vec![9; 5]] {
+        keychain.entries.lock().unwrap().values_mut().for_each(|k| *k = other.clone());
+        vault::register(folder.path(), Some(keychain.clone()));
+        assert!(store::read_credentials(folder.path()).is_none(), "{other:?}");
+        assert_eq!(super::account(folder.path()), None);
+    }
+    // The next sign-in replaces both.
+    sign_in_with(folder.path(), &script, &endpoints, "code=c2").unwrap();
+    assert_eq!(super::account(folder.path()).map(|a| a.kept), Some(Kept::Keychain));
+    assert_eq!(keychain.entries.lock().unwrap().values().next().map(Vec::len), Some(32));
+}
+
+#[test]
+fn a_sign_in_another_wordcraft_sealed_with_a_new_key_is_read() {
+    let (folder, script, _server, endpoints) = signed_in(no_api);
+    assert!(super::account(folder.path()).is_some());
+    // Another WordCraft with this settings folder (named another way, so this process keeps
+    // two; `Path` reads `dir/.` as `dir`): it signs out, which deletes the key, and in again,
+    // with a new key.
+    let other = folder.path().join("..").join(folder.path().file_name().unwrap());
+    assert_ne!(other, folder.path());
+    fake_keychain(&other, true);
+    assert_eq!(sign_out_with(&other, &endpoints), Ok(SignedOut { revoked: true }));
+    sign_in_with(&other, &script, &endpoints, "code=c2").unwrap();
+    // This one still has the old key: it asks the keychain again, and reads the new sign-in.
+    eventually("the new sign-in shows", || super::account(folder.path()).is_some());
+    assert_eq!(store::read_credentials(folder.path()).unwrap().access_token, "access-1");
+}
+
+/// The biggest sign-in the token endpoint is accepted with (each token at `auth::MAX_TOKEN`) seals
+/// into a file the next read takes; one too big for the reader is kept in memory rather than
+/// written where no read would take it.
+#[test]
+fn the_biggest_sign_in_accepted_seals_into_a_file_that_reads_back() {
+    let (folder, _script, _server, _endpoints) = signed_in_with(Some(Arc::new(vault::Fake::default())));
+    let mut c = store::read_credentials(folder.path()).unwrap();
+    let token = |n: &str| n.repeat(super::auth::MAX_TOKEN);
+    (c.access_token, c.refresh_token, c.id_token) = (token("a"), token("r"), token("i"));
+    assert_eq!(store::write_credentials(folder.path(), &c), Ok(Kept::Keychain));
+    let back = store::read_credentials(folder.path()).expect("the sealed file reads back");
+    assert_eq!((back.access_token, back.refresh_token, back.id_token), (c.access_token.clone(), c.refresh_token.clone(), c.id_token.clone()));
+
+    c.name = Some("n".repeat(1 << 20));
+    assert_eq!(store::write_credentials(folder.path(), &c), Ok(Kept::Session));
+    assert!(!folder.path().join(CREDENTIALS_FILE).exists());
+    assert_eq!(store::read_credentials(folder.path()).and_then(|c| c.name).map(|n| n.len()), Some(1 << 20));
+}
+
+#[test]
+fn a_sign_in_kept_in_memory_after_the_keychain_fails_leaves_no_older_sealed_one_behind() {
+    let keychain = Arc::new(vault::Fake::default());
+    let (folder, _script, _server, endpoints) = signed_in_with(Some(keychain.clone()));
+    expire(folder.path());
+    // The keychain fails mid-session (a keyring locked again, or macOS refusing a rebuilt app):
+    // the refresh's new tokens are kept in memory, and the sealed file of the older ones goes.
+    keychain.broken.store(true, Ordering::Relaxed);
+    assert_eq!(access_token(folder.path(), &endpoints, None).unwrap().access_token, "access-1");
+    assert_eq!(super::account(folder.path()).map(|a| a.kept), Some(Kept::Session));
+    assert!(!folder.path().join(CREDENTIALS_FILE).exists());
+    // WordCraft opens again and the keychain answers: nobody is signed in, rather than the older
+    // tokens, whose refresh token ChatGPT may have rotated since.
+    keychain.broken.store(false, Ordering::Relaxed);
+    vault::register(folder.path(), Some(keychain.clone()));
+    assert!(store::read_credentials(folder.path()).is_none());
+}
+
+/// A keychain that answers only once it is let go, as one waiting for the person to unlock it
+/// (or after three seconds, so a window that waited for it fails the test rather than hangs it).
+#[derive(Default)]
+struct Hanging {
+    inner: vault::Fake,
+    hold: AtomicBool,
+}
+
+impl Keychain for Hanging {
+    fn get(&self, account: &str) -> Result<Option<Vec<u8>>, String> {
+        let asked = Instant::now();
+        while self.hold.load(Ordering::Relaxed) && asked.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.inner.get(account)
+    }
+
+    fn set(&self, account: &str, secret: &[u8]) -> Result<(), String> {
+        self.inner.set(account, secret)
+    }
+
+    fn delete(&self, account: &str) -> Result<(), String> {
+        self.inner.delete(account)
+    }
+}
+
+#[test]
+fn the_window_never_waits_for_a_keychain_that_hangs() {
+    let keychain = Arc::new(Hanging::default());
+    let (folder, _script, _server, endpoints) = signed_in_with(Some(keychain.clone()));
+    // WordCraft opens again, and the keychain waits for the person to unlock it.
+    vault::register(folder.path(), Some(keychain.clone()));
+    keychain.hold.store(true, Ordering::Relaxed);
+    let started = Instant::now();
+    assert_eq!(super::account(folder.path()), None);
+    assert!(matches!(readiness(Some(folder.path())), Readiness::SignIn { .. }));
+    let next = SignIn::start(folder.path(), options(&endpoints)).unwrap();
+    assert!(param(next.url(), "id_token_hint").is_none(), "no hint without the keychain");
+    drop(next);
+    assert!(started.elapsed() < Duration::from_secs(2), "the window waited {:?}", started.elapsed());
+    assert!(opening(folder.path()), "a thread of its own asks the keychain");
+    // Unlocked: the sign-in shows.
+    keychain.hold.store(false, Ordering::Relaxed);
+    eventually("the sign-in is read", || super::account(folder.path()).is_some());
+    assert!(!opening(folder.path()));
 }
 
 #[test]

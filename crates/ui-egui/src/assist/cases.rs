@@ -2,11 +2,15 @@
 //! a turn asks to recall from it, what Details › Recalled shows of what came back, and the
 //! `memory.case.*` and `memory.wall.*` writes behind Details › Case ([`page`]).
 //!
-//! The binding is the window's alone and never in a document. A conversation belongs to the case
-//! its document was bound to when it started ([`super::Conversation::case`]); a document bound to
-//! another case gets a new conversation. Recall runs only when a case is bound and no one but the
-//! person and this conversation's assistant can read the document ([`Alone`]); otherwise the turn
-//! runs as it does today, and Details says why.
+//! The binding is never in a document. The person's click binds, and the shelf keeps that binding
+//! for the document's file ([`Shelf::bind_file`]), so the case is offered again when the file is
+//! next opened ([`offer`]), and binds only with the person's click: a path doesn't say which
+//! document is there, and another client's document at it would recall the first client's case.
+//! An unsaved document's binding is the window's alone. A conversation belongs to
+//! the case its document was bound to when it started ([`super::Conversation::case`]); a document
+//! bound to another case gets a new conversation. Recall runs only when a case is bound and no one
+//! but the person and this conversation's assistant can read the document ([`Alone`]); otherwise
+//! the turn runs as it does today, and Details says why.
 //!
 //! Two writers, two doors. The person's click goes through [`super::memory::write`], the one guard,
 //! and the shelf's [`Click`] is its proof: only that door confirms a note, sets facts, replaces the
@@ -15,14 +19,14 @@
 //! current binding: a note or a balance lands there unconfirmed, a plan replaces only a model's
 //! plan, and facts are always a card. The switch is [`ModelWrites`].
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use egui::{RichText, Ui};
 use serde_json::{Value, json};
 use wordcraft_assist::cases::{
-    Alone, Applied, BalanceDraft, Body, Card, Case, CaseError, CaseId, CaseRef, Click, Day, Factor, Facts, LessonDraft, LessonId, LessonOp, Lessons,
-    Listing, ModelWrite, ModelWrites, NoteDraft, NoteId, PersonOp, Place, Plan, Quoted, RecallAsk, RecallSent, RecalledItem, Route, Shelf, Stance,
-    Standing, Topics, WallId,
+    Alone, Applied, BalanceDraft, Body, Card, Case, CaseError, CaseId, CaseRef, Click, Day, Factor, Facts, ItemId, LessonDraft, LessonId, LessonOp,
+    Lessons, Listing, ModelWrite, ModelWrites, NoteDraft, NoteId, PersonOp, Place, Plan, Quoted, RecallAsk, RecallSent, RecalledItem, Route, Shelf,
+    Stance, Standing, Topics, WallId,
 };
 use wordcraft_assist::{Context, Details, ProposalAnswer, Sent, Written};
 
@@ -61,6 +65,11 @@ const MAX_TRIES: u32 = 600;
 pub(crate) struct CasesState {
     /// By document id ([`wordcraft_engine::Session::document_id`]): a window holds several documents.
     bound: BTreeMap<u64, CaseRef>,
+    /// Documents whose file was looked up for an earlier binding ([`offer`]), once each.
+    looked_up: BTreeSet<u64>,
+    /// The case each document's file was bound to when it was last open, with its title, offered
+    /// until the person binds the document or says not now. Never bound without that click.
+    offered: BTreeMap<u64, (CaseRef, String)>,
     /// The shown document's case as its file last read, with when (`clock::now_ms`).
     open: Option<(CaseRef, Case)>,
     read_at: Option<f64>,
@@ -189,6 +198,7 @@ fn changed(app: &mut WordApp) {
 /// Every frame: what the conversation's answers marked for its case goes there, by the one route.
 /// A marker with no case bound to the conversation is dropped, as a `[[used:]]` for nothing is.
 pub(crate) fn tick(app: &mut WordApp) {
+    offer(app);
     let dir = app.services.settings_dir.clone();
     let assist = &mut app.assist;
     if let Some(c) = assist.conversation.as_mut() {
@@ -307,6 +317,7 @@ pub(crate) fn write(app: &mut WordApp, dir: &std::path::Path, what: &str, req: &
                 return Err(CaseError::Gone.to_string());
             }
             app.bind_case(Some(at.clone()));
+            keep(app, &shelf, click, Some(&at));
             suggest::print_bound(app, click, &at);
             Ok(json!({"wall": at.wall.as_str(), "case": at.case.as_str()}))
         }
@@ -315,6 +326,7 @@ pub(crate) fn write(app: &mut WordApp, dir: &std::path::Path, what: &str, req: &
                 return Err(NO_DOCUMENT.into());
             }
             app.bind_case(None);
+            keep(app, &shelf, click, None);
             Ok(json!({"unbound": true}))
         }
         "memory.case.cardDismiss" => {
@@ -389,8 +401,83 @@ fn new_case(app: &mut WordApp, shelf: &Shelf, click: Click, req: &Value) -> Resu
     let (stamp, counter) = stamp();
     let at = shelf.new_case(click, &wall, title, &stamp, counter).map_err(|e| e.to_string())?;
     app.bind_case(Some(at.clone()));
+    keep(app, shelf, click, Some(&at));
     suggest::print_bound(app, click, &at);
     Ok(json!({"wall": at.wall.as_str(), "case": at.case.as_str()}))
+}
+
+/// The person's bind or unbind, kept for the shown document's file, so the file binds again when
+/// it is next opened. An unsaved document has no file: its binding lasts while it is open. The
+/// binding has taken effect either way, so a failure to keep it is said, not returned.
+fn keep(app: &mut WordApp, shelf: &Shelf, click: Click, at: Option<&CaseRef>) {
+    let Some(file) = app.session.path.clone() else { return };
+    let kept = match at {
+        Some(at) => shelf.bind_file(click, &file, at).map(|_| ()),
+        None => shelf.unbind_file(click, &file),
+    };
+    if let Err(e) = kept {
+        log::warn!("a binding wasn't kept for the file: {e}");
+        app.assist.notice =
+            Some(fmt(tl!("WordCraft couldn't remember this for the next time you open the file: {error}"), &[("error", &e.to_string())]));
+    }
+}
+
+/// The first time a saved document is shown, the case the person bound its file to, if that case
+/// is still there ([`Shelf::file_bound`]), is offered: [`offer_line`]. It isn't bound: a path
+/// doesn't say which document is there (another client's saved over it, one made from the same
+/// template), and a bound case's notes go to the model. Once per document: one saved later under a
+/// path that was bound isn't offered its case, as one opened from the path is.
+pub(crate) fn offer(app: &mut WordApp) {
+    let document = app.session.document_id();
+    if !app.assist.cases.looked_up.insert(document) || app.assist.cases.bound.contains_key(&document) {
+        return;
+    }
+    let (Some(dir), Some(file)) = (app.services.settings_dir.as_ref(), app.session.path.as_ref()) else { return };
+    let shelf = Shelf::at(dir);
+    let Some(at) = shelf.file_bound(file) else { return };
+    let title = shelf.open(&at).map(|case| case.title.for_person().to_string()).unwrap_or_default();
+    app.assist.cases.offered.insert(document, (at, title));
+}
+
+/// The case offered to the shown document ([`offer`]), and its title, while the document is bound
+/// to none.
+pub(crate) fn offered(app: &WordApp) -> Option<&(CaseRef, String)> {
+    let document = app.session.document_id();
+    app.assist.cases.offered.get(&document).filter(|_| !app.assist.cases.bound.contains_key(&document))
+}
+
+/// The person's Bind again: the offered case, through the person-only command a click in the case
+/// list runs.
+pub(crate) fn rebind(app: &mut WordApp) {
+    let Some((at, _)) = offered(app).cloned() else { return };
+    run(app, "assist.memory.case.bind", json!({"wall": at.wall.as_str(), "case": at.case.as_str()}));
+}
+
+/// The person's Not now: no offer for this document while it is open. The file's binding stays,
+/// so it is offered again the next time the file is opened.
+pub(crate) fn not_now(app: &mut WordApp) {
+    app.assist.cases.offered.remove(&app.session.document_id());
+}
+
+/// What the pane says of a case offered to a file.
+pub(crate) fn offer_words(title: &str) -> String {
+    let title = if title.is_empty() { tl!("Untitled case") } else { title };
+    fmt(tl!("When you last had this file open, it was bound to {case}."), &[("case", title)])
+}
+
+/// Above the conversation and on Details › Case, while a case is offered to the shown document:
+/// which case, **Bind again** and **Not now**. Nothing recalls from it until the person binds it.
+pub(crate) fn offer_line(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
+    let Some((_, title)) = offered(app).cloned() else { return };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(offer_words(&title)).small().color(t.text_dim));
+        if ui.small_button(tl!("Bind again")).on_hover_text(tl!("Each turn recalls from this case again.")).clicked() {
+            rebind(app);
+        }
+        if ui.small_button(tl!("Not now")).on_hover_text(tl!("Nothing is recalled; it is offered again the next time you open the file.")).clicked() {
+            not_now(app);
+        }
+    });
 }
 
 /// The typed operation a request asks for. Serde does the parsing: a field a record doesn't know
@@ -446,6 +533,7 @@ impl WordApp {
         self.assist.cases.open = None;
         self.assist.cases.read_at = None;
         let document = self.session.document_id();
+        self.assist.cases.offered.remove(&document);
         if self.assist.cases.bound.get(&document) != at.as_ref() {
             // The page's forms hold the old case's text.
             self.assist.cases.drafts.close_forms();
@@ -617,7 +705,10 @@ fn turn_rows(ui: &mut Ui, t: &Tokens, recalled: &RecallSent) {
             ladder_rows(ui, t, item);
             continue;
         }
-        let from = from_words(&item.place, item.title.as_ref());
+        let from = match item.id {
+            ItemId::Case => tl!("this case as it stands: its facts, balance and plan").to_string(),
+            _ => from_words(&item.place, item.title.as_ref()),
+        };
         ui.scope(|ui| {
             // Rows of text, not of controls: a wrapped row takes its height from this as it starts.
             ui.spacing_mut().interact_size.y = 0.0;

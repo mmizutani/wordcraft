@@ -549,6 +549,10 @@ fn main() -> eframe::Result {
     // First, so the panic hook and every start-up warning are recorded (`logging`).
     let logger = logging::install();
     logging::install_panic_hook();
+    // ChatGPT's sign-in is sealed with a key kept in the system's keychain (or, with none, kept
+    // for the session only). Only this program asks for it: tests and tools never reach the
+    // person's keychain.
+    wordcraft_assist::chatgpt::use_system_keychain();
     // The settings folder holds the control channel's keys (with one, an agent would be the
     // window), recovery copies and preferences: no agent invited to a shared document reaches it,
     // whatever files File › Options › Agents lets agents use (#31).

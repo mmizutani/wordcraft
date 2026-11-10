@@ -3,7 +3,9 @@
 //! - [`CLIENT_FILE`]: this installation's host id (`ext_agent_host_id`, made before the first
 //!   sign-in and kept for good) and the client id the first sign-in was issued. Kept when the
 //!   person signs out.
-//! - [`CREDENTIALS_FILE`]: the signed-in account and its tokens. Deleted when they sign out.
+//! - [`CREDENTIALS_FILE`]: the signed-in account and its tokens, sealed with a key that is in the
+//!   system's keychain ([`super::vault`]). With no keychain there is no such file: the sign-in
+//!   is kept in memory for the session only. Deleted when they sign out.
 //! - [`LOCK_FILE`]: empty. Its lock ([`Lock`]) is held while the tokens are refreshed, saved
 //!   by a new sign-in or deleted, so WordCraft processes that share the folder take turns.
 //!
@@ -12,6 +14,7 @@
 //! as missing. The tokens never
 //! reach the log: [`Credentials`]'s `Debug` leaves them out.
 
+use std::cell::Cell;
 use std::fs::{self, TryLockError};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -20,10 +23,15 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::http::{now, random};
+use super::http::random;
+pub(crate) use super::vault::{delete_credentials, peek, read_credentials, write_credentials};
 
-/// The credentials file, in the settings folder.
-pub const CREDENTIALS_FILE: &str = "chatgpt-credentials.json";
+/// The credentials file, sealed, in the settings folder.
+pub const CREDENTIALS_FILE: &str = "chatgpt-credentials.sealed";
+
+/// Where WordCraft kept the credentials before they were sealed, as plain JSON. The first time
+/// the folder is opened they are sealed (or taken into memory), and this file is deleted.
+pub const PLAINTEXT_FILE: &str = "chatgpt-credentials.json";
 
 /// The host id and issued client id, in the settings folder.
 pub const CLIENT_FILE: &str = "chatgpt-client.json";
@@ -33,11 +41,12 @@ pub const CLIENT_FILE: &str = "chatgpt-client.json";
 /// new one.
 pub(crate) const LOCK_FILE: &str = "chatgpt-credentials.lock";
 
-/// Most bytes either file may have; a bigger one reads as damaged.
-const MAX_FILE: u64 = 256 << 10;
+/// Most bytes either JSON file may have; a bigger one reads as damaged. The sealed file's limit
+/// adds what sealing adds (`vault::MAX_SEALED`).
+pub(super) const MAX_FILE: u64 = 256 << 10;
 
 /// The credentials' format.
-const VERSION: u32 = 1;
+pub(super) const VERSION: u32 = 1;
 
 /// This installation's host id and the client id it was issued.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,9 +114,26 @@ impl Credentials {
         !self.refresh_token.is_empty()
     }
 
-    pub(crate) fn account(&self) -> Account {
-        Account { email: self.email.clone(), name: self.name.clone(), plan_usage: self.plan_usage() }
+    /// Whether this build wrote them and can use them.
+    pub(super) fn valid(&self) -> bool {
+        self.version == VERSION && !self.client_id.is_empty()
     }
+
+    pub(crate) fn account(&self, kept: Kept) -> Account {
+        Account { email: self.email.clone(), name: self.name.clone(), plan_usage: self.plan_usage(), kept }
+    }
+}
+
+/// Where the sign-in is kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Kept {
+    /// Sealed in the settings folder, with its key in the system's keychain: it is still there
+    /// the next time WordCraft opens.
+    Keychain,
+    /// In memory only, because there is no keychain to keep its key in (or it failed): the
+    /// person signs in again the next time WordCraft opens.
+    Session,
 }
 
 /// Who is signed in to ChatGPT, as Options › Account shows it.
@@ -121,36 +147,16 @@ pub struct Account {
     /// Whether the person allowed WordCraft to use their ChatGPT plan (Plus and Pro); without
     /// it the assistant can't answer.
     pub plan_usage: bool,
+    /// Where the sign-in is kept.
+    pub kept: Kept,
 }
 
-/// Who is signed in, from the credentials file in `settings` (no network). None when nobody
-/// is, or the file is missing or damaged.
+/// Who is signed in, from what this process knows of `settings`' sign-in (no network). It never
+/// waits for the keychain, so the window's thread may ask: None when nobody is signed in, the
+/// credentials are missing or damaged, or the keychain is still being asked
+/// ([`super::opening`]).
 pub fn account(settings: &Path) -> Option<Account> {
-    read_credentials(settings).filter(Credentials::signed_in).map(|c| c.account())
-}
-
-/// The credentials, if the file holds them.
-pub(crate) fn read_credentials(settings: &Path) -> Option<Credentials> {
-    let c: Credentials = read_json(&settings.join(CREDENTIALS_FILE))?;
-    (c.version == VERSION && !c.client_id.is_empty()).then_some(c)
-}
-
-/// Keep `c` (atomically, mode 0600).
-pub(crate) fn write_credentials(settings: &Path, c: &Credentials) -> Result<(), String> {
-    let mut c = c.clone();
-    c.version = VERSION;
-    c.saved_at = now();
-    let bytes = serde_json::to_vec_pretty(&c).map_err(|e| e.to_string())?;
-    write_private(&settings.join(CREDENTIALS_FILE), &bytes)
-}
-
-/// Delete the credentials file. Its being gone already is fine.
-pub(crate) fn delete_credentials(settings: &Path) -> Result<(), String> {
-    match fs::remove_file(settings.join(CREDENTIALS_FILE)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("the sign-in couldn't be deleted: {e}")),
-    }
+    peek(settings).filter(|(c, _)| c.signed_in()).map(|(c, kept)| c.account(kept))
 }
 
 /// This installation's client record, made (with a new host id) and kept if there is none: the
@@ -188,15 +194,21 @@ fn valid_host_id(id: &str) -> bool {
     id.strip_prefix("urn:uuid:").is_some_and(|u| u.len() == 36 && u.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
 }
 
-/// A JSON file of at most [`MAX_FILE`] bytes, or None when it's missing, too big or damaged.
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+/// A file of at most `limit` bytes, or None when it's missing or too big.
+pub(super) fn read_capped(path: &Path, limit: u64) -> Option<Vec<u8>> {
     let file = fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
-    file.take(MAX_FILE.saturating_add(1)).read_to_end(&mut bytes).ok()?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_FILE {
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes).ok()?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
         log::warn!("{} is too big: ignored", path.display());
         return None;
     }
+    Some(bytes)
+}
+
+/// A JSON file of at most [`MAX_FILE`] bytes, or None when it's missing, too big or damaged.
+pub(super) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    let bytes = read_capped(path, MAX_FILE)?;
     match serde_json::from_slice(&bytes) {
         Ok(v) => Some(v),
         Err(_) => {
@@ -236,6 +248,13 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// The process's own lock on the credentials (its windows take turns).
 static REFRESHING: Mutex<()> = Mutex::new(());
 
+thread_local! {
+    /// Whether this thread holds the [`Lock`]. What needs the lock while a refresh or a new
+    /// sign-in holds it (the keychain asked, an older file sealed) goes on under that one: taking
+    /// it again would wait for itself for ever.
+    static HELD: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Longest [`Lock::take`] waits for another process: twice as long as a holder holds it (a
 /// refresh's one call to the token endpoint, bounded by `http::AUTH_CALL`).
 const LOCK_WAIT: Duration = Duration::from_secs(60);
@@ -250,10 +269,26 @@ pub(crate) struct Lock {
     _process: MutexGuard<'static, ()>,
 }
 
+impl Drop for Lock {
+    fn drop(&mut self) {
+        HELD.set(false);
+    }
+}
+
 impl Lock {
     /// Wait for the lock, at most [`LOCK_WAIT`].
     pub(crate) fn take(settings: &Path) -> Result<Lock, String> {
         Lock::within(settings, LOCK_WAIT)
+    }
+
+    /// Whether this thread holds it now.
+    pub(crate) fn held_here() -> bool {
+        HELD.get()
+    }
+
+    fn held(file: Option<fs::File>, process: MutexGuard<'static, ()>) -> Lock {
+        HELD.set(true);
+        Lock { _file: file, _process: process }
     }
 
     /// Wait at most `wait` for the lock: an error when another process still holds it then. A
@@ -264,13 +299,13 @@ impl Lock {
             Ok(file) => file,
             Err(e) => {
                 log::warn!("ChatGPT sign-in: no lock file ({e}); going on without one");
-                return Ok(Lock { _file: None, _process: process });
+                return Ok(Lock::held(None, process));
             }
         };
         let until = Instant::now().checked_add(wait);
         loop {
             match file.try_lock() {
-                Ok(()) => return Ok(Lock { _file: Some(file), _process: process }),
+                Ok(()) => return Ok(Lock::held(Some(file), process)),
                 Err(TryLockError::WouldBlock) if until.is_none_or(|until| Instant::now() < until) => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -279,7 +314,7 @@ impl Lock {
                 }
                 Err(TryLockError::Error(e)) => {
                     log::warn!("ChatGPT sign-in: the lock file can't be locked ({e}); going on without it");
-                    return Ok(Lock { _file: None, _process: process });
+                    return Ok(Lock::held(None, process));
                 }
             }
         }
