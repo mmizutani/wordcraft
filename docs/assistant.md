@@ -364,7 +364,9 @@ is an ordinary answer, with four more markers that mean something only in it: `c
 main text as it should read now, and why) and `retire` (the note no longer holds, and why) apply to
 the assistant's own unconfirmed notes as any in-case write does, the why kept as how and a retired
 text blocking the assistant from noting it again; on a note you confirmed each is a card, **Keep**
-or **Remove** being your own edit of the note, and nothing changes until you click. `supported`
+or **Remove** being your own edit of the note, and nothing changes until you click. An edit, yours
+or a kept correction, changes the note's text and keeps what it was stated to be about and how
+often turns used it, so it ranks as before. `supported`
 shows as a quiet row with where the record bears the note out, and `gap` as a question for you;
 neither changes anything. A correction to text you dismissed, or that another note already says, is
 refused as a new note would be; what the assistant retires is kept apart from what you removed, so

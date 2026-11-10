@@ -903,8 +903,14 @@ impl Case {
                 self.notes.push(note);
             }
             PersonOp::EditNote(id, draft) => {
-                let at = self.note_mut(id)?.at;
-                let edited = draft.into_note(id, at, confirmed)?;
+                let old = self.note_mut(id)?;
+                let (at, topics, used, last_used) = (old.at, old.stated_topics, old.used, old.last_used);
+                let mut edited = draft.into_note(id, at, confirmed)?;
+                // An edit states no topics and knows nothing of use: what the note was stated to
+                // be about and how often turns used it stay, so an edit doesn't change its rank.
+                edited.stated_topics = topics.union(edited.stated_topics);
+                edited.used = used;
+                edited.last_used = last_used;
                 *self.note_mut(id)? = edited;
             }
             PersonOp::Confirm(id) => {
