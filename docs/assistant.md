@@ -270,6 +270,20 @@ as before and never enter a ladder, and another case's unconfirmed position neve
 Details › Recalled lists a ladder's rungs, each on a few wrapped lines, and a change that pastes a rung's terms
 is flagged as quoting your case notes like any other recalled text.
 
+Each turn of a bound conversation also carries the case itself as it stands: its facts as the
+pickers set them (the kind of contract, your side, whose paper, the counterparty's kind, the
+governing law and the stage), the balance now with its factors, and the plan with its next steps.
+The case's title and the parties' names never go. The plan is your own text and goes as you wrote
+it, each line up to the 400 characters a goal or a step keeps, so a name you write in the plan, or
+in a factor's reason, goes too; a plan or balance the assistant wrote goes marked unconfirmed. The
+facts, the balance and the goal always go, counted first against the 6 KiB a turn recalls. The
+steps go last, in order, with the room the ladders, lessons and notes left, and the summary takes
+at most half of the 6 KiB with them, so a long plan never pushes out what ranked for your question;
+a step that doesn't fit is left out whole, and Details says how many. It goes as data in a source
+of its own, under WordCraft's own words, on ChatGPT and to an ACP agent alike, and to an agent on
+every turn, since the balance and the plan change. Details › Recalled lists it first, as this
+case as it stands. It is off whenever recall is off.
+
 **What the assistant writes.** With a case bound, each turn's instructions also say what the
 case's notes are for: a later conversation about this negotiation will know only these notes and
 the document, so the model should write what that conversation will need and can't read off the

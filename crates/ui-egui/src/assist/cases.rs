@@ -20,9 +20,9 @@ use std::collections::{BTreeMap, VecDeque};
 use egui::{RichText, Ui};
 use serde_json::{Value, json};
 use wordcraft_assist::cases::{
-    Alone, Applied, BalanceDraft, Body, Card, Case, CaseError, CaseId, CaseRef, Click, Day, Factor, Facts, LessonDraft, LessonId, LessonOp, Lessons,
-    Listing, ModelWrite, ModelWrites, NoteDraft, NoteId, PersonOp, Place, Plan, Quoted, RecallAsk, RecallSent, RecalledItem, Route, Shelf, Stance,
-    Standing, Topics, WallId,
+    Alone, Applied, BalanceDraft, Body, Card, Case, CaseError, CaseId, CaseRef, Click, Day, Factor, Facts, ItemId, LessonDraft, LessonId, LessonOp,
+    Lessons, Listing, ModelWrite, ModelWrites, NoteDraft, NoteId, PersonOp, Place, Plan, Quoted, RecallAsk, RecallSent, RecalledItem, Route, Shelf,
+    Stance, Standing, Topics, WallId,
 };
 use wordcraft_assist::{Context, Details, ProposalAnswer, Sent, Written};
 
@@ -592,7 +592,10 @@ fn turn_rows(ui: &mut Ui, t: &Tokens, recalled: &RecallSent) {
             ladder_rows(ui, t, item);
             continue;
         }
-        let from = from_words(&item.place, item.title.as_ref());
+        let from = match item.id {
+            ItemId::Case => tl!("this case as it stands: its facts, balance and plan").to_string(),
+            _ => from_words(&item.place, item.title.as_ref()),
+        };
         ui.scope(|ui| {
             // Rows of text, not of controls: a wrapped row takes its height from this as it starts.
             ui.spacing_mut().interact_size.y = 0.0;

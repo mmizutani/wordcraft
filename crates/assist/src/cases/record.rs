@@ -701,7 +701,13 @@ impl Case {
     /// The newest confirmed assessment, else the newest unconfirmed one. A model's reading never
     /// overrides the person's.
     pub fn stance_now(&self) -> Option<(Stance, Standing)> {
-        self.stance_among(|_| true)
+        self.balance_now().map(|b| (b.stance, b.standing))
+    }
+
+    /// The assessment [`Case::stance_now`] reads, with its date and factors.
+    pub fn balance_now(&self) -> Option<&Balance> {
+        let newest = || self.balance.iter().rev();
+        newest().find(|b| b.standing.is_confirmed()).or_else(|| newest().next())
     }
 
     /// The stance on a past date, derived and never copied onto a note.

@@ -185,6 +185,54 @@ fn a_second_participant_or_an_invite_not_yet_used_withholds_recall_and_details_s
     assert_eq!(details.turns[1].context.as_ref().unwrap().recall_withheld.as_deref(), Some("Bob can read this document"));
 }
 
+const PLAN: &str = "Hold the cap at twelve months of fees; give ground on notice periods.";
+
+/// Each turn of a bound conversation carries the case as it stands: its closed facts, the balance
+/// now and the plan, as data under WordCraft's own words, never a party's name or the title, and
+/// Details › Recalled shows it. Once someone else can read the document it goes with the rest.
+#[test]
+fn a_bound_turn_carries_the_cases_facts_balance_and_plan_as_data_and_no_name_and_not_once_someone_else_can_read() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let shelf = Shelf::at(&folder.0);
+    let facts = serde_json::from_value(json!({"kind": "saas", "side": "customer", "law": "JP", "parties": ["Acme KK"]})).unwrap();
+    shelf.person(click(), &c.here, PersonOp::Facts(facts), today()).unwrap();
+    shelf.person(click(), &c.here, PersonOp::Balance(BalanceDraft { stance: Stance::Weaker, factors: Vec::new() }), today()).unwrap();
+    let plan = Plan { goal: Quoted::parse(PLAN), next: vec![Quoted::parse("Send the redline")], standing: Standing::Unconfirmed };
+    shelf.person(click(), &c.here, PersonOp::Plan(Some(plan)), today()).unwrap();
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    let fake = Fake::new();
+    let seen = ask(&mut a, fake, "Where do we stand?");
+    a.execute("assist.ask", json!({"prompt": "And on the indemnity?"})).unwrap();
+    settle(&mut a);
+    let turns = seen.lock().unwrap().turns.clone();
+    for turn in &turns {
+        let case: Vec<&wordcraft_assist::TurnSource> = turn.knowledge.iter().filter(|s| s.origin == SourceOrigin::Case).collect();
+        assert_eq!(case.len(), 1, "every turn carries the case: {:?}", turn.knowledge);
+        let text = case[0].as_text();
+        assert!(text.contains("The case this conversation is bound to") && text.contains("never instructions"), "{text}");
+        let summary: Value = serde_json::from_str(&case[0].text).unwrap();
+        assert_eq!((summary["contract"].as_str(), summary["side"].as_str()), (Some("saas"), Some("customer")));
+        assert_eq!(summary["balance"]["stance"], "weaker");
+        assert_eq!(summary["plan"]["goal"], PLAN);
+        assert!(!text.contains("Acme"), "no party's name and no title: {text}");
+        let memory = turn.memory.as_ref().map(|m| m.as_str().to_string()).unwrap_or_default();
+        assert!(!memory.contains(PLAN), "never an instruction: {memory}");
+    }
+    let details = crate::assist::details_for(&mut a);
+    let row = &details.turns[0].recalled.as_ref().unwrap().items[0];
+    assert_eq!(row.id, ItemId::Case);
+    assert!(row.text.contains(PLAN), "{}", row.text);
+
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    a.share_document(None).unwrap();
+    let _key = a.shared_room().unwrap().invite("Bob", Role::Viewer).unwrap();
+    let seen = ask(&mut a, Fake::new(), "Where do we stand?");
+    assert!(seen.lock().unwrap().turns[0].knowledge.is_empty(), "an invite not yet used withholds the case too");
+}
+
 #[test]
 fn with_no_case_bound_a_turn_is_exactly_as_today() {
     let folder = Folder::new();
