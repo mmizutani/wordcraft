@@ -765,8 +765,8 @@ pub struct ChangeRow {
     pub b: Pos,
     /// Its text, at most [`ROW_TEXT_CHARS`] characters, objects left out.
     pub text: String,
-    /// Its text as far as [`ROW_FULL_BYTES`], objects left out: what is checked, where `text` is
-    /// what is shown.
+    /// Its text as far as [`ROW_FULL_BYTES`], objects left out and a line break between paragraphs:
+    /// what is checked, where `text` is what is shown.
     pub full: String,
 }
 
@@ -774,6 +774,11 @@ pub struct ChangeRow {
 pub(super) fn add_row_text(text: &mut String, full: &mut String, chars: impl Iterator<Item = char> + Clone) {
     let room = ROW_TEXT_CHARS.saturating_sub(text.chars().count());
     text.extend(chars.clone().take(room));
+    add_full(full, chars);
+}
+
+/// Add `chars` to `full`, up to [`ROW_FULL_BYTES`].
+pub(super) fn add_full(full: &mut String, chars: impl Iterator<Item = char>) {
     for ch in chars {
         if full.len().saturating_add(ch.len_utf8()) > ROW_FULL_BYTES {
             break;
@@ -820,6 +825,10 @@ pub fn change_rows(s: &Session, author: &str, most: usize) -> (Vec<ChangeRow>, u
             }
             let Some(row) = rows.last_mut() else { continue };
             row.b = c.b.clone();
+            // A paragraph mark: its paragraphs' words stay apart, as the recalled text's lines are.
+            if c.a.path != c.b.path && c.kind != "format" {
+                add_full(&mut row.full, std::iter::once('\n'));
+            }
             if c.a.path == c.b.path && !same_words {
                 let piece = s.doc.para(c.a.story, &c.a.path).and_then(|p| p.text.get(c.a.off..c.b.off)).unwrap_or_default();
                 add_row_text(&mut row.text, &mut row.full, piece.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ));

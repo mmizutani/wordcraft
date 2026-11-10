@@ -499,3 +499,77 @@ fn a_flagged_row_keeps_its_flag_when_it_is_noted_again() {
     assert_eq!(row.state, OutputState::Rejected);
     assert!(row.quotes);
 }
+
+#[test]
+fn a_comment_whose_second_paragraph_pastes_recalled_text_is_flagged() {
+    let notes = "Fallback: accept a liability cap of twelve months of fees, no lower.";
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Comment");
+    recalled(&mut t, notes);
+    s.run("select.text", &json!({"text": "two"})).unwrap();
+    let id = s.run("review.newComment", &json!({"text": "Fine as written."})).unwrap()["id"].clone();
+    s.run("review.editComment", &json!({"id": id, "text": "Fine as written.\nOr: accept a liability cap of twelve months of fees."})).unwrap();
+    note(&mut t, &s);
+    let row = t.details().turns[0].output[0].clone();
+    assert_eq!(row.kind, OutputKind::Comment);
+    assert!(row.quotes);
+}
+
+/// The assistant types `first`, Enter, `second` over "two": one tracked insertion across two paragraphs.
+fn two_paragraphs(s: &mut Session, first: &str, second: &str) {
+    rewrite(s, "two", first);
+    s.run("text.newParagraph", &json!({})).unwrap();
+    s.run("text.insert", &json!({"text": second})).unwrap();
+}
+
+#[test]
+fn a_recalled_note_of_two_lines_pasted_as_two_paragraphs_is_flagged() {
+    let notes = "Fallback: twelve months\nno lower than that";
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Rewrite");
+    recalled(&mut t, notes);
+    two_paragraphs(&mut s, "Fallback: twelve months", "no lower than that");
+    note(&mut t, &s);
+    assert!(t.details().turns[0].output.iter().any(|r| r.kind == OutputKind::Insert && r.quotes), "{:?}", listed(&t));
+}
+
+#[test]
+fn two_short_paragraphs_that_would_read_as_recalled_text_joined_are_not_flagged() {
+    let notes = "Fallback: accept a liability cap of twelve months of fees, no lower.";
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Rewrite");
+    recalled(&mut t, notes);
+    two_paragraphs(&mut s, "accept a liability cap ", "of twelve months of fees");
+    note(&mut t, &s);
+    assert!(t.details().turns[0].output.iter().all(|r| !r.quotes), "{:?}", listed(&t));
+}
+
+#[test]
+fn replacing_a_comment_s_quote_with_other_words_clears_its_flag() {
+    let notes = "Fallback: accept a liability cap of twelve months of fees, no lower.";
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Comment");
+    recalled(&mut t, notes);
+    s.run("select.text", &json!({"text": "two"})).unwrap();
+    let id = s.run("review.newComment", &json!({"text": "They may accept a liability cap of twelve months of fees."})).unwrap()["id"].clone();
+    note(&mut t, &s);
+    assert!(t.details().turns[0].output[0].quotes);
+    s.run("review.editComment", &json!({"id": id, "text": "Consider the renewal term instead."})).unwrap();
+    note(&mut t, &s);
+    let row = t.details().turns[0].output[0].clone();
+    assert_eq!(row.state, OutputState::Open);
+    assert!(!row.quotes);
+}
+
+#[test]
+fn recalls_too_short_to_quote_keep_no_batch() {
+    let mut t = Transcript::default();
+    for n in 0..512 {
+        recalled(&mut t, &format!("short {n}"));
+    }
+    assert_eq!(t.batches_for_test(), 0);
+}

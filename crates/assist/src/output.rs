@@ -85,6 +85,21 @@ impl OutputRow {
         json!({"author": name, "kind": kind})
     }
 
+    /// The row as Details shows it: without `full`, which only the quote check reads.
+    pub(crate) fn shown(&self) -> OutputRow {
+        OutputRow {
+            kind: self.kind,
+            text: self.text.clone(),
+            state: self.state,
+            start: self.start,
+            end: self.end,
+            comment: self.comment,
+            in_paragraph: self.in_paragraph,
+            quotes: self.quotes,
+            full: String::new(),
+        }
+    }
+
     /// `select.range`'s parameters for it.
     pub fn range(&self) -> Option<Value> {
         let (start, end) = (self.start?, self.end?);

@@ -458,8 +458,9 @@ pub struct RecallSent {
     pub bytes: u32,
     /// Why less than expected was recalled, when the person should know.
     pub problem: Option<String>,
-    /// Every text the items carried to the model, field by field (terms, what was traded for, traps,
-    /// guards, how, a balance's factors): what [`crate::Transcript`] checks an output row against.
+    /// Every text the items sent carried to the model, field by field (terms, what was traded for,
+    /// traps, guards, how, a balance's factors): what [`crate::Transcript`] checks an output row
+    /// against. An item the session had already (`again`) isn't sent, so it isn't here.
     /// It keeps them apart from the entry, so this isn't shown or sent on.
     #[serde(skip)]
     pub sent_text: Vec<String>,
@@ -498,10 +499,15 @@ impl Recalled {
 
     pub(crate) fn sent(&self) -> RecallSent {
         let mut sent_text = Vec::new();
-        for json in &self.json {
+        for json in self.fresh() {
             strings(json, 0, &mut sent_text);
         }
         RecallSent { sent_text, ..self.sent.clone() }
+    }
+
+    /// The JSON of the items this turn carries: those not sent to this session before.
+    fn fresh(&self) -> impl Iterator<Item = &Value> {
+        self.json.iter().zip(&self.sent.items).filter(|(_, item)| !item.again).map(|(j, _)| j)
     }
 
     /// The ids of the items this turn carries, for [`Told::record`] once the prompt was taken.
@@ -512,7 +518,7 @@ impl Recalled {
     /// The items not sent to this session before, as one data-grade source; none when there are
     /// none.
     pub(crate) fn into_sources(self) -> Vec<TurnSource> {
-        let fresh: Vec<&Value> = self.json.iter().zip(&self.sent.items).filter(|(_, item)| !item.again).map(|(j, _)| j).collect();
+        let fresh: Vec<&Value> = self.fresh().collect();
         if fresh.is_empty() {
             return Vec::new();
         }
@@ -912,6 +918,27 @@ mod tests {
         let problem = a.transcript().entries().find_map(|e| if let crate::Entry::Recalled(sent) = e { sent.problem.clone() } else { None });
         assert_eq!(problem.as_deref(), Some("Bob can read this document"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An item a retaining session has already, marked `again`, isn't sent, so a change pasting it
+    /// isn't a quote of this turn; what is sent is indexed.
+    #[test]
+    fn only_the_items_sent_are_indexed_for_the_quote_check() {
+        let confirmed = Standing::Confirmed { on: day("2026-01-01") };
+        let pool = Pool { here: case("here", 1, confirmed), neighbors: Vec::new(), damaged: false, skipped: 0 };
+        let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
+        let rule = "Liability cap pattern 0 for the renewal.";
+        let mut told = Told::default();
+        let first = compose(&pool, &query);
+        told.record(first.fresh_ids(), Some(0));
+        let mut again = compose(&pool, &query);
+        told.filter(&mut again, Some(0));
+        assert!(again.sent.items.iter().all(|i| i.again));
+        let mut t = crate::Transcript::default();
+        t.record(&crate::Event::Recalled(again.sent()));
+        assert!(!t.quotes_recalled_for_test(rule), "nothing was sent, so nothing is indexed");
+        t.record(&crate::Event::Recalled(first.sent()));
+        assert!(t.quotes_recalled_for_test(rule));
     }
 
     #[test]

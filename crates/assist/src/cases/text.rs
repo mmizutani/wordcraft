@@ -32,9 +32,10 @@ fn fold(c: char) -> char {
     }
 }
 
-/// `text` as the tokenizer folds it ([`fold`]).
+/// `text` as the tokenizer folds it ([`fold`]), with `\r` left out so a line break is `\n` whichever
+/// way it was written.
 pub fn folded(text: &str) -> String {
-    text.chars().map(fold).collect()
+    text.chars().filter(|c| *c != '\r').map(fold).collect()
 }
 
 /// The windows of `folded`: from each character boundary to the first boundary at or past `min`

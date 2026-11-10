@@ -60,6 +60,10 @@ impl SentWindows {
             let folded = crate::cases::text::folded(text);
             batch.extend(crate::cases::text::windows(&folded, QUOTE_BYTES).map(hash));
         }
+        // A recall too short for one window would be a batch eviction never reaches.
+        if batch.is_empty() {
+            return;
+        }
         if batch.len() > MAX_WINDOWS {
             self.dropped = self.dropped.saturating_add(u64::try_from(batch.len().saturating_sub(MAX_WINDOWS)).unwrap_or(u64::MAX));
             batch.truncate(MAX_WINDOWS);
@@ -455,7 +459,7 @@ impl Transcript {
                 Entry::Usage(usage) => out.usage = Some(usage.clone()),
                 Entry::Context(sent) => turn.context = Some(sent.clone()),
                 Entry::Recalled(sent) => turn.recalled = Some(sent.clone()),
-                Entry::Output(row) => turn.output.push(row.clone()),
+                Entry::Output(row) => turn.output.push(row.shown()),
                 Entry::Answer { text } => turn.cite(text),
                 Entry::Used { id } => turn.used.push(id.clone()),
                 Entry::Thought { .. }
@@ -491,15 +495,11 @@ impl Transcript {
         for action in actions {
             match action {
                 Action::Write(i, mut row) => {
-                    // Seen rows come without the flag: keep it, and look again only at words that grew.
-                    let before = match self.entries.get(i) {
-                        Some(Entry::Output(k)) => Some((k.quotes, k.full == row.full)),
-                        _ => None,
-                    };
-                    row.quotes = match before {
-                        Some((quotes, true)) => quotes,
-                        Some((quotes, false)) => quotes || self.quotes_recalled(&row.full),
-                        None => self.quotes_recalled(&row.full),
+                    // Seen rows come without the flag: a row whose words are the same keeps it (only
+                    // its state changed), and one whose words changed is read again.
+                    row.quotes = match self.entries.get(i) {
+                        Some(Entry::Output(k)) if k.full == row.full => k.quotes,
+                        _ => self.quotes_recalled(&row.full),
                     };
                     self.overwrite(i, Entry::Output(row));
                 }
@@ -531,6 +531,12 @@ impl Transcript {
     #[cfg(test)]
     pub(crate) fn windows_dropped(&self) -> u64 {
         self.sent_windows.dropped
+    }
+
+    /// How many recalls' windows are kept.
+    #[cfg(test)]
+    pub(crate) fn batches_for_test(&self) -> usize {
+        self.sent_windows.batches.len()
     }
 
     #[cfg(test)]
