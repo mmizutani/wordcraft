@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use wordcraft_engine::room::{ParticipantId, Room};
 
 use super::lessons::{KeptLesson, LessonId};
-use super::record::{Applies, Body, Case, CaseError, Day, Factor, Kind, Note, Quoted, Side, Stance, Standing, Topic, Topics};
+use super::record::{Applies, Body, Case, CaseError, Day, Factor, Kind, Note, Quoted, Side, Stage, Stance, Standing, Topic, Topics};
 use super::store::{CaseId, CaseRef, Shelf};
 use super::text::{Bm25, Token, tokens, topics_in};
 use crate::backend::{cut, label, shown};
@@ -951,22 +951,29 @@ fn place_line(title: Option<&String>) -> String {
 /// the parties stay out, as [`facts_json`] leaves them out of every item. The plan is the person's
 /// text, or a model's marked unconfirmed, sent as written: its goal whole, and its steps in order
 /// while the summary takes at most `room` bytes of the budget, its JSON and one more as an item
-/// counts. `None` when none of these is set.
+/// counts. `None` when none of these is set and the case is still being negotiated.
 fn case_item(here: &Case, today: Day, room: usize) -> Option<(RecalledItem, Value)> {
     let mut facts = serde_json::Map::new();
     facts_json(&mut facts, &here.applies(today));
     let balance = here.balance_now();
-    if facts.is_empty() && balance.is_none() && here.plan.is_none() {
+    // The stage is set on its own, apart from the facts `applies` carries: a case closed with
+    // nothing else set still says so.
+    let closed = here.facts.stage != Stage::Negotiating;
+    if facts.is_empty() && balance.is_none() && here.plan.is_none() && !closed {
         return None;
     }
     let confirmed = |s: Standing| matches!(s, Standing::Confirmed { .. });
     let listed: Vec<&str> = facts.values().filter_map(Value::as_str).collect();
     let mut words = vec![format!("facts: {}", if listed.is_empty() { "none set".to_string() } else { listed.join(", ") })];
+    let stage = serde_json::to_value(here.facts.stage).unwrap_or(Value::Null);
+    if closed {
+        words.push(format!("stage: {}", stage.as_str().unwrap_or_default()));
+    }
     let mut json = serde_json::Map::new();
     json.insert("id".into(), Value::String(ItemId::Case.to_string()));
     json.insert("kind".into(), Value::String("case".into()));
     json.append(&mut facts);
-    json.insert("stage".into(), serde_json::to_value(here.facts.stage).unwrap_or(Value::Null));
+    json.insert("stage".into(), stage);
     let mut all_confirmed = true;
     if let Some(b) = balance {
         all_confirmed &= confirmed(b.standing);
@@ -1854,6 +1861,23 @@ mod tests {
         let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
         let sources = compose(&pool, &query).into_sources();
         assert_eq!(sources.iter().map(|s| s.origin).collect::<Vec<_>>(), [SourceOrigin::Recalled]);
+    }
+
+    /// A case closed as Signed or Abandoned with nothing else set still says so: its stage is set
+    /// on the case page apart from the facts recall weighs.
+    #[test]
+    fn a_case_with_only_its_stage_set_sends_its_stage() {
+        for stage in [Stage::Signed, Stage::Abandoned] {
+            let mut here = bare("Acme MSA", 1);
+            here.facts.stage = stage;
+            let pool = Pool { here, neighbors: Vec::new(), damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false };
+            let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
+            let recalled = compose(&pool, &query);
+            let word = serde_json::to_value(stage).unwrap();
+            assert_eq!(recalled.sent.items[0].id, ItemId::Case, "{stage:?}");
+            assert!(recalled.sent.items[0].text.contains(&format!("stage: {}", word.as_str().unwrap())), "{}", recalled.sent.items[0].text);
+            assert_eq!(summary_of(&recalled.into_sources())["stage"], word);
+        }
     }
 
     /// The plan goes as the person wrote it: no step is cut short, and with room left over in the
