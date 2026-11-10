@@ -12,6 +12,14 @@ depend on the backend. Playbooks, the clause library and templates are knowledge
 organisation level (hosted WordCraft, read-only on a desktop), the client wall level and the case
 level, and they reach the model as data, never as instructions.
 
+It also corrects `docs/collaboration.md`. Its Known limits and What comes next sections still said
+MCP over HTTP (#75) and the outbound relay (#76) were not built, though both issues are closed and
+`crates/http` and `crates/relay` are on `main`. The design records the owner's decisions of
+2026-11-10 for four problems found while reading the assistant: credentials kept by the OS keychain
+or in memory only, a case binding that survives a restart, the bound case sent to the model as
+data, and the replayed MCP request fixed by syncing with upstream. Each is fixed in a pull request
+of its own.
+
 The milestones are LA0 (this design) to LA9 (the evaluation), each a stacked pull request. The
 owner decides the questions in the design's last table before LA1 starts.
 
