@@ -457,6 +457,7 @@ fn bound(app: &mut WordApp, ui: &mut Ui, t: &Tokens, at: &CaseRef, case: &Case) 
     heading(ui, "Record");
     super::record::section(app, ui, t, at, case);
     ui.add_space(6.0);
+    super::review::button(app, ui, t);
     delete(app, ui, t, at, case);
     let drafts = &mut app.assist.cases.drafts;
     if !drafts.any_form() {

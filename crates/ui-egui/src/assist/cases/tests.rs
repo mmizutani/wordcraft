@@ -17,33 +17,33 @@ use wordcraft_engine::room::Role;
 use crate::assist::memory::tests::{Folder, settle, window};
 use crate::{Services, WordApp};
 
-const HERE: &str = "Cap liability at twelve months of fees, and say so early.";
+pub(super) const HERE: &str = "Cap liability at twelve months of fees, and say so early.";
 const NEIGHBOR: &str = "The indemnity carve-out for IP claims held once we offered a cap.";
 const UNCONFIRMED_CANARY: &str = "Canary: a model's unconfirmed note in the neighbour.";
 const OTHER_WALL_CANARY: &str = "Canary: another client's note on the liability cap.";
-const TODAY: &str = "2026-11-10";
+pub(super) const TODAY: &str = "2026-11-10";
 
-fn today() -> Day {
+pub(super) fn today() -> Day {
     Day::parse(TODAY).unwrap()
 }
 
-fn click() -> Click {
+pub(super) fn click() -> Click {
     Click::by_person(true).unwrap()
 }
 
-fn draft(text: &str) -> NoteDraft {
+pub(super) fn draft(text: &str) -> NoteDraft {
     NoteDraft { body: Body::Pattern { rule: Quoted::parse(text), traps: None }, how: None, topics: Topics::default() }
 }
 
 /// Two walls: the bound case and a neighbour in one, a case with a canary in the other.
-struct Cases {
-    here: CaseRef,
-    neighbor: CaseRef,
+pub(super) struct Cases {
+    pub(super) here: CaseRef,
+    pub(super) neighbor: CaseRef,
     /// Another client's case.
-    other: CaseRef,
+    pub(super) other: CaseRef,
 }
 
-fn cases(folder: &Folder) -> Cases {
+pub(super) fn cases(folder: &Folder) -> Cases {
     let shelf = Shelf::at(&folder.0);
     let wall = |n: u64| -> WallId { shelf.new_wall(click(), &format!("Client {n}"), TODAY, n).unwrap() };
     let case = |wall: &WallId, title: &str, n: u64| shelf.new_case(click(), wall, title, TODAY, n).unwrap();
@@ -61,7 +61,7 @@ fn cases(folder: &Folder) -> Cases {
 }
 
 /// Ask `prompt` of a new scripted conversation: what its first turn was given.
-fn ask(a: &mut WordApp, fake: Fake, prompt: &str) -> std::sync::Arc<std::sync::Mutex<Seen>> {
+pub(super) fn ask(a: &mut WordApp, fake: Fake, prompt: &str) -> std::sync::Arc<std::sync::Mutex<Seen>> {
     let seen = fake.seen();
     a.assist_with(Box::new(fake));
     a.execute("assist.ask", json!({"prompt": prompt})).unwrap();
@@ -71,7 +71,7 @@ fn ask(a: &mut WordApp, fake: Fake, prompt: &str) -> std::sync::Arc<std::sync::M
 
 /// Frames until `done`, within a generous deadline: a loaded machine schedules the conversation's
 /// thread late, so no wait here is a fixed number of ticks.
-fn frames_until(a: &mut WordApp, what: &str, mut done: impl FnMut(&mut WordApp) -> bool) {
+pub(super) fn frames_until(a: &mut WordApp, what: &str, mut done: impl FnMut(&mut WordApp) -> bool) {
     let ctx = egui::Context::default();
     let started = std::time::Instant::now();
     while !done(a) {
@@ -82,7 +82,7 @@ fn frames_until(a: &mut WordApp, what: &str, mut done: impl FnMut(&mut WordApp) 
     }
 }
 
-fn recalled_json(turn: &Turn) -> Vec<Value> {
+pub(super) fn recalled_json(turn: &Turn) -> Vec<Value> {
     let recalled: Vec<&wordcraft_assist::TurnSource> = turn.knowledge.iter().filter(|s| s.origin == SourceOrigin::Recalled).collect();
     assert_eq!(recalled.len(), 1, "one recalled source: {:?}", turn.knowledge);
     let text = recalled[0].as_text();
@@ -410,6 +410,7 @@ fn writes() -> Vec<(&'static str, Value)> {
         ("assist.memory.case.delete", json!({})),
         ("assist.memory.case.record", json!({"value": true})),
         ("assist.memory.case.recordDelete", json!({})),
+        ("assist.memory.case.review", json!({})),
         ("assist.memory.wall.delete", json!({"wall": id})),
         ("assist.memory.lesson.keep", json!({"text": "Planted lesson"})),
         ("assist.memory.lesson.edit", json!({"id": "l1", "text": "Planted"})),
@@ -810,12 +811,12 @@ fn poisoned_window(folder: &Folder, at: &CaseRef) -> WordApp {
 }
 
 /// The notes of `at`: each main text and whether it is confirmed.
-fn notes_of(folder: &Folder, at: &CaseRef) -> Vec<(String, bool)> {
+pub(super) fn notes_of(folder: &Folder, at: &CaseRef) -> Vec<(String, bool)> {
     let case = Shelf::at(&folder.0).open(at).unwrap();
     case.notes.iter().map(|n| (n.body.texts().next().unwrap().for_person().to_string(), matches!(n.standing, Standing::Confirmed { .. }))).collect()
 }
 
-fn entries(a: &WordApp) -> Vec<Entry> {
+pub(super) fn entries(a: &WordApp) -> Vec<Entry> {
     a.assist.conversation.as_ref().map(|c| c.assistant.transcript().entries().cloned().collect()).unwrap_or_default()
 }
 
@@ -976,7 +977,7 @@ fn a_cards_not_this_is_the_persons_alone() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn harness(a: WordApp) -> egui_kittest::Harness<'static, WordApp> {
+pub(super) fn harness(a: WordApp) -> egui_kittest::Harness<'static, WordApp> {
     let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 1200.0)).build_ui_state(
         |ui, app: &mut WordApp| {
             let ctx = ui.ctx().clone();

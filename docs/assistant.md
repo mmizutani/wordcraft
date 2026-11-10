@@ -170,7 +170,9 @@ make a model write one too: it is the card, and your click on it, that counts. S
 the exact text before anything is stored, and the control channel's click on Keep does nothing. A
 proposal of something you already kept or said no to shows no card, whatever its spacing or case,
 and neither does any proposal while memory is off. The file keeps a hash of what you said no to,
-not the text. No extra request is made: proposals come within the turns you asked for.
+not the text. No request is made for proposals: they come within the turns you asked for. The one
+extra request the assistant's memory makes is **Review this case** ([Cases](#cases)), and only
+when you click it.
 
 **What shaped an answer.** The model is asked to write `[[used: m1]]` where one of your preferences
 shapes its answer. That marker becomes a numbered chip in the answer, such as **M1**: hover over it
@@ -231,7 +233,7 @@ steps, and the notes grouped by kind, each with **Edit** and **Remove**. A note 
 shows dimmed as unconfirmed with **Confirm**; what you wrote or confirmed is confirmed on the day
 you set it; a confirmed note also has **Make a lesson**. The commands are
 `assist.memory.case.new`, `.bind`, `.unbind`, `.facts`, `.balance`, `.plan`, `.note`, `.noteEdit`,
-`.noteConfirm`, `.noteRemove`, `.cardDismiss`, `.record`, `.recordDelete` and `.delete`, `assist.memory.wall.new` and
+`.noteConfirm`, `.noteRemove`, `.cardDismiss`, `.record`, `.recordDelete`, `.review` and `.delete`, `assist.memory.wall.new` and
 `.delete` for a client, and `assist.memory.lesson.keep`, `.edit`, `.off` and `.remove` for a
 lesson. They are yours alone, as [Memory](#memory)'s are, and refuse a script, an agent, a click or
 key the control channel made and a macro's step. There is no command that reads a case: the pane
@@ -308,6 +310,25 @@ refuse everything but your click. Recall of the same client's other cases takes 
 only, so an unconfirmed note never leaves the case it was written in. The switch for all of this is
 one constant, `MODEL_WRITES` in `crates/assist/src/cases/marker.rs`: `InCase` stores notes as
 described; `CardsOnly` turns every write into a card and stores nothing without a click.
+
+**Review this case.** Under the case's Record section, **Review this case** asks one turn in this
+document's conversation, and says in front of the button that it spends one request on your plan.
+The prompt is fixed, WordCraft's own words; beside it the turn carries the case's notes (ids, kinds,
+whether you confirmed each, how it was known, dates), its facts, balance and plan, and the most
+recent 96 KiB of its record if it keeps one, as one source marked as data, under the same proof as
+recall: with anyone else in the room, or invited, the review is withheld and says who. The answer
+is an ordinary answer, with four more markers that mean something only in it: `correct` (a note's
+main text as it should read now, and why) and `retire` (the note no longer holds, and why) apply to
+the assistant's own unconfirmed notes as any in-case write does, the why kept as how and a retired
+text blocking the assistant from noting it again; on a note you confirmed each is a card, **Keep**
+or **Remove** being your own edit of the note, and nothing changes until you click. `supported`
+shows as a quiet row with where the record bears the note out, and `gap` as a question for you;
+neither changes anything. A correction to text you dismissed, or that another note already says, is
+refused as a new note would be; what the assistant retires is kept apart from what you removed, so
+however many of its notes it retires, your dismissals stay. A note id the case doesn't have, and
+any of the four in a turn you didn't ask as a review, is dropped and counted in Details. A script,
+an agent, the control channel's click and a macro's step start no review. The command is
+`assist.memory.case.review`, and Search leaves it out, as it does Delete.
 
 **Lessons that cross clients.** A note stays inside its client. The one thing that crosses is a
 lesson you kept on a card: its text, and the coarse facts you left ticked. The card opens from

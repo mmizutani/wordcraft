@@ -766,7 +766,7 @@ fn wanted(app: &WordApp, role: Option<Role>) -> Option<Role> {
 /// person's selection, or with the caret at its end (`at_end`). The pane opens, so the person
 /// sees the turn and can stop it; the keyboard stays where it is.
 pub(crate) fn ask(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) -> Result<Value, String> {
-    let r = ask_inner(app, prompt, role, at_end);
+    let r = ask_inner(app, prompt, role, at_end, false);
     app.assist.notice = r.as_ref().err().cloned();
     if r.is_ok() {
         app.session.view.assistant_pane = true;
@@ -777,7 +777,20 @@ pub(crate) fn ask(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: b
     r
 }
 
-fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) -> Result<Value, String> {
+/// **Review this case** (`memory.case.review`, the person's click): one ordinary turn in the bound
+/// case's conversation, asked with the fixed [`wordcraft_assist::cases::REVIEW_ASK`] and carrying
+/// the case's notes and its recent record as one data-grade source ([`cases::review`]). With
+/// anyone else in the room, or invited, it is withheld and says why, as recall is.
+pub(crate) fn review(app: &mut WordApp) -> Result<Value, String> {
+    let r = ask_inner(app, wordcraft_assist::cases::REVIEW_ASK, None, false, true);
+    app.assist.notice = r.as_ref().err().cloned();
+    if r.is_ok() {
+        app.session.view.assistant_pane = true;
+    }
+    r
+}
+
+fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool, review: bool) -> Result<Value, String> {
     if !app.has_document() {
         return Err("no document is open".into());
     }
@@ -835,7 +848,15 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     let kept = memory::for_turn(app, &mut sent);
     // Bound, the turn also says what the case's notes are for ([`cases::marker::CASE_ASK`]).
     let kept = if bound.is_some() { Some(wordcraft_assist::memory::Instructions::with_case_ask(kept)) } else { kept };
-    let recall = cases::for_turn(app, prompt, &ctx, &mut sent);
+    let recall = if review {
+        // A review with nothing to carry is no review: the turn isn't sent, and the person is told why.
+        Some(
+            cases::review::for_review(app, &mut sent)
+                .ok_or_else(|| format!("The review was withheld: {}.", sent.recall_withheld.as_deref().unwrap_or("the case can't be read")))?,
+        )
+    } else {
+        cases::for_turn(app, prompt, &ctx, &mut sent)
+    };
     let saved = app.conversation().and_then(|a| app.session.prefs.assistant.models.get(&a.info().id)).cloned().unwrap_or_default();
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
     a.set_memory(kept);
@@ -843,6 +864,9 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     a.set_knowledge(carried);
     a.choose(saved.model, saved.effort);
     a.ask_with_policy(prompt, Some(context), selection, policy).map_err(|e| e.to_string())?;
+    if review {
+        a.review_turn();
+    }
     a.gave(sent);
     let (name, role, tracked) = (a.name().to_string(), a.role(), a.tracked());
     app.assist.feedback.clear();
@@ -1111,6 +1135,10 @@ pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
                 wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Balance(b)) => {
                     b.factors.iter().filter_map(|f| f.why.as_ref()).map(|q| q.for_person().to_string()).collect()
                 }
+                wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Correct { text, why, .. }) => {
+                    vec![text.for_person().to_string(), why.for_person().to_string()]
+                }
+                wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Retire { why, .. }) => vec![why.for_person().to_string()],
                 wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Used(_)) => vec![],
             };
             texts
