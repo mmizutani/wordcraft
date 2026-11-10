@@ -1,0 +1,341 @@
+//! The lineage suggestion: when the pane shows a document bound to no case, a worker takes the
+//! document's print ([`DraftPrint`]) from a clone and compares it with the prints in every case's
+//! file, in every client's folder. This is the one thing that reads across walls, and its result
+//! goes only to the person's screen: a card with the percentage, the case and **Use it**, **Not
+//! this**, **New case**. Nothing is bound without the person's click, and a control-channel click
+//! on Use it binds nothing, since Use it runs the person-only `assist.memory.case.bind`. The
+//! percentage is shown because two contracts from one template overlap too: it informs the person
+//! and decides nothing. The print of a document the person binds goes into the case the same way,
+//! off the frame ([`print_bound`]).
+
+use std::collections::BTreeSet;
+use std::sync::mpsc::Receiver;
+
+use egui::{RichText, Ui};
+use serde_json::json;
+use wordcraft_assist::cases::{CaseRef, Click, DraftPrint, PersonOp, Shelf};
+
+use crate::WordApp;
+use crate::i18n::fmt;
+use crate::theme::Tokens;
+
+/// The least share of the document's paragraphs a past draft must hold to be suggested. Half: a
+/// later draft of the same contract keeps most clauses, while two contracts from one template share
+/// its boilerplate and differ in the rest, so below half the card would show on every document
+/// made from a common template and name a case it has nothing to do with. The percentage is shown
+/// either way, so the person decides the ambiguous middle.
+pub(crate) const THRESHOLD: f32 = 0.5;
+
+/// Fewest printed paragraphs a document needs before it is compared: a near-empty document
+/// matches any case on a signature block.
+pub(crate) const MIN_PARAGRAPHS: usize = 8;
+
+/// Accepted changes to the document before its print is taken again while it stays unbound: a
+/// person pasting a contract into a new document gets the card without reopening it, and typing
+/// doesn't hash the document every frame.
+const RECHECK_EVERY: u64 = 64;
+
+/// A document's version: its id and how many changes it has taken.
+type Version = (u64, u64);
+
+#[derive(Default)]
+pub(crate) struct SuggestState {
+    /// The document and version the result stands for.
+    computed: Option<Version>,
+    pending: Option<(Version, Receiver<Option<Suggestion>>)>,
+    found: Option<(u64, Suggestion)>,
+    /// Documents the person said Not this for, in this window. No file write.
+    dismissed: BTreeSet<u64>,
+}
+
+/// What the card says: the best match at or above [`THRESHOLD`].
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Suggestion {
+    pub(crate) at: CaseRef,
+    pub(crate) title: String,
+    pub(crate) client: String,
+    pub(crate) percent: u8,
+}
+
+/// The suggestion for the shown document, if any: the worker's result is read, and a worker is
+/// started when the document shown has no result yet or has changed by [`RECHECK_EVERY`] since.
+/// Nothing while a case is bound or after Not this.
+pub(crate) fn refresh(app: &mut WordApp) -> Option<Suggestion> {
+    if !app.has_document() || super::bound_for(app).is_some() {
+        return None;
+    }
+    let now = version(app);
+    let state = &mut app.assist.cases.suggest;
+    if let Some((at, rx)) = &state.pending
+        && let Ok(found) = rx.try_recv()
+    {
+        let at = *at;
+        state.computed = Some(at);
+        state.found = found.map(|s| (at.0, s));
+        state.pending = None;
+    }
+    let fresh = state.computed.is_some_and(|(document, changes)| document == now.0 && now.1.saturating_sub(changes) < RECHECK_EVERY);
+    let waiting = state.pending.as_ref().is_some_and(|((document, _), _)| *document == now.0);
+    if !fresh && !waiting {
+        start(app, now);
+    }
+    let state = &app.assist.cases.suggest;
+    if state.dismissed.contains(&now.0) {
+        return None;
+    }
+    state.found.as_ref().filter(|(document, _)| *document == now.0).map(|(_, s)| s.clone())
+}
+
+fn version(app: &WordApp) -> Version {
+    (app.session.document_id(), app.session.changes().version())
+}
+
+/// Whether the shown document's result is in: nothing pending and a result for its version.
+#[doc(hidden)]
+pub fn settled(app: &WordApp) -> bool {
+    let now = version(app);
+    let state = &app.assist.cases.suggest;
+    state.pending.is_none() && state.computed.is_some_and(|(document, changes)| document == now.0 && now.1.saturating_sub(changes) < RECHECK_EVERY)
+}
+
+/// The worker: the document's print from a clone, then every case's prints. Its result comes
+/// back through the channel and nowhere else.
+fn start(app: &mut WordApp, at: Version) {
+    let Some(dir) = app.services.settings_dir.clone() else { return };
+    let Ok(today) = super::today() else { return };
+    let doc = app.session.doc.clone();
+    let name = app.title_stem();
+    let ctx = app.ctx.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.assist.cases.suggest.pending = Some((at, rx));
+    off_frame("case lineage", move || {
+        let print = DraftPrint::of(&doc, &name, today);
+        let _ = tx.send(best(&Shelf::at(&dir), &print));
+        if let Some(ctx) = ctx {
+            ctx.request_repaint();
+        }
+    });
+}
+
+/// Not this: hidden for this document in this window, and nothing written.
+pub(crate) fn dismiss(app: &mut WordApp) {
+    let document = app.session.document_id();
+    app.assist.cases.suggest.dismissed.insert(document);
+}
+
+/// The person bound the shown document to `at`: its print joins the case, off the frame, through
+/// the same typed op as every other write of theirs. A refusal is logged and loses only the print.
+pub(crate) fn print_bound(app: &mut WordApp, click: Click, at: &CaseRef) {
+    let Some(dir) = app.services.settings_dir.clone() else { return };
+    let Ok(today) = super::today() else { return };
+    let doc = app.session.doc.clone();
+    let name = app.title_stem();
+    let at = at.clone();
+    off_frame("case draft print", move || {
+        let print = DraftPrint::of(&doc, &name, today);
+        if let Err(e) = Shelf::at(&dir).person(click, &at, PersonOp::AddDraft(print), today) {
+            log::warn!("the document's print wasn't kept with its case: {e}");
+        }
+    });
+}
+
+/// On a thread, or here when none can be made (the web build has no threads).
+fn off_frame(name: &str, work: impl FnOnce() + Send + 'static) {
+    let work = std::sync::Mutex::new(Some(work));
+    let run = move || {
+        if let Some(work) = work.lock().ok().and_then(|mut w| w.take()) {
+            work();
+        }
+    };
+    if let Err(run) = std::thread::Builder::new().name(name.into()).spawn(run) {
+        let _ = run;
+    }
+}
+
+/// The card in the pane header, when there is a suggestion.
+pub(crate) fn card(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
+    let Some(s) = refresh(app) else { return };
+    egui::Frame::NONE.stroke(egui::Stroke::new(1.5, t.accent)).corner_radius(6).inner_margin(6).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let title = if s.title.is_empty() { tl!("Untitled case").to_string() } else { s.title.clone() };
+        let line = fmt(
+            tl!("{percent}% of this document's paragraphs match a draft of {title} ({client})."),
+            &[("percent", &s.percent.to_string()), ("title", &title), ("client", &s.client)],
+        );
+        ui.add(egui::Label::new(RichText::new(line).font(crate::theme::semibold(12.0)).color(t.text)).wrap());
+        ui.add(
+            egui::Label::new(
+                RichText::new(tl!("Two contracts from one template overlap too, so the number informs you and decides nothing."))
+                    .small()
+                    .color(t.text_dim),
+            )
+            .wrap(),
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(tl!("Use it")).on_hover_text(tl!("Bind this document to that case.")).clicked() {
+                super::run(app, "assist.memory.case.bind", json!({"wall": s.at.wall.as_str(), "case": s.at.case.as_str()}));
+            }
+            if ui.button(tl!("Not this")).clicked() {
+                dismiss(app);
+            }
+            if ui.button(tl!("New case")).clicked() {
+                app.assist.view = crate::assist::PaneView::Details;
+            }
+        });
+    });
+}
+
+/// The best match for `print` among every case's prints, at or above [`THRESHOLD`]: the worker's
+/// work. Case files are read as the shelf reads them: a link is refused, a damaged file skipped.
+fn best(shelf: &Shelf, print: &DraftPrint) -> Option<Suggestion> {
+    if print.len() < MIN_PARAGRAPHS {
+        return None;
+    }
+    let mut best: Option<(f32, Suggestion)> = None;
+    for wall in shelf.list().walls {
+        for header in wall.cases.iter().filter(|c| !c.damaged) {
+            let at = CaseRef { wall: wall.id.clone(), case: header.id.clone() };
+            let Ok(case) = shelf.open(&at) else { continue };
+            if case.damaged {
+                continue;
+            }
+            let Some(share) = case.drafts.iter().map(|d| print.overlap(d)).reduce(f32::max) else { continue };
+            if share >= THRESHOLD && best.as_ref().is_none_or(|(b, _)| share > *b) {
+                let percent = (share * 100.0).round().clamp(0.0, 100.0) as u8;
+                best =
+                    Some((share, Suggestion { at, title: case.title.for_person().to_string(), client: wall.name.for_person().to_string(), percent }));
+            }
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use wordcraft_assist::cases::Shelf;
+    use wordcraft_doc::Document;
+
+    use super::super::tests::{Cases, cases, frames_until, harness};
+    use super::*;
+    use crate::assist::cases::bound_for;
+    use crate::assist::memory::tests::{Folder, control_click, window};
+
+    fn clauses(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("Clause {i}. Kestrel Freight KK shall perform the services described in schedule {i} with reasonable skill and care."))
+            .collect()
+    }
+
+    fn document(paragraphs: &[String]) -> Document {
+        Document::from_text(&paragraphs.join("\n"))
+    }
+
+    /// A window on `paragraphs`, in `folder`.
+    fn window_on(folder: &Folder, paragraphs: &[String]) -> WordApp {
+        let mut a = window(folder);
+        a.session.set_document(document(paragraphs));
+        a
+    }
+
+    /// Bind a window on `paragraphs` to `c.here` as the person and wait for the print to be in
+    /// the case's file.
+    fn bind_first(folder: &Folder, c: &Cases, paragraphs: &[String]) {
+        let mut a = window_on(folder, paragraphs);
+        a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+        assert_eq!(bound_for(&a), Some(c.here.clone()));
+        let shelf = Shelf::at(&folder.0);
+        frames_until(&mut a, "the print never reached the case", |_| shelf.open(&c.here).unwrap().drafts.len() == 1);
+        let case = shelf.open(&c.here).unwrap();
+        assert_eq!(case.drafts[0].len(), paragraphs.len());
+        assert_eq!(case.drafts[0].name.for_person(), a.title_stem());
+    }
+
+    /// Frames until the worker's result for the shown document is in; what it is.
+    fn suggestion(a: &mut WordApp) -> Option<Suggestion> {
+        frames_until(a, "the suggestion worker never answered", |a| {
+            refresh(a);
+            settled(a)
+        });
+        refresh(a)
+    }
+
+    #[test]
+    fn a_later_draft_of_a_bound_cases_document_is_suggested_and_an_unrelated_one_is_not() {
+        let folder = Folder::new();
+        let c = cases(&folder);
+        let first = clauses(30);
+        bind_first(&folder, &c, &first);
+        let mut later = first.clone();
+        for i in [3usize, 7, 11, 19, 25] {
+            later[i] = format!("Clause {i}. Kestrel Freight KK shall perform the services in schedule {i} with the care of a prudent operator.");
+        }
+        later.truncate(27);
+        later.extend((30..34).map(|i| format!("Clause {i}. Bluefin Systems Ltd may audit the records once a year on thirty days' notice.")));
+        let mut b = window_on(&folder, &later);
+        let s = suggestion(&mut b).expect("the later draft is suggested");
+        assert_eq!(s.at, c.here);
+        assert_eq!(s.percent, 71, "22 of 31 paragraphs");
+        assert_eq!(s.title, "Acme MSA");
+        assert_eq!(s.client, "Client 1");
+        assert_eq!(bound_for(&b), None, "a suggestion binds nothing");
+        let unrelated: Vec<String> =
+            (0..30).map(|i| format!("Section {i}. The tenant shall keep the premises at unit {i} in good repair and insured.")).collect();
+        let mut u = window_on(&folder, &unrelated);
+        assert_eq!(suggestion(&mut u), None);
+        assert_eq!(Shelf::at(&folder.0).open(&c.here).unwrap().drafts.len(), 1, "a suggestion writes nothing");
+    }
+
+    #[test]
+    fn two_contracts_from_one_template_are_suggested_with_their_percentage_and_not_this_hides_it() {
+        let folder = Folder::new();
+        let c = cases(&folder);
+        let template = clauses(12);
+        let mut first = template.clone();
+        first.extend((0..8).map(|i| format!("Schedule A item {i}. Kestrel Freight KK pays 1,200,000 yen a month for the Osaka route.")));
+        bind_first(&folder, &c, &first);
+        let mut second = template;
+        second.extend((0..8).map(|i| format!("Schedule B item {i}. Bluefin Systems Ltd pays 900 pounds a month for the Leeds route.")));
+        let mut b = window_on(&folder, &second);
+        let s = suggestion(&mut b).expect("the template's share is suggested");
+        assert_eq!((s.at.clone(), s.percent), (c.here.clone(), 60));
+        assert_eq!(bound_for(&b), None, "never bound without a click");
+        let file = folder.0.join("assistant-cases").join(c.here.wall.as_str()).join(c.here.case.as_str()).join("case.json");
+        let before = std::fs::read(&file).unwrap();
+        dismiss(&mut b);
+        assert_eq!(refresh(&mut b), None);
+        assert!(settled(&b), "Not this starts no worker");
+        for _ in 0..3 {
+            crate::assist::tick(&mut b);
+        }
+        assert_eq!(refresh(&mut b), None, "hidden for this document");
+        assert_eq!(std::fs::read(&file).unwrap(), before, "Not this writes nothing");
+        // Another document in the same window is suggested again.
+        b.session.set_document(document(&second));
+        assert!(suggestion(&mut b).is_some());
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn a_control_channel_click_on_use_it_binds_nothing_and_the_persons_click_binds() {
+        use egui_kittest::kittest::Queryable;
+        let folder = Folder::new();
+        let c = cases(&folder);
+        let first = clauses(30);
+        bind_first(&folder, &c, &first);
+        let mut b = window_on(&folder, &first);
+        b.session.view.assistant_pane = true;
+        assert_eq!(suggestion(&mut b).map(|s| s.percent), Some(100));
+        let mut h = harness(b);
+        assert!(h.query_by_label_contains("100%").is_some(), "the card shows the percentage");
+        control_click(&mut h, "Use it");
+        assert_eq!(bound_for(h.state()), None, "the control channel's Use it binds nothing");
+        assert!(h.query_by_label("Use it").is_some(), "the card is still there");
+        h.get_by_label("Use it").click();
+        h.run_steps(3);
+        assert_eq!(bound_for(h.state()), Some(c.here.clone()), "the person's Use it binds");
+        assert!(h.query_by_label("Use it").is_none(), "bound: no card");
+        let shelf = Shelf::at(&folder.0);
+        frames_until(h.state_mut(), "the second print never reached the case", |_| shelf.open(&c.here).unwrap().drafts.len() == 2);
+    }
+}

@@ -34,6 +34,7 @@ pub(crate) mod lesson;
 pub(crate) mod page;
 pub(crate) mod record;
 pub(crate) mod review;
+pub(crate) mod suggest;
 
 /// Why a turn recalled nothing, as Details says it.
 const NO_CASE: &str = "no case is bound to this document";
@@ -83,6 +84,8 @@ pub(crate) struct CasesState {
     pub model_writes: ModelWrites,
     /// The case's record on the page, and the workers deleting or searching it.
     pub(crate) record: record::RecordState,
+    /// The lineage suggestion for an unbound document, and its worker.
+    pub(crate) suggest: suggest::SuggestState,
 }
 
 /// The last listing read, kept while a newer one is read: a name lookup during the read must
@@ -304,6 +307,7 @@ pub(crate) fn write(app: &mut WordApp, dir: &std::path::Path, what: &str, req: &
                 return Err(CaseError::Gone.to_string());
             }
             app.bind_case(Some(at.clone()));
+            suggest::print_bound(app, click, &at);
             Ok(json!({"wall": at.wall.as_str(), "case": at.case.as_str()}))
         }
         "memory.case.unbind" => {
@@ -385,6 +389,7 @@ fn new_case(app: &mut WordApp, shelf: &Shelf, click: Click, req: &Value) -> Resu
     let (stamp, counter) = stamp();
     let at = shelf.new_case(click, &wall, title, &stamp, counter).map_err(|e| e.to_string())?;
     app.bind_case(Some(at.clone()));
+    suggest::print_bound(app, click, &at);
     Ok(json!({"wall": at.wall.as_str(), "case": at.case.as_str()}))
 }
 
