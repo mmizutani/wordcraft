@@ -81,7 +81,7 @@ These rules of the assistant as built are kept, and each new piece is held to th
 | Cases | Typed cases, notes, power balances, walls, recall (`crates/assist/src/cases/`); #107's AS8.1–AS8.9 built, including lessons that cross clients (AS8.7), the clause ladder computed from position notes (AS8.8) and an opt-in record of a negotiation (AS8.9); Review this case and the draft suggestion are not | Facts for picking positions; position notes, the ladder and balance for negotiation; the record for decisions |
 | Topics | `Topic` and `Topics(u16)`, 11 topics with English and Japanese terms, serialized as a list of names (`crates/assist/src/cases/record.rs:265, 299-302`); the classifier is in `crates/assist/src/cases/text.rs` | More topics than 16 bits hold, and the table one layer lower |
 | The other side's markup | `get_changes` lists edits after a version the reader saw (`crates/mcp/src/tools.rs:155`), not markup already in an opened file | Revisions and comments read from the document itself |
-| Case binding | In the UI's memory (`crates/ui-egui/src/assist/cases.rs:61`), lost on restart; fixed on its own branch (below) | Survives a restart, since findings are kept with the case |
+| Case binding | In the UI's memory (`crates/ui-egui/src/assist/cases.rs:61`), lost on restart; fixed in #135 (below) | Survives a restart, offered for one click, since findings are kept with the case |
 | Writing actions | Prompt constants for draft, rewrite, shorten, expand, proofread (`crates/engine/src/cmd/assist.rs:640-650`) | Review, respond, translate |
 | Hosted | A Rust Worker on ChatGPT Sites with D1 and R2 behind Sites identity (Phase 1 verified) | A knowledge API |
 
@@ -92,12 +92,12 @@ Nothing for playbooks, a clause library, findings or clause-level reading exists
 Reading the assistant for this design turned up four problems. Each is fixed in a pull request of
 its own, ahead of LA1, by the owner's decision of 2026-11-10:
 
-| Problem on `main` | Fix | Branch |
+| Problem on `main` | Fix | Pull request |
 |---|---|---|
-| ChatGPT's tokens are a plaintext file (`crates/assist/src/chatgpt/store.rs:26`), with mode 0600 only on Unix | A random key in the OS keychain and the tokens sealed with AES-256-GCM in the settings folder; with no keychain, memory only for the session. The hosted edition does not persist visitors' ChatGPT credentials. | `claude/chatgpt-credentials-keychain` |
-| A document's case binding is lost on restart | The person's binding is kept per file path in the cases shelf, never in the document | `claude/case-binding-restart` |
-| The model never sees the case its conversation is bound to | Each turn carries the bound case's facts, plan and current balance as data, never party names, under the room check | `claude/case-summary-turn` |
-| The MCP bridge can send a state-changing request again after its reply was lost (`crates/mcp/src/backend.rs`) | Upstream's fix (f2d7a4fe, 0e7dc8da), brought in by a full sync with upstream | `claude/upstream-sync-2026-11-10` |
+| ChatGPT's tokens are a plaintext file (`crates/assist/src/chatgpt/store.rs:26`), with mode 0600 only on Unix | A random key in the OS keychain and the tokens sealed with AES-256-GCM in the settings folder; with no keychain, memory only for the session. The hosted edition does not persist visitors' ChatGPT credentials. | #134 |
+| A document's case binding is lost on restart | The person's binding is kept per file path in the cases shelf, never in the document, and the reopened file offers its case for the person's click: a path doesn't say which document is there | #135 |
+| The model never sees the case its conversation is bound to | Each turn carries the bound case's facts, plan and current balance as data, never party names, under the room check | #136 |
+| The MCP bridge can send a state-changing request again after its reply was lost (`crates/mcp/src/backend.rs`) | Upstream's fix (f2d7a4fe, 0e7dc8da), brought in by a full sync with upstream | #137 |
 
 This pull request also corrects [collaboration.md](collaboration.md), which still said MCP over HTTP
 and the relay were not built.
@@ -230,10 +230,11 @@ pub enum Anchor {
   `[[case]]`: closed fields, unknown fields refused, at most 40 per turn, 4 KiB each, a marker inside
   code is an example.
 - **Where they are kept.** With the case when the document is bound to one
-  (`assistant-cases/<wall>/<case>/review.json`), so a reopened contract keeps its review. Without a
-  case they last as long as the window. This needs the binding to survive a restart, which the
-  binding fix above adds: the person's binding is remembered per file path in the cases shelf,
-  never in the document.
+  (`assistant-cases/<wall>/<case>/review.json`), so a reopened contract keeps its review once it is
+  bound again. Without a case they last as long as the window. This needs the binding to survive a
+  restart, which the binding fix above adds: the person's binding is remembered per file path in
+  the cases shelf, never in the document, and the reopened file offers its case, which binds with
+  one click. It never binds by itself, since another client's document can be at the same path.
 - **Applying a fix.** The person's Apply checks the range against the quote once more, then runs the
   fix as commands: select the range by its anchors (not by searching the text), type the replacement
   or insert the clause. It runs as a participant with the **suggester** role under the assistant's
@@ -548,7 +549,7 @@ Each is a pull request stacked on the last. Each passes `cargo xtask ci` and add
 |---|---|---|---|
 | LA0 | This design | — | The owner has decided the open questions below |
 | LA1 | `crates/legal`: clause map, term index, cross-references, checks returning `Issue`s, and the topic table moved down from `assist`; `wordcraft-cli legal check` | — | The corpus tests pass in CI; checks on the Japanese NDA find every seeded problem; `cargo xtask layers` passes with AS8 using the moved table |
-| LA2 | Findings: the type and anchors, `[[finding]]`, quote verification, range mapping and Stale, the Review view with checks shown as findings, Apply as a suggester, Dismiss, keeping findings with a case | LA1, the binding fix | Invented quotes are refused; deleting an earlier copy of the quoted words makes a finding Stale; an editor conversation's Apply is still tracked; findings are back after a restart in a test |
+| LA2 | Findings: the type and anchors, `[[finding]]`, quote verification, range mapping and Stale, the Review view with checks shown as findings, Apply as a suggester, Dismiss, keeping findings with a case | LA1, the binding fix | Invented quotes are refused; deleting an earlier copy of the quoted words makes a finding Stale; an editor conversation's Apply is still tracked; findings are back after a restart and Bind again in a test |
 | LA3 | Client playbooks and library: types, the wall shelf, `person_only` extended, import and export, the Knowledge page; topics past 16 | LA2 | Existing case files read unchanged; the new prefixes are refused on the control channel, in macros and to participants |
 | LA4 | The review job: a viewer reviewer, batches, clause states and `[[reviewed]]`, the estimate, Stop and Resume, missing clauses, invalidation keys; `read_clauses` | LA3 | With fakes on both backends: every clause ends Acknowledged or Incomplete, a truncated batch leaves its clauses Incomplete, the reviewer's edit and comment are refused, and a new playbook version re-reviews only the clauses it covers |
 | LA5 | Answering the other side: the digest from the document's revisions and comments, `[[respond]]`, cards, accept and reject as the person, counters as a suggester | LA4, the case-summary fix | A .docx opened with the other side's markup lists every change before any local edit; a fake backend's counter lands as a tracked change at the chosen rung |
@@ -568,7 +569,7 @@ Each is a pull request stacked on the last. Each passes `cargo xtask ci` and add
 | May the model write client positions or library clauses? | No, only propose them on a card | They gain authority over every later review, unlike a case note |
 | How large should the topic set be? | About 40 contract topics in a wider set, kept in `crates/legal` | 11 topics in 16 bits cannot hold a playbook's positions |
 | Translate a whole contract in place? | No: into a new document; selected clauses in place as tracked changes | Hundreds of tracked changes bury every other change |
-| Which credentials store? | **Decided (2026-11-10):** a key in the OS keychain and credentials sealed with it; memory only without a keychain; the hosted edition keeps no visitor's ChatGPT credentials | Done for ChatGPT on its own branch; the hosted knowledge token follows the same rule in LA8 |
+| Which credentials store? | **Decided (2026-11-10):** a key in the OS keychain and credentials sealed with it; memory only without a keychain; the hosted edition keeps no visitor's ChatGPT credentials | Done for ChatGPT in #134; the hosted knowledge token follows the same rule in LA8 |
 
 ## Not in this design
 
