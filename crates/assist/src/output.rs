@@ -63,6 +63,8 @@ pub struct OutputRow {
     /// `None` when the paragraph was too long to look through each time the document changes.
     #[serde(skip)]
     pub in_paragraph: Option<u32>,
+    /// Its words share a run with case notes this conversation recalled: see [`crate::cases::text::shares_run`].
+    pub quotes: bool,
 }
 
 impl OutputRow {
@@ -104,6 +106,7 @@ pub(crate) fn rows(session: &Session, name: &str) -> (Vec<OutputRow>, usize) {
         end: doc.anchor_at(&c.b),
         text: c.text,
         state: OutputState::Open,
+        quotes: false,
     });
     let (comments, more_comments) = comment_rows(session, name, MAX_COMMENTS);
     let comments = comments.into_iter().map(|c| {
@@ -116,6 +119,7 @@ pub(crate) fn rows(session: &Session, name: &str) -> (Vec<OutputRow>, usize) {
             end: at,
             comment: Some(c.id),
             in_paragraph: None,
+            quotes: false,
         }
     });
     (changes.chain(comments).collect(), more.saturating_add(more_comments))

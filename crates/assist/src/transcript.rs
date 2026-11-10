@@ -25,6 +25,10 @@ pub const MAX_ENTRY_BYTES: usize = 256 << 10;
 /// Most proposals one turn shows; more are dropped.
 pub const MAX_PROPOSALS: u8 = 3;
 
+/// The shared run, in bytes, that makes a change a quote of recalled notes: about six English words
+/// or twelve Japanese characters. Shorter runs are phrases any contract has.
+const QUOTE_BYTES: usize = 36;
+
 /// What the person said to a proposal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -410,9 +414,24 @@ impl Transcript {
         let mut new = Vec::new();
         for action in actions {
             match action {
-                Action::Write(i, row) => self.overwrite(i, Entry::Output(row)),
+                Action::Write(i, mut row) => {
+                    // Seen rows come without the flag: keep it, and look again only at words that grew.
+                    let before = match self.entries.get(i) {
+                        Some(Entry::Output(k)) => Some((k.quotes, k.text == row.text)),
+                        _ => None,
+                    };
+                    row.quotes = match before {
+                        Some((quotes, true)) => quotes,
+                        Some((quotes, false)) => quotes || self.quotes_recalled(&row.text),
+                        None => self.quotes_recalled(&row.text),
+                    };
+                    self.overwrite(i, Entry::Output(row));
+                }
                 Action::Drop(i) => dropped.push(i),
-                Action::New(row) => new.push(row),
+                Action::New(mut row) => {
+                    row.quotes = self.quotes_recalled(&row.text);
+                    new.push(row);
+                }
             }
         }
         dropped.sort_unstable();
@@ -424,6 +443,15 @@ impl Transcript {
             self.push(Entry::Output(row));
         }
         self.prune_output();
+    }
+
+    /// Whether `text` shares [`QUOTE_BYTES`] with what any turn of the conversation recalled. A row's
+    /// text is cut to a few lines, so this is one short text against each recalled item.
+    fn quotes_recalled(&self, text: &str) -> bool {
+        self.entries.iter().any(|e| match e {
+            Entry::Recalled(sent) => sent.items.iter().any(|i| crate::cases::text::shares_run(text, &i.text, QUOTE_BYTES)),
+            _ => false,
+        })
     }
 
     /// Take the entry at `i` away.

@@ -694,3 +694,29 @@ fn junk_in_a_case_write_is_refused_not_crashed() {
     let (_, case) = crate::assist::cases::open_case(&mut a, true).unwrap();
     assert!(case.notes.is_empty() && case.balance.is_empty() && case.plan.is_none() && case.facts == Default::default(), "nothing of the junk stuck");
 }
+
+/// A change that pastes what the turn recalled says so in Details › Output, beside its buttons.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn an_output_row_that_quotes_recalled_notes_says_so() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    let pasted = "Cap liability at twelve months of fees";
+    let fake = Fake::new().then(vec![Step::tool("select_text", json!({"text": "two"})), Step::tool("type_text", json!({"text": pasted}))]);
+    ask(&mut a, fake, "Review the liability cap");
+    a.session.view.assistant_pane = true;
+    a.assist.view = crate::assist::PaneView::Details;
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 3000.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    assert!(h.query_by_label("This quotes your case notes").is_some());
+}

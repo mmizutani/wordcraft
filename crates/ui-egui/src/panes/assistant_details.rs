@@ -286,6 +286,9 @@ fn output_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, row: &OutputRow) {
                 }
             }
         }
+        if row.quotes {
+            ui.label(RichText::new(tl!("This quotes your case notes")).small().color(t.orange));
+        }
     });
 }
 

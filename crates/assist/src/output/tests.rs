@@ -371,3 +371,55 @@ fn a_change_across_paragraphs_says_only_that_it_was_resolved() {
     note(&mut t, &s);
     assert!(listed(&t).iter().all(|r| r.2 == OutputState::Resolved), "{:?}", listed(&t));
 }
+
+fn recalled(t: &mut Transcript, text: &str) {
+    use crate::cases::recall::{ItemId, Place, RecallSent, RecalledItem};
+    use crate::cases::record::NoteId;
+    let id = ItemId::Here { note: NoteId::parse("n1").unwrap() };
+    let item = RecalledItem { id, place: Place::ThisCase, title: None, kind: None, text: text.into(), balance: None, confirmed: true, again: false };
+    t.record(&crate::Event::Recalled(RecallSent { items: vec![item], ..RecallSent::default() }));
+}
+
+/// Whether the one change the assistant types over "one two three" is flagged, when the turn recalled `pasted`.
+fn flagged(pasted: Option<&str>, typed: &str) -> bool {
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Rewrite");
+    if let Some(pasted) = pasted {
+        recalled(&mut t, pasted);
+    }
+    rewrite(&mut s, "two", typed);
+    note(&mut t, &s);
+    t.details().turns.iter().flat_map(|turn| turn.output.iter()).any(|r| r.quotes)
+}
+
+#[test]
+fn a_change_that_pastes_a_recalled_note_is_flagged() {
+    let notes = "Fallback: accept a liability cap of twelve months of fees, no lower.";
+    assert!(flagged(Some(notes), "accept a liability cap of twelve months of fees"));
+    let jp = "最終的な譲歩案は損害賠償の上限を十二か月分の料金とすることです。";
+    assert!(flagged(Some(jp), "損害賠償の上限を十二か月分"));
+}
+
+#[test]
+fn a_short_shared_phrase_or_no_recall_is_not_flagged() {
+    let notes = "Fallback: accept a liability cap of twelve months of fees, no lower.";
+    assert!(!flagged(Some(notes), "a liability cap of"));
+    assert!(!flagged(None, "accept a liability cap of twelve months of fees"));
+}
+
+#[test]
+fn a_flagged_row_keeps_its_flag_when_it_is_noted_again() {
+    let notes = "Fallback: accept a liability cap of twelve months of fees, no lower.";
+    let mut s = session();
+    let mut t = Transcript::default();
+    t.asked("Rewrite");
+    recalled(&mut t, notes);
+    rewrite(&mut s, "two", "accept a liability cap of twelve months of fees");
+    note(&mut t, &s);
+    s.run("review.rejectAll", &json!({})).unwrap();
+    note(&mut t, &s);
+    let row = t.details().turns[0].output[0].clone();
+    assert_eq!(row.state, OutputState::Rejected);
+    assert!(row.quotes);
+}

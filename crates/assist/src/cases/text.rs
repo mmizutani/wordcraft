@@ -32,6 +32,21 @@ fn fold(c: char) -> char {
     }
 }
 
+/// Whether `a` and `b` share a run of at least `min` bytes, compared as the tokenizer folds them.
+/// A text that long is `a`'s own length at most, so `a` should be a short one: each window of
+/// `a` is looked for in `b`.
+pub fn shares_run(a: &str, b: &str, min: usize) -> bool {
+    let a: String = a.chars().map(fold).collect();
+    let b: String = b.chars().map(fold).collect();
+    let starts: Vec<usize> = a.char_indices().map(|(i, _)| i).chain(std::iter::once(a.len())).collect();
+    starts.iter().any(|&from| {
+        // The first character boundary at or after `min` bytes on: a shared run of `min` bytes
+        // that starts here holds this window.
+        let Some(&to) = starts.iter().find(|&&e| e >= from.saturating_add(min)) else { return false };
+        a.get(from..to).is_some_and(|w| b.contains(w))
+    })
+}
+
 fn is_hiragana(c: char) -> bool {
     matches!(c, '\u{3040}'..='\u{309F}')
 }

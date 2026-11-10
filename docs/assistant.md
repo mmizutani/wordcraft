@@ -261,6 +261,11 @@ the key from a file you keep outside the repository, for example `set -a; . ~/se
 +a` before the command; never type the value into a command, which a shell may save to its
 history.
 
+**Quotes.** A tracked change or comment the assistant makes that repeats a run of 36 bytes (about
+six English words or twelve Japanese characters) from what the conversation recalled shows "This
+quotes your case notes" in Details › Output beside its buttons, so you see it before accepting a
+file you may send on. It is a flag, not a wall: a paraphrase passes.
+
 **When recall is off.** Nothing is recalled with no case bound, on the web (no settings folder),
 or while anyone besides you and this conversation's assistant can read the document: another
 participant, or an invite not yet used. Details › Recalled says which. Once a conversation has
