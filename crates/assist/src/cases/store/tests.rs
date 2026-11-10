@@ -162,6 +162,14 @@ fn full_case() -> Case {
         };
         case.apply_person(PersonOp::AddNote(draft), today()).unwrap();
     }
+    let paragraphs: Vec<String> = (0..300).map(|i| format!("Clause {i}. The supplier delivers lot {i} to the named warehouse by noon.")).collect();
+    let doc = wordcraft_doc::Document::from_text(&paragraphs.join("\n"));
+    for _ in 0..crate::cases::MAX_DRAFTS {
+        let print = crate::cases::DraftPrint::of(&doc, &"題".repeat(MAX_TEXT), today());
+        assert_eq!(print.len(), crate::cases::MAX_HASHES);
+        case.apply_person(PersonOp::AddDraft(print), today()).unwrap();
+    }
+    assert_eq!(case.drafts.len(), crate::cases::MAX_DRAFTS);
     case
 }
 

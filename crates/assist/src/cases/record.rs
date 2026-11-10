@@ -670,6 +670,12 @@ pub struct Case {
     pub plan: Option<Plan>,
     #[serde(default)]
     pub notes: Vec<Note>,
+    /// The prints of the drafts the person bound to this case ([`super::lineage`]), oldest first,
+    /// at most [`MAX_DRAFTS`]. Only [`PersonOp::AddDraft`] adds one, and no turn reads them.
+    ///
+    /// [`MAX_DRAFTS`]: super::lineage::MAX_DRAFTS
+    #[serde(default)]
+    pub drafts: Vec<super::lineage::DraftPrint>,
     /// SHA-256 of a note's text the person removed, so the model doesn't note it again.
     #[serde(default)]
     dismissed: Vec<String>,
@@ -702,6 +708,7 @@ impl Case {
             balance: Vec::new(),
             plan: None,
             notes: Vec::new(),
+            drafts: Vec::new(),
             dismissed: Vec::new(),
             model_dismissed: Vec::new(),
             last_note: 0,
@@ -779,6 +786,10 @@ impl Case {
             cut |= p.cut(MAX_SHORT);
         }
         cut |= self.plan.as_mut().is_some_and(Plan::clamp);
+        cut |= drop_oldest(&mut self.drafts, super::lineage::MAX_DRAFTS);
+        for d in &mut self.drafts {
+            cut |= d.clamp();
+        }
         for list in [&mut self.dismissed, &mut self.model_dismissed] {
             let before = list.len();
             list.retain(|k| is_key(k));
@@ -899,6 +910,11 @@ impl Case {
             PersonOp::RemoveNote(id) => self.remove_note(id, false)?,
             PersonOp::Close(stage) => self.facts.stage = stage,
             PersonOp::Record(on) => self.record = on,
+            PersonOp::AddDraft(mut print) => {
+                print.clamp();
+                self.drafts.push(print);
+                drop_oldest(&mut self.drafts, super::lineage::MAX_DRAFTS);
+            }
         }
         Ok(())
     }
@@ -1017,6 +1033,16 @@ fn truncate<T>(list: &mut Vec<T>, max: usize) -> bool {
     true
 }
 
+/// Keep the newest `max` of a list held oldest first; whether anything went.
+fn drop_oldest<T>(list: &mut Vec<T>, max: usize) -> bool {
+    let over = list.len().saturating_sub(max);
+    if over == 0 {
+        return false;
+    }
+    list.drain(..over);
+    true
+}
+
 /// A note as a marker or a command gives it, before the shelf adds the id, the date and the
 /// standing. Deserialized flat, so a marker's body is the note's fields beside `op`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1066,6 +1092,8 @@ pub enum PersonOp {
     Close(Stage),
     /// Keep a record of this case's conversations, or stop.
     Record(bool),
+    /// The print of a document the person bound to this case ([`super::lineage`]).
+    AddDraft(super::lineage::DraftPrint),
 }
 
 /// Everything a model can do to a case. It has no Confirm, no Facts, no bind and no delete. The

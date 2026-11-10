@@ -8,6 +8,7 @@
 //! the person kept on a card crosses clients, as text and coarse facts only ([`lessons`]).
 
 pub mod lessons;
+pub mod lineage;
 pub mod log;
 pub mod marker;
 pub mod recall;
@@ -16,6 +17,7 @@ pub mod store;
 pub mod text;
 
 pub use lessons::{KeptLesson, LessonDraft, LessonId, LessonOp, LessonProposal, Lessons, names_in};
+pub use lineage::{DraftPrint, MAX_DRAFTS, MAX_HASHES};
 pub use log::{
     CaseLog, CommentLine, LogHit, LogSearch, REVIEW_RECORD_BYTES, Record, RedlineLine, ToolLine, delete_log, log_size, recent_records, search_log,
 };

@@ -773,7 +773,7 @@ impl Recalled {
 /// dismissed hashes, and the most recent record lines up to [`REVIEW_RECORD_BYTES`], as one item.
 /// A damaged case reviews nothing, since what it holds may be cut; a case with no record reviews
 /// its notes alone.
-fn compose_review(shelf: &Shelf, at: &CaseRef) -> Result<Recalled, CaseError> {
+pub(crate) fn compose_review(shelf: &Shelf, at: &CaseRef) -> Result<Recalled, CaseError> {
     let case = shelf.open(at)?;
     if case.damaged {
         return Ok(Recalled::nothing("this case's file is damaged, so it can't be reviewed".into()));
