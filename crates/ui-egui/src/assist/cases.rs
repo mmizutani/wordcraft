@@ -641,13 +641,13 @@ fn card_words(card: &Card) -> (&'static str, Vec<String>, &'static str) {
                     lines.push(format!("{name}: {v}"));
                 }
             };
-            say(tl!("Contract"), facts.kind.map(word));
-            say(tl!("Our side"), facts.side.map(word));
-            say(tl!("Paper"), facts.paper.map(word));
-            say(tl!("Counterparty"), facts.theirs.map(word));
+            say(tl!("Contract"), facts.kind.map(|v| page::word(&page::KINDS, v).to_string()));
+            say(tl!("Our side"), facts.side.map(|v| page::word(&page::SIDES, v).to_string()));
+            say(tl!("Paper"), facts.paper.map(|v| page::word(&page::PAPERS, v).to_string()));
+            say(tl!("Counterparty"), facts.theirs.map(|v| page::word(&page::THEIRS, v).to_string()));
             say(tl!("Law"), facts.law.map(String::from));
-            say(tl!("Size"), facts.size.map(word));
-            say(tl!("Language"), facts.language.map(word));
+            say(tl!("Size"), facts.size.map(|v| page::word(&page::SIZES, v).to_string()));
+            say(tl!("Language"), facts.language.map(|v| page::word(&page::LANGS, v).to_string()));
             (tl!("The assistant suggests these facts for this case."), lines, tl!("Use these"))
         }
         Card::Write(ModelWrite::Note(draft)) => {
@@ -669,11 +669,6 @@ fn card_words(card: &Card) -> (&'static str, Vec<String>, &'static str) {
         }
         Card::Write(ModelWrite::Used(_)) => ("", Vec::new(), ""),
     }
-}
-
-/// A typed value's name, as its JSON reads.
-fn word<T: serde::Serialize>(v: T) -> String {
-    serde_json::to_value(v).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
 }
 
 /// The person's Use or Keep on a card: the command it runs, on the bound case. Facts proposed fill

@@ -972,3 +972,15 @@ fn the_quiet_rows_confirm_is_the_persons_alone() {
     assert!(notes_of(&folder, &c.here)[1].1, "the person's click did");
     assert!(h.query_by_label("Confirmed").is_some() && h.query_by_label("Confirm").is_none(), "the row says so");
 }
+
+#[test]
+fn a_facts_card_names_the_facts_as_the_case_page_does() {
+    let facts = wordcraft_assist::cases::marker::FactsDraft {
+        kind: Some(wordcraft_assist::cases::ContractKind::Msa),
+        side: Some(wordcraft_assist::cases::OurSide::Customer),
+        ..Default::default()
+    };
+    let (_, lines, _) = super::card_words(&wordcraft_assist::cases::Card::Facts(facts));
+    assert!(lines.contains(&"Contract: Master services agreement".to_string()), "{lines:?}");
+    assert!(lines.contains(&"Our side: Customer".to_string()), "{lines:?}");
+}

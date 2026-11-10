@@ -145,7 +145,7 @@ impl NoteForm {
     }
 }
 
-const KINDS: [(ContractKind, &str); 12] = [
+pub(super) const KINDS: [(ContractKind, &str); 12] = [
     (ContractKind::Nda, "NDA"),
     (ContractKind::Msa, "Master services agreement"),
     (ContractKind::Saas, "SaaS"),
@@ -160,7 +160,7 @@ const KINDS: [(ContractKind, &str); 12] = [
     (ContractKind::Other, "Other"),
 ];
 
-const SIDES: [(OurSide, &str); 13] = [
+pub(super) const SIDES: [(OurSide, &str); 13] = [
     (OurSide::Vendor, "Vendor"),
     (OurSide::Customer, "Customer"),
     (OurSide::Licensor, "Licensor"),
@@ -176,9 +176,9 @@ const SIDES: [(OurSide, &str); 13] = [
     (OurSide::Other, "Other"),
 ];
 
-const PAPERS: [(Paper, &str); 3] = [(Paper::Ours, "Ours"), (Paper::Theirs, "Theirs"), (Paper::ThirdParty, "A third party's")];
+pub(super) const PAPERS: [(Paper, &str); 3] = [(Paper::Ours, "Ours"), (Paper::Theirs, "Theirs"), (Paper::ThirdParty, "A third party's")];
 
-const THEIRS: [(CounterpartyKind, &str); 6] = [
+pub(super) const THEIRS: [(CounterpartyKind, &str); 6] = [
     (CounterpartyKind::Startup, "Startup"),
     (CounterpartyKind::Sme, "Small or medium business"),
     (CounterpartyKind::Enterprise, "Enterprise"),
@@ -187,9 +187,10 @@ const THEIRS: [(CounterpartyKind, &str); 6] = [
     (CounterpartyKind::Other, "Other"),
 ];
 
-const SIZES: [(SizeBand, &str); 4] = [(SizeBand::Small, "Small"), (SizeBand::Medium, "Medium"), (SizeBand::Large, "Large"), (SizeBand::Huge, "Huge")];
+pub(super) const SIZES: [(SizeBand, &str); 4] =
+    [(SizeBand::Small, "Small"), (SizeBand::Medium, "Medium"), (SizeBand::Large, "Large"), (SizeBand::Huge, "Huge")];
 
-const LANGS: [(Lang, &str); 3] = [(Lang::En, "English"), (Lang::Ja, "Japanese"), (Lang::Other, "Other")];
+pub(super) const LANGS: [(Lang, &str); 3] = [(Lang::En, "English"), (Lang::Ja, "Japanese"), (Lang::Other, "Other")];
 
 const STAGES: [(Stage, &str); 3] = [(Stage::Negotiating, "Negotiating"), (Stage::Signed, "Signed"), (Stage::Abandoned, "Abandoned")];
 
@@ -224,7 +225,7 @@ const TOPICS: [(Topic, &str); 11] = [
     (Topic::Payment, "Payment"),
 ];
 
-fn word<T: PartialEq + Copy>(table: &[(T, &'static str)], value: T) -> &'static str {
+pub(super) fn word<T: PartialEq + Copy>(table: &[(T, &'static str)], value: T) -> &'static str {
     table.iter().find(|(v, _)| *v == value).map_or("", |(_, w)| tl!(w))
 }
 
