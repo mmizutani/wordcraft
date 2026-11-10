@@ -21,6 +21,9 @@ use crate::theme::{Tokens, semibold};
 /// person confirmed a party's name may go.
 pub(crate) struct LessonCard {
     pub(crate) text: String,
+    /// The case's facts as the card opened: each keeps its tick box, ticked or not.
+    facts: Applies,
+    /// The facts left ticked: what Keep sends.
     applies: Applies,
     /// The case's parties when the card opened, for the name check.
     parties: Vec<Quoted>,
@@ -33,9 +36,11 @@ impl LessonCard {
     /// A card for `proposal` from `case`: the facts as of the first note it names, else today.
     pub(crate) fn new(proposal: &LessonProposal, at: Option<&CaseRef>, case: Option<&Case>, today: Day) -> LessonCard {
         let on = case.and_then(|c| c.notes.iter().find(|n| proposal.notes.contains(&n.id)).map(|n| n.at)).unwrap_or(today);
+        let facts = case.map(|c| c.applies(on)).unwrap_or_default();
         LessonCard {
             text: proposal.text.for_person().to_string(),
-            applies: case.map(|c| c.applies(on)).unwrap_or_default(),
+            facts,
+            applies: facts,
             parties: case.map(|c| c.facts.parties.clone()).unwrap_or_default(),
             from: at.cloned(),
             named_ok: false,
@@ -92,7 +97,7 @@ pub(crate) fn card(app: &mut WordApp, ui: &mut Ui, t: &Tokens, c: &mut LessonCar
             ui.checkbox(&mut c.named_ok, tl!("Keep it with the name"));
         }
         ui.label(RichText::new(tl!("These facts go with it, so a similar deal finds it. Untick one to leave it out.")).small().color(t.text_dim));
-        facts_ticks(ui, &mut c.applies);
+        facts_ticks(ui, &c.facts, &mut c.applies);
         ui.label(RichText::new(tl!("This goes to every client's cases. Nothing else of this case does.")).small().color(t.text_dim));
         let can = !c.text.trim().is_empty() && (names.is_empty() || c.named_ok);
         ui.horizontal_wrapped(|ui| {
@@ -113,23 +118,23 @@ pub(crate) fn card(app: &mut WordApp, ui: &mut Ui, t: &Tokens, c: &mut LessonCar
     answer
 }
 
-/// A tick per fact that is set, named as [`fact_lines`] names it: unticked, it is dropped from
-/// what travels.
-fn facts_ticks(ui: &mut Ui, applies: &mut Applies) {
-    fn tick<T: Copy>(ui: &mut Ui, slot: &mut Option<T>, name: &str, shown: impl Fn(T) -> String) {
-        if let Some(v) = *slot {
-            let mut on = true;
+/// A tick per fact of `facts` that is set, named as [`fact_lines`] names it: unticked, it is
+/// dropped from `travels`, and ticked again it travels again.
+fn facts_ticks(ui: &mut Ui, facts: &Applies, travels: &mut Applies) {
+    fn tick<T: Copy>(ui: &mut Ui, fact: Option<T>, slot: &mut Option<T>, name: &str, shown: impl Fn(T) -> String) {
+        if let Some(v) = fact {
+            let mut on = slot.is_some();
             ui.checkbox(&mut on, format!("{name}: {}", shown(v)));
             *slot = on.then_some(v);
         }
     }
-    tick(ui, &mut applies.kind, tl!("Contract"), |v| word(&KINDS, v).to_string());
-    tick(ui, &mut applies.side, tl!("Our side"), |v| word(&SIDES, v).to_string());
-    tick(ui, &mut applies.paper, tl!("Paper"), |v| word(&PAPERS, v).to_string());
-    tick(ui, &mut applies.theirs, tl!("Counterparty"), |v| word(&THEIRS, v).to_string());
-    tick(ui, &mut applies.law, tl!("Law"), String::from);
-    tick(ui, &mut applies.stance, tl!("Balance then"), |v| word(&STANCES, v).to_string());
-    tick(ui, &mut applies.year, tl!("Year"), |y| y.to_string());
+    tick(ui, facts.kind, &mut travels.kind, tl!("Contract"), |v| word(&KINDS, v).to_string());
+    tick(ui, facts.side, &mut travels.side, tl!("Our side"), |v| word(&SIDES, v).to_string());
+    tick(ui, facts.paper, &mut travels.paper, tl!("Paper"), |v| word(&PAPERS, v).to_string());
+    tick(ui, facts.theirs, &mut travels.theirs, tl!("Counterparty"), |v| word(&THEIRS, v).to_string());
+    tick(ui, facts.law, &mut travels.law, tl!("Law"), String::from);
+    tick(ui, facts.stance, &mut travels.stance, tl!("Balance then"), |v| word(&STANCES, v).to_string());
+    tick(ui, facts.year, &mut travels.year, tl!("Year"), |y| y.to_string());
 }
 
 /// A card under an answer ([`wordcraft_assist::Entry::CaseCard`] with [`wordcraft_assist::cases::Card::Lesson`]):

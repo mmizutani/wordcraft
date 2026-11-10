@@ -1094,7 +1094,7 @@ fn a_models_lesson_marker_is_a_card_and_stores_nothing_until_the_persons_keep() 
 /// there; a fact unticked stays home and the rest travel.
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
-fn the_card_flags_a_partys_name_and_an_unticked_fact_stays_home() {
+fn the_card_flags_a_partys_name_and_an_unticked_fact_stays_home_until_ticked_again() {
     use egui_kittest::kittest::Queryable;
     let folder = Folder::new();
     let c = cases(&folder);
@@ -1109,6 +1109,11 @@ fn the_card_flags_a_partys_name_and_an_unticked_fact_stays_home() {
     h.run_steps(3);
     assert!(kept(&folder).is_empty(), "Keep waits for the second confirmation");
     h.get_by_label("Contract: SaaS").click();
+    h.run_steps(2);
+    h.get_by_label("Law: JP").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Law: JP").is_some(), "an unticked fact keeps its tick box");
+    h.get_by_label("Law: JP").click();
     h.run_steps(2);
     h.get_by_label("Keep it with the name").click();
     h.run_steps(2);
