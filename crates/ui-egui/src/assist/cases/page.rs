@@ -442,6 +442,9 @@ fn bound(app: &mut WordApp, ui: &mut Ui, t: &Tokens, at: &CaseRef, case: &Case) 
             run(app, "assist.memory.case.unbind", json!({}));
         }
     });
+    if super::restored(app) {
+        ui.label(RichText::new(super::restored_words(case.title.for_person())).small().color(t.text_dim));
+    }
     if case.damaged {
         ui.label(RichText::new(tl!("Its file can't be read whole; your next change moves it aside as case.json.damaged.")).small().color(t.orange));
     }

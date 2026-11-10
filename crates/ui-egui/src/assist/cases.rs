@@ -2,11 +2,13 @@
 //! a turn asks to recall from it, what Details › Recalled shows of what came back, and the
 //! `memory.case.*` and `memory.wall.*` writes behind Details › Case ([`page`]).
 //!
-//! The binding is the window's alone and never in a document. A conversation belongs to the case
-//! its document was bound to when it started ([`super::Conversation::case`]); a document bound to
-//! another case gets a new conversation. Recall runs only when a case is bound and no one but the
-//! person and this conversation's assistant can read the document ([`Alone`]); otherwise the turn
-//! runs as it does today, and Details says why.
+//! The binding is never in a document. The person's click binds, and the shelf keeps that binding
+//! for the document's file ([`Shelf::bind_file`]), so the file binds again when it is next opened
+//! ([`restore`]); an unsaved document's binding is the window's alone. A conversation belongs to
+//! the case its document was bound to when it started ([`super::Conversation::case`]); a document
+//! bound to another case gets a new conversation. Recall runs only when a case is bound and no one
+//! but the person and this conversation's assistant can read the document ([`Alone`]); otherwise
+//! the turn runs as it does today, and Details says why.
 //!
 //! Two writers, two doors. The person's click goes through [`super::memory::write`], the one guard,
 //! and the shelf's [`Click`] is its proof: only that door confirms a note, sets facts, replaces the
@@ -15,7 +17,7 @@
 //! current binding: a note or a balance lands there unconfirmed, a plan replaces only a model's
 //! plan, and facts are always a card. The switch is [`ModelWrites`].
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use egui::{RichText, Ui};
 use serde_json::{Value, json};
@@ -59,6 +61,10 @@ const MAX_TRIES: u32 = 600;
 pub(crate) struct CasesState {
     /// By document id ([`wordcraft_engine::Session::document_id`]): a window holds several documents.
     bound: BTreeMap<u64, CaseRef>,
+    /// Documents whose file was looked up for an earlier binding ([`restore`]), once each.
+    looked_up: BTreeSet<u64>,
+    /// Documents bound by that lookup and not by a click in this window: the pane says so.
+    restored: BTreeSet<u64>,
     /// The shown document's case as its file last read, with when (`clock::now_ms`).
     open: Option<(CaseRef, Case)>,
     read_at: Option<f64>,
@@ -185,6 +191,7 @@ fn changed(app: &mut WordApp) {
 /// Every frame: what the conversation's answers marked for its case goes there, by the one route.
 /// A marker with no case bound to the conversation is dropped, as a `[[used:]]` for nothing is.
 pub(crate) fn tick(app: &mut WordApp) {
+    restore(app);
     let assist = &mut app.assist;
     if let Some(c) = assist.conversation.as_mut() {
         let marked = c.assistant.take_case_markers();
@@ -287,6 +294,7 @@ pub(crate) fn write(app: &mut WordApp, dir: &std::path::Path, what: &str, req: &
                 return Err(CaseError::Gone.to_string());
             }
             app.bind_case(Some(at.clone()));
+            keep(app, &shelf, click, Some(&at));
             Ok(json!({"wall": at.wall.as_str(), "case": at.case.as_str()}))
         }
         "memory.case.unbind" => {
@@ -294,6 +302,7 @@ pub(crate) fn write(app: &mut WordApp, dir: &std::path::Path, what: &str, req: &
                 return Err(NO_DOCUMENT.into());
             }
             app.bind_case(None);
+            keep(app, &shelf, click, None);
             Ok(json!({"unbound": true}))
         }
         "memory.case.cardDismiss" => {
@@ -367,7 +376,66 @@ fn new_case(app: &mut WordApp, shelf: &Shelf, click: Click, req: &Value) -> Resu
     let (stamp, counter) = stamp();
     let at = shelf.new_case(click, &wall, title, &stamp, counter).map_err(|e| e.to_string())?;
     app.bind_case(Some(at.clone()));
+    keep(app, shelf, click, Some(&at));
     Ok(json!({"wall": at.wall.as_str(), "case": at.case.as_str()}))
+}
+
+/// The person's bind or unbind, kept for the shown document's file, so the file binds again when
+/// it is next opened. An unsaved document has no file: its binding lasts while it is open. The
+/// binding has taken effect either way, so a failure to keep it is said, not returned.
+fn keep(app: &mut WordApp, shelf: &Shelf, click: Click, at: Option<&CaseRef>) {
+    let Some(file) = app.session.path.clone() else { return };
+    let kept = match at {
+        Some(at) => shelf.bind_file(click, &file, at).map(|_| ()),
+        None => shelf.unbind_file(click, &file),
+    };
+    if let Err(e) = kept {
+        log::warn!("a binding wasn't kept for the file: {e}");
+        app.assist.notice =
+            Some(fmt(tl!("WordCraft couldn't remember this for the next time you open the file: {error}"), &[("error", &e.to_string())]));
+    }
+}
+
+/// The first time a saved document is shown, the binding the person made for its file, if its
+/// case is still there ([`Shelf::file_bound`]). Once per document: one saved later under a path
+/// that was bound doesn't take that binding, as one opened from the path does.
+pub(crate) fn restore(app: &mut WordApp) {
+    let document = app.session.document_id();
+    if !app.assist.cases.looked_up.insert(document) || app.assist.cases.bound.contains_key(&document) {
+        return;
+    }
+    let (Some(dir), Some(file)) = (app.services.settings_dir.as_ref(), app.session.path.as_ref()) else { return };
+    if let Some(at) = Shelf::at(dir).file_bound(file) {
+        app.assist.cases.bound.insert(document, at);
+        app.assist.cases.restored.insert(document);
+    }
+}
+
+/// Whether the shown document's binding came back with its file rather than from a click in this
+/// window ([`restore`]).
+pub(crate) fn restored(app: &WordApp) -> bool {
+    app.assist.cases.restored.contains(&app.session.document_id())
+}
+
+/// What the pane says of a binding that came back with the file.
+pub(crate) fn restored_words(title: &str) -> String {
+    let title = if title.is_empty() { tl!("Untitled case") } else { title };
+    fmt(tl!("Bound to {case} as when you last had this file open."), &[("case", title)])
+}
+
+/// Above the conversation, while the shown document's binding is one that came back with its
+/// file: which case, and Unbind, before a turn recalls from it.
+pub(crate) fn restored_line(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
+    if !restored(app) {
+        return;
+    }
+    let Some((_, case)) = open_case(app, false) else { return };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(restored_words(case.title.for_person())).small().color(t.text_dim));
+        if ui.small_button(tl!("Unbind")).on_hover_text(tl!("This document stops using the case; its conversation ends.")).clicked() {
+            run(app, "assist.memory.case.unbind", json!({}));
+        }
+    });
 }
 
 /// The typed operation a request asks for. Serde does the parsing: a field a record doesn't know
@@ -423,6 +491,7 @@ impl WordApp {
         self.assist.cases.open = None;
         self.assist.cases.read_at = None;
         let document = self.session.document_id();
+        self.assist.cases.restored.remove(&document);
         if self.assist.cases.bound.get(&document) != at.as_ref() {
             // The page's forms hold the old case's text.
             self.assist.cases.drafts.close_forms();

@@ -789,6 +789,8 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     }
     let role = wanted(app, role);
     let chosen_id = chosen(app).map(|o| o.id.clone());
+    // A file opened since the last frame binds as it does on one.
+    cases::restore(app);
     let bound = cases::bound_for(app);
     let keep = app.conversation().is_some_and(|a| {
         !a.has_ended() && role.is_none_or(|r| r == a.role()) && (app.assist.next.is_none()) && chosen_id.as_deref().is_none_or(|id| id == a.info().id)

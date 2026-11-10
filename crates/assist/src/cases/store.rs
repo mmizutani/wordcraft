@@ -3,6 +3,7 @@
 //! ```text
 //! assistant-cases/
 //!   .trash-<id>/            a delete in progress, swept at each listing
+//!   bindings.json           which file the person bound to which case ([`bindings`])
 //!   <wall id>/              one client, or "My cases"
 //!     wall.json             its name
 //!     <case id>.lock        beside the folder, not in it, so a delete can rename the folder while holding it
@@ -28,6 +29,8 @@ use sha2::{Digest, Sha256};
 use super::lessons::{LessonId, LessonOp, Lessons};
 use super::record::{Applied, Case, CaseError, Click, Day, ModelWrite, PersonOp, Quoted, VERSION};
 use crate::atomic::{self, Lock, LockError};
+
+pub mod bindings;
 
 /// The folder, in the settings folder.
 pub const FOLDER: &str = "assistant-cases";
@@ -212,10 +215,18 @@ impl Shelf {
                 out.skipped = out.skipped.saturating_add(1);
                 continue;
             };
-            if name.starts_with(TRASH) {
+            if let Some(id) = name.strip_prefix(TRASH) {
                 if is_real_dir(&entry) {
+                    // A delete a crash interrupted: its bindings go before its folder does.
+                    if CaseId::parse(id).is_some() {
+                        self.forget(id);
+                    }
                     let _ = fs::remove_dir_all(entry.path());
                 }
+                continue;
+            }
+            // The shelf's own files ([`bindings`]); only a folder can be a wall.
+            if entry.file_type().is_ok_and(|t| t.is_file()) {
                 continue;
             }
             match WallId::parse(name) {
@@ -408,8 +419,10 @@ impl Shelf {
         self.update(at, false, Lock::try_take, |case| case.apply_model(write, today))
     }
 
-    /// Rename `dir` to a trash folder under the root, then remove it. Safe to run twice, and a
-    /// crash between the two is finished by the next [`Shelf::list`].
+    /// Rename `dir` to a trash folder under the root, drop the bindings to it, then remove it.
+    /// Safe to run twice, and a crash after the rename is finished by the next [`Shelf::list`].
+    /// A case's record goes this way too, as `<case id>-log`, which names no binding, so the
+    /// file stays bound to its case ([`super::log::delete_log`]).
     pub(crate) fn trash(&self, dir: &Path, id: &str) -> Result<(), CaseError> {
         let trash = self.root.join(format!("{TRASH}{id}"));
         match fs::rename(dir, &trash) {
@@ -417,6 +430,8 @@ impl Shelf {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(CaseError::Io(format!("{} can't be removed: {e}", dir.display()))),
         }
+        // Before the folder goes, so a crash in between leaves the trash for the sweep to find.
+        self.forget(id);
         match fs::remove_dir_all(&trash) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

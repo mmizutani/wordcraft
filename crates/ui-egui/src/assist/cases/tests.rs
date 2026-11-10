@@ -616,7 +616,7 @@ fn a_case_made_through_the_commands_survives_a_restart() {
     drop(a);
 
     let mut a = window(&folder);
-    assert_eq!(crate::assist::cases::bound_for(&a), None, "a binding lives for the document's life in its window");
+    assert_eq!(crate::assist::cases::bound_for(&a), None, "an unsaved document's binding lives for its life in its window");
     a.run("assist.memory.case.bind", json!({"wall": at.wall.as_str(), "case": at.case.as_str()})).unwrap();
     let (_, case) = crate::assist::cases::open_case(&mut a, false).unwrap();
     assert_eq!(case.title.for_person(), "Acme MSA");
@@ -644,6 +644,94 @@ fn a_case_made_through_the_commands_survives_a_restart() {
     );
     let listing = Shelf::at(&folder.0).list();
     assert_eq!(listing.walls[0].name.for_person(), "Acme");
+}
+
+/// A window started later on the same settings folder that opens `file`, past a frame.
+fn reopened(folder: &Folder, file: &std::path::Path) -> WordApp {
+    let mut a = window(folder);
+    a.run("file.open", json!({"path": file.to_string_lossy()})).unwrap();
+    crate::assist::tick(&mut a);
+    a
+}
+
+/// The person's binding is kept for the file: a window started later binds the file again as it
+/// opens it, says so, and recalls from the case; a copy saved under another name binds to nothing.
+#[test]
+fn a_files_binding_survives_a_restart_and_a_copy_saved_under_another_name_does_not_take_it() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let file = folder.0.join("Acme MSA draft.docx");
+    let copy = folder.0.join("Copy for the other side.docx");
+    let mut a = window(&folder);
+    a.run("file.saveAs", json!({"path": file.to_string_lossy()})).unwrap();
+    a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+    assert!(!crate::assist::cases::restored(&a), "bound by a click, not restored");
+    a.run("file.saveAs", json!({"path": copy.to_string_lossy()})).unwrap();
+    drop(a);
+
+    let mut a = reopened(&folder, &file);
+    assert_eq!(crate::assist::cases::bound_for(&a), Some(c.here.clone()), "the file binds again");
+    assert!(crate::assist::cases::restored(&a), "and the pane says it came back with the file");
+    let seen = ask(&mut a, Fake::new(), "Review the liability cap and the indemnity clause");
+    assert_eq!(recalled_json(&seen.lock().unwrap().turns[0]).len(), 3, "recall applies again");
+
+    let a = reopened(&folder, &copy);
+    assert_eq!(crate::assist::cases::bound_for(&a), None, "a copy saved under another name doesn't inherit the binding");
+}
+
+/// Unbind and Delete change what the file binds to next time, and an unsaved document's binding
+/// is the window's alone.
+#[test]
+fn unbinding_or_deleting_the_case_is_kept_for_the_file_and_an_unsaved_documents_binding_is_not() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let file = folder.0.join("Acme MSA draft.docx");
+    let mut a = window(&folder);
+    a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+    a.run("file.saveAs", json!({"path": file.to_string_lossy()})).unwrap();
+    drop(a);
+    assert_eq!(crate::assist::cases::bound_for(&reopened(&folder, &file)), None, "bound before it had a file: nothing was kept");
+
+    let mut a = window(&folder);
+    a.run("file.open", json!({"path": file.to_string_lossy()})).unwrap();
+    a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+    a.run("assist.memory.case.unbind", json!({})).unwrap();
+    drop(a);
+    assert_eq!(crate::assist::cases::bound_for(&reopened(&folder, &file)), None, "unbound, it stays unbound");
+
+    let mut a = window(&folder);
+    a.run("file.open", json!({"path": file.to_string_lossy()})).unwrap();
+    a.run("assist.memory.case.bind", json!({"wall": c.neighbor.wall.as_str(), "case": c.neighbor.case.as_str()})).unwrap();
+    drop(a);
+    let mut a = reopened(&folder, &file);
+    assert_eq!(crate::assist::cases::bound_for(&a), Some(c.neighbor.clone()));
+    a.run("assist.memory.case.delete", json!({})).unwrap();
+    frames_until(&mut a, "the delete worker", |a| a.assist.cases.record.deleting.is_none());
+    assert!(a.assist.notice.is_none(), "{:?}", a.assist.notice);
+    let bindings = std::fs::read_to_string(cases_dir(&folder).join(wordcraft_assist::cases::store::bindings::FILE)).unwrap();
+    assert!(!bindings.contains(c.neighbor.case.as_str()), "the deleted case's binding went with it: {bindings}");
+    assert_eq!(crate::assist::cases::bound_for(&reopened(&folder, &file)), None);
+}
+
+/// A damaged bindings file binds nothing and crashes nothing; the person's next bind moves it
+/// aside.
+#[test]
+fn a_damaged_bindings_file_binds_nothing_and_the_next_bind_moves_it_aside() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let file = folder.0.join("Acme MSA draft.docx");
+    let mut a = window(&folder);
+    a.run("file.saveAs", json!({"path": file.to_string_lossy()})).unwrap();
+    let path = cases_dir(&folder).join(wordcraft_assist::cases::store::bindings::FILE);
+    std::fs::write(&path, b"{\"version\":1,\"files\":[{\"path\":").unwrap();
+    drop(a);
+    let mut a = reopened(&folder, &file);
+    assert_eq!(crate::assist::cases::bound_for(&a), None);
+    a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+    let aside = std::fs::read(cases_dir(&folder).join("bindings.json.damaged")).unwrap();
+    assert_eq!(aside, b"{\"version\":1,\"files\":[{\"path\":");
+    drop(a);
+    assert_eq!(crate::assist::cases::bound_for(&reopened(&folder, &file)), Some(c.here.clone()));
 }
 
 /// Delete removes the case's folder with its notes, and a later turn of that document recalls
