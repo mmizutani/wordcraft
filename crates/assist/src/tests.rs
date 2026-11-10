@@ -1344,6 +1344,76 @@ fn an_oversized_unclosed_or_unreadable_case_marker_is_dropped_counted_and_never_
     assert_eq!(t.take_case_markers().len(), 6);
 }
 
+/// The close is found outside the JSON's strings only, so a note whose text holds `[[/case]]`
+/// parses whole, and a marker nested outside a string is one malformed body: hidden up to the
+/// outer close and counted once, with nothing of it shown.
+#[test]
+fn a_close_inside_a_json_string_doesnt_end_the_marker_and_a_nested_marker_is_one_drop() {
+    let inner = r#"[[case]]{"op":"note","kind":"pattern","rule":"Say [[/case]] to end it.","how":"Clause \"9\" \\ [[/case]]"}[[/case]]"#;
+    let whole = format!("Done. {inner} After.");
+    for at in 0..whole.len() {
+        let (a, b) = whole.split_at(at);
+        let (answer, markers, dropped) = case_streamed(&[a, b]);
+        assert_eq!((answer.as_str(), markers.len(), dropped), ("Done.  After.", 1, 0), "split at {at}");
+        match &markers[0] {
+            crate::cases::CaseMarker::Note(n) => assert_eq!(n.body.texts().next().unwrap().for_person(), "Say [[/case]] to end it."),
+            other => panic!("{other:?}"),
+        }
+    }
+    let nested = r#"[[case]]{"op":"note", [[case]]{"op":"note","kind":"pattern","rule":"inner"}[[/case]] }[[/case]]"#;
+    let whole = format!("Done. {nested} After.");
+    for at in 0..whole.len() {
+        let (a, b) = whole.split_at(at);
+        let (answer, markers, dropped) = case_streamed(&[a, b]);
+        assert_eq!((answer.as_str(), markers.len(), dropped), ("Done.  After.", 0, 1), "split at {at}");
+    }
+}
+
+/// A marker inside code is an example, shown as written and never routed; one after the code
+/// closes is a marker again.
+#[test]
+fn a_marker_in_code_is_text_not_a_write() {
+    let fenced = format!("Write it so:\n```\n{CASE_NOTE}\n```\nThen {CASE_NOTE} done.");
+    for at in 0..fenced.len() {
+        let (a, b) = fenced.split_at(at);
+        let (answer, markers, dropped) = case_streamed(&[a, b]);
+        assert_eq!(answer, format!("Write it so:\n```\n{CASE_NOTE}\n```\nThen  done."), "split at {at}");
+        assert_eq!((markers.len(), dropped), (1, 0), "split at {at}");
+    }
+    let inline = format!("Write `{CASE_NOTE}` and `[[remember: lists]]` and `[[used: m1]]`. {CASE_NOTE} [[remember: Use lists.]]");
+    let (answer, markers, dropped) = case_streamed(&[&inline]);
+    assert_eq!(answer, format!("Write `{CASE_NOTE}` and `[[remember: lists]]` and `[[used: m1]]`.  "));
+    assert_eq!((markers.len(), dropped), (1, 0));
+    assert_eq!(streamed(&[&inline]).1, ["Use lists."]);
+    // A fence left open hides nothing from the next turn.
+    let mut t = Transcript::default();
+    t.asked("One");
+    t.record(&Event::Text { text: "```\n[[case".into() });
+    t.record(&Event::Done { stop: StopReason::EndTurn });
+    t.asked("Two");
+    t.record(&Event::Text { text: CASE_NOTE.into() });
+    assert_eq!(t.take_case_markers().len(), 1);
+}
+
+/// One limit, on the body between the tags, whether the close arrives whole or split anywhere.
+#[test]
+fn the_limit_is_the_same_wherever_the_stream_splits() {
+    for body_len in [crate::markers::MAX_CASE - 1, crate::markers::MAX_CASE, crate::markers::MAX_CASE + 1] {
+        let head = r#"{"op":"note","kind":"pattern","rule":""#;
+        let tail = r#""}"#;
+        let body = format!("{head}{}{tail}", "x".repeat(body_len - head.len() - tail.len()));
+        assert_eq!(body.len(), body_len);
+        let whole = format!("Before. [[case]]{body}[[/case]] After.");
+        let expect = if body_len <= crate::markers::MAX_CASE { (1, 0) } else { (0, 1) };
+        let close_at = whole.find("[[/case]]").unwrap();
+        for at in close_at - 3..=close_at + 9 {
+            let (a, b) = whole.split_at(at);
+            let (answer, markers, dropped) = case_streamed(&[a, b]);
+            assert_eq!((answer.as_str(), markers.len(), dropped), ("Before.  After.", expect.0, expect.1), "body {body_len}, split at {at}");
+        }
+    }
+}
+
 #[test]
 fn what_only_looks_like_a_marker_stays_text() {
     for text in ["[[link]] and [x] and [", "a [[rem", "[[remember: never closed", "[[used: m1", "[[", "]]", "[[cas", "[[/case]] alone"] {
