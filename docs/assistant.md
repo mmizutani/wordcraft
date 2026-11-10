@@ -260,7 +260,7 @@ contracts from one template overlap too, so it informs you and decides nothing; 
 until you click **Use it**, which runs `assist.memory.case.bind` and so refuses a click the control
 channel made. **Not this** hides the card for this document in this window and writes nothing.
 The print is taken once per document shown, and again after 64 more changes to it while it stays
-unbound, or at once when a document too short to compare gains or loses a paragraph, so a draft
+unbound, or at once when a document whose paragraphs are too few or too slight to compare (blank, or only numbering and headings) gains or loses one, so a draft
 pasted into a blank document is looked at as soon as it lands. A document that copies your paragraphs earns a suggestion, which still takes your click.
 
 **What a turn recalls.** With a case bound, each turn carries what ranks highest for the prompt and

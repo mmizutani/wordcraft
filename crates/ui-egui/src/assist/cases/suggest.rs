@@ -42,10 +42,12 @@ type Version = (u64, u64);
 
 #[derive(Default)]
 pub(crate) struct SuggestState {
-    /// The document and version the result stands for, and its body paragraphs then, counted up
-    /// to [`MIN_PARAGRAPHS`] ([`paragraphs`]).
-    computed: Option<(Version, usize)>,
-    pending: Option<(Version, usize, Receiver<Option<Suggestion>>)>,
+    /// The document and version the result stands for, and, when its print was too short to
+    /// compare then, how many body paragraphs it had ([`paragraphs`]).
+    computed: Option<(Version, Option<usize>)>,
+    /// The running worker's document and version, its paragraphs as it started, and where its
+    /// answer comes: whether the print was too short to compare, and the suggestion.
+    pending: Option<(Version, usize, Receiver<(bool, Option<Suggestion>)>)>,
     found: Option<(u64, Suggestion)>,
     /// Documents the person said Not this for, in this window. No file write.
     dismissed: BTreeSet<u64>,
@@ -91,8 +93,9 @@ pub(crate) fn refresh(app: &mut WordApp) -> Option<Suggestion> {
             state.pending = None;
             // A result for a document no longer shown is dropped; the one shown starts its own.
             if at.0 == now.0 {
-                state.computed = Some((at, seen));
-                state.found = answer.ok().flatten().map(|s| (at.0, s));
+                let (short, found) = answer.unwrap_or((false, None));
+                state.computed = Some((at, short.then_some(seen)));
+                state.found = found.map(|s| (at.0, s));
             }
         }
     }
@@ -111,20 +114,22 @@ fn version(app: &WordApp) -> Version {
     (app.session.document_id(), app.session.changes().version())
 }
 
-/// The shown document's body paragraphs, counted up to [`MIN_PARAGRAPHS`]: a document with
-/// fewer was too short to compare when it was last looked at.
+/// The shown document's body paragraphs, trivial ones included: what tells a short document's
+/// result apart from the same document with a draft pasted in.
 fn paragraphs(app: &WordApp) -> usize {
-    app.session.doc.para_paths(wordcraft_doc::StoryRef::Body).len().min(MIN_PARAGRAPHS)
+    app.session.doc.para_paths(wordcraft_doc::StoryRef::Body).len()
 }
 
 /// Whether the result stands for the shown document as it is now: the same document, fewer than
-/// [`RECHECK_EVERY`] changes since, and, when it was too short to compare then, no paragraph added
-/// or removed since. A draft pasted into a blank document is one change, and is looked at again
-/// at once rather than 64 changes later. Paragraphs are counted only for a document that was short
-/// and has changed since, so a long one costs nothing here.
+/// [`RECHECK_EVERY`] changes since, and, when its print was too short to compare then, no paragraph
+/// added or removed since. Short is the print's, not the paragraph count's: ten numbering lines
+/// are ten paragraphs and print nothing. A draft pasted into a blank or numbering-only document
+/// is one change, and is looked at again at once rather than 64 changes later. Paragraphs are
+/// counted only for a document whose print was short and that has changed since, so a document
+/// with a print costs nothing here.
 fn fresh(app: &WordApp, now: Version) -> bool {
-    let Some(((document, changes), seen)) = app.assist.cases.suggest.computed else { return false };
-    document == now.0 && now.1.saturating_sub(changes) < RECHECK_EVERY && (seen >= MIN_PARAGRAPHS || now.1 == changes || paragraphs(app) == seen)
+    let Some(((document, changes), short)) = app.assist.cases.suggest.computed else { return false };
+    document == now.0 && now.1.saturating_sub(changes) < RECHECK_EVERY && short.is_none_or(|seen| now.1 == changes || paragraphs(app) == seen)
 }
 
 /// Whether the shown document's result is in: nothing pending and a result for its version.
@@ -153,7 +158,8 @@ fn start(app: &mut WordApp, at: Version) {
         #[cfg(test)]
         drop(hold.read());
         let print = DraftPrint::of(&doc, &name, today);
-        let _ = tx.send(best(&Shelf::at(&dir), &print));
+        let short = print.len() < MIN_PARAGRAPHS;
+        let _ = tx.send((short, best(&Shelf::at(&dir), &print)));
         if let Some(ctx) = ctx {
             ctx.request_repaint();
         }
@@ -333,6 +339,13 @@ mod tests {
         let s = suggestion(&mut b).expect("the pasted draft is suggested");
         assert_eq!(s.at, c.here);
         assert_eq!(bound_for(&b), None, "a suggestion binds nothing");
+        // A document of many trivial paragraphs (numbering, headings) has a print too short to
+        // compare however many paragraphs it has, so a paste into it is looked at again too.
+        let numbering: Vec<String> = (1..=10).map(|i| format!("{i}.")).collect();
+        let mut n = window_on(&folder, &numbering);
+        assert_eq!(suggestion(&mut n), None, "numbering alone matches nothing");
+        n.execute("text.insert", json!({"paragraphs": true, "text": first.join("\n")})).unwrap();
+        assert_eq!(suggestion(&mut n).map(|s| s.at), Some(c.here.clone()), "the draft pasted after the numbering is suggested");
     }
 
     #[test]
