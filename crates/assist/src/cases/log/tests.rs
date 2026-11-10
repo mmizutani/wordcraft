@@ -101,8 +101,9 @@ fn a_full_queue_never_blocks_and_becomes_a_dropped_record() {
     }
     // A write that waited for the writer would wait for the gate, which stays shut: forever.
     assert!(started.elapsed() < std::time::Duration::from_secs(5), "a write waited for the writer");
-    // The writer took one record off the queue before the gate, so two of the eight waited there.
-    assert!(log.dropped() >= 4, "{}", log.dropped());
+    // The writer takes one record before the gate whenever its thread runs, and the slot that
+    // frees may go to a `Dropped` line mid-way, so only some count is certain here.
+    assert!(log.dropped() >= 1, "{}", log.dropped());
     {
         let (open, wake) = &*gate;
         *open.lock().unwrap() = true;
@@ -140,25 +141,32 @@ fn a_dropped_log_still_counts_what_the_queue_had_no_room_for() {
     for n in 0..8 {
         log.write(decided(&format!("change {n}")));
     }
-    assert!(log.dropped() >= 4, "{}", log.dropped());
+    // As in the full-queue test, only some count is certain whenever the writer's thread runs.
+    assert!(log.dropped() >= 1, "{}", log.dropped());
     drop(log);
     {
         let (open, wake) = &*gate;
         *open.lock().unwrap() = true;
         wake.notify_all();
     }
+    // A `Dropped` line queued mid-way can end the file before the last one: wait for the count.
+    let accounted = |records: &[Record]| {
+        records
+            .iter()
+            .map(|r| if let Record::Dropped { n } = r { *n as usize } else { usize::from(matches!(r, Record::Decided { .. })) })
+            .sum::<usize>()
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let records = loop {
         let records: Vec<Record> = lines(&shelf, &at).iter().filter_map(|l| serde_json::from_str(l).ok()).collect();
-        if matches!(records.last(), Some(Record::Dropped { .. })) {
+        if accounted(&records) >= 8 {
             break records;
         }
-        assert!(std::time::Instant::now() < deadline, "the writer never wrote the count: {records:?}");
+        assert!(std::time::Instant::now() < deadline, "the writer never counted every record: {records:?}");
         std::thread::sleep(std::time::Duration::from_millis(5));
     };
-    let dropped: u32 = records.iter().filter_map(|r| if let Record::Dropped { n } = r { Some(*n) } else { None }).sum();
-    let kept = records.iter().filter(|r| matches!(r, Record::Decided { .. })).count();
-    assert_eq!(dropped as usize + kept, 8, "every record is written or counted: {records:?}");
+    assert_eq!(accounted(&records), 8, "every record is written or counted: {records:?}");
+    assert!(matches!(records.last(), Some(Record::Dropped { .. })), "the count ends the file: {records:?}");
 }
 
 /// A `Redlines` snapshot whose texts are each within their cap can still pass the reader's line
