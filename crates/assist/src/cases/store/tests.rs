@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use super::{CaseId, CaseRef, DAMAGED_SUFFIX, MAX_FILE, Shelf, WallId};
 use crate::cases::record::{
     Applied, Body, CaseError, Click, Day, Factor, FactorKind, Facts, MAX_BALANCES, MAX_DISMISSED, MAX_FACTORS, MAX_LIST, MAX_NOTES, MAX_SHORT,
-    MAX_TEXT, MAX_UNCONFIRMED, ModelWrite, NoteDraft, NoteId, PersonOp, Plan, Quoted, Side, Stance, Standing, Topics,
+    MAX_TEXT, MAX_UNCONFIRMED, ModelWrite, NoteDraft, NoteId, PersonOp, Plan, Quoted, Side, Stance, Standing, Topic, Topics,
 };
 use crate::cases::record::{BalanceDraft, Case};
 
@@ -41,6 +41,28 @@ fn pitfall(text: &str) -> NoteDraft {
 
 fn plan(goal: &str) -> Plan {
     Plan { goal: Quoted::parse(goal), next: Vec::new(), standing: Standing::Unconfirmed }
+}
+
+/// The person's edit changes what they edited: the text and the how. The topics the note was
+/// stated to be about and how often turns used it stay, since the edit form states neither, so a
+/// review's Keep on a correction, which is such an edit, doesn't change how the note ranks.
+#[test]
+fn an_edit_keeps_the_notes_stated_topics_and_its_use() {
+    let (shelf, at) = shelf_with_case("edit-keeps");
+    let mut draft = pitfall("The cap excludes data breaches");
+    draft.topics.insert(Topic::Liability);
+    shelf.person(click(), &at, PersonOp::AddNote(draft), today()).unwrap();
+    let id = shelf.open(&at).unwrap().notes[0].id;
+    shelf.model(&at, ModelWrite::Used(vec![id]), today()).unwrap();
+    let before = shelf.open(&at).unwrap().notes[0].clone();
+    assert_eq!((before.used, before.last_used), (1, Some(today())));
+
+    let edit = pitfall("The cap excludes data breaches and IP claims");
+    shelf.person(click(), &at, PersonOp::EditNote(id, edit), today()).unwrap();
+    let after = shelf.open(&at).unwrap().notes[0].clone();
+    assert_eq!(after.body.texts().next().map(Quoted::raw), Some("The cap excludes data breaches and IP claims"));
+    assert!(after.stated_topics.contains(Topic::Liability), "the stated topic is kept");
+    assert_eq!((after.used, after.last_used), (1, Some(today())), "its use is kept");
 }
 
 #[test]
