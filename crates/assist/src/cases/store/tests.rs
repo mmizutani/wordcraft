@@ -186,6 +186,29 @@ fn a_full_case_fits_the_file() {
 }
 
 #[test]
+fn the_newest_cases_of_every_wall_are_read_up_to_a_count_and_a_byte_budget() {
+    let shelf = Shelf::at(&folder("newest"));
+    let a = shelf.new_wall(click(), "Kestrel Freight KK", TODAY, 1).unwrap();
+    let b = shelf.new_wall(click(), "Bluefin Systems Ltd", TODAY, 2).unwrap();
+    let old = shelf.new_case(click(), &a, "Old", TODAY, 3).unwrap();
+    let damaged = shelf.new_case(click(), &b, "Damaged", TODAY, 4).unwrap();
+    let new = shelf.new_case(click(), &a, "New", TODAY, 5).unwrap();
+    std::fs::write(shelf.case_dir(&damaged).join("case.json"), b"{not json").unwrap();
+    for (at, second) in [(&old, 1), (&damaged, 2), (&new, 3)] {
+        let file = std::fs::File::options().write(true).open(shelf.case_dir(at).join("case.json")).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(second)).unwrap();
+    }
+    let titles = |cases: Vec<(CaseRef, Case)>| cases.into_iter().map(|(_, c)| c.title.for_person().to_string()).collect::<Vec<_>>();
+    assert_eq!(titles(shelf.newest_cases(10, MAX_FILE)), ["New", "Old"], "newest first, across walls, the damaged one left out");
+    assert_eq!(titles(shelf.newest_cases(2, MAX_FILE)), ["New"], "the damaged file counts against the count");
+    let len = |at: &CaseRef| std::fs::metadata(shelf.case_dir(at).join("case.json")).unwrap().len();
+    let all = len(&new) + len(&damaged) + len(&old);
+    assert_eq!(titles(shelf.newest_cases(10, all - 1)), ["New"], "and against the bytes");
+    assert_eq!(titles(shelf.newest_cases(10, all)), ["New", "Old"]);
+    assert_eq!(shelf.wall_name(&b).for_person(), "Bluefin Systems Ltd");
+}
+
+#[test]
 fn a_damaged_case_moves_aside() {
     let (shelf, at) = shelf_with_case("damaged");
     let path = shelf.case_dir(&at).join("case.json");

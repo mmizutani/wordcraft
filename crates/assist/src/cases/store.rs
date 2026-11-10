@@ -225,10 +225,7 @@ impl Shelf {
         }
         walls.sort();
         for (id, dir) in walls {
-            let name = read_whole(&dir.join(WALL_FILE), MAX_FILE)
-                .and_then(|bytes| serde_json::from_slice::<WallFile>(&bytes).ok())
-                .filter(|w| w.version == VERSION)
-                .map_or_else(|| Quoted::parse(""), |w| w.name);
+            let name = read_wall_name(&dir);
             let mut cases = Vec::new();
             for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
                 let file = entry.file_name();
@@ -277,31 +274,29 @@ impl Shelf {
     /// nothing, since what it holds may be cut.
     pub(crate) fn recent_cases(&self, at: &CaseRef, max_cases: usize, max_bytes: u64) -> (Vec<(CaseId, Case)>, u32) {
         let Ok(dir) = self.real_wall_dir(&at.wall) else { return (Vec::new(), 0) };
-        let mut found: Vec<(std::time::SystemTime, u64, CaseId, PathBuf)> = Vec::new();
-        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let name = entry.file_name();
-            let Some(id) = name.to_str().and_then(CaseId::parse).filter(|id| *id != at.case && is_real_dir(&entry)) else { continue };
-            let file = entry.path().join(CASE_FILE);
-            let Ok(meta) = fs::symlink_metadata(&file) else { continue };
-            found.push((meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), meta.len(), id, file));
+        let mut found = Vec::new();
+        stat_cases(&at.wall, &dir, &mut found);
+        found.retain(|(_, _, other, _)| other.case != at.case);
+        let (cases, skipped) = read_newest(found, max_cases, max_bytes);
+        (cases.into_iter().map(|(at, case)| (at.case, case)).collect(), skipped)
+    }
+
+    /// Every client's cases, most recently changed first, at most `max_cases` of them and
+    /// `max_bytes` of their files; a damaged one counts against both and is left out. The lineage
+    /// suggestion's scan, the one read across walls, whose result goes only to the person's
+    /// screen: off the frame. Each case file is read once.
+    pub fn newest_cases(&self, max_cases: usize, max_bytes: u64) -> Vec<(CaseRef, Case)> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(&self.root).into_iter().flatten().flatten() {
+            let Some(wall) = entry.file_name().to_str().and_then(WallId::parse).filter(|_| is_real_dir(&entry)) else { continue };
+            stat_cases(&wall, &entry.path(), &mut found);
         }
-        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
-        let mut out = Vec::new();
-        let mut skipped = 0u32;
-        let mut bytes = 0u64;
-        for (_, len, id, file) in found.into_iter().take(max_cases) {
-            bytes = bytes.saturating_add(len);
-            if bytes > max_bytes {
-                break;
-            }
-            let case = read_case(&file);
-            if case.damaged {
-                skipped = skipped.saturating_add(1);
-                continue;
-            }
-            out.push((id, case));
-        }
-        (out, skipped)
+        read_newest(found, max_cases, max_bytes).0
+    }
+
+    /// The wall's name as its file holds it; empty when it can't be read.
+    pub fn wall_name(&self, wall: &WallId) -> Quoted {
+        self.real_wall_dir(wall).map_or_else(|_| Quoted::parse(""), |dir| read_wall_name(&dir))
     }
 
     /// Cheap: one stat. Other windows learn of a delete here.
@@ -494,6 +489,50 @@ fn read_whole(path: &Path, max: u64) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(max.saturating_add(1)).read_to_end(&mut bytes).ok()?;
     (u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= max).then_some(bytes)
+}
+
+/// A case file found by a scan: when it last changed, its length, the case and the file.
+type Found = (std::time::SystemTime, u64, CaseRef, PathBuf);
+
+/// The case files of wall `wall`'s folder `dir`, one stat each.
+fn stat_cases(wall: &WallId, dir: &Path, found: &mut Vec<Found>) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(case) = name.to_str().and_then(CaseId::parse).filter(|_| is_real_dir(&entry)) else { continue };
+        let file = entry.path().join(CASE_FILE);
+        let Ok(meta) = fs::symlink_metadata(&file) else { continue };
+        found.push((meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), meta.len(), CaseRef { wall: wall.clone(), case }, file));
+    }
+}
+
+/// `found`'s cases, most recently changed first, read until `max_cases` files or `max_bytes` of
+/// them, and how many of those were damaged: a damaged file is read, so it counts against both.
+fn read_newest(mut found: Vec<Found>, max_cases: usize, max_bytes: u64) -> (Vec<(CaseRef, Case)>, u32) {
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| (&a.2.wall, &a.2.case).cmp(&(&b.2.wall, &b.2.case))));
+    let mut out = Vec::new();
+    let mut skipped = 0u32;
+    let mut bytes = 0u64;
+    for (_, len, at, file) in found.into_iter().take(max_cases) {
+        bytes = bytes.saturating_add(len);
+        if bytes > max_bytes {
+            break;
+        }
+        let case = read_case(&file);
+        if case.damaged {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
+        out.push((at, case));
+    }
+    (out, skipped)
+}
+
+/// The name in a wall folder's `wall.json`; empty when it can't be read.
+fn read_wall_name(dir: &Path) -> Quoted {
+    read_whole(&dir.join(WALL_FILE), MAX_FILE)
+        .and_then(|bytes| serde_json::from_slice::<WallFile>(&bytes).ok())
+        .filter(|w| w.version == VERSION)
+        .map_or_else(|| Quoted::parse(""), |w| w.name)
 }
 
 /// The case at `path`: damaged when it can't be read whole or holds more than this build reads.

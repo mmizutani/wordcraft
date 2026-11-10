@@ -1,15 +1,17 @@
 //! The lineage suggestion: when the pane shows a document bound to no case, a worker takes the
-//! document's print ([`DraftPrint`]) from a clone and compares it with the prints in every case's
-//! file, in every client's folder. This is the one thing that reads across walls, and its result
-//! goes only to the person's screen: a card with the percentage, the case and **Use it**, **Not
-//! this**, **New case**. Nothing is bound without the person's click, and a control-channel click
-//! on Use it binds nothing, since Use it runs the person-only `assist.memory.case.bind`. The
-//! percentage is shown because two contracts from one template overlap too: it informs the person
-//! and decides nothing. The print of a document the person binds goes into the case the same way,
-//! off the frame ([`print_bound`]).
+//! document's print ([`DraftPrint`]) from a clone and compares it with the prints of the most
+//! recently changed cases, in every client's folder, up to [`MAX_CASES`] of them and [`MAX_BYTES`]
+//! of their files; one worker runs at a time. This is the one thing that reads across walls, and
+//! its result goes only to the person's screen: a card with the percentage, the case and **Use
+//! it**, **Not this**, **New case**. Nothing is bound without the person's click, and a
+//! control-channel click on Use it binds nothing, since Use it runs the person-only
+//! `assist.memory.case.bind`. The percentage is shown because two contracts from one template
+//! overlap too: it informs the person and decides nothing. The print of a document the person
+//! binds goes into the case the same way, off the frame ([`print_bound`]).
 
 use std::collections::BTreeSet;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use egui::{RichText, Ui};
 use serde_json::json;
@@ -46,7 +48,21 @@ pub(crate) struct SuggestState {
     found: Option<(u64, Suggestion)>,
     /// Documents the person said Not this for, in this window. No file write.
     dismissed: BTreeSet<u64>,
+    /// Test-only: a worker waits for this before its work, so a test can hold one running.
+    #[cfg(test)]
+    hold: Arc<std::sync::RwLock<()>>,
+    /// Test-only: workers started in this window.
+    #[cfg(test)]
+    started: u32,
 }
+
+/// Most cases a worker compares, the most recently changed first: the person is most likely
+/// continuing a negotiation they worked on lately, and the scan reads across every client, so it
+/// stops at a bound whatever the folder holds.
+pub(crate) const MAX_CASES: usize = 128;
+
+/// Most bytes of case files a worker reads, recall's budget for a wall's other cases.
+const MAX_BYTES: u64 = 16 << 20;
 
 /// What the card says: the best match at or above [`THRESHOLD`].
 #[derive(Clone, Debug, PartialEq)]
@@ -66,17 +82,22 @@ pub(crate) fn refresh(app: &mut WordApp) -> Option<Suggestion> {
     }
     let now = version(app);
     let state = &mut app.assist.cases.suggest;
-    if let Some((at, rx)) = &state.pending
-        && let Ok(found) = rx.try_recv()
-    {
-        let at = *at;
-        state.computed = Some(at);
-        state.found = found.map(|s| (at.0, s));
-        state.pending = None;
+    if let Some((at, rx)) = &state.pending {
+        // Anything but Empty: the worker is done, and one that ended without an answer found nothing.
+        let answer = rx.try_recv();
+        if !matches!(answer, Err(TryRecvError::Empty)) {
+            let at = *at;
+            state.pending = None;
+            // A result for a document no longer shown is dropped; the one shown starts its own.
+            if at.0 == now.0 {
+                state.computed = Some(at);
+                state.found = answer.ok().flatten().map(|s| (at.0, s));
+            }
+        }
     }
     let fresh = state.computed.is_some_and(|(document, changes)| document == now.0 && now.1.saturating_sub(changes) < RECHECK_EVERY);
-    let waiting = state.pending.as_ref().is_some_and(|((document, _), _)| *document == now.0);
-    if !fresh && !waiting {
+    // One worker at a time: another document waits until the running one returns.
+    if !fresh && state.pending.is_none() {
         start(app, now);
     }
     let state = &app.assist.cases.suggest;
@@ -98,8 +119,8 @@ pub(crate) fn settled(app: &WordApp) -> bool {
     state.pending.is_none() && state.computed.is_some_and(|(document, changes)| document == now.0 && now.1.saturating_sub(changes) < RECHECK_EVERY)
 }
 
-/// The worker: the document's print from a clone, then every case's prints. Its result comes
-/// back through the channel and nowhere else.
+/// The worker: the document's print from a clone, then the cases' prints ([`best`]). Its result
+/// comes back through the channel and nowhere else.
 fn start(app: &mut WordApp, at: Version) {
     let Some(dir) = app.services.settings_dir.clone() else { return };
     let Ok(today) = super::today() else { return };
@@ -108,7 +129,14 @@ fn start(app: &mut WordApp, at: Version) {
     let ctx = app.ctx.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     app.assist.cases.suggest.pending = Some((at, rx));
+    #[cfg(test)]
+    let hold = {
+        app.assist.cases.suggest.started += 1;
+        Arc::clone(&app.assist.cases.suggest.hold)
+    };
     off_frame("case lineage", move || {
+        #[cfg(test)]
+        drop(hold.read());
         let print = DraftPrint::of(&doc, &name, today);
         let _ = tx.send(best(&Shelf::at(&dir), &print));
         if let Some(ctx) = ctx {
@@ -139,17 +167,39 @@ pub(crate) fn print_bound(app: &mut WordApp, click: Click, at: &CaseRef) {
     });
 }
 
-/// On a thread, or here when none can be made (the web build has no threads).
-fn off_frame(name: &str, work: impl FnOnce() + Send + 'static) {
-    let work = std::sync::Mutex::new(Some(work));
+/// On a thread, or here when none can be made (the web build has no threads). The work waits in a
+/// slot the thread takes it from, since a spawn that fails drops the closure it was given.
+fn off_frame<F: FnOnce() + Send + 'static>(name: &str, work: F) {
+    let slot = Arc::new(Mutex::new(Some(work)));
+    let theirs = Arc::clone(&slot);
     let run = move || {
-        if let Some(work) = work.lock().ok().and_then(|mut w| w.take()) {
+        if let Some(work) = take(&theirs) {
             work();
         }
     };
-    if let Err(run) = std::thread::Builder::new().name(name.into()).spawn(run) {
-        let _ = run;
+    if spawn(name, run).is_err()
+        && let Some(work) = take(&slot)
+    {
+        work();
     }
+}
+
+fn take<F>(slot: &Mutex<Option<F>>) -> Option<F> {
+    slot.lock().unwrap_or_else(PoisonError::into_inner).take()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: no thread can be made from this one, as on the web.
+    static NO_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn spawn(name: &str, run: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    #[cfg(test)]
+    if NO_THREADS.get() {
+        return Err(std::io::Error::other("this test makes no threads"));
+    }
+    std::thread::Builder::new().name(name.into()).spawn(run).map(drop)
 }
 
 /// The card in the pane header, when there is a suggestion.
@@ -185,29 +235,23 @@ pub(crate) fn card(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     });
 }
 
-/// The best match for `print` among every case's prints, at or above [`THRESHOLD`]: the worker's
-/// work. Case files are read as the shelf reads them: a link is refused, a damaged file skipped.
+/// The best match for `print` among the prints of the [`MAX_CASES`] most recently changed cases,
+/// at or above [`THRESHOLD`]: the worker's work. Case files are read once each, as the shelf reads
+/// them: a link is refused, a damaged file skipped. Only the best one's client name is read.
 fn best(shelf: &Shelf, print: &DraftPrint) -> Option<Suggestion> {
     if print.len() < MIN_PARAGRAPHS {
         return None;
     }
-    let mut best: Option<(f32, Suggestion)> = None;
-    for wall in shelf.list().walls {
-        for header in wall.cases.iter().filter(|c| !c.damaged) {
-            let at = CaseRef { wall: wall.id.clone(), case: header.id.clone() };
-            let Ok(case) = shelf.open(&at) else { continue };
-            if case.damaged {
-                continue;
-            }
-            let Some(share) = case.drafts.iter().map(|d| print.overlap(d)).reduce(f32::max) else { continue };
-            if share >= THRESHOLD && best.as_ref().is_none_or(|(b, _)| share > *b) {
-                let percent = (share * 100.0).round().clamp(0.0, 100.0) as u8;
-                best =
-                    Some((share, Suggestion { at, title: case.title.for_person().to_string(), client: wall.name.for_person().to_string(), percent }));
-            }
+    let mut best: Option<(f32, CaseRef, String)> = None;
+    for (at, case) in shelf.newest_cases(MAX_CASES, MAX_BYTES) {
+        let Some(share) = case.drafts.iter().map(|d| print.overlap(d)).reduce(f32::max) else { continue };
+        if share >= THRESHOLD && best.as_ref().is_none_or(|(b, ..)| share > *b) {
+            best = Some((share, at, case.title.for_person().to_string()));
         }
     }
-    best.map(|(_, s)| s)
+    let (share, at, title) = best?;
+    let client = shelf.wall_name(&at.wall).for_person().to_string();
+    Some(Suggestion { at, title, client, percent: (share * 100.0).round().clamp(0.0, 100.0) as u8 })
 }
 
 #[cfg(test)]
@@ -216,7 +260,7 @@ mod tests {
     use wordcraft_assist::cases::Shelf;
     use wordcraft_doc::Document;
 
-    use super::super::tests::{Cases, cases, frames_until, harness};
+    use super::super::tests::{Cases, TODAY, cases, click, frames_until, harness};
     use super::*;
     use crate::assist::cases::bound_for;
     use crate::assist::memory::tests::{Folder, control_click, window};
@@ -319,6 +363,71 @@ mod tests {
         b.session.set_document(document(&unrelated));
         assert_eq!(refresh(&mut b), None, "the last document's card while this one's worker runs");
         assert_eq!(suggestion(&mut b), None);
+    }
+
+    #[test]
+    fn a_worker_compares_only_the_most_recently_changed_cases_up_to_the_cap() {
+        let folder = Folder::new();
+        let c = cases(&folder);
+        let first = clauses(30);
+        bind_first(&folder, &c, &first);
+        let shelf = Shelf::at(&folder.0);
+        let wall = shelf.new_wall(click(), "Client 3", TODAY, 10).unwrap();
+        for n in 0..MAX_CASES as u64 {
+            shelf.new_case(click(), &wall, &format!("Matter {n}"), TODAY, 100 + n).unwrap();
+        }
+        let changed = |when: std::time::SystemTime| {
+            let file = folder.0.join("assistant-cases").join(c.here.wall.as_str()).join(c.here.case.as_str()).join("case.json");
+            std::fs::File::options().write(true).open(file).unwrap().set_modified(when).unwrap();
+        };
+        changed(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000));
+        let mut oldest = window_on(&folder, &first);
+        assert_eq!(suggestion(&mut oldest), None, "more than the cap changed since the matching case");
+        changed(std::time::SystemTime::now() + std::time::Duration::from_secs(3600));
+        let mut newest = window_on(&folder, &first);
+        assert_eq!(suggestion(&mut newest).map(|s| s.at), Some(c.here.clone()), "the matching case changed last");
+    }
+
+    #[test]
+    fn switching_documents_while_a_worker_runs_starts_no_second_one_and_its_late_result_is_not_shown() {
+        let folder = Folder::new();
+        let c = cases(&folder);
+        let first = clauses(30);
+        bind_first(&folder, &c, &first);
+        let mut b = window_on(&folder, &first);
+        let hold = Arc::clone(&b.assist.cases.suggest.hold);
+        let held = hold.write().unwrap();
+        assert_eq!(refresh(&mut b), None);
+        for place in ["premises", "warehouse", "garage"] {
+            let unrelated: Vec<String> =
+                (0..30).map(|i| format!("Section {i}. The tenant shall keep the {place} at unit {i} in good repair and insured.")).collect();
+            b.session.set_document(document(&unrelated));
+            assert_eq!(refresh(&mut b), None);
+        }
+        assert_eq!(b.assist.cases.suggest.started, 1, "the first document's worker is still running");
+        drop(held);
+        frames_until(&mut b, "the shown document's worker never answered", |a| {
+            assert_eq!(refresh(a), None, "the first document's result, shown on another");
+            settled(a)
+        });
+        assert_eq!(b.assist.cases.suggest.started, 2, "the shown document's worker started after the first returned");
+        b.session.set_document(document(&first));
+        assert_eq!(suggestion(&mut b).map(|s| s.percent), Some(100), "the dropped result is taken again");
+    }
+
+    #[test]
+    fn where_no_thread_can_be_made_the_work_runs_on_the_frame() {
+        let folder = Folder::new();
+        let c = cases(&folder);
+        let first = clauses(30);
+        NO_THREADS.set(true);
+        let mut a = window_on(&folder, &first);
+        a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+        assert_eq!(Shelf::at(&folder.0).open(&c.here).unwrap().drafts.len(), 1, "the print was kept with no frame waited");
+        let mut b = window_on(&folder, &first);
+        refresh(&mut b);
+        assert_eq!(refresh(&mut b).map(|s| s.at), Some(c.here.clone()), "the suggestion came with no frame waited");
+        NO_THREADS.set(false);
     }
 
     #[test]
