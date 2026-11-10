@@ -530,6 +530,21 @@ fn creating_a_case_by_client_name_while_the_listing_is_read_makes_no_second_clie
     assert_eq!(wall.cases.len(), 3, "the new case joined the client's two");
 }
 
+#[test]
+fn creating_a_case_for_a_client_another_window_just_made_joins_that_client() {
+    let folder = Folder::new();
+    let _ = cases(&folder);
+    let mut a = window(&folder);
+    a.assist.cases.listing = super::ListState { last: Some(Shelf::at(&folder.0).list()), pending: None };
+    a.assist.cases.listed_at = Some(crate::clock::now_ms());
+    let click = wordcraft_assist::cases::Click::by_person(true).unwrap();
+    let theirs = Shelf::at(&folder.0).new_wall(click, "Client 3", "another window", 1).unwrap();
+    a.run("assist.memory.case.new", json!({"title": "Harbour lease", "client": "Client 3"})).unwrap();
+    let listing = Shelf::at(&folder.0).list();
+    assert_eq!(listing.walls.iter().filter(|w| w.name.for_person() == "Client 3").count(), 1, "{listing:?}");
+    assert_eq!(crate::assist::cases::bound_for(&a).unwrap().wall, theirs, "the case joined the client the other window made");
+}
+
 /// Binding through the command makes the next turn recall, unbinding stops it, and binding another
 /// case ends the conversation that ran under the first.
 #[test]

@@ -210,11 +210,11 @@ fn new_case(app: &mut WordApp, shelf: &Shelf, click: Click, req: &Value) -> Resu
         Some(id) => WallId::parse(id).ok_or("`wall`: not an id")?,
         None => {
             let name = req.get("client").and_then(Value::as_str).filter(|c| !c.trim().is_empty()).unwrap_or(MY_CASES);
-            let listing = match &app.assist.cases.listing.last {
-                Some(listing) => listing.clone(),
-                None => shelf.list(),
-            };
-            match listing.walls.iter().find(|w| w.name.for_person() == name).map(|w| w.id.clone()) {
+            let named = |listing: &Listing| listing.walls.iter().find(|w| w.name.for_person() == name).map(|w| w.id.clone());
+            // The cached listing may be older than another window's new client, so a name it lacks
+            // is looked up on disk once more before a second client of that name is made.
+            let found = app.assist.cases.listing.last.as_ref().and_then(named).or_else(|| named(&shelf.list()));
+            match found {
                 Some(id) => id,
                 None => {
                     let (stamp, counter) = stamp();
