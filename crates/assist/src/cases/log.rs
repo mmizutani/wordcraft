@@ -216,9 +216,14 @@ impl CaseLog {
 
     fn open_with(shelf: &Shelf, at: &CaseRef, stamp: &str, queue: usize, gate: Option<Gate>) -> Result<CaseLog, CaseError> {
         let dir = shelf.real_case_dir(at)?.join(FOLDER);
-        super::store::make_dir(&dir, false).or_else(|e| if e.kind() == std::io::ErrorKind::AlreadyExists { Ok(()) } else { Err(e) }).map_err(|e| {
-            CaseError::Io(format!("{} can't be made: {e}", dir.display()))
-        })?;
+        super::store::make_dir(&dir, false)
+            .or_else(|e| if e.kind() == std::io::ErrorKind::AlreadyExists { Ok(()) } else { Err(e) })
+            .map_err(|e| CaseError::Io(format!("{} can't be made: {e}", dir.display())))?;
+        // A link where `log/` should be could point into another client's case: the folder is
+        // the wall, as `store` keeps it, so a link is refused and never written through.
+        if !super::store::real_dir(&dir) {
+            return Err(CaseError::Gone);
+        }
         make_room(&dir);
         let stamp: String = stamp.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(64).collect();
         let stamp = if stamp.is_empty() { "conversation".to_string() } else { stamp };
@@ -226,6 +231,8 @@ impl CaseLog {
         for n in 0..8u32 {
             let name = if n == 0 { format!("{stamp}.jsonl") } else { format!("{stamp}-{n}.jsonl") };
             let path = dir.join(name);
+            // `create_new` fails on a link as on a file (O_EXCL doesn't follow), so no line is
+            // ever appended through one.
             let mut open = fs::OpenOptions::new();
             open.write(true).create_new(true);
             #[cfg(unix)]
@@ -337,16 +344,24 @@ fn writer(mut file: fs::File, rx: std::sync::mpsc::Receiver<Record>, gate: Optio
     }
 }
 
-/// The record's files in `dir`, oldest first by name (the stamp is a time), each with its size.
+/// The record's plain `.jsonl` files in `dir`, oldest first by name (the stamp is a time), each
+/// with its size. `dir` must be a folder and not a link to one, and a link inside it is left out:
+/// one could point at another client's file, and everything here reads or removes what it lists.
 fn files_in(dir: &std::path::Path) -> Vec<(PathBuf, u64)> {
+    if !super::store::real_dir(dir) {
+        return Vec::new();
+    }
     let mut out: Vec<(PathBuf, u64)> = fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .take(MAX_FILES)
         .filter_map(|e| {
-            let meta = e.metadata().ok().filter(fs::Metadata::is_file)?;
+            if !e.file_type().is_ok_and(|t| t.is_file()) {
+                return None;
+            }
             let path = e.path();
+            let meta = fs::symlink_metadata(&path).ok().filter(fs::Metadata::is_file)?;
             (path.extension().is_some_and(|x| x == "jsonl")).then_some((path, meta.len()))
         })
         .collect();
@@ -407,7 +422,8 @@ pub fn search_log(shelf: &Shelf, at: &CaseRef, query: &str, limit: usize) -> Res
     let query = query.trim().to_lowercase();
     let mut out = LogSearch::default();
     for (path, _) in files_in(&dir).into_iter().rev() {
-        let Ok(file) = fs::File::open(&path) else {
+        // Listed as a plain file a moment ago; a link put there since is refused here too.
+        let Ok(file) = open_plain(&path) else {
             out.skipped = out.skipped.saturating_add(1);
             continue;
         };
@@ -445,6 +461,19 @@ pub fn search_log(shelf: &Shelf, at: &CaseRef, query: &str, limit: usize) -> Res
         }
     }
     Ok(out)
+}
+
+/// `path` open for reading, if it is a plain file and not a link: checked first, and on Unix the
+/// open itself refuses a link too (`O_NOFOLLOW`), so nothing swapped in between is followed.
+fn open_plain(path: &std::path::Path) -> std::io::Result<fs::File> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(std::io::Error::other("not a plain file"));
+    }
+    let mut open = fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    open.open(path)
 }
 
 /// Read past the rest of an over-long line; whether a line end was found.

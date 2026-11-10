@@ -196,3 +196,49 @@ fn hostile_lines_are_skipped_and_counted() {
     assert_eq!(found.skipped, 4);
     assert_eq!(search_log(&shelf, &at, "kept", 0).unwrap().hits.len(), 0, "a limit of none");
 }
+
+/// A link where `log/` should be, or a `.jsonl` link inside it, points at another client's files:
+/// nothing is read through it, nothing is written through it, and nothing outside `log/` goes.
+#[test]
+#[cfg(unix)]
+fn a_link_in_or_as_the_record_folder_is_never_followed() {
+    let click = Click::by_person(true).unwrap();
+    let shelf = Shelf::at(&folder("links"));
+    let ours = shelf.new_wall(click, "Kestrel Freight KK", TODAY, 1).unwrap();
+    let theirs = shelf.new_wall(click, "Bluefin Systems Ltd", TODAY, 2).unwrap();
+    let here = shelf.new_case(click, &ours, "Kestrel MSA", TODAY, 3).unwrap();
+    let other = shelf.new_case(click, &theirs, "Bluefin licence", TODAY, 4).unwrap();
+    // The other client's case has a record of its own.
+    let mut log = CaseLog::open(&shelf, &other, "20261110T090000-1").unwrap();
+    log.write(decided("Canary: Bluefin's clause"));
+    log.close();
+    let other_dir = shelf.log_dir(&other);
+    let other_file = std::fs::read_dir(&other_dir).unwrap().next().unwrap().unwrap().path();
+
+    // `log/` is a link to the other client's record.
+    std::os::unix::fs::symlink(&other_dir, shelf.log_dir(&here)).unwrap();
+    assert!(matches!(CaseLog::open(&shelf, &here, "20261110T100000-2"), Err(_)), "opened through a link");
+    assert!(search(&shelf, &here, "").hits.is_empty(), "read through a link");
+    assert_eq!(log_size(&shelf, &here), 0);
+    assert_eq!(std::fs::read_dir(&other_dir).unwrap().count(), 1, "the other client's record changed");
+    std::fs::remove_file(shelf.log_dir(&here)).unwrap();
+
+    // A `.jsonl` link inside a real `log/`, pointing at the other client's file, beside enough
+    // filler that `make_room` would remove the oldest.
+    let mut log = CaseLog::open(&shelf, &here, "20261110T100000-2").unwrap();
+    log.write(decided("ours"));
+    log.close();
+    let dir = shelf.log_dir(&here);
+    std::os::unix::fs::symlink(&other_file, dir.join("20261101T000000-0.jsonl")).unwrap();
+    let filler = vec![b'{'; (MAX_FILE_BYTES / 2) as usize];
+    for n in 0..(MAX_CASE_BYTES / (MAX_FILE_BYTES / 2)) as usize {
+        std::fs::write(dir.join(format!("20261102T0000{n:02}-9.jsonl")), &filler).unwrap();
+    }
+    let found = search(&shelf, &here, "Canary");
+    assert!(found.hits.is_empty(), "read the other client's file through a link: {found:?}");
+    let log = CaseLog::open(&shelf, &here, "20261111T090000-3").unwrap();
+    log.close();
+    assert!(other_file.exists(), "make_room removed the link's target");
+    assert!(dir.join("20261101T000000-0.jsonl").symlink_metadata().is_ok(), "the link itself is left, never followed");
+    assert!(!dir.join("20261102T000000-9.jsonl").exists(), "the oldest plain file went");
+}

@@ -1,5 +1,6 @@
 //! The person's cases (#107): `assist.memory.case.*` binds the shown document to a case of a
-//! client, sets its facts and its power balance, keeps its plan and notes, and deletes it;
+//! client, sets its facts and its power balance, keeps its plan and notes, turns its record on
+//! and off, and deletes it or the record;
 //! `assist.memory.wall.*` makes and deletes a client; `assist.memory.lesson.*` keeps, edits, turns
 //! off and removes a lesson, which every client's cases recall. Each checks the shape of what it is
 //! given and hands the window a `memory.case.<verb>`, `memory.wall.<verb>` or `memory.lesson.<verb>` request, so every guard
@@ -85,6 +86,21 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             Ok(json!({"deleted": true}))
         })
         .params(r#"{"keepLessons"?: bool} → the bound case's folder and every note in it go, and can't be brought back, with the lessons kept from it unless `keepLessons`, which leaves them without the link; what a model provider or an agent already holds isn't reached. Yours alone, as `assist.memory.add` is"#)
+        .when(memory_here)
+        .pure(),
+        CommandSpec::new("assist.memory.case.record", "Keep a Record of the Case", "Home › Assistant", |s, v| {
+            let on = v.get("value").and_then(Value::as_bool).ok_or_else(|| CmdError::Params("`value`: true to keep a record, false to stop".into()))?;
+            s.push_ui_request(json!({"assist": "memory.case.record", "value": on}));
+            Ok(json!({"record": on}))
+        })
+        .params(r#"{"value": bool} → on, the bound case keeps a record of its conversations in its own folder (each turn as it ended, your Accept and Reject of anyone's change, your edits of the assistant's text, a snapshot of the other side's redlines); off, nothing more is written and what was stays until deleted. Off for every case until you turn it on. Yours alone, as `assist.memory.add` is"#)
+        .when(memory_here)
+        .pure(),
+        CommandSpec::new("assist.memory.case.recordDelete", "Delete the Case's Record", "Home › Assistant", |s, _| {
+            s.push_ui_request(json!({"assist": "memory.case.recordDelete"}));
+            Ok(json!({"deleted": true}))
+        })
+        .params(r#"{} → the bound case's record (its `log/` folder) goes, and can't be brought back; the case and its notes stay. Yours alone, as `assist.memory.add` is"#)
         .when(memory_here)
         .pure(),
         CommandSpec::new("assist.memory.lesson.keep", "Keep a Lesson", "Home › Assistant", lesson_keep)

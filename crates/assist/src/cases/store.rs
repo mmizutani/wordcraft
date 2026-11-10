@@ -474,7 +474,7 @@ pub(crate) fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
 }
 
 /// A folder, and not a link to one.
-fn real_dir(path: &Path) -> bool {
+pub(crate) fn real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 

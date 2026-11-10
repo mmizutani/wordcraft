@@ -545,7 +545,7 @@ fn yours_alone_in_the_params_doc_and_person_only_agree() {
             cases += 1;
         }
     }
-    assert_eq!(cases, 18, "the case, wall and lesson commands are registered");
+    assert_eq!(cases, 20, "the case, wall and lesson commands are registered");
 }
 
 /// The case commands check the shape of what they are given and hand the window a request; the
@@ -576,7 +576,13 @@ fn the_case_commands_check_what_they_are_given() {
     assert_eq!(requests(&mut s), [json!({"assist": "memory.lesson.off", "id": "l3", "value": true})]);
     s.run("assist.memory.case.delete", &json!({"keepLessons": true})).unwrap();
     assert_eq!(requests(&mut s), [json!({"assist": "memory.case.delete", "keepLessons": true})]);
+    s.run("assist.memory.case.record", &json!({"value": true})).unwrap();
+    assert_eq!(requests(&mut s), [json!({"assist": "memory.case.record", "value": true})]);
+    s.run("assist.memory.case.recordDelete", &json!({})).unwrap();
+    assert_eq!(requests(&mut s), [json!({"assist": "memory.case.recordDelete"})]);
     for (id, bad) in [
+        ("assist.memory.case.record", json!({})),
+        ("assist.memory.case.record", json!({"value": "yes"})),
         ("assist.memory.lesson.keep", json!({"text": ""})),
         ("assist.memory.lesson.keep", json!({"text": "x", "applies": "saas"})),
         ("assist.memory.lesson.keep", json!({"text": "x", "from": "../x"})),
