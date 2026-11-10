@@ -408,6 +408,8 @@ fn writes() -> Vec<(&'static str, Value)> {
         ("assist.memory.case.noteRemove", json!({"id": "n1"})),
         ("assist.memory.case.cardDismiss", json!({"card": 1})),
         ("assist.memory.case.delete", json!({})),
+        ("assist.memory.case.record", json!({"value": true})),
+        ("assist.memory.case.recordDelete", json!({})),
         ("assist.memory.wall.delete", json!({"wall": id})),
         ("assist.memory.lesson.keep", json!({"text": "Planted lesson"})),
         ("assist.memory.lesson.edit", json!({"id": "l1", "text": "Planted"})),

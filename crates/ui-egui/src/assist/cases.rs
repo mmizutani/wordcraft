@@ -32,6 +32,7 @@ use crate::theme::Tokens;
 
 pub(crate) mod lesson;
 pub(crate) mod page;
+pub(crate) mod record;
 
 /// Why a turn recalled nothing, as Details says it.
 const NO_CASE: &str = "no case is bound to this document";
@@ -79,6 +80,8 @@ pub(crate) struct CasesState {
     /// [`wordcraft_assist::cases::MODEL_WRITES`], which tests change to try the other setting.
     #[doc(hidden)]
     pub model_writes: ModelWrites,
+    /// The case's record on the page, and the workers deleting or searching it.
+    pub(crate) record: record::RecordState,
 }
 
 /// The last listing read, kept while a newer one is read: a name lookup during the read must
@@ -198,6 +201,7 @@ pub(crate) fn tick(app: &mut WordApp) {
         }
     }
     drain(app);
+    record::tick(app);
 }
 
 /// The writes waiting, in order, each into its own case. A busy lock stops the frame's draining;
@@ -301,11 +305,9 @@ pub(crate) fn write(app: &mut WordApp, dir: &std::path::Path, what: &str, req: &
         "memory.case.delete" => {
             let at = bound_for(app).ok_or(NOT_BOUND)?;
             let keep_lessons = req.get("keepLessons") == Some(&Value::Bool(true));
-            // The conversation holds the case's notes: it ends first, with its transcript.
-            app.bind_case(None);
-            super::end(app);
-            shelf.delete_case(click, &at, keep_lessons).map_err(|e| e.to_string()).map(|()| json!({"deleted": at.case.as_str()}))
+            record::delete_case(app, &shelf, click, &at, keep_lessons)
         }
+        "memory.case.record" | "memory.case.recordDelete" => record::write(app, &shelf, click, what, req),
         "memory.lesson.keep" => {
             let text = req.get("text").and_then(Value::as_str).unwrap_or("");
             let applies = serde_json::from_value(req.get("applies").cloned().unwrap_or(json!({}))).map_err(|e| format!("`applies`: {e}"))?;
