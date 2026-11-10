@@ -299,7 +299,7 @@ mod tests {
         let Route::Write(write) = retire("n2").route(ModelWrites::InCase) else { panic!() };
         assert_eq!(case.apply_model(write, today), Ok(Applied::Removed(NoteId::parse("n2").unwrap())));
         assert_eq!(case.notes.len(), 1);
-        assert_eq!(case.dismissed().len(), 1, "its text joins dismissed");
+        assert_eq!(case.dismissed().len(), 0, "a model's retirement is kept apart from the person's dismissals");
         let again = NoteDraft {
             body: Body::Pattern { rule: Quoted::parse("Bluefin Systems Ltd signs by March."), traps: None },
             how: None,
@@ -310,6 +310,56 @@ mod tests {
         assert!(matches!(case.apply_model(write, today), Ok(Applied::Card(ModelWrite::Retire { .. }))));
         assert_eq!(case.notes.len(), 1, "the confirmed note stands");
         assert!(matches!(retire("n1").route(ModelWrites::CardsOnly), Route::Card(Card::Write(ModelWrite::Retire { .. }))));
+    }
+
+    /// A correction is a new text, so it answers to what a new note answers to: text the person
+    /// dismissed, or text another note already says, is refused and nothing changes.
+    #[test]
+    fn a_correction_to_dismissed_or_duplicate_text_is_refused_as_a_new_note_would_be() {
+        use super::super::record::{Applied, Case, Day, NoteId, PersonOp};
+        let today = Day::parse("2026-11-10").unwrap();
+        let mut case: Case = case_with("They never move on the cap.", "The cap is twelve months.");
+        let draft = |text: &str| NoteDraft { body: Body::Pattern { rule: Quoted::parse(text), traps: None }, how: None, topics: Default::default() };
+        case.apply_person(PersonOp::AddNote(draft("Audit rights are waived.")), today).unwrap();
+        case.apply_person(PersonOp::RemoveNote(NoteId::parse("n3").unwrap()), today).unwrap();
+        let correct = |text: &str| {
+            let m = CaseMarker::parse(&format!(r#"{{"op":"correct","note":"n2","text":"{text}","why":"planted"}}"#)).unwrap();
+            let Route::Write(write) = m.route(ModelWrites::InCase) else { panic!() };
+            write
+        };
+        assert_eq!(case.apply_model(correct("Audit rights are waived."), today), Ok(Applied::Known), "the person said no to that text");
+        assert_eq!(case.apply_model(correct("THEY NEVER MOVE ON THE CAP."), today), Ok(Applied::Known), "another note says it");
+        let n2 = case.notes.iter().find(|n| n.id == NoteId::parse("n2").unwrap()).unwrap();
+        assert_eq!(n2.body.texts().next().unwrap().for_person(), "The cap is twelve months.");
+        assert_eq!(n2.how, None);
+    }
+
+    /// A model can retire only its own notes, and what it retires blocks only the model; however
+    /// many it retires, the person's own dismissals stay and keep blocking.
+    #[test]
+    fn model_retirements_never_push_out_the_persons_dismissals() {
+        use super::super::record::{Applied, Case, Day, MAX_DISMISSED, NoteId, PersonOp};
+        let today = Day::parse("2026-11-10").unwrap();
+        let mut case: Case = Case::new("Bluefin Systems Ltd licence");
+        let draft = |text: &str| NoteDraft { body: Body::Pattern { rule: Quoted::parse(text), traps: None }, how: None, topics: Default::default() };
+        case.apply_person(PersonOp::AddNote(draft("Never accept their audit clause.")), today).unwrap();
+        case.apply_person(PersonOp::RemoveNote(NoteId::parse("n1").unwrap()), today).unwrap();
+        for i in 0..MAX_DISMISSED + 8 {
+            let Applied::Added(id) = case.apply_model(ModelWrite::Note(draft(&format!("Planted note {i}."))), today).unwrap() else { panic!() };
+            let write = ModelWrite::Retire { note: id, why: Quoted::parse("planted") };
+            assert_eq!(case.apply_model(write, today), Ok(Applied::Removed(id)));
+        }
+        assert_eq!(case.dismissed().len(), 1, "the person's dismissal is still there");
+        assert_eq!(
+            case.apply_model(ModelWrite::Note(draft("NEVER accept their AUDIT clause.")), today),
+            Ok(Applied::Known),
+            "and still blocks the model"
+        );
+        assert_eq!(case.apply_model(ModelWrite::Note(draft("Planted note 263.")), today), Ok(Applied::Known), "a retired text blocks the model too");
+        assert!(
+            matches!(case.apply_model(ModelWrite::Note(draft("Planted note 0.")), today), Ok(Applied::Added(_))),
+            "the oldest model dismissal went"
+        );
     }
 
     #[test]

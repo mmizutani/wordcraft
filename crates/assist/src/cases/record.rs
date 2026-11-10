@@ -670,9 +670,14 @@ pub struct Case {
     pub plan: Option<Plan>,
     #[serde(default)]
     pub notes: Vec<Note>,
-    /// SHA-256 of a removed note's text, so the model doesn't note it again.
+    /// SHA-256 of a note's text the person removed, so the model doesn't note it again.
     #[serde(default)]
     dismissed: Vec<String>,
+    /// The same for a note a review retired. Kept apart from `dismissed`, each capped on its
+    /// own, so a model retiring its own notes over and over can push out nothing the person
+    /// said no to. It blocks the model only.
+    #[serde(default)]
+    model_dismissed: Vec<String>,
     #[serde(default)]
     last_note: u64,
     /// Whether the case keeps a record of its conversations ([`super::log`]). Off for every new
@@ -698,6 +703,7 @@ impl Case {
             plan: None,
             notes: Vec::new(),
             dismissed: Vec::new(),
+            model_dismissed: Vec::new(),
             last_note: 0,
             record: false,
             damaged: false,
@@ -759,6 +765,7 @@ impl Case {
         cut |= truncate(&mut self.balance, MAX_BALANCES);
         cut |= truncate(&mut self.facts.parties, MAX_LIST);
         cut |= truncate(&mut self.dismissed, MAX_DISMISSED);
+        cut |= truncate(&mut self.model_dismissed, MAX_DISMISSED);
         for note in &mut self.notes {
             cut |= note.clamp();
         }
@@ -772,9 +779,11 @@ impl Case {
             cut |= p.cut(MAX_SHORT);
         }
         cut |= self.plan.as_mut().is_some_and(Plan::clamp);
-        let before = self.dismissed.len();
-        self.dismissed.retain(|k| is_key(k));
-        cut |= self.dismissed.len() != before;
+        for list in [&mut self.dismissed, &mut self.model_dismissed] {
+            let before = list.len();
+            list.retain(|k| is_key(k));
+            cut |= list.len() != before;
+        }
         let mut seen = std::collections::HashSet::new();
         let before = self.notes.len();
         self.notes.retain(|n| seen.insert(n.id));
@@ -805,10 +814,23 @@ impl Case {
         self.notes.iter_mut().find(|n| n.id == id).ok_or(CaseError::NoSuchNote(id))
     }
 
-    /// A note that says `draft`'s main text already, or a dismissal of it.
+    /// A note that says `draft`'s main text already, or the person's dismissal of it. The
+    /// person's own write answers to this too, as it did before reviews (#107, AS8.1).
     fn knows(&self, draft: &NoteDraft) -> bool {
-        let said = draft.said();
-        self.notes.iter().any(|n| n.said() == said) || self.dismissed.contains(&key_of(&draft.main()))
+        self.knows_text(&draft.main(), None) || self.dismissed.contains(&key_of(&draft.main()))
+    }
+
+    /// What a model's new text answers to: what [`Case::knows`] refuses, and what a review
+    /// retired. `except` is the note being corrected, which may of course say its own text.
+    fn model_knows(&self, text: &str, except: Option<NoteId>) -> bool {
+        let key = key_of(text);
+        self.knows_text(text, except) || self.dismissed.contains(&key) || self.model_dismissed.contains(&key)
+    }
+
+    /// Whether a note other than `except` says `text`, normalized.
+    fn knows_text(&self, text: &str, except: Option<NoteId>) -> bool {
+        let said = normalized(text);
+        self.notes.iter().any(|n| Some(n.id) != except && n.said() == said)
     }
 
     /// Append a balance, after `evict` has made room: past the cap the person drops the oldest,
@@ -874,23 +896,25 @@ impl Case {
                     note.standing = confirmed;
                 }
             }
-            PersonOp::RemoveNote(id) => self.remove_note(id)?,
+            PersonOp::RemoveNote(id) => self.remove_note(id, false)?,
             PersonOp::Close(stage) => self.facts.stage = stage,
             PersonOp::Record(on) => self.record = on,
         }
         Ok(())
     }
 
-    /// The note goes, and a hash of its main text stays so a model doesn't note it again.
-    fn remove_note(&mut self, id: NoteId) -> Result<(), CaseError> {
+    /// The note goes, and a hash of its main text joins the person's or the model's dismissals so
+    /// a model doesn't note it again.
+    fn remove_note(&mut self, id: NoteId, by_model: bool) -> Result<(), CaseError> {
         let i = self.notes.iter().position(|n| n.id == id).ok_or(CaseError::NoSuchNote(id))?;
         let gone = self.notes.remove(i);
         let key = key_of(gone.body.texts().next().map_or("", Quoted::raw));
-        if !self.dismissed.contains(&key) {
-            self.dismissed.push(key);
+        let list = if by_model { &mut self.model_dismissed } else { &mut self.dismissed };
+        if !list.contains(&key) {
+            list.push(key);
         }
-        if self.dismissed.len() > MAX_DISMISSED {
-            self.dismissed.remove(0);
+        if list.len() > MAX_DISMISSED {
+            list.remove(0);
         }
         Ok(())
     }
@@ -902,10 +926,14 @@ impl Case {
     pub(crate) fn apply_model(&mut self, write: ModelWrite, today: Day) -> Result<Applied, CaseError> {
         match write {
             ModelWrite::Correct { note, text, why } => {
-                let n = self.note_mut(note)?;
-                if n.standing.is_confirmed() {
+                if self.note_mut(note)?.standing.is_confirmed() {
                     return Ok(Applied::Card(ModelWrite::Correct { note, text, why }));
                 }
+                // A correction is a new text: what a new note can't say, it can't either.
+                if self.model_knows(text.raw(), Some(note)) {
+                    return Ok(Applied::Known);
+                }
+                let n = self.note_mut(note)?;
                 n.body.set_main(text);
                 n.how = Some(why);
                 if n.clamp() {
@@ -917,11 +945,11 @@ impl Case {
                 if self.note_mut(note)?.standing.is_confirmed() {
                     return Ok(Applied::Card(ModelWrite::Retire { note, why }));
                 }
-                self.remove_note(note)?;
+                self.remove_note(note, true)?;
                 Ok(Applied::Removed(note))
             }
             ModelWrite::Note(draft) => {
-                if self.knows(&draft) {
+                if self.model_knows(&draft.main(), None) {
                     return Ok(Applied::Known);
                 }
                 let unconfirmed: Vec<usize> = self.notes.iter().enumerate().filter(|(_, n)| !n.standing.is_confirmed()).map(|(i, _)| i).collect();
@@ -1005,10 +1033,6 @@ pub struct NoteDraft {
 impl NoteDraft {
     fn main(&self) -> String {
         self.body.texts().next().map(|q| q.raw().to_string()).unwrap_or_default()
-    }
-
-    fn said(&self) -> String {
-        normalized(&self.main())
     }
 
     fn into_note(self, id: NoteId, at: Day, standing: Standing) -> Result<Note, CaseError> {

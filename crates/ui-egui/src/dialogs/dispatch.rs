@@ -1565,9 +1565,18 @@ fn match_fields_dialog(ui: &mut Ui, d: &mut Dialog) -> bool {
 }
 
 /// Commands Search leaves out: they need a parameter it can't give (which Language pack), and
-/// File › Options › Language does them with the list in front of the person.
-const NOT_IN_SEARCH: [&str; 6] =
-    ["proof.installPack", "proof.removePack", "assist.backend", "assist.defaultRole", "assist.memory.case.delete", "assist.memory.wall.delete"];
+/// File › Options › Language does them with the list in front of the person; or they spend or
+/// destroy something the page they live on says in front of the button (a review's request, a
+/// case's or a client's delete).
+const NOT_IN_SEARCH: [&str; 7] = [
+    "proof.installPack",
+    "proof.removePack",
+    "assist.backend",
+    "assist.defaultRole",
+    "assist.memory.case.delete",
+    "assist.memory.wall.delete",
+    "assist.memory.case.review",
+];
 
 fn check_errors_dialog(ui: &mut Ui, d: &mut Dialog) -> bool {
     let Dialog::CheckErrors { unknown, records } = d else {

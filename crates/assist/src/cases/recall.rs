@@ -806,13 +806,15 @@ pub fn compose_for_eval_without_room_check(shelf: &Shelf, at: &CaseRef, about: &
     Ok((recalled.sent(), recalled.into_sources()))
 }
 
-/// Every string in `json`, as [`note_item`], [`balance_item`] and [`ladder_item`] build it: a
-/// ladder's rungs are the deepest, three levels down.
+/// Every string in `json`, however deep: a review item carries record lines whose tool details
+/// sit four levels down, and a text the index misses is a quote the window can't flag. The depth
+/// guard only bounds the recursion; `serde_json` parses nothing deeper than 128 levels, so no
+/// string of a record line is beyond it.
 fn strings(json: &Value, depth: u8, out: &mut Vec<String>) {
     match json {
         Value::String(s) => out.push(s.clone()),
-        Value::Array(items) if depth < 4 => items.iter().for_each(|v| strings(v, depth.saturating_add(1), out)),
-        Value::Object(fields) if depth < 4 => fields.values().for_each(|v| strings(v, depth.saturating_add(1), out)),
+        Value::Array(items) if depth < 128 => items.iter().for_each(|v| strings(v, depth.saturating_add(1), out)),
+        Value::Object(fields) if depth < 128 => fields.values().for_each(|v| strings(v, depth.saturating_add(1), out)),
         _ => {}
     }
 }
@@ -1170,6 +1172,82 @@ mod tests {
 
     fn id(n: u8) -> CaseId {
         CaseId::parse(&format!("{n:016x}")).unwrap()
+    }
+
+    /// Every string in `json`, however deep.
+    fn all_strings(json: &Value, out: &mut Vec<String>) {
+        match json {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => items.iter().for_each(|v| all_strings(v, out)),
+            Value::Object(fields) => fields.values().for_each(|v| all_strings(v, out)),
+            _ => {}
+        }
+    }
+
+    /// A review's item carries the whole case and its record, so every text in it is what a
+    /// pasted quote is checked against: nothing nests too deep for the quote index, and a case with
+    /// no record reviews its notes alone. The record is read newest first up to its cap.
+    #[test]
+    fn a_review_item_puts_every_string_it_carries_in_the_quote_index_and_works_without_a_record() {
+        use crate::cases::log::{CaseLog, Record};
+        use crate::cases::record::{Click, NoteDraft, PersonOp};
+        let dir = std::env::temp_dir().join(format!("wordcraft-review-item-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Kestrel Freight KK", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Kestrel supply agreement", "2026-11-10", 2).unwrap();
+        let draft = NoteDraft {
+            body: Body::Position {
+                topic: Topic::Liability,
+                moved: Side::Them,
+                terms: Quoted::parse("Cap at twelve months of fees."),
+                traded_for: Some(Quoted::parse("notice cut to sixty days")),
+                landed: true,
+            },
+            how: Some(Quoted::parse("Reported from the Tuesday call.")),
+            topics: Topics::default(),
+        };
+        shelf.person(click, &at, PersonOp::AddNote(draft), day("2026-11-10")).unwrap();
+        let without = compose_review(&shelf, &at).unwrap();
+        assert_eq!(without.sent.items.len(), 1);
+        assert!(without.sent.items[0].text.contains("0 record lines"), "{}", without.sent.items[0].text);
+        let mut log = CaseLog::open(&shelf, &at, "2026-11-10T10-00-00").unwrap();
+        for n in 1..=3u32 {
+            log.write(Record::Turn {
+                at: format!("2026-11-10T10:0{n}:00"),
+                n,
+                asked: Quoted::parse(&format!("Turn {n}: is the audit clause in the Bluefin draft usual?")),
+                answer: Some(Quoted::parse(&format!("Turn {n} answer: the audit right is wider than the market's."))),
+                tools: vec![crate::cases::log::ToolLine {
+                    title: Quoted::parse("read"),
+                    status: crate::ToolStatus::Completed,
+                    detail: Quoted::parse(&format!("clause 14 (turn {n})")),
+                }],
+                model: Some("scripted".into()),
+                stop: None,
+                recalled: vec!["n1".into()],
+                used: Vec::new(),
+            });
+        }
+        log.close();
+        let recalled = compose_review(&shelf, &at).unwrap();
+        let sent = recalled.sent();
+        let mut every = Vec::new();
+        all_strings(&recalled.json[0], &mut every);
+        assert!(every.iter().any(|s| s == "clause 14 (turn 3)"), "the tool detail is three levels down a record line: {every:?}");
+        assert!(every.iter().any(|s| s == "Reported from the Tuesday call."));
+        for s in &every {
+            assert!(sent.sent_text.contains(s), "{s:?} isn't in the quote index: {:?}", sent.sent_text);
+        }
+        assert_eq!(sent.items[0].id, ItemId::Review);
+        assert!(sent.items[0].text.contains("1 notes") && sent.items[0].text.contains("3 record lines"), "{}", sent.items[0].text);
+        // The cap keeps the newest lines.
+        let (newest, skipped, cut) = crate::cases::log::recent_records(&shelf, &at, 400).unwrap();
+        assert_eq!((newest.len(), skipped, cut), (1, 0, true));
+        assert!(matches!(&newest[0], Record::Turn { n: 3, .. }));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// What the loader reads from the lessons file on disk: the lessons that are on, and none at

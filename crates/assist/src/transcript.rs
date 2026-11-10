@@ -429,13 +429,14 @@ pub struct Transcript {
     /// The case markers parsed that the window hasn't routed yet ([`Transcript::take_case_markers`]).
     #[serde(skip)]
     unrouted: Vec<CaseMarker>,
-    /// How many case markers the current turn has kept, and the most it may
-    /// ([`crate::cases::marker::MAX_PER_TURN`], or [`crate::cases::marker::MAX_PER_REVIEW`] for
-    /// a review's turn).
+    /// How many case markers the current turn has kept.
     #[serde(skip)]
     case_marked: u8,
+    /// The current turn is a review's ([`Transcript::review_turn`]): its answer's review verbs
+    /// are kept, up to [`crate::cases::marker::MAX_PER_REVIEW`]. In any other turn a review verb
+    /// is dropped and counted here and never reaches the window.
     #[serde(skip)]
-    marker_cap: u8,
+    review: bool,
     /// The last card's number.
     #[serde(skip)]
     last_card: u64,
@@ -654,7 +655,7 @@ impl Transcript {
         self.turn_start = self.entries.len();
         self.proposed = 0;
         self.case_marked = 0;
-        self.marker_cap = MAX_PER_TURN;
+        self.review = false;
         self.turns = self.turns.saturating_add(1);
         self.push(Entry::Asked { text: text.to_string() });
     }
@@ -662,7 +663,7 @@ impl Transcript {
     /// The turn just asked is a review's ([`crate::cases::marker::REVIEW_ASK`]): it may carry a
     /// marker per note. Called right after [`Transcript::asked`], by the window that sent it.
     pub fn review_turn(&mut self) {
-        self.marker_cap = crate::cases::marker::MAX_PER_REVIEW;
+        self.review = true;
     }
 
     /// The window dropped a case marker of the turn (a review's verb outside a review, or a note
@@ -862,7 +863,8 @@ impl Transcript {
             Piece::Remember(t) => self.propose(&t),
             Piece::Used(id) => self.mark_used(&id),
             Piece::Case(body) => match CaseMarker::parse(&body) {
-                Some(marker) if self.case_marked < self.marker_cap.max(MAX_PER_TURN) => {
+                Some(marker) if marker.review_only() && !self.review => self.dropped_marker(),
+                Some(marker) if self.case_marked < if self.review { crate::cases::marker::MAX_PER_REVIEW } else { MAX_PER_TURN } => {
                     self.case_marked = self.case_marked.saturating_add(1);
                     self.unrouted.push(marker);
                 }
