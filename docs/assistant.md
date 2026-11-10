@@ -258,7 +258,7 @@ was recalled when nothing was.
 **The clause ladder.** When the prompt names a topic (the liability cap, say) on which this case
 and the same client's other cases hold three or more positions, those notes go as one item,
 `ladder:liability`, instead of one by one: every position on that topic, each with where it is
-from, its date, who moved, the terms, what it was traded for, whether it landed, the balance then
+from, its date, who moved, the terms, what it was traded for, whether it landed, how it is known (from you, or from the other side's text), the balance then
 against now, and whether you confirmed it. The ladder is computed from the case files for each
 turn and stored nowhere, so deleting a case takes its rungs with it and nothing can go stale. It
 is ordered for the question "what did we concede, and when were we weaker": the position taken

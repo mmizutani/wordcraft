@@ -514,8 +514,8 @@ fn topic_name(topic: Topic) -> String {
 }
 
 /// One position on a topic, as the ladder shows it: where it is from, when, who moved, the terms,
-/// what was traded, whether it landed, the balance then against now, and whether the person
-/// confirmed it. The same record goes to the model, the pane and the quote index.
+/// what was traded, whether it landed, how it is known, the balance then against now, and whether
+/// the person confirmed it. The same record goes to the model, the pane and the quote index.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Rung {
@@ -527,6 +527,8 @@ pub struct Rung {
     pub terms: String,
     pub traded_for: Option<String>,
     pub landed: bool,
+    /// The note's `how`: from the person, or the other side's text or demand, as `CASE_ASK` asks.
+    pub how: Option<String>,
     pub balance: BalanceGap,
     pub confirmed: bool,
 }
@@ -557,6 +559,7 @@ pub(crate) fn ladder(topic: Topic, pool: &Pool, now: Option<Stance>) -> Vec<Rung
             terms: terms.for_person().to_string(),
             traded_for: traded_for.as_ref().map(|q| q.for_person().to_string()),
             landed: *landed,
+            how: note.how.as_ref().map(|q| q.for_person().to_string()),
             balance: BalanceGap { then: case.stance_on(note.at), now },
             confirmed: matches!(note.standing, Standing::Confirmed { .. }),
         })
@@ -959,6 +962,9 @@ fn ladder_item(topic: Topic, rungs: Vec<Rung>, now: Option<Stance>) -> (Recalled
             });
             if let Some(t) = &r.traded_for {
                 j["tradedFor"] = Value::String(t.clone());
+            }
+            if let Some(how) = &r.how {
+                j["how"] = Value::String(how.clone());
             }
             j
         })
@@ -1584,6 +1590,23 @@ mod tests {
             assert!(t.quotes_recalled_for_test(trade), "{trade}");
         }
         assert!(!t.quotes_recalled_for_test(TRADES[3]), "a trade no rung holds isn't flagged");
+    }
+
+    /// A rung keeps how its position is known, as a note item does: a position the other side only
+    /// demanded must still say so once it is a rung, and that text is indexed for the quote check.
+    #[test]
+    fn ladder_rung_keeps_how_the_position_is_known() {
+        let mut pool = ladder_pool();
+        let how = "From their redline: their counsel's demand, never agreed by us.";
+        pool.neighbors[0].case.notes[1].how = Some(Quoted::parse(how));
+        let out = compose(&pool, &liability_query(&pool));
+        let at = out.sent.items.iter().position(|i| matches!(i.id, ItemId::Ladder { .. })).unwrap();
+        let rows = out.json[at]["rungs"].as_array().cloned().unwrap_or_default();
+        assert!(rows.iter().any(|r| r["how"] == how), "{rows:#?}");
+        assert!(rows.iter().filter(|r| r.get("how").is_some()).count() == 1, "only the rung whose note says how: {rows:#?}");
+        let mut t = crate::Transcript::default();
+        t.record(&crate::Event::Recalled(out.sent()));
+        assert!(t.quotes_recalled_for_test(how));
     }
 
     /// A ladder too long for the budget whole still goes, with the rungs that fit in their order;
