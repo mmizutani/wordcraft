@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use wordcraft_engine::room::{ParticipantId, Room};
 
 use super::lessons::{KeptLesson, LessonId};
-use super::record::{Applies, Body, Case, CaseError, Day, Kind, Note, Quoted, Stance, Standing, Topics};
+use super::record::{Applies, Body, Case, CaseError, Day, Kind, Note, Quoted, Side, Stance, Standing, Topic, Topics};
 use super::store::{CaseId, CaseRef, Shelf};
 use super::text::{Bm25, Token, tokens, topics_in};
 use crate::backend::{cut, label, shown};
@@ -273,6 +273,8 @@ pub const BUDGET: usize = 6 << 10;
 pub const MAX_ITEMS: usize = 12;
 /// Most notes one other case contributes to a turn.
 pub const MAX_PER_NEIGHBOR: usize = 3;
+/// From this many `Position` notes on one of the query's topics, they go as one ladder item.
+pub const LADDER_FROM: usize = 3;
 /// Below this an item isn't about the thing at hand enough to send. A guess, and the knob.
 pub const MIN_SCORE: f32 = 0.1;
 /// Most other cases of the wall read for one turn, most recently changed first, and most bytes of
@@ -415,7 +417,7 @@ impl RecallAsk {
 
 /// What recall can see: the bound case, the other cases of its wall, and the lessons the person
 /// kept from any client. Built from one wall's folder and the lessons file, and nothing else.
-struct Pool {
+pub(crate) struct Pool {
     here: Case,
     neighbors: Vec<Neighbor>,
     /// The kept lessons that aren't off, from every client.
@@ -482,8 +484,8 @@ impl Neighbor {
 }
 
 /// What a recalled item is called in `[[used: …]]` and in Details: `n12` for this case's note,
-/// `<case>:n12` for another case's, `<case>:balance` for its balance, `l3` for a lesson. Disjoint
-/// from a preference's `m1`.
+/// `<case>:n12` for another case's, `<case>:balance` for its balance, `l3` for a lesson,
+/// `ladder:liability` for a topic's ladder. Disjoint from a preference's `m1`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "where")]
 pub enum ItemId {
@@ -491,6 +493,7 @@ pub enum ItemId {
     Neighbor { case: CaseId, note: super::record::NoteId },
     NeighborBalance { case: CaseId },
     Lesson { lesson: LessonId },
+    Ladder { topic: Topic },
 }
 
 impl std::fmt::Display for ItemId {
@@ -500,8 +503,73 @@ impl std::fmt::Display for ItemId {
             ItemId::Neighbor { case, note } => write!(f, "{}:{note}", case.as_str()),
             ItemId::NeighborBalance { case } => write!(f, "{}:balance", case.as_str()),
             ItemId::Lesson { lesson } => write!(f, "{lesson}"),
+            ItemId::Ladder { topic } => write!(f, "ladder:{}", topic_name(*topic)),
         }
     }
+}
+
+/// A topic as its JSON name: `liability`, `dataProtection`.
+fn topic_name(topic: Topic) -> String {
+    serde_json::to_value(topic).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
+}
+
+/// One position on a topic, as the ladder shows it: where it is from, when, who moved, the terms,
+/// what was traded, whether it landed, the balance then against now, and whether the person
+/// confirmed it. The same record goes to the model, the pane and the quote index.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Rung {
+    pub place: Place,
+    /// The other case's title, for [`Place::SameClient`].
+    pub title: Option<String>,
+    pub on: Day,
+    pub moved: Side,
+    pub terms: String,
+    pub traded_for: Option<String>,
+    pub landed: bool,
+    pub balance: BalanceGap,
+    pub confirmed: bool,
+}
+
+/// Most rungs one ladder carries. Past it the rungs that order last are counted in `left_out`.
+pub const MAX_RUNGS: usize = 8;
+
+/// The clause ladder: every `Position` note on `topic` in the pool, this case's and the same
+/// client's confirmed ones, as rungs. Derived per query and stored nowhere, so it can't go stale
+/// and deleting a case takes its rungs with it. Lessons and other kinds never enter.
+///
+/// The order answers "what did we concede, and when were we weaker": the rung whose balance is
+/// closest to now first, since that is the precedent that transfers, with an unknown balance
+/// last; then landed before open, since a landed position is a fact and an open one an ask; then
+/// newest first.
+pub(crate) fn ladder(topic: Topic, pool: &Pool, now: Option<Stance>) -> Vec<Rung> {
+    let rung_of = |note: &Note, case: &Case, neighbor: Option<&Neighbor>| {
+        let Body::Position { topic: t, moved, terms, traded_for, landed } = &note.body else { return None };
+        if *t != topic {
+            return None;
+        }
+        let (place, title, _) = place_words(neighbor);
+        Some(Rung {
+            place,
+            title,
+            on: note.at,
+            moved: *moved,
+            terms: terms.for_person().to_string(),
+            traded_for: traded_for.as_ref().map(|q| q.for_person().to_string()),
+            landed: *landed,
+            balance: BalanceGap { then: case.stance_on(note.at), now },
+            confirmed: matches!(note.standing, Standing::Confirmed { .. }),
+        })
+    };
+    let here = pool.here.notes.iter().filter_map(|n| rung_of(n, &pool.here, None));
+    let theirs = pool.neighbors.iter().flat_map(|nb| nb.case.notes.iter().filter_map(move |n| rung_of(n, &nb.case, Some(nb))));
+    let mut rungs: Vec<Rung> = here.chain(theirs).collect();
+    let gap = |r: &Rung| match (r.balance.then, now) {
+        (Some(then), Some(now)) => (rung(now) - rung(then)).abs(),
+        _ => i8::MAX,
+    };
+    rungs.sort_by(|a, b| gap(a).cmp(&gap(b)).then(b.landed.cmp(&a.landed)).then(b.on.cmp(&a.on)));
+    rungs
 }
 
 /// The balance an item was learned under, against the balance now: the model sees these words on
@@ -541,6 +609,25 @@ pub struct RecalledItem {
     pub confirmed: bool,
     /// Sent to this agent session in an earlier turn, so not sent again this turn.
     pub again: bool,
+    /// A ladder's positions, in the order sent; empty for every other item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rungs: Vec<Rung>,
+}
+
+impl RecalledItem {
+    /// What [`Told`] remembers an item by. A ladder is its rungs: one whose rungs changed is
+    /// new text, so it is keyed by their content and not by its id alone.
+    fn told_key(&self) -> String {
+        if self.rungs.is_empty() {
+            return self.id.to_string();
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for r in &self.rungs {
+            (&r.title, r.on, r.terms.as_str(), r.traded_for.as_deref(), r.landed, r.moved as u8).hash(&mut h);
+        }
+        format!("{}#{:x}", self.id, h.finish())
+    }
 }
 
 /// What a turn recalled: for Details, and what `[[used: …]]` is checked against.
@@ -564,7 +651,11 @@ pub struct RecallSent {
 
 impl RecallSent {
     pub(crate) fn bytes(&self) -> usize {
-        self.items.iter().map(|i| i.text.len() + i.title.as_ref().map_or(0, String::len) + 32).sum::<usize>()
+        let rung = |r: &Rung| r.terms.len() + r.traded_for.as_ref().map_or(0, String::len) + r.title.as_ref().map_or(0, String::len) + 32;
+        self.items
+            .iter()
+            .map(|i| i.text.len() + i.title.as_ref().map_or(0, String::len) + 32 + i.rungs.iter().map(rung).sum::<usize>())
+            .sum::<usize>()
             + self.problem.as_ref().map_or(0, String::len)
     }
 
@@ -574,6 +665,7 @@ impl RecallSent {
         for item in &mut self.items {
             item.text = cut(shown(std::mem::take(&mut item.text)), super::record::MAX_TEXT.saturating_mul(4));
             item.title = item.title.take().map(|t| label(&t));
+            item.rungs.truncate(MAX_RUNGS);
         }
         self.problem = self.problem.map(|p| label(&p));
         self
@@ -608,7 +700,7 @@ impl Recalled {
 
     /// The ids of the items this turn carries, for [`Told::record`] once the prompt was taken.
     pub(crate) fn fresh_ids(&self) -> Vec<String> {
-        self.sent.items.iter().filter(|i| !i.again).map(|i| i.id.to_string()).collect()
+        self.sent.items.iter().filter(|i| !i.again).map(RecalledItem::told_key).collect()
     }
 
     /// The items not sent to this session before, as one data-grade source; none when there are
@@ -637,7 +729,8 @@ pub fn compose_for_eval_without_room_check(shelf: &Shelf, at: &CaseRef, about: &
     Ok((recalled.sent(), recalled.into_sources()))
 }
 
-/// Every string in `json`, as [`note_item`] and [`balance_item`] build it: three levels deep at most.
+/// Every string in `json`, as [`note_item`], [`balance_item`] and [`ladder_item`] build it: a
+/// ladder's rungs are the deepest, three levels down.
 fn strings(json: &Value, depth: u8, out: &mut Vec<String>) {
     match json {
         Value::String(s) => out.push(s.clone()),
@@ -667,7 +760,7 @@ impl Told {
             return;
         }
         for item in &mut recalled.sent.items {
-            item.again = self.keys.contains(&item.id.to_string());
+            item.again = self.keys.contains(&item.told_key());
         }
     }
 
@@ -686,7 +779,20 @@ impl Told {
 /// Greedy by score inside [`BUDGET`], at most [`MAX_PER_NEIGHBOR`] notes from one other case and
 /// [`MAX_ITEMS`] in all, nothing below [`MIN_SCORE`]. An other case's newest confirmed balance
 /// rides with its first note that made the cut, so the model sees why that case stood where it did.
+///
+/// A topic of the query with at least [`LADDER_FROM`] `Position` notes in the pool goes as one
+/// [`ladder`] item in their place: it takes the rank of its best rung, counts as one item and its
+/// JSON against the budget, and its rungs count toward no neighbor's cap and bring no balance
+/// item, since each rung carries its own balance. The notes it replaces are neither sent nor
+/// counted as left out; rungs past [`MAX_RUNGS`] are.
 fn compose(pool: &Pool, query: &Query) -> Recalled {
+    let positions = |topic: Topic| {
+        let on = |n: &Note| n.body.topic() == Some(topic);
+        pool.here.notes.iter().filter(|n| on(n)).count()
+            + pool.neighbors.iter().map(|nb| nb.case.notes.iter().filter(|n| on(n)).count()).sum::<usize>()
+    };
+    let laddered: Vec<Topic> = Topic::ALL.into_iter().filter(|t| query.topics.contains(*t) && positions(*t) >= LADDER_FROM).collect();
+    let mut ladders_sent: Vec<Topic> = Vec::new();
     let here: Vec<Candidate<'_>> = pool.here.notes.iter().map(|note| Candidate::Note { note, case: &pool.here, place: Place::ThisCase }).collect();
     let theirs =
         pool.neighbors.iter().flat_map(|nb| nb.case.notes.iter().map(move |note| Candidate::Note { note, case: &nb.case, place: Place::SameClient }));
@@ -707,6 +813,21 @@ fn compose(pool: &Pool, query: &Query) -> Recalled {
         true
     };
     for ranked in rank(query, &candidates) {
+        if let Some(topic) = ranked.candidate.note().and_then(|n| n.body.topic()).filter(|t| laddered.contains(t)) {
+            if ladders_sent.contains(&topic) {
+                continue;
+            }
+            ladders_sent.push(topic);
+            let mut rungs = ladder(topic, pool, now);
+            let all = u32::try_from(rungs.len()).unwrap_or(u32::MAX);
+            rungs.truncate(MAX_RUNGS);
+            let kept = u32::try_from(rungs.len()).unwrap_or(u32::MAX);
+            let (item, json) = ladder_item(topic, rungs, now);
+            let sent = ranked.score >= MIN_SCORE && push(&mut out, item, json);
+            let left = if sent { all.saturating_sub(kept) } else { all };
+            out.sent.left_out = out.sent.left_out.saturating_add(left);
+            continue;
+        }
         if ranked.score < MIN_SCORE {
             out.sent.left_out = out.sent.left_out.saturating_add(1);
             continue;
@@ -751,9 +872,17 @@ fn place_words(neighbor: Option<&Neighbor>) -> (Place, Option<String>, String) {
         None => (Place::ThisCase, None, "this case".to_string()),
         Some(nb) => {
             let title = label(nb.case.title.for_person());
-            let words = format!("the same client's case {}", serde_json::to_string(&title).unwrap_or_default());
+            let words = place_line(Some(&title));
             (Place::SameClient, Some(title), words)
         }
+    }
+}
+
+/// The place as the model reads it: this case, or the same client's case by its title.
+fn place_line(title: Option<&String>) -> String {
+    match title {
+        None => "this case".to_string(),
+        Some(title) => format!("the same client's case {}", serde_json::to_string(title).unwrap_or_default()),
     }
 }
 
@@ -788,9 +917,57 @@ fn lesson_item(lesson: &KeptLesson, now: Option<Stance>) -> (RecalledItem, Value
     facts_json(&mut json, &lesson.applies);
     json.insert("balance".into(), Value::String(gap.words()));
     json.insert("confirmed".into(), Value::Bool(true));
-    let item =
-        RecalledItem { id, place: Place::Lesson, title: None, kind: Some(Kind::Lesson), text, balance: Some(gap), confirmed: true, again: false };
+    let item = RecalledItem {
+        id,
+        place: Place::Lesson,
+        title: None,
+        kind: Some(Kind::Lesson),
+        text,
+        balance: Some(gap),
+        confirmed: true,
+        again: false,
+        rungs: Vec::new(),
+    };
     (item, Value::Object(json))
+}
+
+/// A topic's ladder as the model sees it: its rungs in order, each with its place, date, mover,
+/// terms, trade, whether it landed, the balance then against now, and its standing.
+fn ladder_item(topic: Topic, rungs: Vec<Rung>, now: Option<Stance>) -> (RecalledItem, Value) {
+    let id = ItemId::Ladder { topic };
+    let landed = rungs.iter().filter(|r| r.landed).count();
+    let confirmed = rungs.iter().all(|r| r.confirmed);
+    let text = format!("{}: {} positions, {landed} landed", topic_name(topic), rungs.len());
+    let rows: Vec<Value> = rungs
+        .iter()
+        .map(|r| {
+            let mut j = json!({
+                "place": place_line(r.title.as_ref()),
+                "on": String::from(r.on),
+                "moved": r.moved,
+                "terms": r.terms,
+                "landed": r.landed,
+                "balance": r.balance.words(),
+                "confirmed": r.confirmed,
+            });
+            if let Some(t) = &r.traded_for {
+                j["tradedFor"] = Value::String(t.clone());
+            }
+            j
+        })
+        .collect();
+    let json = json!({
+        "id": id.to_string(),
+        "place": "this case and the same client's cases",
+        "kind": "ladder",
+        "topic": topic_name(topic),
+        "text": text,
+        "rungs": rows,
+        "balance": BalanceGap { then: None, now }.words(),
+        "confirmed": confirmed,
+    });
+    let item = RecalledItem { id, place: Place::ThisCase, title: None, kind: None, text, balance: None, confirmed, again: false, rungs };
+    (item, json)
 }
 
 fn note_item(note: &Note, case: &Case, neighbor: Option<&Neighbor>, now: Option<Stance>) -> (RecalledItem, Value) {
@@ -842,7 +1019,7 @@ fn note_item(note: &Note, case: &Case, neighbor: Option<&Neighbor>, now: Option<
     facts_json(&mut json, &case.applies(note.at));
     json.insert("balance".into(), Value::String(gap.words()));
     json.insert("confirmed".into(), Value::Bool(confirmed));
-    let item = RecalledItem { id, place, title, kind: Some(note.kind()), text, balance: Some(gap), confirmed, again: false };
+    let item = RecalledItem { id, place, title, kind: Some(note.kind()), text, balance: Some(gap), confirmed, again: false, rungs: Vec::new() };
     (item, Value::Object(json))
 }
 
@@ -872,7 +1049,7 @@ fn balance_item(nb: &Neighbor, balance: &super::record::Balance, now: Option<Sta
     facts_json(&mut json, &nb.case.applies(balance.on));
     json.insert("balance".into(), Value::String(gap.words()));
     json.insert("confirmed".into(), Value::Bool(true));
-    let item = RecalledItem { id, place, title, kind: None, text, balance: Some(gap), confirmed: true, again: false };
+    let item = RecalledItem { id, place, title, kind: None, text, balance: Some(gap), confirmed: true, again: false, rungs: Vec::new() };
     (item, Value::Object(json))
 }
 
@@ -1180,6 +1357,7 @@ mod tests {
             balance: None,
             confirmed: true,
             again: false,
+            rungs: Vec::new(),
         };
         a.transcript_mut().record(&crate::Event::Recalled(RecallSent {
             items: vec![item],
@@ -1199,6 +1377,212 @@ mod tests {
         assert!(!a.transcript().quotes_recalled_for_test(rule), "the withheld text is not indexed either");
         assert!(a.transcript().quotes_recalled_for_test(&filler[..40]), "the first recall is checked still");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn position(n: u8, on: &str, terms: &str, landed: bool, standing: Standing) -> Note {
+        Note {
+            id: NoteId::parse(&format!("n{n}")).unwrap(),
+            at: day(on),
+            body: Body::Position {
+                topic: Topic::Liability,
+                moved: Side::Us,
+                terms: Quoted::parse(terms),
+                traded_for: Some(Quoted::parse(&format!("Trade {n}: a longer initial term with no termination for convenience."))),
+                landed,
+            },
+            how: None,
+            standing,
+            stated_topics: Topics::default(),
+            used: 0,
+            last_used: None,
+        }
+    }
+
+    fn confirmed() -> Standing {
+        Standing::Confirmed { on: day("2026-01-01") }
+    }
+
+    fn balance(on: &str, stance: Stance) -> Balance {
+        Balance { on: day(on), stance, factors: Vec::new(), standing: confirmed() }
+    }
+
+    /// Three positions on the liability cap, two of them a neighbor's, and a pattern on the same
+    /// topic that is no rung: one ladder item carries the positions, the pattern goes as before.
+    fn ladder_pool() -> Pool {
+        let mut here = Case::new("here");
+        here.balance.push(balance("2026-01-01", Stance::Weaker));
+        here.notes.push(position(1, "2026-03-01", "Cap at twelve months of fees paid, here.", false, Standing::Unconfirmed));
+        here.notes.push(Note {
+            id: NoteId::parse("n2").unwrap(),
+            at: day("2026-03-01"),
+            body: Body::Pattern { rule: Quoted::parse("The liability cap moves last in every renewal."), traps: None },
+            how: None,
+            standing: confirmed(),
+            stated_topics: Topics::default(),
+            used: 0,
+            last_used: None,
+        });
+        let mut nb = Case::new("Kestrel Freight renewal");
+        nb.balance.push(balance("2025-01-01", Stance::Stronger));
+        nb.balance.push(balance("2025-06-01", Stance::Weaker));
+        nb.notes.push(position(1, "2025-02-01", "Cap at fees paid in the prior year, stronger then.", true, confirmed()));
+        nb.notes.push(position(2, "2025-07-01", "Cap at six months of fees, weaker then.", true, confirmed()));
+        Pool { here, neighbors: vec![Neighbor::of(id(1), nb)], damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false }
+    }
+
+    fn liability_query(pool: &Pool) -> Query {
+        Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"))
+    }
+
+    /// The ladder is a read of `Position` notes alone, in the order the question wants: the rung
+    /// under the balance closest to now first, then landed, then newest. Each rung says where it
+    /// is from, the balance then against now, and whether the person confirmed it.
+    #[test]
+    fn ladder_derives_from_position_notes_alone_closest_balance_first() {
+        let pool = ladder_pool();
+        let rungs = ladder(Topic::Liability, &pool, Some(Stance::Weaker));
+        let terms: Vec<&str> = rungs.iter().map(|r| r.terms.as_str()).collect();
+        assert_eq!(
+            terms,
+            [
+                "Cap at six months of fees, weaker then.",
+                "Cap at twelve months of fees paid, here.",
+                "Cap at fees paid in the prior year, stronger then."
+            ],
+            "{rungs:?}"
+        );
+        assert_eq!((rungs[0].place, rungs[0].title.as_deref(), rungs[0].confirmed), (Place::SameClient, Some("Kestrel Freight renewal"), true));
+        assert_eq!((rungs[1].place, rungs[1].title.as_deref(), rungs[1].confirmed), (Place::ThisCase, None, false));
+        assert_eq!(rungs[2].balance, BalanceGap { then: Some(Stance::Stronger), now: Some(Stance::Weaker) });
+        assert!(rungs.iter().all(|r| !r.terms.contains("moves last")), "a pattern on the topic is no rung");
+        assert!(ladder(Topic::Indemnity, &pool, None).is_empty());
+    }
+
+    /// Under three positions on the topic the notes go as they did; from three, one ladder item
+    /// replaces them, counted once, with every rung's balance gap, and the pattern still goes.
+    #[test]
+    fn ladder_item_replaces_three_or_more_positions_on_the_topic() {
+        let pool = ladder_pool();
+        let out = compose(&pool, &liability_query(&pool));
+        let mut ids: Vec<String> = out.sent.items.iter().map(|i| i.id.to_string()).collect();
+        ids.sort();
+        assert_eq!(ids, ["ladder:liability", "n2"], "{:?}", out.sent.items);
+        let at = out.sent.items.iter().position(|i| i.id == ItemId::Ladder { topic: Topic::Liability }).unwrap();
+        let item = &out.sent.items[at];
+        assert_eq!(item.rungs.len(), 3);
+        assert_eq!(out.sent.left_out, 0);
+        let json = &out.json[at];
+        assert_eq!(json["kind"], "ladder");
+        assert_eq!(json["topic"], "liability");
+        assert_eq!(json["rungs"].as_array().map(Vec::len), Some(3));
+        assert_eq!(json["rungs"][0]["balance"], "then weaker, now weaker");
+        assert_eq!(json["rungs"][2]["balance"], "then stronger, now weaker");
+        assert_eq!(json["rungs"][1]["confirmed"], false);
+        assert_eq!(json["rungs"][0]["place"], "the same client's case \"Kestrel Freight renewal\"");
+        assert_eq!(json["rungs"][0]["tradedFor"], "Trade 2: a longer initial term with no termination for convenience.");
+        let mut fewer = ladder_pool();
+        fewer.neighbors[0].case.notes.pop();
+        let out = compose(&fewer, &liability_query(&fewer));
+        let mut ids: Vec<String> = out.sent.items.iter().map(|i| i.id.to_string()).collect();
+        ids.sort();
+        assert_eq!(ids, ["n1", "n2"], "{:?}", out.sent.items);
+        assert_eq!(out.sent.left_out, 1, "the rung won while stronger scores under MIN_SCORE on its own; a ladder would have carried it");
+    }
+
+    /// The ladder is computed from the files each turn and stored nowhere: deleting the neighbor
+    /// takes its rungs with it, with no other write.
+    #[test]
+    fn ladder_loses_a_deleted_neighbors_rungs_with_no_other_write() {
+        use crate::cases::record::{Click, NoteDraft, PersonOp};
+        let dir = std::env::temp_dir().join(format!("wordcraft-ladder-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = || Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click(), "Kestrel Freight KK", "2026-11-10", 1).unwrap();
+        let here = shelf.new_case(click(), &wall, "Kestrel MSA", "2026-11-10", 2).unwrap();
+        let nb = shelf.new_case(click(), &wall, "Kestrel renewal", "2026-11-10", 3).unwrap();
+        let add = |at: &CaseRef, terms: &str| {
+            let body = Body::Position { topic: Topic::Liability, moved: Side::Us, terms: Quoted::parse(terms), traded_for: None, landed: true };
+            shelf.person(click(), at, PersonOp::AddNote(NoteDraft { body, how: None, topics: Topics::default() }), day("2026-11-10")).unwrap();
+        };
+        add(&here, "Cap at twelve months of fees, here.");
+        add(&nb, "Cap at six months of fees, there.");
+        add(&nb, "Cap at nine months of fees, there.");
+        let query = |pool: &Pool| Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
+        let pool = Pool::load(&shelf, &here).unwrap();
+        let out = compose(&pool, &query(&pool));
+        assert_eq!(out.sent.items.iter().map(|i| i.rungs.len()).collect::<Vec<_>>(), [3]);
+        shelf.delete_case(click(), &nb, true).unwrap();
+        let pool = Pool::load(&shelf, &here).unwrap();
+        let out = compose(&pool, &query(&pool));
+        let ids: Vec<String> = out.sent.items.iter().map(|i| i.id.to_string()).collect();
+        assert_eq!(ids, ["n1"]);
+        assert!(out.sent.items[0].rungs.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A model's note in another case never leaves it: read through the shelf, an unconfirmed
+    /// position in a neighbor is no rung, and its text is nowhere in what is sent.
+    #[test]
+    fn ladder_never_carries_a_neighbors_unconfirmed_position() {
+        use crate::cases::record::{Click, ModelWrite, NoteDraft, PersonOp};
+        let dir = std::env::temp_dir().join(format!("wordcraft-ladder-unconfirmed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = || Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click(), "Bluefin Systems Ltd", "2026-11-10", 1).unwrap();
+        let here = shelf.new_case(click(), &wall, "Bluefin MSA", "2026-11-10", 2).unwrap();
+        let nb = shelf.new_case(click(), &wall, "Bluefin renewal", "2026-11-10", 3).unwrap();
+        let draft = |terms: &str| {
+            let body = Body::Position { topic: Topic::Liability, moved: Side::Us, terms: Quoted::parse(terms), traded_for: None, landed: true };
+            NoteDraft { body, how: None, topics: Topics::default() }
+        };
+        for terms in ["Cap at twelve months of fees, here.", "Cap at nine months of fees, here too.", "Cap at six months of fees, here again."] {
+            shelf.person(click(), &here, PersonOp::AddNote(draft(terms)), day("2026-11-10")).unwrap();
+        }
+        const CANARY: &str = "CANARY unlimited liability accepted in the renewal.";
+        shelf.model(&nb, ModelWrite::Note(draft(CANARY)), day("2026-11-10")).unwrap();
+        let pool = Pool::load(&shelf, &here).unwrap();
+        let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
+        let recalled = compose(&pool, &query);
+        assert_eq!(recalled.sent.items[0].rungs.len(), 3);
+        let sources = recalled.into_sources();
+        assert!(!sources[0].as_text().contains("CANARY"), "{}", sources[0].as_text());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every rung's terms and trade are indexed, so a change pasting one is flagged as a quote
+    /// like a pasted note.
+    #[test]
+    fn ladder_rungs_are_indexed_for_the_quote_check() {
+        let pool = ladder_pool();
+        let sent = compose(&pool, &liability_query(&pool)).sent();
+        let mut t = crate::Transcript::default();
+        t.record(&crate::Event::Recalled(sent));
+        assert!(t.quotes_recalled_for_test("Cap at fees paid in the prior year, stronger then."));
+        assert!(t.quotes_recalled_for_test("Trade 2: a longer initial term with no termination for convenience."));
+    }
+
+    /// A retaining session told a ladder isn't told the same ladder again, but is told one whose
+    /// rungs changed: a new position is new text.
+    #[test]
+    fn ladder_with_changed_rungs_is_new_to_a_session_that_was_told_it() {
+        let pool = ladder_pool();
+        let mut told = Told::default();
+        let first = compose(&pool, &liability_query(&pool));
+        told.record(first.fresh_ids(), Some(0));
+        let is_ladder = |i: &&RecalledItem| matches!(i.id, ItemId::Ladder { .. });
+        let mut same = compose(&pool, &liability_query(&pool));
+        told.filter(&mut same, Some(0));
+        assert!(same.sent.items.iter().find(is_ladder).unwrap().again);
+        let mut grown = ladder_pool();
+        grown.here.notes.push(position(3, "2026-10-01", "Cap at eighteen months of fees, new.", false, confirmed()));
+        let mut changed = compose(&grown, &liability_query(&grown));
+        told.filter(&mut changed, Some(0));
+        let ladder = changed.sent.items.iter().find(is_ladder).unwrap();
+        assert!(!ladder.again, "{ladder:?}");
     }
 
     #[test]

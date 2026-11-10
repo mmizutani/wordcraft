@@ -16,7 +16,7 @@ pub mod text;
 
 pub use lessons::{KeptLesson, LessonDraft, LessonId, LessonOp, LessonProposal, Lessons, names_in};
 pub use marker::{CASE_ASK, Card, CaseMarker, MODEL_WRITES, ModelWrites, Route};
-pub use recall::{Alone, BalanceGap, ItemId, Others, Place, RecallAsk, RecallSent, RecalledItem};
+pub use recall::{Alone, BalanceGap, ItemId, MAX_RUNGS, Others, Place, RecallAsk, RecallSent, RecalledItem, Rung};
 pub use record::{
     Applied, Applies, Balance, BalanceDraft, Body, Case, CaseError, Click, ContractKind, CounterpartyKind, Day, Factor, FactorKind, Facts, Kind,
     Lang, Law, ModelWrite, Note, NoteDraft, NoteId, OurSide, Paper, PersonOp, Plan, Quoted, Side, SizeBand, Stage, Stance, Standing, Topic, Topics,

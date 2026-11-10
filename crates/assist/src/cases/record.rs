@@ -531,7 +531,7 @@ impl Body {
     }
 
     /// The topic a position names; other kinds state none here.
-    fn topic(&self) -> Option<Topic> {
+    pub(crate) fn topic(&self) -> Option<Topic> {
         match self {
             Body::Position { topic, .. } => Some(*topic),
             _ => None,

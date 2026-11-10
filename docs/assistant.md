@@ -255,6 +255,19 @@ where it came from (this case, which of the client's cases, or "a lesson you kep
 unconfirmed, the balance then against now, how many more scored but didn't fit, and why nothing
 was recalled when nothing was.
 
+**The clause ladder.** When the prompt names a topic (the liability cap, say) on which this case
+and the same client's other cases hold three or more positions, those notes go as one item,
+`ladder:liability`, instead of one by one: every position on that topic, each with where it is
+from, its date, who moved, the terms, what it was traded for, whether it landed, the balance then
+against now, and whether you confirmed it. The ladder is computed from the case files for each
+turn and stored nowhere, so deleting a case takes its rungs with it and nothing can go stale. It
+is ordered for the question "what did we concede, and when were we weaker": the position taken
+under the balance closest to now first, then landed before open, then newest; at most eight rungs
+go, and the rest are counted with what didn't fit. Lessons, patterns and pitfalls on the topic go
+as before and never enter a ladder, and another case's unconfirmed position never does either.
+Details › Recalled shows a ladder as a table of its rungs, and a change that pastes a rung's terms
+is flagged as quoting your case notes like any other recalled text.
+
 **What the assistant writes.** With a case bound, each turn's instructions also say what the
 case's notes are for: a later conversation about this negotiation will know only these notes and
 the document, so the model should write what that conversation will need and can't read off the

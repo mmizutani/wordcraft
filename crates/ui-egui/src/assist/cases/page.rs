@@ -214,7 +214,7 @@ const FACTORS: [(FactorKind, &str); 7] = [
     (FactorKind::Other, "Other"),
 ];
 
-const FAVORS: [(Side, &str); 3] = [(Side::Us, "Us"), (Side::Them, "Them"), (Side::Neither, "Neither")];
+pub(super) const FAVORS: [(Side, &str); 3] = [(Side::Us, "Us"), (Side::Them, "Them"), (Side::Neither, "Neither")];
 
 const NOTE_KINDS: [(Kind, &str); 5] =
     [(Kind::Pattern, "Pattern"), (Kind::Pitfall, "Pitfall"), (Kind::Lesson, "Lesson"), (Kind::Leverage, "Leverage"), (Kind::Position, "Position")];

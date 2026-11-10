@@ -21,8 +21,8 @@ use egui::{RichText, Ui};
 use serde_json::{Value, json};
 use wordcraft_assist::cases::{
     Alone, Applied, BalanceDraft, Body, Card, Case, CaseError, CaseId, CaseRef, Click, Day, Factor, Facts, LessonDraft, LessonId, LessonOp, Lessons,
-    Listing, ModelWrite, ModelWrites, NoteDraft, NoteId, PersonOp, Place, Plan, Quoted, RecallAsk, RecallSent, Route, Shelf, Stance, Standing,
-    Topics, WallId,
+    Listing, ModelWrite, ModelWrites, NoteDraft, NoteId, PersonOp, Place, Plan, Quoted, RecallAsk, RecallSent, RecalledItem, Route, Shelf, Stance,
+    Standing, Topics, WallId,
 };
 use wordcraft_assist::{Context, Details, ProposalAnswer, Sent, Written};
 
@@ -541,14 +541,53 @@ pub(crate) fn section(ui: &mut Ui, t: &Tokens, details: &Details) {
     }
 }
 
+fn from_words(place: &Place, title: Option<&String>) -> String {
+    match (place, title) {
+        (Place::SameClient, Some(title)) => fmt(tl!("{title}, the same client's case"), &[("title", title)]),
+        (Place::SameClient, None) => tl!("the same client's case").to_string(),
+        (Place::ThisCase, _) => tl!("this case").to_string(),
+        (Place::Lesson, _) => tl!("a lesson you kept").to_string(),
+    }
+}
+
+/// A ladder item: its id and line, then its rungs as a table, from what was sent and nothing else.
+fn ladder_rows(ui: &mut Ui, t: &Tokens, item: &RecalledItem) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(item.id.to_string()).small().color(t.accent));
+        ui.label(RichText::new(&item.text).small().color(t.text));
+        if item.again {
+            ui.label(RichText::new(tl!("sent earlier")).small().color(t.text_dim));
+        }
+    });
+    egui::Grid::new(("ladder", item.id.to_string())).striped(true).min_col_width(40.0).max_col_width(320.0).show(ui, |ui| {
+        for head in [tl!("Date"), tl!("Where"), tl!("Moved"), tl!("Terms"), tl!("Traded for"), tl!("Landed"), tl!("Balance then, now")] {
+            ui.label(RichText::new(head).small().color(t.text_dim));
+        }
+        ui.end_row();
+        for r in &item.rungs {
+            let mut from = from_words(&r.place, r.title.as_ref());
+            if !r.confirmed {
+                from = format!("{from}, {}", tl!("unconfirmed"));
+            }
+            ui.label(RichText::new(String::from(r.on)).small().color(t.text));
+            ui.add(egui::Label::new(RichText::new(from).small().color(if r.confirmed { t.text_dim } else { t.orange })).wrap());
+            ui.label(RichText::new(page::word(&page::FAVORS, r.moved)).small().color(t.text));
+            ui.add(egui::Label::new(RichText::new(&r.terms).small().color(t.text)).wrap());
+            ui.add(egui::Label::new(RichText::new(r.traded_for.as_deref().unwrap_or("")).small().color(t.text)).wrap());
+            ui.label(RichText::new(if r.landed { tl!("landed") } else { tl!("open") }).small().color(t.text));
+            ui.label(RichText::new(format!("{}, {}", stance_word(r.balance.then), stance_word(r.balance.now))).small().color(t.text_dim));
+            ui.end_row();
+        }
+    });
+}
+
 fn turn_rows(ui: &mut Ui, t: &Tokens, recalled: &RecallSent) {
     for item in &recalled.items {
-        let from = match (&item.place, &item.title) {
-            (Place::SameClient, Some(title)) => fmt(tl!("{title}, the same client's case"), &[("title", title)]),
-            (Place::SameClient, None) => tl!("the same client's case").to_string(),
-            (Place::ThisCase, _) => tl!("this case").to_string(),
-            (Place::Lesson, _) => tl!("a lesson you kept").to_string(),
-        };
+        if !item.rungs.is_empty() {
+            ladder_rows(ui, t, item);
+            continue;
+        }
+        let from = from_words(&item.place, item.title.as_ref());
         ui.scope(|ui| {
             // Rows of text, not of controls: a wrapped row takes its height from this as it starts.
             ui.spacing_mut().interact_size.y = 0.0;

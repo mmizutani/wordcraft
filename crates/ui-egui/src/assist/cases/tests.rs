@@ -735,6 +735,54 @@ fn an_output_row_that_quotes_recalled_notes_says_so() {
     assert!(h.query_by_label("This quotes your case notes").is_some());
 }
 
+/// Three positions on the liability cap go to the turn as one ladder item, and Details › Recalled
+/// shows it as a positions table built from what was sent: each rung's date, where it is from,
+/// who moved, the terms, what was traded, whether it landed, and the balance then and now.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn details_shows_a_ladder_as_a_positions_table() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::cases::{Side, Topic};
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let shelf = Shelf::at(&folder.0);
+    let position = |terms: &str, traded: Option<&str>, landed: bool| NoteDraft {
+        body: Body::Position { topic: Topic::Liability, moved: Side::Us, terms: Quoted::parse(terms), traded_for: traded.map(Quoted::parse), landed },
+        how: None,
+        topics: Topics::default(),
+    };
+    shelf.person(click(), &c.here, PersonOp::AddNote(position("Cap at twelve months of fees paid, offered first.", None, false)), today()).unwrap();
+    shelf
+        .person(
+            click(),
+            &c.neighbor,
+            PersonOp::AddNote(position("Cap at six months of fees paid, which landed.", Some("A three-year initial term."), true)),
+            today(),
+        )
+        .unwrap();
+    shelf.person(click(), &c.neighbor, PersonOp::AddNote(position("Cap at nine months of fees paid, refused.", None, false)), today()).unwrap();
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    let seen = ask(&mut a, Fake::new(), "What did we concede on the liability cap?");
+    let items = recalled_json(&seen.lock().unwrap().turns[0]);
+    let ladder = items.iter().find(|i| i["id"] == "ladder:liability").unwrap_or_else(|| panic!("{items:#?}"));
+    assert_eq!(ladder["rungs"].as_array().map(Vec::len), Some(3), "{ladder:#?}");
+    a.session.view.assistant_pane = true;
+    a.assist.view = crate::assist::PaneView::Details;
+    let h = harness(a);
+    assert!(h.query_by_label("ladder:liability").is_some());
+    for shown in [
+        "Cap at six months of fees paid, which landed.",
+        "A three-year initial term.",
+        "Cap at twelve months of fees paid, offered first.",
+        "Acme SaaS renewal",
+        TODAY,
+    ] {
+        assert!(h.query_all_by_label_contains(shown).next().is_some(), "{shown} is not in the table");
+    }
+    assert!(h.query_by_label("Traded for").is_some() && h.query_by_label("Landed").is_some(), "the table has its headers");
+}
+
 /// What the poisoned document tells the model to record as the person's standing position.
 const MODEL_NOTE: &str = "Harbourline always accepts unlimited liability for data loss.";
 
