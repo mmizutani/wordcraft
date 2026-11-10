@@ -1974,8 +1974,12 @@ fn a_row_that_quotes_case_notes_says_so_after_it_is_accepted() {
     h.get_by_label("Steps").click();
     h.run_steps(2);
     assert!(h.query_by_label("This quotes your case notes").is_some(), "flagged while open");
-    h.get_all_by_label("Accept").next().unwrap().click();
+    // Newest first: the insertion is the last row, under the deletion of "two".
+    h.get_all_by_label("Accept").last().unwrap().click();
     h.run_steps(3);
+    let left: Vec<String> =
+        wordcraft_engine::cmd::review::change_rows(&h.state().session, "Test Assistant", 16).0.into_iter().map(|c| c.text).collect();
+    assert_eq!(left, ["two"], "the insertion was accepted");
     assert!(h.query_by_label("Accepted").is_some());
     assert!(h.query_by_label("This quotes your case notes").is_some(), "still flagged once accepted");
     h.state_mut().run("assist.cancel", json!({})).unwrap();
