@@ -380,6 +380,30 @@ fn report_recalled(report: &Value) -> bool {
     report["prompt"].as_array().unwrap().iter().any(|b| b.as_str().is_some_and(|t| t.contains(RECALLED_NOTE)))
 }
 
+/// The bound case's facts, balance and plan reach the agent on every turn, a session that keeps
+/// what it read included, since they say how the case stands now: as a resource when the agent
+/// takes them, else as marked text.
+#[test]
+fn the_bound_cases_summary_reaches_the_agent_every_turn() {
+    use crate::cases::{Click, Day, PersonOp, Plan, Quoted, Standing};
+    const GOAL: &str = "Hold the liability cap at twelve months of fees.";
+    let recalls = Recalls::new("summary");
+    let plan = Plan { goal: Quoted::parse(GOAL), next: Vec::new(), standing: Standing::Unconfirmed };
+    recalls.shelf.person(Click::by_person(true).unwrap(), &recalls.at, PersonOp::Plan(Some(plan)), Day::parse("2026-11-10").unwrap()).unwrap();
+    let carries = |v: &Value| v.to_string().contains(GOAL) && v.to_string().contains("The case this conversation is bound to");
+    for embedded in [true, false] {
+        let script = Script { embedded_context: embedded, turns: vec![vec![Step::Report], vec![Step::Report]], ..Script::default() };
+        let mut c = Chat::with(&script);
+        for turn in 0..2 {
+            c.a.set_recall(Some(recalls.ask(&c)));
+            c.ask("Where do we stand?");
+            let report = c.report();
+            let carried = if embedded { &report["resources"] } else { &report["prompt"] };
+            assert!(carries(carried), "turn {turn}, resources {embedded}: {report}");
+        }
+    }
+}
+
 /// An item is remembered as told only once the agent took the prompt: a prompt that failed may
 /// never have reached its model, so the next turn carries the item again.
 #[test]

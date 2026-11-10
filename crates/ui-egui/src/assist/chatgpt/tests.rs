@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use wordcraft_assist::Readiness;
-use wordcraft_assist::chatgpt::{CREDENTIALS_FILE, Endpoints, ID, SCOPES};
+use wordcraft_assist::chatgpt::{CREDENTIALS_FILE, Endpoints, ID, Kept, SCOPES, SignIn, SignInOptions, fake_keychain};
 use wordcraft_engine::cmd::assist::ChatGptStatus;
 
 use super::{FINISHING, Notice, YOURS, status};
@@ -30,6 +30,8 @@ impl Folder {
         let dir = std::env::temp_dir().join(format!("wordcraft-ui-chatgpt-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // Its key goes to a keychain in memory: tests never reach the system's.
+        fake_keychain(&dir, true);
         Folder(dir)
     }
 
@@ -295,11 +297,14 @@ fn the_person_signs_in_and_chatgpt_is_ready_at_once_but_a_script_can_t() {
     assert_eq!(chatgpt_offer(&a), Readiness::Ready);
     assert!(a.session.assistant.ready);
     assert_eq!(a.session.why_disabled("assist.chatgpt.signOut"), None);
-    // The tokens stay in the settings folder: neither the window's answers nor its state hold one.
+    // The tokens stay with the library: neither the window's answers nor its state hold one, and
+    // on disk they are sealed, with the key in the keychain.
     let listed = a.execute("assist.backend", json!({})).unwrap().to_string();
     assert!(!listed.contains("secret"), "{listed}");
     assert!(!format!("{:?} {:?}", a.assist.chatgpt.account, a.assist.chatgpt.sign_in.as_ref().map(|s| format!("{s:?}"))).contains("secret"));
-    assert!(std::fs::read_to_string(folder.path().join(CREDENTIALS_FILE)).unwrap().contains("refresh-secret"));
+    assert_eq!(account.kept, Kept::Keychain);
+    let sealed = std::fs::read_to_string(folder.path().join(CREDENTIALS_FILE)).unwrap();
+    assert!(!sealed.contains("secret") && !sealed.contains("writer@example.com"), "{sealed}");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -631,15 +636,24 @@ fn a_sign_in_elsewhere_drops_the_signed_out_notice() {
     let (folder, server) = (Folder::new(), serve());
     let mut a = window(&folder, &server);
     sign_in(&mut a, &server);
-    let kept = std::fs::read(folder.path().join(CREDENTIALS_FILE)).unwrap();
     a.run("assist.chatgpt.signOut", json!({})).unwrap();
     until(&mut a, "signed out", |a| status(a) == ChatGptStatus::SignedOut);
     assert!(matches!(a.assist.chatgpt.notice, Some(Notice::SignedOut { .. })));
-    // Another WordCraft signs in: the credentials file is back.
-    std::fs::write(folder.path().join(CREDENTIALS_FILE), &kept).unwrap();
+    // Another WordCraft with this settings folder (named another way, so this process keeps it
+    // apart) signs in: a new sealed file, with a new key in the keychain.
+    let other = folder.path().join("..").join(folder.path().file_name().unwrap());
+    fake_keychain(&other, true);
+    let mut elsewhere =
+        SignIn::start(&other, SignInOptions { endpoints: Endpoints::local(&server.base), port: 0, ..SignInOptions::default() }).unwrap();
+    *server.script.nonce.lock().unwrap() = param(elsewhere.url(), "nonce").unwrap();
+    answer_at(elsewhere.redirect_uri(), &format!("code=c2&state={}", param(elsewhere.url(), "state").unwrap()));
+    assert!(elsewhere.wait(WAIT).unwrap().is_ok());
+    // The window's next reading asks the keychain for the new key, without waiting for it, and
+    // reads again every frame until it has it, not ten seconds later.
     a.assist.chatgpt.read_at = Some(crate::clock::now_ms() - 11_000.0);
-    crate::assist::tick(&mut a);
-    assert_eq!(status(&a), ChatGptStatus::SignedIn);
+    let asked = Instant::now();
+    until(&mut a, "the sign-in elsewhere shows", |a| status(a) == ChatGptStatus::SignedIn);
+    assert!(asked.elapsed() < Duration::from_secs(5), "shown only after {:?}", asked.elapsed());
     assert_eq!(a.assist.chatgpt.notice, None, "no 'signed out' line under Signed in as …");
 }
 
@@ -654,6 +668,7 @@ fn the_account_page_shows_who_is_signed_in_and_its_sign_out_button_works() {
     let mut h = harness(a);
     use egui_kittest::kittest::Queryable;
     assert!(h.query_by_label("Signed in as A Writer (writer@example.com)").is_some());
+    assert!(h.query_by_label("Your ChatGPT sign-in is kept in this computer's keychain.").is_some());
     assert!(h.query_by_label("See your plan's usage").is_some());
     assert!(h.query_by_label_contains("plan usage isn't allowed").is_none());
     assert!(h.query_by_label("Sign In Again").is_none());
@@ -708,6 +723,23 @@ fn the_pane_says_how_to_sign_in_once() {
     assert!(h.query_by_label("Sign in with a ChatGPT Plus or Pro account in Options › Account.").is_some());
     assert!(h.query_by_label_contains("Sign in: ").is_none());
     assert!(h.query_by_label("Continue with ChatGPT").is_some());
+}
+
+/// With no keychain to keep its key in, the sign-in is kept for the session only, nothing of it
+/// is on disk, and the pane says the person signs in again next time.
+#[test]
+fn without_a_keychain_the_pane_says_the_sign_in_is_for_this_session_only() {
+    let (folder, server) = (Folder::new(), serve());
+    fake_keychain(folder.path(), false);
+    let a = on_chatgpt(&folder, &server);
+    assert_eq!(super::account(&a).map(|x| x.kept), Some(Kept::Session));
+    assert!(!folder.path().join(CREDENTIALS_FILE).exists());
+    assert!(!folder.path().join(wordcraft_assist::chatgpt::PLAINTEXT_FILE).exists());
+    let h = harness(a);
+    use egui_kittest::kittest::Queryable;
+    assert!(h.query_by_label_contains("kept for this session only").is_some());
+    assert!(h.query_by_label_contains("you'll sign in again the next time you open WordCraft").is_some());
+    assert!(h.query_by_label_contains("kept in this computer's keychain").is_none());
 }
 
 /// The two models the issue's list has, in its order: `gpt-6.1-sol` first.
