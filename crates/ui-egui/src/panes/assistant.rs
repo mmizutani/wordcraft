@@ -42,6 +42,7 @@ pub(super) fn assistant(app: &mut WordApp, ui: &mut Ui) {
     if crate::assist::desktop(app) || !app.assist.offers.is_empty() {
         who(app, ui, &t);
     }
+    crate::assist::cases::suggest::card(app, ui, &t);
     if app.has_document() && app.shared_room().is_some() && !app.shows_shared_document() {
         ui.label(
             RichText::new(tl!("Another document is shared. Switching ends its conversation and disconnects its participants."))

@@ -261,6 +261,16 @@ impl Assistant {
         self.transcript.take_case_markers()
     }
 
+    /// The turn just asked is a review's: see [`crate::Transcript::review_turn`].
+    pub fn review_turn(&mut self) {
+        self.transcript.review_turn();
+    }
+
+    /// The window dropped a case marker: see [`crate::Transcript::drop_case_marker`].
+    pub fn drop_case_marker(&mut self) {
+        self.transcript.drop_case_marker();
+    }
+
     /// The turn that just ended, once, as one line for this conversation's case record
     /// ([`crate::cases::log`]); `None` while a turn runs or when the last one was taken.
     pub fn take_finished_turn(&mut self) -> Option<crate::cases::Record> {
@@ -489,8 +499,9 @@ impl Assistant {
 
     /// End the conversation: stop the turn, take the invite back (every copy that joined with
     /// it is out of the room, so nothing more of the assistant's reaches the document), and let
-    /// the thread end its backend. Pending events are dropped; the transcript is kept.
-    /// Never waits for the thread. Ending twice does nothing.
+    /// the thread end its backend. Pending events are dropped; the transcript is kept, and a
+    /// turn that was running ends in it as cancelled, so [`Assistant::take_finished_turn`]
+    /// gives it once. Never waits for the thread. Ending twice does nothing.
     pub fn end(&mut self) {
         if self.ended {
             return;
@@ -500,6 +511,9 @@ impl Assistant {
         self.permissions.cancel();
         // Disconnect retained conversations so a full queue cannot block backend cleanup.
         self.events = None;
+        if self.busy {
+            self.transcript.cut_turn();
+        }
         self.busy = false;
         self.room.revoke(&self.seat.key);
         let _ = self.jobs.send(Job::End);
@@ -596,8 +610,17 @@ impl Work {
             // be read makes it find nothing and say so: a memory failure never stops a turn.
             let mut carried = Vec::new();
             if let Some(ask) = recall {
+                let review = ask.is_review();
                 let recalled = ask.run(&self.told, self.backend.retains());
                 self.events.send(Event::Recalled(recalled.sent()));
+                // A review is of its case. Without the case (someone else can read the document
+                // now, the file is damaged, no room is left to check quotes) the model would
+                // review from what it holds, so no request is made and the turn says why.
+                if review && let Some(why) = recalled.none_because() {
+                    self.events.send(Event::Error { message: format!("The review was withheld: {why}.") });
+                    self.events.send(Event::Done { stop: StopReason::EndTurn });
+                    continue;
+                }
                 carried = recalled.fresh_ids();
                 turn.knowledge.extend(recalled.into_sources());
             }

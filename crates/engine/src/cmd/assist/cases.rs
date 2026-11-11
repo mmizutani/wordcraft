@@ -103,6 +103,13 @@ pub(super) fn specs() -> Vec<CommandSpec> {
         .params(r#"{} → the bound case's record (its `log/` folder) goes, and can't be brought back; the case and its notes stay. Yours alone, as `assist.memory.add` is"#)
         .when(memory_here)
         .pure(),
+        CommandSpec::new("assist.memory.case.review", "Review the Case", "Home › Assistant", |s, _| {
+            s.push_ui_request(json!({"assist": "memory.case.review"}));
+            Ok(json!({"asked": true}))
+        })
+        .params(r#"{} → one turn in the bound case's conversation with a fixed prompt, the case's notes and its recent record as data: the answer corrects, retires or supports the case's unconfirmed notes and asks what the record can't answer; a confirmed note changes only by your click on a card. It spends one request on your plan. Yours alone, as `assist.memory.add` is"#)
+        .when(memory_here)
+        .pure(),
         CommandSpec::new("assist.memory.lesson.keep", "Keep a Lesson", "Home › Assistant", lesson_keep)
             .params(r#"{"text": string (at most 400 characters), "applies"?: {"kind"?, "side"?, "paper"?, "theirs"?, "law"?, "stance"?, "year"?}, "from"?: string (the case's id)} → a lesson every client's cases can recall: this text and these facts, nothing else. Yours alone, as `assist.memory.add` is"#)
             .when(memory_here)

@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use wordcraft_engine::room::{ParticipantId, Room};
 
 use super::lessons::{KeptLesson, LessonId};
+use super::log::REVIEW_RECORD_BYTES;
 use super::record::{Applies, Body, Case, CaseError, Day, Factor, Kind, Note, Quoted, Side, Stage, Stance, Standing, Topic, Topics};
 use super::store::{CaseId, CaseRef, Shelf};
 use super::text::{Bm25, Token, tokens, topics_in};
@@ -356,6 +357,9 @@ pub struct RecallAsk {
     /// Windows of recalled text the conversation's transcript can still take
     /// ([`crate::Transcript::recall_room`]): a recall with more is withheld.
     room: usize,
+    /// A review's turn ([`super::marker::REVIEW_ASK`]): the whole case and its recent record go
+    /// as the one item, nothing is ranked, and nothing is held back as sent before.
+    review: bool,
 }
 
 impl std::fmt::Debug for RecallAsk {
@@ -374,7 +378,21 @@ impl RecallAsk {
             alone,
             after_reading: None,
             room: crate::transcript::MAX_WINDOWS,
+            review: false,
         }
+    }
+
+    /// What **Review this case** carries: the case's notes with their ids, standing, how and
+    /// dates, its facts, balance and plan, and the most recent [`REVIEW_RECORD_BYTES`] of its
+    /// record, as one data-grade source. The same proof as a recall, since the same text leaves
+    /// the case; nothing of the client's other cases or the lessons goes.
+    pub fn review(shelf: Shelf, at: CaseRef, today: Day, alone: Alone) -> RecallAsk {
+        RecallAsk { review: true, ..RecallAsk::new(shelf, at, "", today, alone) }
+    }
+
+    /// Whether this is a review's ask: one that is no use without its case.
+    pub(crate) fn is_review(&self) -> bool {
+        self.review
     }
 
     /// With `room` windows left in the conversation's transcript, set as the turn is sent.
@@ -400,20 +418,31 @@ impl RecallAsk {
         if let Err(o) = self.alone.recheck() {
             return others(o);
         }
-        let pool = match Pool::load(&self.shelf, &self.at) {
-            Ok(pool) => pool,
-            Err(e) => return Recalled::nothing(format!("the case couldn't be read: {e}")),
+        let mut recalled = if self.review {
+            match compose_review(&self.shelf, &self.at) {
+                Ok(recalled) => recalled,
+                Err(e) => return Recalled::nothing(format!("the case couldn't be read: {e}")),
+            }
+        } else {
+            let pool = match Pool::load(&self.shelf, &self.at) {
+                Ok(pool) => pool,
+                Err(e) => return Recalled::nothing(format!("the case couldn't be read: {e}")),
+            };
+            let query = Query::new(&self.about, pool.here.applies(self.today), self.today);
+            let mut recalled = compose(&pool, &query);
+            recalled.sent.problem = pool.problem();
+            recalled
         };
-        let query = Query::new(&self.about, pool.here.applies(self.today), self.today);
-        let mut recalled = compose(&pool, &query);
-        recalled.sent.problem = pool.problem();
         if let Some(f) = self.after_reading {
             f();
         }
         if let Err(o) = self.alone.recheck() {
             return others(o);
         }
-        told.filter(&mut recalled, retains);
+        // A review is asked for whole each time: what a session had of it before doesn't count.
+        if !self.review {
+            told.filter(&mut recalled, retains);
+        }
         // Fail closed: text that can't be checked for quotes afterwards isn't sent. Nothing in
         // the set leaves to make room, since a retaining session still holds what it was sent.
         if crate::transcript::recall_windows(recalled.sent().sent_text.iter().map(String::as_str)) > self.room {
@@ -498,18 +527,32 @@ impl Neighbor {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "where")]
 pub enum ItemId {
-    Here { note: super::record::NoteId },
-    Neighbor { case: CaseId, note: super::record::NoteId },
-    NeighborBalance { case: CaseId },
-    Lesson { lesson: LessonId },
-    Ladder { topic: Topic },
+    Here {
+        note: super::record::NoteId,
+    },
+    Neighbor {
+        case: CaseId,
+        note: super::record::NoteId,
+    },
+    NeighborBalance {
+        case: CaseId,
+    },
+    Lesson {
+        lesson: LessonId,
+    },
+    Ladder {
+        topic: Topic,
+    },
     Case,
+    /// The whole case and its recent record, as a review's turn carries them.
+    Review,
 }
 
 impl std::fmt::Display for ItemId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ItemId::Case => write!(f, "case"),
+            ItemId::Review => write!(f, "review"),
             ItemId::Here { note } => write!(f, "{note}"),
             ItemId::Neighbor { case, note } => write!(f, "{}:{note}", case.as_str()),
             ItemId::NeighborBalance { case } => write!(f, "{}:balance", case.as_str()),
@@ -701,10 +744,16 @@ impl Recalled {
         Recalled { sent: RecallSent { problem: Some(problem), ..RecallSent::default() }, json: Vec::new() }
     }
 
+    /// Why nothing was recalled, when nothing was. A review can't go without its case, so the
+    /// conversation's thread asks this before it sends one.
+    pub(crate) fn none_because(&self) -> Option<String> {
+        self.sent.items.is_empty().then(|| self.sent.problem.clone().unwrap_or_else(|| "nothing of the case could be read".into()))
+    }
+
     pub(crate) fn sent(&self) -> RecallSent {
         let mut sent_text = Vec::new();
         for json in self.fresh() {
-            strings(json, 0, &mut sent_text);
+            strings(json, &mut sent_text);
         }
         RecallSent { sent_text, ..self.sent.clone() }
     }
@@ -742,6 +791,43 @@ impl Recalled {
     }
 }
 
+/// What a review's turn carries ([`RecallAsk::review`]): the case as its file holds it, less its
+/// dismissed hashes, and the most recent record lines up to [`REVIEW_RECORD_BYTES`], as one item.
+/// A damaged case reviews nothing, since what it holds may be cut; a case with no record reviews
+/// its notes alone.
+pub(crate) fn compose_review(shelf: &Shelf, at: &CaseRef) -> Result<Recalled, CaseError> {
+    let case = shelf.open(at)?;
+    if case.damaged {
+        return Ok(Recalled::nothing("this case's file is damaged, so it can't be reviewed".into()));
+    }
+    let (record, skipped, cut) = super::log::recent_records(shelf, at, REVIEW_RECORD_BYTES)?;
+    let json = json!({
+        "title": case.title.for_person(),
+        "facts": case.facts,
+        "balance": case.balance,
+        "plan": case.plan,
+        "notes": case.notes,
+        "record": record,
+        "recordLinesUnreadable": skipped,
+        "recordOlderLinesLeftOut": cut,
+    });
+    let text = format!("{} notes, the balance and plan, and {} record lines", case.notes.len(), record.len());
+    let problem = (skipped > 0).then(|| format!("{skipped} lines of the record couldn't be read"));
+    let bytes = u32::try_from(json.to_string().len()).unwrap_or(u32::MAX);
+    let item = RecalledItem {
+        id: ItemId::Review,
+        place: Place::ThisCase,
+        title: None,
+        kind: None,
+        text,
+        balance: None,
+        confirmed: true,
+        again: false,
+        rungs: Vec::new(),
+    };
+    Ok(Recalled { sent: RecallSent { items: vec![item], left_out: 0, bytes, problem, sent_text: Vec::new() }, json: vec![json] })
+}
+
 /// For the evaluation harness (`examples/case_eval.rs`): what a turn bound to `at` would carry
 /// of `shelf`, by the same composer a turn uses. The harness has no room, so the [`Alone`] proof
 /// can't be made there and isn't checked; nothing in the app calls this.
@@ -753,14 +839,19 @@ pub fn compose_for_eval_without_room_check(shelf: &Shelf, at: &CaseRef, about: &
     Ok((recalled.sent(), recalled.into_sources()))
 }
 
-/// Every string in `json`, as [`note_item`], [`balance_item`] and [`ladder_item`] build it: a
-/// ladder's rungs are the deepest, three levels down.
-fn strings(json: &Value, depth: u8, out: &mut Vec<String>) {
-    match json {
-        Value::String(s) => out.push(s.clone()),
-        Value::Array(items) if depth < 4 => items.iter().for_each(|v| strings(v, depth.saturating_add(1), out)),
-        Value::Object(fields) if depth < 4 => fields.values().for_each(|v| strings(v, depth.saturating_add(1), out)),
-        _ => {}
+/// Every string in `json`, however deep, in order: a text the index misses is a quote the window
+/// can't flag. A stack and no depth limit, since a review item wraps a record line, which may nest
+/// as deep as `serde_json` reads, in more levels of its own; the work is bounded by the item's
+/// size, which is capped.
+fn strings(json: &Value, out: &mut Vec<String>) {
+    let mut stack = vec![json];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => stack.extend(items.iter().rev()),
+            Value::Object(fields) => stack.extend(fields.values().rev()),
+            _ => {}
+        }
     }
 }
 
@@ -1231,6 +1322,124 @@ mod tests {
         CaseId::parse(&format!("{n:016x}")).unwrap()
     }
 
+    /// Every string in `json`, however deep.
+    fn all_strings(json: &Value, out: &mut Vec<String>) {
+        match json {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => items.iter().for_each(|v| all_strings(v, out)),
+            Value::Object(fields) => fields.values().for_each(|v| all_strings(v, out)),
+            _ => {}
+        }
+    }
+
+    /// A review's item carries the whole case and its record, so every text in it is what a
+    /// pasted quote is checked against: nothing nests too deep for the quote index, and a case with
+    /// no record reviews its notes alone. The record is read newest first up to its cap.
+    #[test]
+    fn a_review_item_puts_every_string_it_carries_in_the_quote_index_and_works_without_a_record() {
+        use crate::cases::log::{CaseLog, Record};
+        use crate::cases::record::{Click, NoteDraft, PersonOp};
+        let dir = std::env::temp_dir().join(format!("wordcraft-review-item-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Kestrel Freight KK", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Kestrel supply agreement", "2026-11-10", 2).unwrap();
+        let draft = NoteDraft {
+            body: Body::Position {
+                topic: Topic::Liability,
+                moved: Side::Them,
+                terms: Quoted::parse("Cap at twelve months of fees."),
+                traded_for: Some(Quoted::parse("notice cut to sixty days")),
+                landed: true,
+            },
+            how: Some(Quoted::parse("Reported from the Tuesday call.")),
+            topics: Topics::default(),
+        };
+        shelf.person(click, &at, PersonOp::AddNote(draft), day("2026-11-10")).unwrap();
+        let without = compose_review(&shelf, &at).unwrap();
+        assert_eq!(without.sent.items.len(), 1);
+        assert!(without.sent.items[0].text.contains("0 record lines"), "{}", without.sent.items[0].text);
+        let mut log = CaseLog::open(&shelf, &at, "2026-11-10T10-00-00").unwrap();
+        for n in 1..=3u32 {
+            log.write(Record::Turn {
+                at: format!("2026-11-10T10:0{n}:00"),
+                n,
+                asked: Quoted::parse(&format!("Turn {n}: is the audit clause in the Bluefin draft usual?")),
+                answer: Some(Quoted::parse(&format!("Turn {n} answer: the audit right is wider than the market's."))),
+                tools: vec![crate::cases::log::ToolLine {
+                    title: Quoted::parse("read"),
+                    status: crate::ToolStatus::Completed,
+                    detail: Quoted::parse(&format!("clause 14 (turn {n})")),
+                }],
+                model: Some("scripted".into()),
+                stop: None,
+                recalled: vec!["n1".into()],
+                used: Vec::new(),
+            });
+        }
+        log.close();
+        let recalled = compose_review(&shelf, &at).unwrap();
+        let sent = recalled.sent();
+        let mut every = Vec::new();
+        all_strings(&recalled.json[0], &mut every);
+        assert!(every.iter().any(|s| s == "clause 14 (turn 3)"), "the tool detail is three levels down a record line: {every:?}");
+        assert!(every.iter().any(|s| s == "Reported from the Tuesday call."));
+        for s in &every {
+            assert!(sent.sent_text.contains(s), "{s:?} isn't in the quote index: {:?}", sent.sent_text);
+        }
+        assert_eq!(sent.items[0].id, ItemId::Review);
+        assert!(sent.items[0].text.contains("1 notes") && sent.items[0].text.contains("3 record lines"), "{}", sent.items[0].text);
+        // The cap keeps the newest lines.
+        let (newest, skipped, cut) = crate::cases::log::recent_records(&shelf, &at, 400).unwrap();
+        assert_eq!((newest.len(), skipped, cut), (1, 0, true));
+        assert!(matches!(&newest[0], Record::Turn { n: 3, .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A redline's position is a JSON value a file can nest as deep as the parser reads a line,
+    /// and the review item wraps the line in more levels: its strings are in the quote index
+    /// however deep they land.
+    #[test]
+    fn a_string_nested_as_deep_as_a_record_line_parses_is_in_the_quote_index() {
+        use crate::cases::log::{CaseLog, Record, RedlineLine};
+        use crate::cases::record::Click;
+        let dir = std::env::temp_dir().join(format!("wordcraft-review-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Kestrel Freight KK", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Kestrel supply agreement", "2026-11-10", 2).unwrap();
+        // The line nests the record, its changes and a change, so 124 arrays more is the 127
+        // levels `serde_json` reads.
+        let mut position = json!(["Kestrel deep canary"]);
+        for _ in 1..124 {
+            position = json!([position]);
+        }
+        let mut log = CaseLog::open(&shelf, &at, "2026-11-10T10-00-00").unwrap();
+        log.write(Record::Redlines {
+            at: "2026-11-10T10:00:00".into(),
+            draft: Quoted::parse("Kestrel supply agreement"),
+            changes: vec![RedlineLine {
+                kind: "insert".into(),
+                author: Quoted::parse("Bluefin Systems Ltd"),
+                date: "2026-11-10".into(),
+                text: Quoted::parse("audit on ten days' notice"),
+                at: Some(position),
+            }],
+            comments: Vec::new(),
+            more: 0,
+        });
+        log.close();
+        let recalled = compose_review(&shelf, &at).unwrap();
+        assert!(recalled.json[0].to_string().contains("Kestrel deep canary"), "the line didn't parse, so the fixture proves nothing");
+        let sent = recalled.sent();
+        assert!(sent.sent_text.iter().any(|s| s == "Kestrel deep canary"), "sent to the model but not in the quote index: {:?}", sent.sent_text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// What the loader reads from the lessons file on disk: the lessons that are on, and none at
     /// all from a file that parsed but had to be cut to the limits, since a damaged file is
     /// withheld whole rather than sent in part.
@@ -1407,6 +1616,55 @@ mod tests {
         assert!(turns[0].knowledge.is_empty(), "{:?}", turns[0].knowledge);
         let problem = a.transcript().entries().find_map(|e| if let crate::Entry::Recalled(sent) = e { sent.problem.clone() } else { None });
         assert_eq!(problem.as_deref(), Some("Bob can read this document"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A review without its case to check is no review: when the case can't be sent (someone
+    /// else can read the document by the time the turn runs, or the case file is damaged), no
+    /// request is made and the turn says why, rather than reviewing from what the model holds.
+    #[test]
+    fn a_review_whose_case_cant_be_sent_makes_no_request() {
+        use crate::cases::record::{Click, NoteDraft, PersonOp};
+        use crate::{Fake, Options};
+        use wordcraft_engine::room::{Role, Room};
+        let dir = std::env::temp_dir().join(format!("wordcraft-review-withheld-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Kestrel Freight", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Kestrel MSA", "2026-11-10", 2).unwrap();
+        let draft = NoteDraft {
+            body: Body::Pattern { rule: Quoted::parse("Cap liability at twelve months."), traps: None },
+            how: None,
+            topics: Topics::default(),
+        };
+        shelf.person(click, &at, PersonOp::AddNote(draft), day("2026-11-10")).unwrap();
+        let review = |shelf: Shelf, damage: bool| {
+            let mut session = wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("one"));
+            let (room, own) = Room::host(&mut session, "Minoru").unwrap();
+            let fake = Fake::new();
+            let seen = fake.seen();
+            let mut a = crate::Assistant::start(&room, Box::new(fake), Options::default()).unwrap();
+            let alone = Alone::check(&room, own.id(), a.name()).unwrap();
+            a.set_recall(Some(RecallAsk::review(shelf, at.clone(), day("2026-11-10"), alone)));
+            if !damage {
+                let _key = room.invite("Bob", Role::Viewer).unwrap();
+            }
+            a.ask("Review this case.", None).unwrap();
+            assert!(a.wait_idle(std::time::Duration::from_secs(30)));
+            let turns = seen.lock().unwrap().turns.len();
+            let error = a.transcript().entries().find_map(|e| if let crate::Entry::Error { message } = e { Some(message.clone()) } else { None });
+            (turns, error)
+        };
+        let (turns, error) = review(shelf.clone(), false);
+        assert_eq!(turns, 0, "no request is made for a review that can't see its case");
+        assert!(error.as_deref().is_some_and(|e| e.contains("Bob can read this document")), "{error:?}");
+        let file = dir.join("assistant-cases").join(at.wall.as_str()).join(at.case.as_str()).join("case.json");
+        std::fs::write(&file, "{ not a case").unwrap();
+        let (turns, error) = review(shelf, true);
+        assert_eq!(turns, 0);
+        assert!(error.as_deref().is_some_and(|e| e.contains("damaged")), "{error:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

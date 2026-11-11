@@ -170,7 +170,9 @@ make a model write one too: it is the card, and your click on it, that counts. S
 the exact text before anything is stored, and the control channel's click on Keep does nothing. A
 proposal of something you already kept or said no to shows no card, whatever its spacing or case,
 and neither does any proposal while memory is off. The file keeps a hash of what you said no to,
-not the text. No extra request is made: proposals come within the turns you asked for.
+not the text. No request is made for proposals: they come within the turns you asked for. The one
+extra request the assistant's memory makes is **Review this case** ([Cases](#cases)), and only
+when you click it.
 
 **What shaped an answer.** The model is asked to write `[[used: m1]]` where one of your preferences
 shapes its answer. That marker becomes a numbered chip in the answer, such as **M1**: hover over it
@@ -231,7 +233,7 @@ steps, and the notes grouped by kind, each with **Edit** and **Remove**. A note 
 shows dimmed as unconfirmed with **Confirm**; what you wrote or confirmed is confirmed on the day
 you set it; a confirmed note also has **Make a lesson**. The commands are
 `assist.memory.case.new`, `.bind`, `.unbind`, `.facts`, `.balance`, `.plan`, `.note`, `.noteEdit`,
-`.noteConfirm`, `.noteRemove`, `.cardDismiss`, `.record`, `.recordDelete` and `.delete`, `assist.memory.wall.new` and
+`.noteConfirm`, `.noteRemove`, `.cardDismiss`, `.record`, `.recordDelete`, `.review` and `.delete`, `assist.memory.wall.new` and
 `.delete` for a client, and `assist.memory.lesson.keep`, `.edit`, `.off` and `.remove` for a
 lesson. They are yours alone, as [Memory](#memory)'s are, and refuse a script, an agent, a click or
 key the control channel made and a macro's step. There is no command that reads a case: the pane
@@ -253,6 +255,25 @@ window, so bind it again once it has a file to keep it. A conversation belongs t
 document was bound to when it started. Binding the document to another case, or unbinding it, ends
 the conversation, stopping a running turn, since the model holds what that case's notes said and the
 next turn would run under another case.
+
+When you bind a document, the case keeps a print of it: the 256 smallest hashes of its folded
+paragraphs (headings, numbering and lines shorter than 24 letters left out), with the day and the
+document's title. No paragraph text is kept, a case holds the newest eight prints, and no turn
+carries one. When the pane shows a document bound to no case, the window compares the document's
+print with the prints of the 128 most recently changed cases, in every client's folder, reading at
+most 16 MiB of their files, on one worker thread at a time, and the best match
+holding at least half of the document's paragraphs becomes a card at the top of the pane: "71% of
+this document's paragraphs match a draft of Kestrel MSA 2026 (Kestrel Freight KK)" with **Use it**,
+**Not this** and **New case**. This is the one thing that reads across clients, and its result goes
+only to your screen: never to a model, a log or a file. The percentage is shown because two
+contracts from one template overlap too, so it informs you and decides nothing; nothing is bound
+until you click **Use it**, which runs `assist.memory.case.bind` and so refuses a click the control
+channel made. **Not this** hides the card for this document in this window and writes nothing.
+A reopened file whose own case is offered (**Bind again**) gets no card: binding it put this draft's
+print in that case, so the card would name it twice. **Not now** hides the card too.
+The print is taken once per document shown, and again after 64 more changes to it while it stays
+unbound, or at once when a document whose paragraphs are too few or too slight to compare (blank, or only numbering and headings) gains or loses one, so a draft
+pasted into a blank document is looked at as soon as it lands. A document that copies your paragraphs earns a suggestion, which still takes your click.
 
 **What a turn recalls.** With a case bound, each turn carries what ranks highest for the prompt and
 the text around the caret: this case's notes, the confirmed notes and latest balance of the
@@ -332,6 +353,27 @@ refuse everything but your click. Recall of the same client's other cases takes 
 only, so an unconfirmed note never leaves the case it was written in. The switch for all of this is
 one constant, `MODEL_WRITES` in `crates/assist/src/cases/marker.rs`: `InCase` stores notes as
 described; `CardsOnly` turns every write into a card and stores nothing without a click.
+
+**Review this case.** Under the case's Record section, **Review this case** asks one turn in this
+document's conversation, and says in front of the button that it spends one request on your plan.
+The prompt is fixed, WordCraft's own words; beside it the turn carries the case's notes (ids, kinds,
+whether you confirmed each, how it was known, dates), its facts, balance and plan, and the most
+recent 96 KiB of its record if it keeps one, as one source marked as data, under the same proof as
+recall: with anyone else in the room, or invited, the review is withheld and says who. The answer
+is an ordinary answer, with four more markers that mean something only in it: `correct` (a note's
+main text as it should read now, and why) and `retire` (the note no longer holds, and why) apply to
+the assistant's own unconfirmed notes as any in-case write does, the why kept as how and a retired
+text blocking the assistant from noting it again; on a note you confirmed each is a card, **Keep**
+or **Remove** being your own edit of the note, and nothing changes until you click. An edit, yours
+or a kept correction, changes the note's text and keeps what it was stated to be about and how
+often turns used it, so it ranks as before. `supported`
+shows as a quiet row with where the record bears the note out, and `gap` as a question for you;
+neither changes anything. A correction to text you dismissed, or that another note already says, is
+refused as a new note would be; what the assistant retires is kept apart from what you removed, so
+however many of its notes it retires, your dismissals stay. A note id the case doesn't have, and
+any of the four in a turn you didn't ask as a review, is dropped and counted in Details. A script,
+an agent, the control channel's click and a macro's step start no review. The command is
+`assist.memory.case.review`, and Search leaves it out, as it does Delete.
 
 **Lessons that cross clients.** A note stays inside its client. The one thing that crosses is a
 lesson you kept on a card: its text, and the coarse facts you left ticked. The card opens from

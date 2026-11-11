@@ -179,6 +179,14 @@ pub enum Written {
     Note,
     Plan,
     Balance,
+    /// A review corrected an unconfirmed note ([`crate::cases::ModelWrite::Correct`]).
+    Corrected,
+    /// A review retired an unconfirmed note ([`crate::cases::ModelWrite::Retire`]).
+    Retired,
+    /// A review found the record bears a note out: the text is its evidence. Nothing changed.
+    Supported,
+    /// A review's question for the person: the text is the question. Nothing changed.
+    Gap,
 }
 
 impl Entry {
@@ -424,6 +432,11 @@ pub struct Transcript {
     /// How many case markers the current turn has kept.
     #[serde(skip)]
     case_marked: u8,
+    /// The current turn is a review's ([`Transcript::review_turn`]): its answer's review verbs
+    /// are kept, up to [`crate::cases::marker::MAX_PER_REVIEW`]. In any other turn a review verb
+    /// is dropped and counted here and never reaches the window.
+    #[serde(skip)]
+    review: bool,
     /// The last card's number.
     #[serde(skip)]
     last_card: u64,
@@ -642,8 +655,21 @@ impl Transcript {
         self.turn_start = self.entries.len();
         self.proposed = 0;
         self.case_marked = 0;
+        self.review = false;
         self.turns = self.turns.saturating_add(1);
         self.push(Entry::Asked { text: text.to_string() });
+    }
+
+    /// The turn just asked is a review's ([`crate::cases::marker::REVIEW_ASK`]): it may carry a
+    /// marker per note. Called right after [`Transcript::asked`], by the window that sent it.
+    pub fn review_turn(&mut self) {
+        self.review = true;
+    }
+
+    /// The window dropped a case marker of the turn (a review's verb outside a review, or a note
+    /// id this case doesn't have): Details counts it with the ones that didn't parse.
+    pub fn drop_case_marker(&mut self) {
+        self.dropped_marker();
     }
 
     /// The turn that just ended as one line for the case's record ([`crate::cases::log`]), once:
@@ -651,6 +677,14 @@ impl Transcript {
     /// tool calls as they stand, the model, how it stopped, and the ids recalled and used.
     pub fn take_finished_turn(&mut self) -> Option<Record> {
         self.finished.take()
+    }
+
+    /// The conversation ended while a turn ran: the turn ends here as cancelled, with the answer
+    /// as far as it got, so the record keeps it. Its `Done` event will never be read.
+    pub(crate) fn cut_turn(&mut self) {
+        self.flush_markers();
+        self.push(Entry::Stopped { stop: StopReason::Cancelled });
+        self.finish_turn(StopReason::Cancelled);
     }
 
     fn finish_turn(&mut self, stop: StopReason) {
@@ -829,7 +863,8 @@ impl Transcript {
             Piece::Remember(t) => self.propose(&t),
             Piece::Used(id) => self.mark_used(&id),
             Piece::Case(body) => match CaseMarker::parse(&body) {
-                Some(marker) if self.case_marked < MAX_PER_TURN => {
+                Some(marker) if marker.review_only() && !self.review => self.dropped_marker(),
+                Some(marker) if self.case_marked < if self.review { crate::cases::marker::MAX_PER_REVIEW } else { MAX_PER_TURN } => {
                     self.case_marked = self.case_marked.saturating_add(1);
                     self.unrouted.push(marker);
                 }

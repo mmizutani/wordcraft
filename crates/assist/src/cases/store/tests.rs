@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use super::{CaseId, CaseRef, DAMAGED_SUFFIX, MAX_FILE, Shelf, WallId};
 use crate::cases::record::{
     Applied, Body, CaseError, Click, Day, Factor, FactorKind, Facts, MAX_BALANCES, MAX_DISMISSED, MAX_FACTORS, MAX_LIST, MAX_NOTES, MAX_SHORT,
-    MAX_TEXT, MAX_UNCONFIRMED, ModelWrite, NoteDraft, NoteId, PersonOp, Plan, Quoted, Side, Stance, Standing, Topics,
+    MAX_TEXT, MAX_UNCONFIRMED, ModelWrite, NoteDraft, NoteId, PersonOp, Plan, Quoted, Side, Stance, Standing, Topic, Topics,
 };
 use crate::cases::record::{BalanceDraft, Case};
 
@@ -41,6 +41,28 @@ fn pitfall(text: &str) -> NoteDraft {
 
 fn plan(goal: &str) -> Plan {
     Plan { goal: Quoted::parse(goal), next: Vec::new(), standing: Standing::Unconfirmed }
+}
+
+/// The person's edit changes what they edited: the text and the how. The topics the note was
+/// stated to be about and how often turns used it stay, since the edit form states neither, so a
+/// review's Keep on a correction, which is such an edit, doesn't change how the note ranks.
+#[test]
+fn an_edit_keeps_the_notes_stated_topics_and_its_use() {
+    let (shelf, at) = shelf_with_case("edit-keeps");
+    let mut draft = pitfall("The cap excludes data breaches");
+    draft.topics.insert(Topic::Liability);
+    shelf.person(click(), &at, PersonOp::AddNote(draft), today()).unwrap();
+    let id = shelf.open(&at).unwrap().notes[0].id;
+    shelf.model(&at, ModelWrite::Used(vec![id]), today()).unwrap();
+    let before = shelf.open(&at).unwrap().notes[0].clone();
+    assert_eq!((before.used, before.last_used), (1, Some(today())));
+
+    let edit = pitfall("The cap excludes data breaches and IP claims");
+    shelf.person(click(), &at, PersonOp::EditNote(id, edit), today()).unwrap();
+    let after = shelf.open(&at).unwrap().notes[0].clone();
+    assert_eq!(after.body.texts().next().map(Quoted::raw), Some("The cap excludes data breaches and IP claims"));
+    assert!(after.stated_topics.contains(Topic::Liability), "the stated topic is kept");
+    assert_eq!((after.used, after.last_used), (1, Some(today())), "its use is kept");
 }
 
 #[test]
@@ -162,6 +184,14 @@ fn full_case() -> Case {
         };
         case.apply_person(PersonOp::AddNote(draft), today()).unwrap();
     }
+    let paragraphs: Vec<String> = (0..300).map(|i| format!("Clause {i}. The supplier delivers lot {i} to the named warehouse by noon.")).collect();
+    let doc = wordcraft_doc::Document::from_text(&paragraphs.join("\n"));
+    for _ in 0..crate::cases::MAX_DRAFTS {
+        let print = crate::cases::DraftPrint::of(&doc, &"題".repeat(MAX_TEXT), today());
+        assert_eq!(print.len(), crate::cases::MAX_HASHES);
+        case.apply_person(PersonOp::AddDraft(print), today()).unwrap();
+    }
+    assert_eq!(case.drafts.len(), crate::cases::MAX_DRAFTS);
     case
 }
 
@@ -175,6 +205,47 @@ fn a_full_case_fits_the_file() {
     let back = Case::read(&bytes);
     assert!(!back.damaged);
     assert_eq!(back, case);
+}
+
+#[test]
+fn the_newest_cases_of_every_wall_are_read_up_to_a_count_and_a_byte_budget() {
+    let shelf = Shelf::at(&folder("newest"));
+    let a = shelf.new_wall(click(), "Kestrel Freight KK", TODAY, 1).unwrap();
+    let b = shelf.new_wall(click(), "Bluefin Systems Ltd", TODAY, 2).unwrap();
+    let old = shelf.new_case(click(), &a, "Old", TODAY, 3).unwrap();
+    let damaged = shelf.new_case(click(), &b, "Damaged", TODAY, 4).unwrap();
+    let new = shelf.new_case(click(), &a, "New", TODAY, 5).unwrap();
+    std::fs::write(shelf.case_dir(&damaged).join("case.json"), b"{not json").unwrap();
+    for (at, second) in [(&old, 1), (&damaged, 2), (&new, 3)] {
+        let file = std::fs::File::options().write(true).open(shelf.case_dir(at).join("case.json")).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(second)).unwrap();
+    }
+    let titles = |cases: Vec<(CaseRef, Case)>| cases.into_iter().map(|(_, c)| c.title.for_person().to_string()).collect::<Vec<_>>();
+    assert_eq!(titles(shelf.newest_cases(10, MAX_FILE)), ["New", "Old"], "newest first, across walls, the damaged one left out");
+    assert_eq!(titles(shelf.newest_cases(2, MAX_FILE)), ["New"], "the damaged file counts against the count");
+    let len = |at: &CaseRef| std::fs::metadata(shelf.case_dir(at).join("case.json")).unwrap().len();
+    let all = len(&new) + len(&damaged) + len(&old);
+    assert_eq!(titles(shelf.newest_cases(10, all - 1)), ["New"], "and against the bytes");
+    assert_eq!(titles(shelf.newest_cases(10, all)), ["New", "Old"]);
+    assert_eq!(shelf.wall_name(&b).for_person(), "Bluefin Systems Ltd");
+}
+
+/// Binding a damaged case keeps its draft's print only if the case can be read whole: the print
+/// is the window's own write on the person's bind, not an edit of the case, so it leaves the file
+/// as it is, damaged, for the person's next real change to move aside.
+#[test]
+fn a_draft_print_never_repairs_a_damaged_case() {
+    let (shelf, at) = shelf_with_case("damaged-print");
+    let path = shelf.case_dir(&at).join("case.json");
+    let aside = shelf.case_dir(&at).join(format!("case.json{DAMAGED_SUFFIX}"));
+    let junk = b"{not json".to_vec();
+    std::fs::write(&path, &junk).unwrap();
+    let doc = wordcraft_doc::Document::from_text("Clause 1. Kestrel Freight KK shall perform the services with reasonable skill and care.");
+    let print = crate::cases::DraftPrint::of(&doc, "Kestrel MSA", today());
+    assert_eq!(shelf.person(click(), &at, PersonOp::AddDraft(print), today()), Err(CaseError::Damaged));
+    assert_eq!(std::fs::read(&path).unwrap(), junk, "the damaged file is untouched");
+    assert!(std::fs::symlink_metadata(&aside).is_err(), "nothing was moved aside");
+    assert!(shelf.open(&at).unwrap().damaged, "the case still reads as damaged");
 }
 
 #[test]
