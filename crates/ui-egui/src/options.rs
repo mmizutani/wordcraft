@@ -229,6 +229,21 @@ fn general(app: &mut WordApp, ui: &mut Ui) {
     section(ui, "Interface");
     theme_picker(app, ui);
     interface_size_picker(app, ui);
+    ui.horizontal(|ui| {
+        use wordcraft_engine::cmd::view::PaperColor;
+        let label = ui.label(tl!("Screen paper color:"));
+        let selected = app.session.prefs.paper_color;
+        let combo = craft_ui::ComboBox::from_id_salt("screen_paper_color").selected_text(tl!(selected.label())).width(220.0).show_ui(ui, |ui| {
+            for color in PaperColor::ALL {
+                if ui.selectable_label(selected == color, tl!(color.label())).clicked() {
+                    let _ = app.run("view.paperColor", json!({"value": color}));
+                }
+            }
+        });
+        combo.response.labelled_by(label.id).on_hover_text(tl!(
+            "Screen only. Document backgrounds, printing and exports keep their colours. Dark page and explicit Read Mode colours take precedence."
+        ));
+    });
     ui.checkbox(&mut app.ui.mini_toolbar, tl!("Show the mini toolbar when text is selected"));
     let mut dark_page = app.session.view.dark_mode;
     if ui
@@ -883,6 +898,11 @@ fn assistant(app: &mut WordApp, ui: &mut Ui) {
     );
     ui.add_space(8.0);
     crate::assist::memory::options_section(app, ui);
+    // The lessons the person kept, with no document to show them in the pane (#107).
+    if !app.has_document() && app.services.settings_dir.is_some() {
+        let t = crate::theme::Tokens::get(ui.ctx());
+        crate::assist::cases::lesson::list(app, ui, &t);
+    }
     ui.add_space(8.0);
     // The agents and what each starts with (#24): desktop only, as agents are programs (#26).
     #[cfg(not(target_arch = "wasm32"))]

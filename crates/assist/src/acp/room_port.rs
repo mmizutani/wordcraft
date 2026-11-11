@@ -325,7 +325,10 @@ fn send(out: &mut TcpStream, id: &Value, mut v: Value) -> bool {
         return false;
     }
     let mut writer = WriteDeadline { stream: out, until: Instant::now() + Duration::from_secs(2) };
-    let sent = writeln!(writer, "{v}").is_ok();
+    // Serialized first: straight to the socket, each JSON token is a write and, with no Nagle, a
+    // packet of its own, and a long document's reply runs out the deadline part-way.
+    let line = format!("{v}\n");
+    let sent = writer.write_all(line.as_bytes()).is_ok();
     // Reader and writer are clones of one socket; restore blocking reads after the response.
     out.set_nonblocking(false).is_ok() && sent
 }
@@ -786,6 +789,25 @@ mod tests {
         reader.join().unwrap();
         writer.join().unwrap();
         assert!(!observed.unwrap(), "slow progress must not keep a response alive indefinitely");
+    }
+
+    #[test]
+    fn a_long_reply_of_many_small_values_reaches_a_client_that_reads_it() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let values = 1 << 20;
+        let writer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nodelay(true).unwrap();
+            super::send(&mut stream, &json!(1), json!({"values": vec![0; values]}))
+        });
+        let client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        assert!(writer.join().unwrap(), "the reply must go out within the deadline");
+        let reply: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e} after {} bytes", line.len()));
+        assert_eq!(reply["values"].as_array().map(Vec::len), Some(values));
     }
 
     #[test]

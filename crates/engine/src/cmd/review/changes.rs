@@ -66,9 +66,20 @@ fn resolve_para(
     // An inserted paragraph mark that is rejected, or a deleted one that is accepted, goes away:
     // the next paragraph joins this one (the split is undone). A paragraph left empty goes away
     // whole, so the next one keeps its own style and numbering, as in Word. The mark at the end
-    // of a story or cell can't go, so it just stops being a revision.
-    if ((del && accept) || (ins && !accept)) && (crate::cmd::remove_empty_para(s, story, path)? || crate::cmd::join_next_para(s, story, path)?) {
-        return Ok(());
+    // of a story or cell can't go, so it just stops being a revision. An empty paragraph whose
+    // mark carries a section break goes whole too: its section joins the following one, as when
+    // the break is deleted (#5667). Joining instead gave the next paragraph its properties.
+    if (del && accept) || (ins && !accept) {
+        let sectioned = story == StoryRef::Body
+            && path.0.len() == 1
+            && s.doc.para(story, path).is_some_and(|p| p.is_empty() && p.section.is_some())
+            && crate::cmd::has_next_para(s, story, path);
+        if sectioned {
+            s.doc.remove_section_break(path.last());
+        }
+        if crate::cmd::remove_empty_para(s, story, path)? || crate::cmd::join_next_para(s, story, path)? {
+            return Ok(());
+        }
     }
     let para = s.doc.para_mut(story, path)?;
     if ins {
@@ -732,6 +743,77 @@ pub fn changes_of(s: &Session, author: &str) -> Option<Vec<AuthoredChange>> {
         }
     }
     Some(out)
+}
+
+/// Most distinct authors [`authors`] names.
+const MOST_AUTHORS: usize = 64;
+
+/// The distinct authors of the document's tracked changes, at most [`MOST_AUTHORS`], in the order
+/// of their revisions.
+pub fn authors(s: &Session) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for r in &s.doc.revisions {
+        if out.len() >= MOST_AUTHORS {
+            break;
+        }
+        if !out.contains(&r.author) {
+            out.push(r.author.clone());
+        }
+    }
+    out
+}
+
+/// One tracked change with who made it and when, for a case's record of the other side's draft
+/// ([#107]). Neighbouring runs of one change are one here, as in [`changes_of`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Redline {
+    pub kind: &'static str,
+    pub author: String,
+    pub date: String,
+    /// The start of its text, at most [`AUTHORED_TEXT_CHARS`] characters.
+    pub text: String,
+    pub at: Pos,
+}
+
+/// The first `most` tracked changes by anyone but `except`, in every story, and how many more
+/// there are. Scrubbed metadata comes through as it is: an author of "Author" and an empty date.
+pub fn redlines(s: &Session, except: &[&str], most: usize) -> (Vec<Redline>, usize) {
+    let stories = std::iter::once(StoryRef::Body).chain(s.doc.parts.keys().map(|id| StoryRef::Part(*id)));
+    let mut out: Vec<Redline> = Vec::new();
+    let mut more = 0usize;
+    for story in stories {
+        // The run before: its revision and kind, where it ends, and whether it was kept. A run
+        // past the cap is remembered too, so the rest of its change is counted with it and not
+        // again, but nothing joins text onto an entry it isn't part of: that entry would lend
+        // another revision's words its author and date.
+        let mut last: Option<(u32, &'static str, Pos, bool)> = None;
+        for c in changes_in(s, story) {
+            let Some(rev) = c.rev else { continue };
+            let Some(r) = s.doc.revisions.get(rev as usize).filter(|r| !except.contains(&r.author.as_str())) else { continue };
+            let joins = last.as_ref().filter(|(l, kind, end, _)| *l == rev && *kind == c.kind && *end == c.a).map(|(_, _, _, kept)| *kept);
+            let kept = match joins {
+                Some(true) => {
+                    if let Some(l) = out.last_mut() {
+                        add_text(s, &c, &mut l.text);
+                    }
+                    true
+                }
+                Some(false) => false,
+                None if out.len() >= most => {
+                    more = more.saturating_add(1);
+                    false
+                }
+                None => {
+                    let mut text = String::new();
+                    add_text(s, &c, &mut text);
+                    out.push(Redline { kind: c.kind, author: r.author.clone(), date: r.date.clone(), text, at: c.a.clone() });
+                    true
+                }
+            };
+            last = Some((rev, c.kind, c.b, kept));
+        }
+    }
+    (out, more)
 }
 
 /// Add what piece `c` of a change holds to `text`, up to [`AUTHORED_TEXT_CHARS`] characters: the

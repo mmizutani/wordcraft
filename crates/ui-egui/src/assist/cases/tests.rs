@@ -17,33 +17,33 @@ use wordcraft_engine::room::Role;
 use crate::assist::memory::tests::{Folder, settle, window};
 use crate::{Services, WordApp};
 
-const HERE: &str = "Cap liability at twelve months of fees, and say so early.";
+pub(super) const HERE: &str = "Cap liability at twelve months of fees, and say so early.";
 const NEIGHBOR: &str = "The indemnity carve-out for IP claims held once we offered a cap.";
 const UNCONFIRMED_CANARY: &str = "Canary: a model's unconfirmed note in the neighbour.";
 const OTHER_WALL_CANARY: &str = "Canary: another client's note on the liability cap.";
-const TODAY: &str = "2026-11-10";
+pub(super) const TODAY: &str = "2026-11-10";
 
-fn today() -> Day {
+pub(super) fn today() -> Day {
     Day::parse(TODAY).unwrap()
 }
 
-fn click() -> Click {
+pub(super) fn click() -> Click {
     Click::by_person(true).unwrap()
 }
 
-fn draft(text: &str) -> NoteDraft {
+pub(super) fn draft(text: &str) -> NoteDraft {
     NoteDraft { body: Body::Pattern { rule: Quoted::parse(text), traps: None }, how: None, topics: Topics::default() }
 }
 
 /// Two walls: the bound case and a neighbour in one, a case with a canary in the other.
-struct Cases {
-    here: CaseRef,
-    neighbor: CaseRef,
+pub(super) struct Cases {
+    pub(super) here: CaseRef,
+    pub(super) neighbor: CaseRef,
     /// Another client's case.
-    other: CaseRef,
+    pub(super) other: CaseRef,
 }
 
-fn cases(folder: &Folder) -> Cases {
+pub(super) fn cases(folder: &Folder) -> Cases {
     let shelf = Shelf::at(&folder.0);
     let wall = |n: u64| -> WallId { shelf.new_wall(click(), &format!("Client {n}"), TODAY, n).unwrap() };
     let case = |wall: &WallId, title: &str, n: u64| shelf.new_case(click(), wall, title, TODAY, n).unwrap();
@@ -61,7 +61,7 @@ fn cases(folder: &Folder) -> Cases {
 }
 
 /// Ask `prompt` of a new scripted conversation: what its first turn was given.
-fn ask(a: &mut WordApp, fake: Fake, prompt: &str) -> std::sync::Arc<std::sync::Mutex<Seen>> {
+pub(super) fn ask(a: &mut WordApp, fake: Fake, prompt: &str) -> std::sync::Arc<std::sync::Mutex<Seen>> {
     let seen = fake.seen();
     a.assist_with(Box::new(fake));
     a.execute("assist.ask", json!({"prompt": prompt})).unwrap();
@@ -71,7 +71,7 @@ fn ask(a: &mut WordApp, fake: Fake, prompt: &str) -> std::sync::Arc<std::sync::M
 
 /// Frames until `done`, within a generous deadline: a loaded machine schedules the conversation's
 /// thread late, so no wait here is a fixed number of ticks.
-fn frames_until(a: &mut WordApp, what: &str, mut done: impl FnMut(&mut WordApp) -> bool) {
+pub(super) fn frames_until(a: &mut WordApp, what: &str, mut done: impl FnMut(&mut WordApp) -> bool) {
     let ctx = egui::Context::default();
     let started = std::time::Instant::now();
     while !done(a) {
@@ -82,7 +82,7 @@ fn frames_until(a: &mut WordApp, what: &str, mut done: impl FnMut(&mut WordApp) 
     }
 }
 
-fn recalled_json(turn: &Turn) -> Vec<Value> {
+pub(super) fn recalled_json(turn: &Turn) -> Vec<Value> {
     let recalled: Vec<&wordcraft_assist::TurnSource> = turn.knowledge.iter().filter(|s| s.origin == SourceOrigin::Recalled).collect();
     assert_eq!(recalled.len(), 1, "one recalled source: {:?}", turn.knowledge);
     let text = recalled[0].as_text();
@@ -183,6 +183,54 @@ fn a_second_participant_or_an_invite_not_yet_used_withholds_recall_and_details_s
     assert!(turns[1].knowledge.is_empty(), "a participant withholds recall");
     let details = crate::assist::details_for(&mut a);
     assert_eq!(details.turns[1].context.as_ref().unwrap().recall_withheld.as_deref(), Some("Bob can read this document"));
+}
+
+const PLAN: &str = "Hold the cap at twelve months of fees; give ground on notice periods.";
+
+/// Each turn of a bound conversation carries the case as it stands: its closed facts, the balance
+/// now and the plan, as data under WordCraft's own words, never a party's name or the title, and
+/// Details › Recalled shows it. Once someone else can read the document it goes with the rest.
+#[test]
+fn a_bound_turn_carries_the_cases_facts_balance_and_plan_as_data_and_no_name_and_not_once_someone_else_can_read() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let shelf = Shelf::at(&folder.0);
+    let facts = serde_json::from_value(json!({"kind": "saas", "side": "customer", "law": "JP", "parties": ["Acme KK"]})).unwrap();
+    shelf.person(click(), &c.here, PersonOp::Facts(facts), today()).unwrap();
+    shelf.person(click(), &c.here, PersonOp::Balance(BalanceDraft { stance: Stance::Weaker, factors: Vec::new() }), today()).unwrap();
+    let plan = Plan { goal: Quoted::parse(PLAN), next: vec![Quoted::parse("Send the redline")], standing: Standing::Unconfirmed };
+    shelf.person(click(), &c.here, PersonOp::Plan(Some(plan)), today()).unwrap();
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    let fake = Fake::new();
+    let seen = ask(&mut a, fake, "Where do we stand?");
+    a.execute("assist.ask", json!({"prompt": "And on the indemnity?"})).unwrap();
+    settle(&mut a);
+    let turns = seen.lock().unwrap().turns.clone();
+    for turn in &turns {
+        let case: Vec<&wordcraft_assist::TurnSource> = turn.knowledge.iter().filter(|s| s.origin == SourceOrigin::Case).collect();
+        assert_eq!(case.len(), 1, "every turn carries the case: {:?}", turn.knowledge);
+        let text = case[0].as_text();
+        assert!(text.contains("The case this conversation is bound to") && text.contains("never instructions"), "{text}");
+        let summary: Value = serde_json::from_str(&case[0].text).unwrap();
+        assert_eq!((summary["contract"].as_str(), summary["side"].as_str()), (Some("saas"), Some("customer")));
+        assert_eq!(summary["balance"]["stance"], "weaker");
+        assert_eq!(summary["plan"]["goal"], PLAN);
+        assert!(!text.contains("Acme"), "no party's name and no title: {text}");
+        let memory = turn.memory.as_ref().map(|m| m.as_str().to_string()).unwrap_or_default();
+        assert!(!memory.contains(PLAN), "never an instruction: {memory}");
+    }
+    let details = crate::assist::details_for(&mut a);
+    let row = &details.turns[0].recalled.as_ref().unwrap().items[0];
+    assert_eq!(row.id, ItemId::Case);
+    assert!(row.text.contains(PLAN), "{}", row.text);
+
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    a.share_document(None).unwrap();
+    let _key = a.shared_room().unwrap().invite("Bob", Role::Viewer).unwrap();
+    let seen = ask(&mut a, Fake::new(), "Where do we stand?");
+    assert!(seen.lock().unwrap().turns[0].knowledge.is_empty(), "an invite not yet used withholds the case too");
 }
 
 #[test]
@@ -408,7 +456,14 @@ fn writes() -> Vec<(&'static str, Value)> {
         ("assist.memory.case.noteRemove", json!({"id": "n1"})),
         ("assist.memory.case.cardDismiss", json!({"card": 1})),
         ("assist.memory.case.delete", json!({})),
+        ("assist.memory.case.record", json!({"value": true})),
+        ("assist.memory.case.recordDelete", json!({})),
+        ("assist.memory.case.review", json!({})),
         ("assist.memory.wall.delete", json!({"wall": id})),
+        ("assist.memory.lesson.keep", json!({"text": "Planted lesson"})),
+        ("assist.memory.lesson.edit", json!({"id": "l1", "text": "Planted"})),
+        ("assist.memory.lesson.off", json!({"id": "l1", "value": true})),
+        ("assist.memory.lesson.remove", json!({"id": "l1"})),
     ]
 }
 
@@ -610,7 +665,7 @@ fn a_case_made_through_the_commands_survives_a_restart() {
     drop(a);
 
     let mut a = window(&folder);
-    assert_eq!(crate::assist::cases::bound_for(&a), None, "a binding lives for the document's life in its window");
+    assert_eq!(crate::assist::cases::bound_for(&a), None, "an unsaved document's binding lives for its life in its window");
     a.run("assist.memory.case.bind", json!({"wall": at.wall.as_str(), "case": at.case.as_str()})).unwrap();
     let (_, case) = crate::assist::cases::open_case(&mut a, false).unwrap();
     assert_eq!(case.title.for_person(), "Acme MSA");
@@ -640,6 +695,113 @@ fn a_case_made_through_the_commands_survives_a_restart() {
     assert_eq!(listing.walls[0].name.for_person(), "Acme");
 }
 
+/// A window started later on the same settings folder that opens `file`, past a frame.
+pub(super) fn reopened(folder: &Folder, file: &std::path::Path) -> WordApp {
+    let mut a = window(folder);
+    a.run("file.open", json!({"path": file.to_string_lossy()})).unwrap();
+    crate::assist::tick(&mut a);
+    a
+}
+
+/// The case offered to a reopened document, as the pane shows it.
+fn offered(a: &WordApp) -> Option<(CaseRef, String)> {
+    crate::assist::cases::offered(a).cloned()
+}
+
+/// The person's binding is kept for the file: a window started later offers the case as it opens
+/// the file and binds it only with the person's Bind again, after which turns recall from it; Not
+/// now leaves the document unbound. A copy saved under another name is offered nothing.
+#[test]
+fn a_files_case_is_offered_after_a_restart_and_binds_only_with_the_persons_click() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let file = folder.0.join("Acme MSA draft.docx");
+    let copy = folder.0.join("Copy for the other side.docx");
+    let mut a = window(&folder);
+    a.run("file.saveAs", json!({"path": file.to_string_lossy()})).unwrap();
+    a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+    assert_eq!(offered(&a), None, "bound by a click: nothing to offer");
+    a.run("file.saveAs", json!({"path": copy.to_string_lossy()})).unwrap();
+    drop(a);
+
+    let mut a = reopened(&folder, &file);
+    assert_eq!(crate::assist::cases::bound_for(&a), None, "the file doesn't bind by itself");
+    assert_eq!(offered(&a), Some((c.here.clone(), "Acme MSA".to_string())), "its case is offered");
+    let seen = ask(&mut a, Fake::new(), "Review the liability cap and the indemnity clause");
+    let knowledge = seen.lock().unwrap().turns[0].knowledge.clone();
+    assert!(knowledge.iter().all(|s| s.origin != SourceOrigin::Recalled), "nothing recalls before the click: {knowledge:?}");
+    crate::assist::cases::rebind(&mut a);
+    assert_eq!(crate::assist::cases::bound_for(&a), Some(c.here.clone()), "Bind again binds it");
+    assert_eq!(offered(&a), None);
+    let seen = ask(&mut a, Fake::new(), "Review the liability cap and the indemnity clause");
+    assert_eq!(recalled_json(&seen.lock().unwrap().turns[0]).len(), 3, "recall applies again");
+    drop(a);
+
+    let mut a = reopened(&folder, &file);
+    crate::assist::cases::not_now(&mut a);
+    assert_eq!((offered(&a), crate::assist::cases::bound_for(&a)), (None, None), "Not now leaves it unbound");
+    assert!(reopened(&folder, &file).assist.cases.offered.values().any(|(at, _)| *at == c.here), "and it is offered the next time");
+
+    let a = reopened(&folder, &copy);
+    assert_eq!(offered(&a), None, "a copy saved under another name is offered nothing");
+}
+
+/// Unbind and Delete change what the file binds to next time, and an unsaved document's binding
+/// is the window's alone.
+#[test]
+fn unbinding_or_deleting_the_case_is_kept_for_the_file_and_an_unsaved_documents_binding_is_not() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let file = folder.0.join("Acme MSA draft.docx");
+    let mut a = window(&folder);
+    a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+    a.run("file.saveAs", json!({"path": file.to_string_lossy()})).unwrap();
+    drop(a);
+    assert_eq!(offered(&reopened(&folder, &file)), None, "bound before it had a file: nothing was kept");
+
+    let mut a = window(&folder);
+    a.run("file.open", json!({"path": file.to_string_lossy()})).unwrap();
+    a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+    a.run("assist.memory.case.unbind", json!({})).unwrap();
+    drop(a);
+    assert_eq!(offered(&reopened(&folder, &file)), None, "unbound, nothing is offered");
+
+    let mut a = window(&folder);
+    a.run("file.open", json!({"path": file.to_string_lossy()})).unwrap();
+    a.run("assist.memory.case.bind", json!({"wall": c.neighbor.wall.as_str(), "case": c.neighbor.case.as_str()})).unwrap();
+    drop(a);
+    let mut a = reopened(&folder, &file);
+    assert_eq!(offered(&a).map(|(at, _)| at), Some(c.neighbor.clone()), "the last binding is the one offered");
+    crate::assist::cases::rebind(&mut a);
+    a.run("assist.memory.case.delete", json!({})).unwrap();
+    frames_until(&mut a, "the delete worker", |a| a.assist.cases.record.deleting.is_none());
+    assert!(a.assist.notice.is_none(), "{:?}", a.assist.notice);
+    let bindings = std::fs::read_to_string(cases_dir(&folder).join(wordcraft_assist::cases::store::bindings::FILE)).unwrap();
+    assert!(!bindings.contains(c.neighbor.case.as_str()), "the deleted case's binding went with it: {bindings}");
+    assert_eq!(offered(&reopened(&folder, &file)), None);
+}
+
+/// A damaged bindings file binds nothing and crashes nothing; the person's next bind moves it
+/// aside.
+#[test]
+fn a_damaged_bindings_file_binds_nothing_and_the_next_bind_moves_it_aside() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let file = folder.0.join("Acme MSA draft.docx");
+    let mut a = window(&folder);
+    a.run("file.saveAs", json!({"path": file.to_string_lossy()})).unwrap();
+    let path = cases_dir(&folder).join(wordcraft_assist::cases::store::bindings::FILE);
+    std::fs::write(&path, b"{\"version\":1,\"files\":[{\"path\":").unwrap();
+    drop(a);
+    let mut a = reopened(&folder, &file);
+    assert_eq!(offered(&a), None, "a damaged file offers nothing");
+    a.run("assist.memory.case.bind", json!({"wall": c.here.wall.as_str(), "case": c.here.case.as_str()})).unwrap();
+    let aside = std::fs::read(cases_dir(&folder).join("bindings.json.damaged")).unwrap();
+    assert_eq!(aside, b"{\"version\":1,\"files\":[{\"path\":");
+    drop(a);
+    assert_eq!(offered(&reopened(&folder, &file)).map(|(at, _)| at), Some(c.here.clone()));
+}
+
 /// Delete removes the case's folder with its notes, and a later turn of that document recalls
 /// nothing.
 #[test]
@@ -654,6 +816,7 @@ fn delete_removes_the_case_and_its_notes_and_a_later_turn_recalls_nothing() {
     let seen = ask(&mut a, Fake::new(), "Review the liability cap");
     assert_eq!(recalled_json(&seen.lock().unwrap().turns[0]).len(), 1);
     a.run("assist.memory.case.delete", json!({})).unwrap();
+    frames_until(&mut a, "the delete worker", |a| a.assist.cases.record.deleting.is_none());
     assert!(!case_dir.exists(), "the folder is gone");
     assert!(a.conversation().unwrap().has_ended(), "the conversation that read the notes ended");
     let listing = Shelf::at(&folder.0).list();
@@ -731,6 +894,60 @@ fn an_output_row_that_quotes_recalled_notes_says_so() {
     assert!(h.query_by_label("This quotes your case notes").is_some());
 }
 
+/// Three positions on the liability cap go to the turn as one ladder item, and Details › Recalled
+/// shows its rungs, built from what was sent and wrapped inside the narrow pane: each rung's date,
+/// where it is from, who moved, the terms, what was traded, whether it landed, and the balance
+/// then and now.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn details_shows_a_ladders_rungs_inside_the_pane() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::cases::{Side, Topic};
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let shelf = Shelf::at(&folder.0);
+    let position = |terms: &str, traded: Option<&str>, landed: bool| NoteDraft {
+        body: Body::Position { topic: Topic::Liability, moved: Side::Us, terms: Quoted::parse(terms), traded_for: traded.map(Quoted::parse), landed },
+        how: None,
+        topics: Topics::default(),
+    };
+    shelf.person(click(), &c.here, PersonOp::AddNote(position("Cap at twelve months of fees paid, offered first.", None, false)), today()).unwrap();
+    shelf
+        .person(
+            click(),
+            &c.neighbor,
+            PersonOp::AddNote(position("Cap at six months of fees paid, which landed.", Some("A three-year initial term."), true)),
+            today(),
+        )
+        .unwrap();
+    shelf.person(click(), &c.neighbor, PersonOp::AddNote(position("Cap at nine months of fees paid, refused.", None, false)), today()).unwrap();
+    let mut a = window(&folder);
+    a.bind_case(Some(c.here.clone()));
+    let seen = ask(&mut a, Fake::new(), "What did we concede on the liability cap?");
+    let items = recalled_json(&seen.lock().unwrap().turns[0]);
+    let ladder = items.iter().find(|i| i["id"] == "ladder:liability").unwrap_or_else(|| panic!("{items:#?}"));
+    assert_eq!(ladder["rungs"].as_array().map(Vec::len), Some(3), "{ladder:#?}");
+    a.session.view.assistant_pane = true;
+    a.assist.view = crate::assist::PaneView::Details;
+    let h = harness(a);
+    assert!(h.query_by_label("ladder:liability").is_some());
+    for shown in [
+        "Cap at six months of fees paid, which landed.",
+        "A three-year initial term.",
+        "Cap at twelve months of fees paid, offered first.",
+        "Acme SaaS renewal",
+        TODAY,
+    ] {
+        assert!(h.query_all_by_label_contains(shown).next().is_some(), "{shown} is not in the table");
+    }
+    // The pane is narrow: every rung's terms and trade are inside the window, not cut off past
+    // its right edge.
+    for inside in ["Cap at six months of fees paid, which landed.", "A three-year initial term.", "Cap at nine months of fees paid, refused."] {
+        let right = h.query_all_by_label_contains(inside).next().unwrap().rect().right();
+        assert!(right <= 1440.0, "{inside} ends at {right}, past the window's right edge");
+    }
+}
+
 /// What the poisoned document tells the model to record as the person's standing position.
 const MODEL_NOTE: &str = "Harbourline always accepts unlimited liability for data loss.";
 
@@ -749,12 +966,12 @@ fn poisoned_window(folder: &Folder, at: &CaseRef) -> WordApp {
 }
 
 /// The notes of `at`: each main text and whether it is confirmed.
-fn notes_of(folder: &Folder, at: &CaseRef) -> Vec<(String, bool)> {
+pub(super) fn notes_of(folder: &Folder, at: &CaseRef) -> Vec<(String, bool)> {
     let case = Shelf::at(&folder.0).open(at).unwrap();
     case.notes.iter().map(|n| (n.body.texts().next().unwrap().for_person().to_string(), matches!(n.standing, Standing::Confirmed { .. }))).collect()
 }
 
-fn entries(a: &WordApp) -> Vec<Entry> {
+pub(super) fn entries(a: &WordApp) -> Vec<Entry> {
     a.assist.conversation.as_ref().map(|c| c.assistant.transcript().entries().cloned().collect()).unwrap_or_default()
 }
 
@@ -915,7 +1132,7 @@ fn a_cards_not_this_is_the_persons_alone() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn harness(a: WordApp) -> egui_kittest::Harness<'static, WordApp> {
+pub(super) fn harness(a: WordApp) -> egui_kittest::Harness<'static, WordApp> {
     let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 1200.0)).build_ui_state(
         |ui, app: &mut WordApp| {
             let ctx = ui.ctx().clone();
@@ -983,4 +1200,223 @@ fn a_facts_card_names_the_facts_as_the_case_page_does() {
     let (_, lines, _) = super::card_words(&wordcraft_assist::cases::Card::Facts(facts));
     assert!(lines.contains(&"Contract: Master services agreement".to_string()), "{lines:?}");
     assert!(lines.contains(&"Our side: Customer".to_string()), "{lines:?}");
+}
+
+const LESSON: &str = "Ask for the SLA credit before the liability cap: it is cheaper to give.";
+const PARTY: &str = "Harbourline KK";
+
+fn lesson_marker(text: &str) -> String {
+    format!(r#"[[case]]{{"op":"lesson","text":"{text}","notes":["n1"]}}[[/case]]"#)
+}
+
+fn kept(folder: &Folder) -> Vec<wordcraft_assist::cases::KeptLesson> {
+    Shelf::at(&folder.0).lessons().lessons
+}
+
+/// A case with a party named and typed facts, so a lesson from it has names to flag and facts to
+/// travel.
+fn name_and_facts(folder: &Folder, at: &CaseRef) {
+    let facts = wordcraft_assist::cases::Facts {
+        kind: Some(wordcraft_assist::cases::ContractKind::Saas),
+        law: wordcraft_assist::cases::Law::parse("JP"),
+        parties: vec![Quoted::parse(PARTY)],
+        ..wordcraft_assist::cases::Facts::default()
+    };
+    Shelf::at(&folder.0).person(click(), at, PersonOp::Facts(facts), today()).unwrap();
+}
+
+/// A lesson kept from one client's case reaches another client's turn, as its text and coarse
+/// facts; that client's notes, the source case's notes, its id and its party's name never do.
+#[test]
+fn a_kept_lesson_reaches_another_clients_turn_and_nothing_else_of_its_case_does() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    name_and_facts(&folder, &c.here);
+    let shelf = Shelf::at(&folder.0);
+    let here = shelf.open(&c.here).unwrap();
+    let draft = wordcraft_assist::cases::LessonDraft {
+        text: Quoted::parse(LESSON),
+        applies: here.applies(today()),
+        topics: Default::default(),
+        from: Some(c.here.case.clone()),
+    };
+    shelf.lesson(click(), wordcraft_assist::cases::LessonOp::Keep(draft)).unwrap();
+    let mut a = window(&folder);
+    a.bind_case(Some(c.other.clone()));
+    let seen = ask(&mut a, Fake::new(), "Review the liability cap and the SLA credit");
+    let turns = seen.lock().unwrap().turns.clone();
+    let items = recalled_json(&turns[0]);
+    let mut ids: Vec<&str> = items.iter().map(|i| i["id"].as_str().unwrap()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["l1", "n1"], "the other client's own note and the lesson, nothing of the lesson's client: {items:#?}");
+    let lesson = items.iter().find(|i| i["id"] == "l1").unwrap();
+    assert_eq!(lesson["text"], LESSON);
+    assert_eq!(lesson["place"], "a lesson the person kept");
+    assert_eq!(lesson["contract"], "saas");
+    assert_eq!(lesson["law"], "JP");
+    assert_eq!(lesson["year"], 2026);
+    assert!(lesson.get("from").is_none() && lesson.get("size").is_none(), "{lesson:?}");
+    let everything = format!("{turns:?}");
+    for canary in [HERE, NEIGHBOR, UNCONFIRMED_CANARY, PARTY, c.here.case.as_str(), c.here.wall.as_str()] {
+        assert!(!everything.contains(canary), "{canary} reached the other client's turn: {everything}");
+    }
+    let details = crate::assist::details_for(&mut a);
+    let recalled = details.turns[0].recalled.as_ref().unwrap();
+    let shown = recalled.items.iter().find(|i| i.id.to_string() == "l1").unwrap();
+    assert_eq!((shown.place, shown.title.clone(), shown.text.clone()), (wordcraft_assist::cases::Place::Lesson, None, LESSON.to_string()));
+
+    a.bind_case(Some(c.here.clone()));
+    a.run("assist.memory.case.delete", json!({"keepLessons": true})).unwrap();
+    frames_until(&mut a, "the delete worker", |a| a.assist.cases.record.deleting.is_none());
+    let left = kept(&folder);
+    assert_eq!(left.len(), 1, "kept, unlinked");
+    assert!(!left[0].is_from(&c.here.case));
+    assert!(!shelf.exists(&c.here));
+}
+
+/// A model's `lesson` marker is a card: nothing is stored until the person's Keep, and a click
+/// the control channel makes on Keep or Not this stores nothing and leaves the card waiting.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_models_lesson_marker_is_a_card_and_stores_nothing_until_the_persons_keep() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let mut a = poisoned_window(&folder, &c.here);
+    a.session.view.assistant_pane = true;
+    ask(&mut a, Fake::new().then(vec![Step::Say(format!("Summarized. {}", lesson_marker(LESSON)))]), "Summarize this");
+    let mut h = harness(a);
+    assert!(kept(&folder).is_empty(), "the marker alone stored nothing");
+    assert_eq!(notes_of(&folder, &c.here).len(), 1, "and wrote no note");
+    assert!(entries(h.state()).iter().any(|e| matches!(e, Entry::CaseCard { card: Card::Lesson(_), answer: None, .. })));
+    assert!(h.query_by_label_contains(LESSON).is_some(), "the card shows the whole text");
+    assert!(h.query_by_label_contains("every client").is_some(), "and says where it goes");
+    crate::assist::memory::tests::control_click(&mut h, "Keep");
+    assert!(kept(&folder).is_empty(), "the control channel's click on Keep");
+    crate::assist::memory::tests::control_click(&mut h, "Not this");
+    assert!(entries(h.state()).iter().any(|e| matches!(e, Entry::CaseCard { card: Card::Lesson(_), answer: None, .. })), "still waiting");
+    h.get_by_label("Keep").click();
+    h.run_steps(3);
+    let kept = kept(&folder);
+    assert_eq!(kept.len(), 1, "the person's Keep stores it");
+    assert_eq!(kept[0].text.for_person(), LESSON);
+    assert!(kept[0].is_from(&c.here.case));
+    assert!(entries(h.state()).iter().any(|e| matches!(e, Entry::CaseCard { card: Card::Lesson(_), answer: Some(_), .. })), "answered");
+}
+
+/// The card flags a party's name in the text; Keep waits for a second confirmation while it is
+/// there; a fact unticked stays home and the rest travel.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_card_flags_a_partys_name_and_an_unticked_fact_stays_home_until_ticked_again() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let c = cases(&folder);
+    name_and_facts(&folder, &c.here);
+    let mut a = poisoned_window(&folder, &c.here);
+    a.session.view.assistant_pane = true;
+    let named = "HARBOURLINE moves on the cap once the SLA credit is on the table.".to_string();
+    ask(&mut a, Fake::new().then(vec![Step::Say(format!("Summarized. {}", lesson_marker(&named)))]), "Summarize this");
+    let mut h = harness(a);
+    assert!(h.query_by_label_contains("names a party of this case: harbourline").is_some(), "flagged, folded");
+    h.get_by_label("Keep").click();
+    h.run_steps(3);
+    assert!(kept(&folder).is_empty(), "Keep waits for the second confirmation");
+    h.get_by_label("Contract: SaaS").click();
+    h.run_steps(2);
+    h.get_by_label("Law: JP").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Law: JP").is_some(), "an unticked fact keeps its tick box");
+    h.get_by_label("Law: JP").click();
+    h.run_steps(2);
+    h.get_by_label("Keep it with the name").click();
+    h.run_steps(2);
+    h.get_by_label("Keep").click();
+    h.run_steps(3);
+    let kept = kept(&folder);
+    assert_eq!(kept.len(), 1, "kept after the second confirmation");
+    assert_eq!(kept[0].text.for_person(), named);
+    assert_eq!(kept[0].applies.kind, None, "the unticked fact stayed home");
+    assert_eq!(kept[0].applies.law, wordcraft_assist::cases::Law::parse("JP"), "the ticked one travels");
+    assert_eq!(kept[0].applies.year, Some(2026));
+}
+
+/// Card ids start again with each conversation, so a lesson card from a conversation on one case
+/// is never reused for a new conversation's proposal with the same id on another case: the new
+/// card shows the new case's facts and flags its party, never the old case's.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_lesson_card_belongs_to_its_conversations_case_and_a_later_conversation_gets_its_own() {
+    use egui_kittest::kittest::Queryable;
+    let folder = Folder::new();
+    let c = cases(&folder);
+    name_and_facts(&folder, &c.here);
+    let shelf = Shelf::at(&folder.0);
+    let other_facts = wordcraft_assist::cases::Facts {
+        kind: Some(wordcraft_assist::cases::ContractKind::Nda),
+        parties: vec![Quoted::parse("Zenith Ltd")],
+        ..wordcraft_assist::cases::Facts::default()
+    };
+    shelf.person(click(), &c.other, PersonOp::Facts(other_facts), today()).unwrap();
+    let mut a = poisoned_window(&folder, &c.here);
+    a.session.view.assistant_pane = true;
+    ask(&mut a, Fake::new().then(vec![Step::Say(format!("Summarized. {}", lesson_marker("Harbourline moves last on the cap.")))]), "Summarize this");
+    let mut h = harness(a);
+    assert!(h.query_by_label_contains("names a party of this case: harbourline").is_some());
+    assert!(h.query_by_label("Contract: SaaS").is_some());
+    h.state_mut().bind_case(Some(c.other.clone()));
+    let fake = Fake::new().then(vec![Step::Say(format!("Summarized. {}", lesson_marker("Zenith moves last on the cap.")))]);
+    h.state_mut().assist_with(Box::new(fake));
+    h.state_mut().execute("assist.ask", json!({"prompt": "Summarize this"})).unwrap();
+    let started = std::time::Instant::now();
+    while h.state().conversation().is_some_and(|c| c.is_busy()) {
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "the second conversation never settled");
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    h.run_steps(4);
+    assert!(h.query_by_label_contains("names a party of this case: zenith").is_some(), "the new case's party is flagged");
+    assert!(h.query_by_label_contains("harbourline").is_none(), "the old case's party is not");
+    assert!(h.query_by_label("Contract: NDA").is_some() && h.query_by_label("Contract: SaaS").is_none(), "the new case's facts");
+}
+
+/// With two lessons kept, Edit on the second opens its editor and Save changes it alone: the rows
+/// before it leave its draft where it is.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_second_of_two_lessons_can_be_edited_from_the_list() {
+    use egui_kittest::kittest::Queryable;
+    use wordcraft_assist::cases::{LessonDraft, LessonOp};
+    let folder = Folder::new();
+    let c = cases(&folder);
+    let shelf = Shelf::at(&folder.0);
+    let keep = |text: &str| {
+        let draft = LessonDraft { text: Quoted::parse(text), applies: Default::default(), topics: Default::default(), from: None };
+        shelf.lesson(click(), LessonOp::Keep(draft)).unwrap().unwrap()
+    };
+    keep("First lesson.");
+    let second = keep("Second lesson.");
+    let mut a = window(&folder);
+    a.session.view.assistant_pane = true;
+    a.assist.view = crate::assist::PaneView::Details;
+    a.bind_case(Some(c.here.clone()));
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 3000.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(4);
+    // The lessons list ends the page: its last Edit is the second lesson's.
+    h.get_all_by_label("Edit").last().unwrap().click();
+    h.run_steps(3);
+    assert!(h.query_by_label("Save").is_some(), "the second lesson's editor is open");
+    h.state_mut().assist.cases.drafts.lesson_edit = Some((second, "Second lesson, reworded.".into()));
+    h.run_steps(2);
+    h.get_by_label("Save").click();
+    h.run_steps(3);
+    let texts: Vec<String> = shelf.lessons().lessons.iter().map(|l| l.text.for_person().to_string()).collect();
+    assert_eq!(texts, ["First lesson.", "Second lesson, reworded."]);
 }

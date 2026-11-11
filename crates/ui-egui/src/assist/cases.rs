@@ -2,11 +2,15 @@
 //! a turn asks to recall from it, what Details › Recalled shows of what came back, and the
 //! `memory.case.*` and `memory.wall.*` writes behind Details › Case ([`page`]).
 //!
-//! The binding is the window's alone and never in a document. A conversation belongs to the case
-//! its document was bound to when it started ([`super::Conversation::case`]); a document bound to
-//! another case gets a new conversation. Recall runs only when a case is bound and no one but the
-//! person and this conversation's assistant can read the document ([`Alone`]); otherwise the turn
-//! runs as it does today, and Details says why.
+//! The binding is never in a document. The person's click binds, and the shelf keeps that binding
+//! for the document's file ([`Shelf::bind_file`]), so the case is offered again when the file is
+//! next opened ([`offer`]), and binds only with the person's click: a path doesn't say which
+//! document is there, and another client's document at it would recall the first client's case.
+//! An unsaved document's binding is the window's alone. A conversation belongs to
+//! the case its document was bound to when it started ([`super::Conversation::case`]); a document
+//! bound to another case gets a new conversation. Recall runs only when a case is bound and no one
+//! but the person and this conversation's assistant can read the document ([`Alone`]); otherwise
+//! the turn runs as it does today, and Details says why.
 //!
 //! Two writers, two doors. The person's click goes through [`super::memory::write`], the one guard,
 //! and the shelf's [`Click`] is its proof: only that door confirms a note, sets facts, replaces the
@@ -15,13 +19,14 @@
 //! current binding: a note or a balance lands there unconfirmed, a plan replaces only a model's
 //! plan, and facts are always a card. The switch is [`ModelWrites`].
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use egui::{RichText, Ui};
 use serde_json::{Value, json};
 use wordcraft_assist::cases::{
-    Alone, Applied, BalanceDraft, Body, Card, Case, CaseError, CaseId, CaseRef, Click, Day, Factor, Facts, Listing, ModelWrite, ModelWrites,
-    NoteDraft, NoteId, PersonOp, Place, Plan, Quoted, RecallAsk, RecallSent, Route, Shelf, Stance, Standing, Topics, WallId,
+    Alone, Applied, BalanceDraft, Body, Card, Case, CaseError, CaseId, CaseRef, Click, Day, Factor, Facts, ItemId, LessonDraft, LessonId, LessonOp,
+    Lessons, Listing, ModelWrite, ModelWrites, NoteDraft, NoteId, PersonOp, Place, Plan, Quoted, RecallAsk, RecallSent, RecalledItem, Route, Shelf,
+    Stance, Standing, Topics, WallId,
 };
 use wordcraft_assist::{Context, Details, ProposalAnswer, Sent, Written};
 
@@ -29,7 +34,11 @@ use crate::WordApp;
 use crate::i18n::fmt;
 use crate::theme::Tokens;
 
+pub(crate) mod lesson;
 pub(crate) mod page;
+pub(crate) mod record;
+pub(crate) mod review;
+pub(crate) mod suggest;
 
 /// Why a turn recalled nothing, as Details says it.
 const NO_CASE: &str = "no case is bound to this document";
@@ -56,12 +65,24 @@ const MAX_TRIES: u32 = 600;
 pub(crate) struct CasesState {
     /// By document id ([`wordcraft_engine::Session::document_id`]): a window holds several documents.
     bound: BTreeMap<u64, CaseRef>,
+    /// Documents whose file was looked up for an earlier binding ([`offer`]), once each.
+    looked_up: BTreeSet<u64>,
+    /// The case each document's file was bound to when it was last open, with its title, offered
+    /// until the person binds the document or says not now. Never bound without that click.
+    offered: BTreeMap<u64, (CaseRef, String)>,
     /// The shown document's case as its file last read, with when (`clock::now_ms`).
     open: Option<(CaseRef, Case)>,
     read_at: Option<f64>,
     /// Every client's cases, read on a worker: a folder scan.
     listing: ListState,
     listed_at: Option<f64>,
+    /// The lessons file as last read, with when.
+    lessons: Option<Lessons>,
+    lessons_at: Option<f64>,
+    /// The lesson cards under answers, by card id: the text as edited and the facts left ticked.
+    /// Card ids start again with each conversation, so this is cleared when one starts, ends or
+    /// is rebound, and a card is reused only while its case is still the conversation's.
+    pub(crate) lesson_cards: BTreeMap<u64, lesson::LessonCard>,
     /// What the page is in the middle of.
     pub(crate) drafts: page::Drafts,
     /// A model's writes, each for the case its conversation belongs to, waiting for the file:
@@ -70,6 +91,10 @@ pub(crate) struct CasesState {
     /// [`wordcraft_assist::cases::MODEL_WRITES`], which tests change to try the other setting.
     #[doc(hidden)]
     pub model_writes: ModelWrites,
+    /// The case's record on the page, and the workers deleting or searching it.
+    pub(crate) record: record::RecordState,
+    /// The lineage suggestion for an unbound document, and its worker.
+    pub(crate) suggest: suggest::SuggestState,
 }
 
 /// The last listing read, kept while a newer one is read: a name lookup during the read must
@@ -152,19 +177,35 @@ fn list_on_worker(app: &mut WordApp) {
     }
 }
 
-/// After a write: the case and the listing are read again before the next frame shows them.
+/// The lessons as last read, read again when stale: one file of at most 1 MiB, as the case is.
+pub(crate) fn lessons(app: &mut WordApp) -> Lessons {
+    let stale = app.assist.cases.lessons_at.is_none_or(|t| crate::clock::now_ms() - t > READ_EVERY);
+    if stale || app.assist.cases.lessons.is_none() {
+        app.assist.cases.lessons_at = Some(crate::clock::now_ms());
+        app.assist.cases.lessons = app.services.settings_dir.as_ref().map(|dir| Shelf::at(dir).lessons());
+    }
+    app.assist.cases.lessons.clone().unwrap_or_default()
+}
+
+/// After a write: the case, the listing and the lessons are read again before the next frame
+/// shows them.
 fn changed(app: &mut WordApp) {
     app.assist.cases.read_at = None;
     app.assist.cases.listed_at = None;
+    app.assist.cases.lessons_at = None;
 }
 
 /// Every frame: what the conversation's answers marked for its case goes there, by the one route.
 /// A marker with no case bound to the conversation is dropped, as a `[[used:]]` for nothing is.
 pub(crate) fn tick(app: &mut WordApp) {
+    offer(app);
+    let dir = app.services.settings_dir.clone();
     let assist = &mut app.assist;
     if let Some(c) = assist.conversation.as_mut() {
         let marked = c.assistant.take_case_markers();
         if let Some(at) = c.case.clone() {
+            // A review's verb outside a review's turn never gets here: the transcript dropped
+            // and counted it ([`wordcraft_assist::Transcript::review_turn`]).
             for marker in marked {
                 match marker.route(assist.cases.model_writes) {
                     Route::Write(write) if assist.cases.unwritten.len() < MAX_UNWRITTEN => assist.cases.unwritten.push_back((at.clone(), write, 0)),
@@ -172,11 +213,14 @@ pub(crate) fn tick(app: &mut WordApp) {
                     Route::Card(card) => {
                         c.assistant.case_card(card);
                     }
+                    Route::Supported { note, evidence } => review::supported(c, dir.as_deref(), &at, note, &evidence),
+                    Route::Gap { question } => c.assistant.case_written(Written::Gap, None, question.for_person()),
                 }
             }
         }
     }
     drain(app);
+    record::tick(app);
 }
 
 /// The writes waiting, in order, each into its own case. A busy lock stops the frame's draining;
@@ -201,12 +245,21 @@ fn drain(app: &mut WordApp) {
                 }
                 return;
             }
+            // A review named a note this case doesn't have (another case's, or one that went):
+            // dropped and counted, as an unknown marker is.
+            Err(CaseError::NoSuchNote(_)) => {
+                if let Some(c) = app.assist.conversation.as_mut().filter(|c| c.case.as_ref() == Some(&at)) {
+                    c.assistant.drop_case_marker();
+                }
+            }
             Err(e) => log::warn!("a model's case note wasn't kept: {e}"),
             Ok(applied) => {
                 // The row and the card belong to the conversation that wrote the marker.
                 if let Some(c) = app.assist.conversation.as_mut().filter(|c| c.case.as_ref() == Some(&at)) {
                     match applied {
-                        Applied::Added(id) | Applied::Replaced { added: id, .. } => c.assistant.case_written(what, Some(id), &text),
+                        Applied::Added(id) | Applied::Replaced { added: id, .. } | Applied::Edited(id) | Applied::Removed(id) => {
+                            c.assistant.case_written(what, Some(id), &text);
+                        }
                         Applied::Changed => c.assistant.case_written(what, None, &text),
                         Applied::Card(write) => {
                             c.assistant.case_card(Card::Write(write));
@@ -227,6 +280,8 @@ fn describe(write: &ModelWrite) -> (Written, String) {
         ModelWrite::Plan(plan) => (Written::Plan, plan.goal.for_person().to_string()),
         ModelWrite::Balance(draft) => (Written::Balance, stance_word(Some(draft.stance)).to_string()),
         ModelWrite::Used(_) => (Written::Note, String::new()),
+        ModelWrite::Correct { text, .. } => (Written::Corrected, text.for_person().to_string()),
+        ModelWrite::Retire { why, .. } => (Written::Retired, why.for_person().to_string()),
     }
 }
 
@@ -262,6 +317,8 @@ pub(crate) fn write(app: &mut WordApp, dir: &std::path::Path, what: &str, req: &
                 return Err(CaseError::Gone.to_string());
             }
             app.bind_case(Some(at.clone()));
+            keep(app, &shelf, click, Some(&at));
+            suggest::print_bound(app, click, &at);
             Ok(json!({"wall": at.wall.as_str(), "case": at.case.as_str()}))
         }
         "memory.case.unbind" => {
@@ -269,6 +326,7 @@ pub(crate) fn write(app: &mut WordApp, dir: &std::path::Path, what: &str, req: &
                 return Err(NO_DOCUMENT.into());
             }
             app.bind_case(None);
+            keep(app, &shelf, click, None);
             Ok(json!({"unbound": true}))
         }
         "memory.case.cardDismiss" => {
@@ -279,10 +337,30 @@ pub(crate) fn write(app: &mut WordApp, dir: &std::path::Path, what: &str, req: &
         }
         "memory.case.delete" => {
             let at = bound_for(app).ok_or(NOT_BOUND)?;
-            // The conversation holds the case's notes: it ends first, with its transcript.
-            app.bind_case(None);
-            super::end(app);
-            shelf.delete_case(click, &at).map_err(|e| e.to_string()).map(|()| json!({"deleted": at.case.as_str()}))
+            let keep_lessons = req.get("keepLessons") == Some(&Value::Bool(true));
+            record::delete_case(app, &shelf, click, &at, keep_lessons)
+        }
+        "memory.case.record" | "memory.case.recordDelete" => record::write(app, &shelf, click, what, req),
+        "memory.case.review" => super::review(app),
+        "memory.lesson.keep" => {
+            let text = req.get("text").and_then(Value::as_str).unwrap_or("");
+            let applies = serde_json::from_value(req.get("applies").cloned().unwrap_or(json!({}))).map_err(|e| format!("`applies`: {e}"))?;
+            let from = match req.get("from").and_then(Value::as_str) {
+                Some(id) => Some(CaseId::parse(id).ok_or("`from`: not an id")?),
+                None => None,
+            };
+            let draft = LessonDraft { text: Quoted::parse(text), applies, topics: Topics::default(), from };
+            let id = shelf.lesson(click, LessonOp::Keep(draft)).map_err(|e| e.to_string())?;
+            Ok(json!({"id": id.map(|id| id.to_string())}))
+        }
+        "memory.lesson.edit" | "memory.lesson.remove" | "memory.lesson.off" => {
+            let id = LessonId::parse(req.get("id").and_then(Value::as_str).unwrap_or("")).ok_or("`id`: not a lesson's")?;
+            let op = match what {
+                "memory.lesson.edit" => LessonOp::Edit(id, req.get("text").and_then(Value::as_str).unwrap_or("").to_string()),
+                "memory.lesson.remove" => LessonOp::Remove(id),
+                _ => LessonOp::Off(id, req.get("value").and_then(Value::as_bool).unwrap_or(true)),
+            };
+            shelf.lesson(click, op).map_err(|e| e.to_string()).map(|_| json!({"id": id.to_string()}))
         }
         _ => {
             let at = bound_for(app).ok_or(NOT_BOUND)?;
@@ -323,7 +401,85 @@ fn new_case(app: &mut WordApp, shelf: &Shelf, click: Click, req: &Value) -> Resu
     let (stamp, counter) = stamp();
     let at = shelf.new_case(click, &wall, title, &stamp, counter).map_err(|e| e.to_string())?;
     app.bind_case(Some(at.clone()));
+    keep(app, shelf, click, Some(&at));
+    suggest::print_bound(app, click, &at);
     Ok(json!({"wall": at.wall.as_str(), "case": at.case.as_str()}))
+}
+
+/// The person's bind or unbind, kept for the shown document's file, so the file binds again when
+/// it is next opened. An unsaved document has no file: its binding lasts while it is open. The
+/// binding has taken effect either way, so a failure to keep it is said, not returned.
+fn keep(app: &mut WordApp, shelf: &Shelf, click: Click, at: Option<&CaseRef>) {
+    let Some(file) = app.session.path.clone() else { return };
+    let kept = match at {
+        Some(at) => shelf.bind_file(click, &file, at).map(|_| ()),
+        None => shelf.unbind_file(click, &file),
+    };
+    if let Err(e) = kept {
+        log::warn!("a binding wasn't kept for the file: {e}");
+        app.assist.notice =
+            Some(fmt(tl!("WordCraft couldn't remember this for the next time you open the file: {error}"), &[("error", &e.to_string())]));
+    }
+}
+
+/// The first time a saved document is shown, the case the person bound its file to, if that case
+/// is still there ([`Shelf::file_bound`]), is offered: [`offer_line`]. It isn't bound: a path
+/// doesn't say which document is there (another client's saved over it, one made from the same
+/// template), and a bound case's notes go to the model. Once per document: one saved later under a
+/// path that was bound isn't offered its case, as one opened from the path is.
+pub(crate) fn offer(app: &mut WordApp) {
+    let document = app.session.document_id();
+    if !app.assist.cases.looked_up.insert(document) || app.assist.cases.bound.contains_key(&document) {
+        return;
+    }
+    let (Some(dir), Some(file)) = (app.services.settings_dir.as_ref(), app.session.path.as_ref()) else { return };
+    let shelf = Shelf::at(dir);
+    let Some(at) = shelf.file_bound(file) else { return };
+    let title = shelf.open(&at).map(|case| case.title.for_person().to_string()).unwrap_or_default();
+    app.assist.cases.offered.insert(document, (at, title));
+}
+
+/// The case offered to the shown document ([`offer`]), and its title, while the document is bound
+/// to none.
+pub(crate) fn offered(app: &WordApp) -> Option<&(CaseRef, String)> {
+    let document = app.session.document_id();
+    app.assist.cases.offered.get(&document).filter(|_| !app.assist.cases.bound.contains_key(&document))
+}
+
+/// The person's Bind again: the offered case, through the person-only command a click in the case
+/// list runs.
+pub(crate) fn rebind(app: &mut WordApp) {
+    let Some((at, _)) = offered(app).cloned() else { return };
+    run(app, "assist.memory.case.bind", json!({"wall": at.wall.as_str(), "case": at.case.as_str()}));
+}
+
+/// The person's Not now: no offer for this document while it is open, and no lineage card, which
+/// would name the same case. The file's binding stays, so it is offered again the next time the
+/// file is opened.
+pub(crate) fn not_now(app: &mut WordApp) {
+    app.assist.cases.offered.remove(&app.session.document_id());
+    suggest::dismiss(app);
+}
+
+/// What the pane says of a case offered to a file.
+pub(crate) fn offer_words(title: &str) -> String {
+    let title = if title.is_empty() { tl!("Untitled case") } else { title };
+    fmt(tl!("When you last had this file open, it was bound to {case}."), &[("case", title)])
+}
+
+/// Above the conversation and on Details › Case, while a case is offered to the shown document:
+/// which case, **Bind again** and **Not now**. Nothing recalls from it until the person binds it.
+pub(crate) fn offer_line(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
+    let Some((_, title)) = offered(app).cloned() else { return };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(offer_words(&title)).small().color(t.text_dim));
+        if ui.small_button(tl!("Bind again")).on_hover_text(tl!("Each turn recalls from this case again.")).clicked() {
+            rebind(app);
+        }
+        if ui.small_button(tl!("Not now")).on_hover_text(tl!("Nothing is recalled; it is offered again the next time you open the file.")).clicked() {
+            not_now(app);
+        }
+    });
 }
 
 /// The typed operation a request asks for. Serde does the parsing: a field a record doesn't know
@@ -379,15 +535,14 @@ impl WordApp {
         self.assist.cases.open = None;
         self.assist.cases.read_at = None;
         let document = self.session.document_id();
+        self.assist.cases.offered.remove(&document);
         if self.assist.cases.bound.get(&document) != at.as_ref() {
             // The page's forms hold the old case's text.
             self.assist.cases.drafts.close_forms();
         }
-        if let Some(c) = self.assist.conversation.as_mut()
-            && c.document == document
-            && c.case != at
-        {
-            c.assistant.end();
+        if self.assist.conversation.as_ref().is_some_and(|c| c.document == document && c.case != at) {
+            record::end(self);
+            self.assist.cases.lesson_cards.clear();
         }
         match at {
             Some(at) => {
@@ -428,18 +583,17 @@ pub(crate) fn refuses(app: &WordApp) -> Option<String> {
 /// goes on (a turn may be running), ends it, stopping its turn, and the pane says why.
 pub(crate) fn guard(app: &mut WordApp) {
     let Some(names) = others_while_recalled(app) else { return };
-    if let Some(c) = app.assist.conversation.as_mut() {
-        c.assistant.end();
-    }
+    record::end(app);
     app.assist.notice = Some(fmt(
         tl!("{names} can now read this document, and this conversation had read your case notes, so it ended. Start a new one."),
         &[("names", &names)],
     ));
 }
 
-/// What the next turn asks to recall: nothing without a bound case, a settings folder, a
-/// conversation, or the proof that no one else reads the document, and `sent` then says which.
-pub(crate) fn for_turn(app: &WordApp, prompt: &str, ctx: &Context, sent: &mut Sent) -> Option<RecallAsk> {
+/// What a turn may read of the person's cases: the shelf, the bound case, today, and the proof
+/// that no one else reads the document. Nothing without a bound case, a settings folder or a
+/// conversation, or with someone else in the room or invited, and `sent` then says which.
+pub(crate) fn proof(app: &WordApp, sent: &mut Sent) -> Option<(Shelf, CaseRef, Day, Alone)> {
     let Some(at) = bound_for(app) else {
         sent.recall_withheld = Some(NO_CASE.into());
         return None;
@@ -460,10 +614,16 @@ pub(crate) fn for_turn(app: &WordApp, prompt: &str, ctx: &Context, sent: &mut Se
         }
     };
     let today = Day::parse(wordcraft_engine::cmd::now_iso().get(..10).unwrap_or_default())?;
+    Some((Shelf::at(dir), at, today, alone))
+}
+
+/// What the next turn asks to recall ([`proof`]), about the prompt and the text around the caret.
+pub(crate) fn for_turn(app: &WordApp, prompt: &str, ctx: &Context, sent: &mut Sent) -> Option<RecallAsk> {
+    let (shelf, at, today, alone) = proof(app, sent)?;
     // The prompt and the text around the caret, which is what the turn is about. The outline is
     // left out: it names every topic.
     let about = [prompt, &ctx.selection, &ctx.lead, &ctx.trail].join("\n");
-    Some(RecallAsk::new(Shelf::at(dir), at, &about, today, alone))
+    Some(RecallAsk::new(shelf, at, &about, today, alone))
 }
 
 /// Details › Recalled: per turn, newest first, what was recalled, from where, under which balance,
@@ -498,12 +658,58 @@ pub(crate) fn section(ui: &mut Ui, t: &Tokens, details: &Details) {
     }
 }
 
+fn from_words(place: &Place, title: Option<&String>) -> String {
+    match (place, title) {
+        (Place::SameClient, Some(title)) => fmt(tl!("{title}, the same client's case"), &[("title", title)]),
+        (Place::SameClient, None) => tl!("the same client's case").to_string(),
+        (Place::ThisCase, _) => tl!("this case").to_string(),
+        (Place::Lesson, _) => tl!("a lesson you kept").to_string(),
+    }
+}
+
+/// A ladder item: its id and line, then each rung, from what was sent and nothing else. A rung is
+/// three wrapped lines (when, where, who moved, landed and the balance; the terms; the trade)
+/// rather than a table row, since the pane is too narrow for seven columns.
+fn ladder_rows(ui: &mut Ui, t: &Tokens, item: &RecalledItem) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(item.id.to_string()).small().color(t.accent));
+        ui.label(RichText::new(&item.text).small().color(t.text));
+        if item.again {
+            ui.label(RichText::new(tl!("sent earlier")).small().color(t.text_dim));
+        }
+    });
+    for r in &item.rungs {
+        let mut from = from_words(&r.place, r.title.as_ref());
+        if !r.confirmed {
+            from = format!("{from}, {}", tl!("unconfirmed"));
+        }
+        let landed = if r.landed { tl!("landed") } else { tl!("open") };
+        let balance = format!("{}, {}", stance_word(r.balance.then), stance_word(r.balance.now));
+        let line = format!(
+            "{} · {from} · {}: {} · {landed} · {}: {balance}",
+            String::from(r.on),
+            tl!("Moved"),
+            page::word(&page::FAVORS, r.moved),
+            tl!("Balance then, now")
+        );
+        ui.add(egui::Label::new(RichText::new(line).small().color(if r.confirmed { t.text_dim } else { t.orange })).wrap());
+        ui.add(egui::Label::new(RichText::new(&r.terms).small().color(t.text)).wrap());
+        if let Some(trade) = &r.traded_for {
+            ui.add(egui::Label::new(RichText::new(format!("{}: {trade}", tl!("Traded for"))).small().color(t.text)).wrap());
+        }
+        ui.add_space(3.0);
+    }
+}
+
 fn turn_rows(ui: &mut Ui, t: &Tokens, recalled: &RecallSent) {
     for item in &recalled.items {
-        let from = match (&item.place, &item.title) {
-            (Place::SameClient, Some(title)) => fmt(tl!("{title}, the same client's case"), &[("title", title)]),
-            (Place::SameClient, None) => tl!("the same client's case").to_string(),
-            (Place::ThisCase, _) => tl!("this case").to_string(),
+        if !item.rungs.is_empty() {
+            ladder_rows(ui, t, item);
+            continue;
+        }
+        let from = match item.id {
+            ItemId::Case => tl!("this case as it stands: its facts, balance and plan").to_string(),
+            _ => from_words(&item.place, item.title.as_ref()),
         };
         ui.scope(|ui| {
             // Rows of text, not of controls: a wrapped row takes its height from this as it starts.
@@ -548,20 +754,26 @@ fn rows_act(app: &WordApp) -> bool {
 /// Edit and Remove are the person's commands.
 pub(crate) fn written_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, what: Written, note: Option<NoteId>, text: &str) {
     let live = rows_act(app).then(|| open_case(app, false)).flatten().map(|(_, case)| case);
-    let lead = match what {
-        Written::Note => tl!("Noted for this case:"),
-        Written::Plan => tl!("Plan for this case, unconfirmed:"),
-        Written::Balance => tl!("Balance for this case, unconfirmed:"),
+    let lead = match (what, note) {
+        (Written::Note, _) => tl!("Noted for this case:").to_string(),
+        (Written::Plan, _) => tl!("Plan for this case, unconfirmed:").to_string(),
+        (Written::Balance, _) => tl!("Balance for this case, unconfirmed:").to_string(),
+        (Written::Corrected, _) => tl!("The review corrected this note:").to_string(),
+        (Written::Retired, Some(id)) => fmt(tl!("The review retired note {id}:"), &[("id", &id.to_string())]),
+        (Written::Retired, None) => tl!("The review retired a note:").to_string(),
+        (Written::Supported, Some(id)) => fmt(tl!("The record supports note {id}:"), &[("id", &id.to_string())]),
+        (Written::Supported, None) => tl!("The record supports a note:").to_string(),
+        (Written::Gap, _) => tl!("The review asks you:").to_string(),
     };
     let now = match (what, note, &live) {
-        (Written::Note, Some(id), Some(case)) => case.notes.iter().find(|n| n.id == id).map(page::note_words),
+        (Written::Note | Written::Corrected, Some(id), Some(case)) => case.notes.iter().find(|n| n.id == id).map(page::note_words),
         _ => None,
     };
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         ui.label(RichText::new(lead).small().color(t.text_dim));
         ui.label(RichText::new(now.as_deref().unwrap_or(text)).small().color(t.text));
-        let (Written::Note, Some(id)) = (what, note) else { return };
+        let (Written::Note | Written::Corrected, Some(id)) = (what, note) else { return };
         let Some(case) = &live else { return };
         match case.notes.iter().find(|n| n.id == id) {
             None => {
@@ -591,11 +803,23 @@ pub(crate) fn written_row(app: &mut WordApp, ui: &mut Ui, t: &Tokens, what: Writ
 /// case and, while it waits, the buttons. Nothing is stored until Use or Keep, which are the
 /// person's commands; Not this stores nothing either.
 pub(crate) fn card(app: &mut WordApp, ui: &mut Ui, t: &Tokens, id: u64, card: &Card, answer: Option<ProposalAnswer>) {
+    if let Card::Lesson(proposal) = card {
+        lesson::transcript_card(app, ui, t, id, proposal, answer);
+        return;
+    }
     let waiting = answer.is_none();
     let stroke = if waiting { egui::Stroke::new(1.5, t.accent) } else { egui::Stroke::new(1.0, t.border_strong) };
     egui::Frame::NONE.stroke(stroke).corner_radius(6).inner_margin(6).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        let (question, lines, keep) = card_words(card);
+        let (question, mut lines, keep) = card_words(card);
+        // A review's card on a confirmed note shows the note as it stands, so the person sees
+        // what Keep would change or remove.
+        if let Card::Write(ModelWrite::Correct { note, .. } | ModelWrite::Retire { note, .. }) = card
+            && let Some((_, case)) = open_case(app, false)
+            && let Some(n) = case.notes.iter().find(|n| n.id == *note)
+        {
+            lines.insert(0, format!("{}: {}", tl!("Now"), page::note_words(n)));
+        }
         let said = match answer {
             None => question,
             Some(ProposalAnswer::Kept) => tl!("Used for this case"),
@@ -617,10 +841,18 @@ pub(crate) fn card(app: &mut WordApp, ui: &mut Ui, t: &Tokens, id: u64, card: &C
             }
             if ui.button(tl!("Edit")).clicked() {
                 match card {
-                    Card::Facts(_) => app.assist.view = super::PaneView::Details,
+                    Card::Facts(_) | Card::Lesson(_) => app.assist.view = super::PaneView::Details,
                     Card::Write(ModelWrite::Note(draft)) => page::draft_note(app, draft),
                     Card::Write(ModelWrite::Plan(plan)) => page::draft_plan(app, plan),
                     Card::Write(ModelWrite::Balance(draft)) => page::draft_balance(app, draft),
+                    Card::Write(ModelWrite::Correct { note, .. }) => {
+                        if let Some((_, case)) = open_case(app, false)
+                            && let Some(n) = case.notes.iter().find(|n| n.id == *note)
+                        {
+                            page::edit_note(app, n);
+                        }
+                    }
+                    Card::Write(ModelWrite::Retire { .. }) => app.assist.view = super::PaneView::Details,
                     Card::Write(ModelWrite::Used(_)) => {}
                 }
             }
@@ -650,6 +882,7 @@ fn card_words(card: &Card) -> (&'static str, Vec<String>, &'static str) {
             say(tl!("Language"), facts.language.map(|v| page::word(&page::LANGS, v).to_string()));
             (tl!("The assistant suggests these facts for this case."), lines, tl!("Use these"))
         }
+        Card::Lesson(p) => (tl!("Keep this as a lesson?"), vec![p.text.for_person().to_string()], tl!("Keep")),
         Card::Write(ModelWrite::Note(draft)) => {
             let mut lines: Vec<String> = draft.body.texts().map(|q| q.for_person().to_string()).collect();
             if let Some(how) = &draft.how {
@@ -666,6 +899,14 @@ fn card_words(card: &Card) -> (&'static str, Vec<String>, &'static str) {
             let mut lines = vec![stance_word(Some(draft.stance)).to_string()];
             lines.extend(draft.factors.iter().filter_map(|f| f.why.as_ref()).map(|w| w.for_person().to_string()));
             (tl!("The assistant reads the balance as this. Reassess?"), lines, tl!("Reassess"))
+        }
+        Card::Write(ModelWrite::Correct { text, why, .. }) => (
+            tl!("The review would correct this confirmed note. Keep the correction?"),
+            vec![text.for_person().to_string(), why.for_person().to_string()],
+            tl!("Keep"),
+        ),
+        Card::Write(ModelWrite::Retire { why, .. }) => {
+            (tl!("The review would retire this confirmed note. Remove it?"), vec![why.for_person().to_string()], tl!("Remove"))
         }
         Card::Write(ModelWrite::Used(_)) => ("", Vec::new(), ""),
     }
@@ -690,7 +931,21 @@ fn use_card(app: &mut WordApp, card: &Card) -> bool {
         Card::Write(ModelWrite::Note(draft)) => run(app, "assist.memory.case.note", json!({"note": draft.body, "how": draft.how})),
         Card::Write(ModelWrite::Plan(plan)) => run(app, "assist.memory.case.plan", json!({"goal": plan.goal, "next": plan.next})),
         Card::Write(ModelWrite::Balance(draft)) => run(app, "assist.memory.case.balance", json!({"stance": draft.stance, "factors": draft.factors})),
-        Card::Write(ModelWrite::Used(_)) => false,
+        // The person's Keep on a review's correction is their edit of the note: the main text
+        // replaced, the review's why as how, every other field as it is.
+        Card::Write(ModelWrite::Correct { note, text, why }) => {
+            let Some((_, case)) = open_case(app, true) else { return false };
+            let Some(n) = case.notes.iter().find(|n| n.id == *note) else {
+                app.assist.notice = Some(CaseError::NoSuchNote(*note).to_string());
+                return false;
+            };
+            let mut body = n.body.clone();
+            body.set_main(text.clone());
+            run(app, "assist.memory.case.noteEdit", json!({"id": note.to_string(), "note": body, "how": why}))
+        }
+        Card::Write(ModelWrite::Retire { note, .. }) => run(app, "assist.memory.case.noteRemove", json!({"id": note.to_string()})),
+        // A lesson's Keep is its own card's ([`lesson::transcript_card`]).
+        Card::Write(ModelWrite::Used(_)) | Card::Lesson(_) => false,
     }
 }
 

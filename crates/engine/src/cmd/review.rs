@@ -18,10 +18,10 @@ pub use changes::{
     AUTHORED_TEXT_CHARS, AuthoredChange, DELETION_TEXT_CHARS, DeletionBalloon, MOST_AUTHORED_CHANGES, changes_by, changes_of, deletion_balloons,
     format_changes, has_deletions, has_format_changes, move_changes, tracking_json,
 };
-pub use changes::{ChangeRow, ROW_FULL_BYTES, ROW_TEXT_CHARS, change_rows};
+pub use changes::{ChangeRow, ROW_FULL_BYTES, ROW_TEXT_CHARS, Redline, authors, change_rows, redlines};
 use changes::{list_changes, nav_change, resolve_all_then, resolve_sel_then, tracking_options};
 pub(crate) use comments::comment_at_caret;
-pub use comments::{CommentRow, comment_list, comment_range_at_caret, comment_rows};
+pub use comments::{CommentRow, RedlineComment, comment_list, comment_range_at_caret, comment_rows, comments_except};
 use comments::{comments_change, delete_comment, edit_comment, list_comments, nav_comment, new_comment, reply, validate_comment_id};
 use proofing::{all_issues, issue_at, next_issue, suggestions, thesaurus, word_count};
 

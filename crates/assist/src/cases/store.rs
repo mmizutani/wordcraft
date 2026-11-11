@@ -3,10 +3,12 @@
 //! ```text
 //! assistant-cases/
 //!   .trash-<id>/            a delete in progress, swept at each listing
+//!   bindings.json           which file the person bound to which case ([`bindings`])
 //!   <wall id>/              one client, or "My cases"
 //!     wall.json             its name
 //!     <case id>.lock        beside the folder, not in it, so a delete can rename the folder while holding it
 //!     <case id>/case.json   the typed record, at most 1 MiB, mode 0600
+//!     <case id>/log/        the case's record, one conversation a file, opt-in ([`super::log`])
 //! ```
 //!
 //! A wall is a folder, so recall can open one wall and nothing else. There is no index, so a
@@ -24,8 +26,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::lessons::{LessonId, LessonOp, Lessons};
 use super::record::{Applied, Case, CaseError, Click, Day, ModelWrite, PersonOp, Quoted, VERSION};
 use crate::atomic::{self, Lock, LockError};
+
+pub mod bindings;
 
 /// The folder, in the settings folder.
 pub const FOLDER: &str = "assistant-cases";
@@ -135,15 +140,50 @@ struct WallFile {
     name: Quoted,
 }
 
-/// The cases in a settings folder.
+/// The cases in a settings folder, and the lessons file beside them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shelf {
     root: PathBuf,
+    lessons: PathBuf,
 }
 
 impl Shelf {
     pub fn at(settings: &Path) -> Shelf {
-        Shelf { root: settings.join(FOLDER) }
+        Shelf { root: settings.join(FOLDER), lessons: settings.join(super::lessons::FILE) }
+    }
+
+    /// The lessons as the file holds them: damaged when it can't be read whole. A file of at most
+    /// 1 MiB, read where a case is.
+    pub fn lessons(&self) -> Lessons {
+        if fs::symlink_metadata(&self.lessons).is_err() {
+            return Lessons::default();
+        }
+        Lessons::read(read_whole(&self.lessons, super::lessons::MAX_FILE).as_deref())
+    }
+
+    /// What the person did to the lessons, with their click: the id of a kept one. Lock, read
+    /// fresh, apply, write; a damaged file is moved aside as `.damaged` first, never replaced in
+    /// silence; a write that would pass [`super::lessons::MAX_FILE`] is refused before the file changes.
+    pub fn lesson(&self, _click: Click, op: LessonOp) -> Result<Option<LessonId>, CaseError> {
+        let _lock = Lock::take(&self.lessons.with_extension("json.lock")).map_err(|e| match e {
+            LockError::Busy => CaseError::Busy,
+            LockError::Io(e) => CaseError::Io(e),
+        })?;
+        let mut lessons = self.lessons();
+        let damaged = std::mem::take(&mut lessons.damaged);
+        if damaged {
+            lessons = Lessons::default();
+        }
+        let r = lessons.apply(op)?;
+        let bytes = lessons.to_bytes().map_err(CaseError::Io)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > super::lessons::MAX_FILE {
+            return Err(CaseError::Full("file"));
+        }
+        if damaged {
+            atomic::rename_if_there(&self.lessons, &self.lessons.with_extension(format!("json{DAMAGED_SUFFIX}"))).map_err(CaseError::Io)?;
+        }
+        atomic::write(&self.lessons, &bytes).map_err(CaseError::Io)?;
+        Ok(r)
     }
 
     fn wall_dir(&self, wall: &WallId) -> PathBuf {
@@ -158,6 +198,11 @@ impl Shelf {
         self.wall_dir(&at.wall).join(format!("{}.lock", at.case.0))
     }
 
+    /// Where the case's record lives ([`super::log`]), whether or not it has one.
+    pub(crate) fn log_dir(&self, at: &CaseRef) -> PathBuf {
+        self.case_dir(at).join(super::log::FOLDER)
+    }
+
     /// Walls and cases, swept first of `.trash-*` folders an interrupted delete left. A scan,
     /// so off the frame.
     pub fn list(&self) -> Listing {
@@ -170,10 +215,18 @@ impl Shelf {
                 out.skipped = out.skipped.saturating_add(1);
                 continue;
             };
-            if name.starts_with(TRASH) {
+            if let Some(id) = name.strip_prefix(TRASH) {
                 if is_real_dir(&entry) {
+                    // A delete a crash interrupted: its bindings go before its folder does.
+                    if CaseId::parse(id).is_some() {
+                        self.forget(id);
+                    }
                     let _ = fs::remove_dir_all(entry.path());
                 }
+                continue;
+            }
+            // The shelf's own files ([`bindings`]); only a folder can be a wall.
+            if entry.file_type().is_ok_and(|t| t.is_file()) {
                 continue;
             }
             match WallId::parse(name) {
@@ -183,10 +236,7 @@ impl Shelf {
         }
         walls.sort();
         for (id, dir) in walls {
-            let name = read_whole(&dir.join(WALL_FILE))
-                .and_then(|bytes| serde_json::from_slice::<WallFile>(&bytes).ok())
-                .filter(|w| w.version == VERSION)
-                .map_or_else(|| Quoted::parse(""), |w| w.name);
+            let name = read_wall_name(&dir);
             let mut cases = Vec::new();
             for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
                 let file = entry.file_name();
@@ -224,7 +274,7 @@ impl Shelf {
     }
 
     /// The case's folder, if it and its wall are folders and not links to one.
-    fn real_case_dir(&self, at: &CaseRef) -> Result<PathBuf, CaseError> {
+    pub(crate) fn real_case_dir(&self, at: &CaseRef) -> Result<PathBuf, CaseError> {
         let dir = self.real_wall_dir(&at.wall)?.join(&at.case.0);
         real_dir(&dir).then_some(dir).ok_or(CaseError::Gone)
     }
@@ -235,31 +285,29 @@ impl Shelf {
     /// nothing, since what it holds may be cut.
     pub(crate) fn recent_cases(&self, at: &CaseRef, max_cases: usize, max_bytes: u64) -> (Vec<(CaseId, Case)>, u32) {
         let Ok(dir) = self.real_wall_dir(&at.wall) else { return (Vec::new(), 0) };
-        let mut found: Vec<(std::time::SystemTime, u64, CaseId, PathBuf)> = Vec::new();
-        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let name = entry.file_name();
-            let Some(id) = name.to_str().and_then(CaseId::parse).filter(|id| *id != at.case && is_real_dir(&entry)) else { continue };
-            let file = entry.path().join(CASE_FILE);
-            let Ok(meta) = fs::symlink_metadata(&file) else { continue };
-            found.push((meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), meta.len(), id, file));
+        let mut found = Vec::new();
+        stat_cases(&at.wall, &dir, &mut found);
+        found.retain(|(_, _, other, _)| other.case != at.case);
+        let (cases, skipped) = read_newest(found, max_cases, max_bytes);
+        (cases.into_iter().map(|(at, case)| (at.case, case)).collect(), skipped)
+    }
+
+    /// Every client's cases, most recently changed first, at most `max_cases` of them and
+    /// `max_bytes` of their files; a damaged one counts against both and is left out. The lineage
+    /// suggestion's scan, the one read across walls, whose result goes only to the person's
+    /// screen: off the frame. Each case file is read once.
+    pub fn newest_cases(&self, max_cases: usize, max_bytes: u64) -> Vec<(CaseRef, Case)> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(&self.root).into_iter().flatten().flatten() {
+            let Some(wall) = entry.file_name().to_str().and_then(WallId::parse).filter(|_| is_real_dir(&entry)) else { continue };
+            stat_cases(&wall, &entry.path(), &mut found);
         }
-        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
-        let mut out = Vec::new();
-        let mut skipped = 0u32;
-        let mut bytes = 0u64;
-        for (_, len, id, file) in found.into_iter().take(max_cases) {
-            bytes = bytes.saturating_add(len);
-            if bytes > max_bytes {
-                break;
-            }
-            let case = read_case(&file);
-            if case.damaged {
-                skipped = skipped.saturating_add(1);
-                continue;
-            }
-            out.push((id, case));
-        }
-        (out, skipped)
+        read_newest(found, max_cases, max_bytes).0
+    }
+
+    /// The wall's name as its file holds it; empty when it can't be read.
+    pub fn wall_name(&self, wall: &WallId) -> Quoted {
+        self.real_wall_dir(wall).map_or_else(|_| Quoted::parse(""), |dir| read_wall_name(&dir))
     }
 
     /// Cheap: one stat. Other windows learn of a delete here.
@@ -353,7 +401,11 @@ impl Shelf {
 
     /// What the person did, with their click: the case as written.
     pub fn person(&self, _click: Click, at: &CaseRef, op: PersonOp, today: Day) -> Result<Case, CaseError> {
-        self.update(at, true, Lock::take, |case| {
+        // A draft's print is written for the person's bind, not as an edit of the case: binding
+        // a damaged case must not move it aside and keep only what could be read, which would
+        // quietly make a truncated case recallable. Only an edit the person makes repairs one.
+        let repairs = !matches!(op, PersonOp::AddDraft(_));
+        self.update(at, repairs, Lock::take, |case| {
             case.apply_person(op, today)?;
             Ok(case.clone())
         })
@@ -366,15 +418,19 @@ impl Shelf {
         self.update(at, false, Lock::try_take, |case| case.apply_model(write, today))
     }
 
-    /// Rename `dir` to a trash folder under the root, then remove it. Safe to run twice, and a
-    /// crash between the two is finished by the next [`Shelf::list`].
-    fn trash(&self, dir: &Path, id: &str) -> Result<(), CaseError> {
+    /// Rename `dir` to a trash folder under the root, drop the bindings to it, then remove it.
+    /// Safe to run twice, and a crash after the rename is finished by the next [`Shelf::list`].
+    /// A case's record goes this way too, as `<case id>-log`, which names no binding, so the
+    /// file stays bound to its case ([`super::log::delete_log`]).
+    pub(crate) fn trash(&self, dir: &Path, id: &str) -> Result<(), CaseError> {
         let trash = self.root.join(format!("{TRASH}{id}"));
         match fs::rename(dir, &trash) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(CaseError::Io(format!("{} can't be removed: {e}", dir.display()))),
         }
+        // Before the folder goes, so a crash in between leaves the trash for the sweep to find.
+        self.forget(id);
         match fs::remove_dir_all(&trash) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -383,7 +439,11 @@ impl Shelf {
     }
 
     /// The case goes, under its lock, so a write racing it finds it gone rather than half there.
-    pub fn delete_case(&self, _click: Click, at: &CaseRef) -> Result<(), CaseError> {
+    /// Under that lock, first its lessons go too, or stay and lose the link to it, under the
+    /// lessons lock: a busy case changes no lesson, a crash between the two leaves the case
+    /// present, and deleting again converges. The order is the case's lock, then the lessons';
+    /// nothing takes them the other way round.
+    pub fn delete_case(&self, click: Click, at: &CaseRef, keep_lessons: bool) -> Result<(), CaseError> {
         let dir = self.real_case_dir(at)?;
         let lock_path = self.lock_path(at);
         {
@@ -391,6 +451,9 @@ impl Shelf {
                 LockError::Busy => CaseError::Busy,
                 LockError::Io(e) => CaseError::Io(e),
             })?;
+            if self.lessons().from_case(&at.case).next().is_some() {
+                self.lesson(click, LessonOp::CaseDeleted { case: at.case.clone(), delete: !keep_lessons })?;
+            }
             self.trash(&dir, at.case.as_str())?;
         }
         let _ = fs::remove_file(&lock_path);
@@ -416,7 +479,7 @@ impl Shelf {
 }
 
 /// A folder only its owner can enter. `recursive` makes missing parents and accepts one that exists.
-fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
+pub(crate) fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(recursive);
     #[cfg(unix)]
@@ -425,7 +488,7 @@ fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
 }
 
 /// A folder, and not a link to one.
-fn real_dir(path: &Path) -> bool {
+pub(crate) fn real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
@@ -437,19 +500,63 @@ fn is_real_dir(entry: &fs::DirEntry) -> bool {
 /// At most [`MAX_FILE`] bytes of `path`; `None` when there are more, it can't be read, or it
 /// isn't a plain file. A link is refused rather than followed: one left in a case folder could
 /// point at another wall's case, and the folder is the ethical wall.
-fn read_whole(path: &Path) -> Option<Vec<u8>> {
+fn read_whole(path: &Path, max: u64) -> Option<Vec<u8>> {
     if !fs::symlink_metadata(path).ok()?.is_file() {
         return None;
     }
     let file = fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
-    file.take(MAX_FILE.saturating_add(1)).read_to_end(&mut bytes).ok()?;
-    (u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_FILE).then_some(bytes)
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes).ok()?;
+    (u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= max).then_some(bytes)
+}
+
+/// A case file found by a scan: when it last changed, its length, the case and the file.
+type Found = (std::time::SystemTime, u64, CaseRef, PathBuf);
+
+/// The case files of wall `wall`'s folder `dir`, one stat each.
+fn stat_cases(wall: &WallId, dir: &Path, found: &mut Vec<Found>) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(case) = name.to_str().and_then(CaseId::parse).filter(|_| is_real_dir(&entry)) else { continue };
+        let file = entry.path().join(CASE_FILE);
+        let Ok(meta) = fs::symlink_metadata(&file) else { continue };
+        found.push((meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), meta.len(), CaseRef { wall: wall.clone(), case }, file));
+    }
+}
+
+/// `found`'s cases, most recently changed first, read until `max_cases` files or `max_bytes` of
+/// them, and how many of those were damaged: a damaged file is read, so it counts against both.
+fn read_newest(mut found: Vec<Found>, max_cases: usize, max_bytes: u64) -> (Vec<(CaseRef, Case)>, u32) {
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| (&a.2.wall, &a.2.case).cmp(&(&b.2.wall, &b.2.case))));
+    let mut out = Vec::new();
+    let mut skipped = 0u32;
+    let mut bytes = 0u64;
+    for (_, len, at, file) in found.into_iter().take(max_cases) {
+        bytes = bytes.saturating_add(len);
+        if bytes > max_bytes {
+            break;
+        }
+        let case = read_case(&file);
+        if case.damaged {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
+        out.push((at, case));
+    }
+    (out, skipped)
+}
+
+/// The name in a wall folder's `wall.json`; empty when it can't be read.
+fn read_wall_name(dir: &Path) -> Quoted {
+    read_whole(&dir.join(WALL_FILE), MAX_FILE)
+        .and_then(|bytes| serde_json::from_slice::<WallFile>(&bytes).ok())
+        .filter(|w| w.version == VERSION)
+        .map_or_else(|| Quoted::parse(""), |w| w.name)
 }
 
 /// The case at `path`: damaged when it can't be read whole or holds more than this build reads.
 fn read_case(path: &Path) -> Case {
-    match read_whole(path) {
+    match read_whole(path, MAX_FILE) {
         Some(bytes) => Case::read(&bytes),
         None => {
             let mut case = Case::new("");

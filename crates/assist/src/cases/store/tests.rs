@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use super::{CaseId, CaseRef, DAMAGED_SUFFIX, MAX_FILE, Shelf, WallId};
 use crate::cases::record::{
     Applied, Body, CaseError, Click, Day, Factor, FactorKind, Facts, MAX_BALANCES, MAX_DISMISSED, MAX_FACTORS, MAX_LIST, MAX_NOTES, MAX_SHORT,
-    MAX_TEXT, MAX_UNCONFIRMED, ModelWrite, NoteDraft, NoteId, PersonOp, Plan, Quoted, Side, Stance, Standing, Topics,
+    MAX_TEXT, MAX_UNCONFIRMED, ModelWrite, NoteDraft, NoteId, PersonOp, Plan, Quoted, Side, Stance, Standing, Topic, Topics,
 };
 use crate::cases::record::{BalanceDraft, Case};
 
@@ -43,6 +43,28 @@ fn plan(goal: &str) -> Plan {
     Plan { goal: Quoted::parse(goal), next: Vec::new(), standing: Standing::Unconfirmed }
 }
 
+/// The person's edit changes what they edited: the text and the how. The topics the note was
+/// stated to be about and how often turns used it stay, since the edit form states neither, so a
+/// review's Keep on a correction, which is such an edit, doesn't change how the note ranks.
+#[test]
+fn an_edit_keeps_the_notes_stated_topics_and_its_use() {
+    let (shelf, at) = shelf_with_case("edit-keeps");
+    let mut draft = pitfall("The cap excludes data breaches");
+    draft.topics.insert(Topic::Liability);
+    shelf.person(click(), &at, PersonOp::AddNote(draft), today()).unwrap();
+    let id = shelf.open(&at).unwrap().notes[0].id;
+    shelf.model(&at, ModelWrite::Used(vec![id]), today()).unwrap();
+    let before = shelf.open(&at).unwrap().notes[0].clone();
+    assert_eq!((before.used, before.last_used), (1, Some(today())));
+
+    let edit = pitfall("The cap excludes data breaches and IP claims");
+    shelf.person(click(), &at, PersonOp::EditNote(id, edit), today()).unwrap();
+    let after = shelf.open(&at).unwrap().notes[0].clone();
+    assert_eq!(after.body.texts().next().map(Quoted::raw), Some("The cap excludes data breaches and IP claims"));
+    assert!(after.stated_topics.contains(Topic::Liability), "the stated topic is kept");
+    assert_eq!((after.used, after.last_used), (1, Some(today())), "its use is kept");
+}
+
 #[test]
 fn two_writers_keep_both_notes() {
     let (shelf, at) = shelf_with_case("writers");
@@ -72,7 +94,7 @@ fn two_writers_keep_both_notes() {
 fn a_deleted_case_does_not_come_back() {
     let (shelf, at) = shelf_with_case("deleted");
     let other = shelf.clone();
-    shelf.delete_case(click(), &at).unwrap();
+    shelf.delete_case(click(), &at, false).unwrap();
     assert_eq!(other.person(click(), &at, PersonOp::AddNote(pitfall("late")), today()), Err(CaseError::Gone));
     assert_eq!(other.model(&at, ModelWrite::Note(pitfall("later")), today()), Err(CaseError::Gone));
     assert!(!shelf.exists(&at));
@@ -91,7 +113,7 @@ fn a_client_with_a_case_is_never_deleted_and_an_empty_one_is() {
     assert_eq!(shelf.delete_empty_wall(click(), &at.wall), Err(CaseError::NotEmpty));
     assert!(shelf.exists(&at), "the case is still there");
     assert_eq!(shelf.list().walls.len(), 1);
-    shelf.delete_case(click(), &at).unwrap();
+    shelf.delete_case(click(), &at, false).unwrap();
     shelf.delete_empty_wall(click(), &at.wall).unwrap();
     assert!(!shelf.wall_dir(&at.wall).exists());
     assert!(shelf.list().walls.is_empty());
@@ -162,6 +184,14 @@ fn full_case() -> Case {
         };
         case.apply_person(PersonOp::AddNote(draft), today()).unwrap();
     }
+    let paragraphs: Vec<String> = (0..300).map(|i| format!("Clause {i}. The supplier delivers lot {i} to the named warehouse by noon.")).collect();
+    let doc = wordcraft_doc::Document::from_text(&paragraphs.join("\n"));
+    for _ in 0..crate::cases::MAX_DRAFTS {
+        let print = crate::cases::DraftPrint::of(&doc, &"題".repeat(MAX_TEXT), today());
+        assert_eq!(print.len(), crate::cases::MAX_HASHES);
+        case.apply_person(PersonOp::AddDraft(print), today()).unwrap();
+    }
+    assert_eq!(case.drafts.len(), crate::cases::MAX_DRAFTS);
     case
 }
 
@@ -175,6 +205,47 @@ fn a_full_case_fits_the_file() {
     let back = Case::read(&bytes);
     assert!(!back.damaged);
     assert_eq!(back, case);
+}
+
+#[test]
+fn the_newest_cases_of_every_wall_are_read_up_to_a_count_and_a_byte_budget() {
+    let shelf = Shelf::at(&folder("newest"));
+    let a = shelf.new_wall(click(), "Kestrel Freight KK", TODAY, 1).unwrap();
+    let b = shelf.new_wall(click(), "Bluefin Systems Ltd", TODAY, 2).unwrap();
+    let old = shelf.new_case(click(), &a, "Old", TODAY, 3).unwrap();
+    let damaged = shelf.new_case(click(), &b, "Damaged", TODAY, 4).unwrap();
+    let new = shelf.new_case(click(), &a, "New", TODAY, 5).unwrap();
+    std::fs::write(shelf.case_dir(&damaged).join("case.json"), b"{not json").unwrap();
+    for (at, second) in [(&old, 1), (&damaged, 2), (&new, 3)] {
+        let file = std::fs::File::options().write(true).open(shelf.case_dir(at).join("case.json")).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(second)).unwrap();
+    }
+    let titles = |cases: Vec<(CaseRef, Case)>| cases.into_iter().map(|(_, c)| c.title.for_person().to_string()).collect::<Vec<_>>();
+    assert_eq!(titles(shelf.newest_cases(10, MAX_FILE)), ["New", "Old"], "newest first, across walls, the damaged one left out");
+    assert_eq!(titles(shelf.newest_cases(2, MAX_FILE)), ["New"], "the damaged file counts against the count");
+    let len = |at: &CaseRef| std::fs::metadata(shelf.case_dir(at).join("case.json")).unwrap().len();
+    let all = len(&new) + len(&damaged) + len(&old);
+    assert_eq!(titles(shelf.newest_cases(10, all - 1)), ["New"], "and against the bytes");
+    assert_eq!(titles(shelf.newest_cases(10, all)), ["New", "Old"]);
+    assert_eq!(shelf.wall_name(&b).for_person(), "Bluefin Systems Ltd");
+}
+
+/// Binding a damaged case keeps its draft's print only if the case can be read whole: the print
+/// is the window's own write on the person's bind, not an edit of the case, so it leaves the file
+/// as it is, damaged, for the person's next real change to move aside.
+#[test]
+fn a_draft_print_never_repairs_a_damaged_case() {
+    let (shelf, at) = shelf_with_case("damaged-print");
+    let path = shelf.case_dir(&at).join("case.json");
+    let aside = shelf.case_dir(&at).join(format!("case.json{DAMAGED_SUFFIX}"));
+    let junk = b"{not json".to_vec();
+    std::fs::write(&path, &junk).unwrap();
+    let doc = wordcraft_doc::Document::from_text("Clause 1. Kestrel Freight KK shall perform the services with reasonable skill and care.");
+    let print = crate::cases::DraftPrint::of(&doc, "Kestrel MSA", today());
+    assert_eq!(shelf.person(click(), &at, PersonOp::AddDraft(print), today()), Err(CaseError::Damaged));
+    assert_eq!(std::fs::read(&path).unwrap(), junk, "the damaged file is untouched");
+    assert!(std::fs::symlink_metadata(&aside).is_err(), "nothing was moved aside");
+    assert!(shelf.open(&at).unwrap().damaged, "the case still reads as damaged");
 }
 
 #[test]
@@ -391,7 +462,7 @@ fn a_case_behind_a_symlinked_wall_is_gone() {
     assert_eq!(shelf.model(&at, ModelWrite::Note(pitfall("through a link")), today()), Err(CaseError::Gone));
     assert_eq!(shelf.person(click(), &at, PersonOp::AddNote(pitfall("through a link")), today()), Err(CaseError::Gone));
     assert_eq!(shelf.open(&at), Err(CaseError::Gone));
-    assert_eq!(shelf.delete_case(click(), &at), Err(CaseError::Gone));
+    assert_eq!(shelf.delete_case(click(), &at, false), Err(CaseError::Gone));
     assert_eq!(shelf.delete_empty_wall(click(), &at.wall), Err(CaseError::Gone));
     assert_eq!(std::fs::read(&path).unwrap(), before, "the target is untouched");
     assert!(other.exists(&at));
@@ -451,4 +522,94 @@ fn note_ids_that_run_out_stop_the_write() {
     v["lastNote"] = serde_json::json!(max + 1);
     std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
     assert!(shelf.open(&at).unwrap().damaged, "past the maximum is damage");
+}
+
+fn lesson_draft(text: &str, from: Option<&CaseRef>) -> crate::cases::LessonDraft {
+    crate::cases::LessonDraft {
+        text: Quoted::parse(text),
+        applies: Default::default(),
+        topics: Topics::default(),
+        from: from.map(|at| at.case.clone()),
+    }
+}
+
+/// Deleting a case with "Delete these too" removes the lessons kept from it; without, they stay
+/// and lose the link, so a later delete of another case never reaches them.
+#[test]
+fn a_deleted_case_s_lessons_go_with_it_or_stay_unlinked() {
+    use crate::cases::LessonOp;
+    let (shelf, at) = shelf_with_case("lessons-delete");
+    let other = shelf.new_case(click(), &at.wall, "Acme SaaS", TODAY, 3).unwrap();
+    shelf.lesson(click(), LessonOp::Keep(lesson_draft("From the MSA.", Some(&at)))).unwrap();
+    shelf.lesson(click(), LessonOp::Keep(lesson_draft("From the SaaS deal.", Some(&other)))).unwrap();
+    shelf.lesson(click(), LessonOp::Keep(lesson_draft("From nowhere.", None))).unwrap();
+    assert_eq!(shelf.lessons().from_case(&at.case).count(), 1);
+    shelf.delete_case(click(), &other, true).unwrap();
+    let kept = shelf.lessons();
+    assert_eq!(kept.lessons.len(), 3, "kept, unlinked");
+    assert_eq!(kept.from_case(&other.case).count(), 0, "the link is gone");
+    assert_eq!(kept.from_case(&at.case).count(), 1);
+    shelf.delete_case(click(), &at, false).unwrap();
+    let left: Vec<String> = shelf.lessons().lessons.iter().map(|l| l.text.for_person().to_string()).collect();
+    assert_eq!(left, ["From the SaaS deal.", "From nowhere."]);
+    assert!(!shelf.exists(&at));
+}
+
+/// A delete refused because another window holds the case's lock leaves its lessons as they were:
+/// the person may not try again, so nothing of the delete happens until the case can go.
+#[test]
+fn a_delete_refused_as_busy_leaves_the_case_s_lessons_alone() {
+    use crate::cases::LessonOp;
+    let (shelf, at) = shelf_with_case("lessons-busy");
+    shelf.lesson(click(), LessonOp::Keep(lesson_draft("From the MSA.", Some(&at)))).unwrap();
+    {
+        let _held = crate::atomic::Lock::take(&shelf.lock_path(&at)).unwrap();
+        assert_eq!(shelf.delete_case(click(), &at, false), Err(CaseError::Busy));
+        assert_eq!(shelf.lessons().from_case(&at.case).count(), 1, "still there and still linked");
+        assert!(shelf.exists(&at));
+    }
+    shelf.delete_case(click(), &at, false).unwrap();
+    assert!(shelf.lessons().lessons.is_empty());
+}
+
+/// A damaged lessons file is moved aside on the person's next write, never replaced in silence,
+/// and until then is read as damaged with no lesson in it.
+#[test]
+fn a_damaged_lessons_file_moves_aside() {
+    use crate::cases::LessonOp;
+    use crate::cases::lessons::FILE;
+    let (shelf, at) = shelf_with_case("lessons-damaged");
+    let path = shelf.lessons.clone();
+    assert!(path.ends_with(FILE));
+    let aside = path.with_extension(format!("json{DAMAGED_SUFFIX}"));
+    shelf.lesson(click(), LessonOp::Keep(lesson_draft("Kept before the damage.", Some(&at)))).unwrap();
+    let newer = br#"{"version": 2, "lessons": [{"id": "l1", "text": "From a newer build", "applies": {"size": "huge"}}]}"#.to_vec();
+    for (what, bytes) in [("junk", b"{not json".to_vec()), ("an unknown version or field", newer)] {
+        std::fs::write(&path, &bytes).unwrap();
+        let _ = std::fs::remove_file(&aside);
+        let read = shelf.lessons();
+        assert!(read.damaged && read.lessons.is_empty(), "{what} reads as damaged, with nothing in it");
+        shelf.lesson(click(), LessonOp::Keep(lesson_draft("Kept after.", None))).unwrap();
+        assert_eq!(std::fs::read(&aside).unwrap(), bytes, "{what} is moved aside, not replaced in silence");
+        let now = shelf.lessons();
+        assert!(!now.damaged);
+        assert_eq!(now.lessons.len(), 1);
+        assert_eq!(now.lessons[0].text.for_person(), "Kept after.");
+    }
+}
+
+#[test]
+fn a_lesson_s_text_is_held_to_the_limit_and_ids_are_not_reused() {
+    use crate::cases::LessonOp;
+    let (shelf, _) = shelf_with_case("lessons-limit");
+    let long: String = "x".repeat(MAX_TEXT + 1);
+    assert_eq!(shelf.lesson(click(), LessonOp::Keep(lesson_draft(&long, None))), Err(CaseError::TooLong));
+    assert_eq!(shelf.lesson(click(), LessonOp::Keep(lesson_draft("  ", None))), Err(CaseError::TooLong));
+    let first = shelf.lesson(click(), LessonOp::Keep(lesson_draft("One.", None))).unwrap().unwrap();
+    shelf.lesson(click(), LessonOp::Remove(first)).unwrap();
+    let second = shelf.lesson(click(), LessonOp::Keep(lesson_draft("Two.", None))).unwrap().unwrap();
+    assert_ne!(first, second);
+    assert_eq!(shelf.lesson(click(), LessonOp::Edit(first, "x".into())), Err(CaseError::NoSuchLesson(first)));
+    shelf.lesson(click(), LessonOp::Off(second, true)).unwrap();
+    assert!(shelf.lessons().lessons[0].off);
 }

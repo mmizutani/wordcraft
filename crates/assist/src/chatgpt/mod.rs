@@ -3,11 +3,15 @@
 //!
 //! - [`SignIn`]: one sign-in attempt. It listens on `127.0.0.1` for the browser's answer, gives
 //!   the URL the window opens, exchanges the code (PKCE, no client secret) and keeps the
-//!   credentials in the settings folder ([`CREDENTIALS_FILE`], mode 0600). The first sign-in
-//!   registers WordCraft (`dynamic_agent_client`) and keeps the client id it is issued, with
-//!   this installation's host id ([`CLIENT_FILE`]), for every sign-in after it.
-//! - [`account`]: who is signed in, read from the file (no network).
-//! - [`SignOut`]: deletes the credentials and revokes their refresh token.
+//!   credentials: sealed in the settings folder ([`CREDENTIALS_FILE`]) with a key in the
+//!   system's keychain, or, with no keychain, in memory for the session only ([`Kept`]). The
+//!   first sign-in registers WordCraft (`dynamic_agent_client`) and keeps the client id it is
+//!   issued, with this installation's host id ([`CLIENT_FILE`]), for every sign-in after it.
+//! - [`account`]: who is signed in and where it is kept (no network, and no wait for the
+//!   keychain, which [`opening`] reports).
+//! - [`SignOut`]: deletes the credentials and their key, and revokes their refresh token.
+//! - [`use_system_keychain`]: the desktop app's opt-in to the system's keychain; without it a
+//!   sign-in is kept for the session only.
 //! - [`models`], [`resolve`]: the models the account may use, and which one a turn runs.
 //! - [`ChatGpt`]: the backend. It calls the Responses API, streamed, with WordCraft's tools as
 //!   function tools that run in this process.
@@ -24,13 +28,15 @@ mod http;
 mod models;
 mod sse;
 mod store;
+mod vault;
 
 pub use auth::{
     AuthError, CALLBACK_PATH, DEFAULT_PORT, PLAN_SCOPE, SCOPES, SIGN_IN_WAIT, SignIn, SignInOptions, SignOut, SignedOut, sign_out, sign_out_with,
 };
 pub use backend::{ChatGpt, MAX_ROUNDS, request_for_eval};
 pub use models::{Resolved, models, models_with, resolve};
-pub use store::{Account, CLIENT_FILE, CREDENTIALS_FILE, account};
+pub use store::{Account, CLIENT_FILE, CREDENTIALS_FILE, Kept, PLAINTEXT_FILE, account};
+pub use vault::{fake_keychain, opening, use_system_keychain};
 
 use std::path::Path;
 

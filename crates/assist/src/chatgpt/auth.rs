@@ -75,7 +75,7 @@ const REFRESH_MARGIN: u64 = 5 * 60;
 const SKEW: u64 = 60;
 
 /// Most bytes of a token taken from the token endpoint.
-const MAX_TOKEN: usize = 64 << 10;
+pub(super) const MAX_TOKEN: usize = 64 << 10;
 
 /// The refresh errors that mean the person signs in again.
 const SIGN_IN_AGAIN: [&str; 6] =
@@ -160,7 +160,8 @@ impl SignIn {
         let secret = |n| random(n).map(|b| b64url(&b)).map_err(AuthError::Failed);
         let (state, nonce, verifier) = (secret(32)?, secret(32)?, secret(48)?);
         let challenge = b64url(Sha256::digest(verifier.as_bytes()).as_slice());
-        let saved = store::read_credentials(settings);
+        // The window's thread starts it: the hints come from what is known without the keychain.
+        let saved = store::peek(settings).map(|(c, _)| c);
         let url =
             authorize_url(&options, &client, saved.as_ref(), &Params { redirect: &redirect, state: &state, nonce: &nonce, challenge: &challenge });
         let pending = Pending {
@@ -580,12 +581,14 @@ pub(super) fn keep_sign_in(
     credentials: Credentials,
     lock: Result<Lock, String>,
 ) -> Result<Account, AuthError> {
-    let kept = lock.and_then(|_lock| store::write_credentials(settings, &credentials));
-    if let Err(e) = kept {
-        revoke_unkept(endpoints, credentials);
-        return Err(AuthError::Storage(e));
-    }
-    let account = credentials.account();
+    let kept = match lock.and_then(|_lock| store::write_credentials(settings, &credentials)) {
+        Ok(kept) => kept,
+        Err(e) => {
+            revoke_unkept(endpoints, credentials);
+            return Err(AuthError::Storage(e));
+        }
+    };
+    let account = credentials.account(kept);
     log::info!("ChatGPT sign-in: signed in (plan usage {})", if account.plan_usage { "allowed" } else { "not allowed" });
     Ok(account)
 }
@@ -816,7 +819,7 @@ fn ended(c: &Credentials) -> Credentials {
 fn save_over(settings: &Path, endpoints: &Endpoints, used: &Credentials, next: &Credentials) -> Result<(), AuthError> {
     let current = store::read_credentials(settings).filter(Credentials::signed_in);
     if current.as_ref().is_some_and(|c| c.client_id == used.client_id && c.refresh_token == used.refresh_token) {
-        return store::write_credentials(settings, next).map_err(AuthError::Storage);
+        return store::write_credentials(settings, next).map(drop).map_err(AuthError::Storage);
     }
     log::warn!("ChatGPT sign-in: the sign-in changed while it was renewed; the renewed tokens aren't kept");
     if next.signed_in() && next.refresh_token != used.refresh_token {

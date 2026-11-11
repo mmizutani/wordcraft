@@ -287,6 +287,45 @@ pub fn comment_rows(s: &Session, author: &str, most: usize) -> (Vec<CommentRow>,
     (rows, more)
 }
 
+/// One comment with who made it and when, for a case's record of the other side's draft (#107).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RedlineComment {
+    pub author: String,
+    pub date: String,
+    /// Its paragraphs, a line break between them, as far as [`super::changes::ROW_FULL_BYTES`].
+    pub text: String,
+    pub at: Option<Pos>,
+    pub resolved: bool,
+}
+
+/// The first `most` comments and replies by anyone but `except`, in the order of the document, and
+/// how many more there are.
+pub fn comments_except(s: &Session, except: &[&str], most: usize) -> (Vec<RedlineComment>, usize) {
+    let all = comment_list(s);
+    let theirs: Vec<(u32, Option<Pos>)> =
+        all.into_iter().filter(|(id, _)| s.doc.comments.get(id).is_some_and(|c| !except.contains(&c.author.as_str()))).collect();
+    let more = theirs.len().saturating_sub(most);
+    let rows = theirs
+        .into_iter()
+        .take(most)
+        .filter_map(|(id, at)| {
+            let c = s.doc.comments.get(&id)?;
+            let mut text = String::new();
+            for (i, path) in s.doc.para_paths(StoryRef::Part(c.part)).into_iter().enumerate() {
+                let Some(p) = s.doc.para(StoryRef::Part(c.part), &path) else { continue };
+                let chars = p.text.chars().filter(|ch| *ch != wordcraft_doc::para::OBJ);
+                if i == 0 {
+                    super::changes::add_full(&mut text, chars);
+                } else {
+                    super::changes::add_full(&mut text, std::iter::once('\n').chain(chars));
+                }
+            }
+            Some(RedlineComment { author: c.author.clone(), date: c.date.clone(), text, at, resolved: c.resolved })
+        })
+        .collect();
+    (rows, more)
+}
+
 pub(super) fn list_comments(s: &mut Session, _: &Value) -> CmdResult {
     let list = comment_list(s);
     Ok(Value::Array(

@@ -399,7 +399,13 @@ impl WordApp {
                 if password.is_some() {
                     return Err(error);
                 }
-                self.dialog = Some(Dialog::Password { name, params: json!({"cloud": true}), password: Default::default(), message: String::new() });
+                self.dialog = Some(Dialog::Password {
+                    name,
+                    then: "ui.cloudApply".to_string(),
+                    params: json!({"cloud": true}),
+                    password: Default::default(),
+                    message: String::new(),
+                });
                 return Ok(json!({"pending": "password"}));
             }
             Err(error) => return Err(error),

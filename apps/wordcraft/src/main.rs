@@ -10,6 +10,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod animations;
+#[cfg(target_os = "linux")]
+mod appimage_env;
 #[cfg(target_os = "macos")]
 mod apple_events;
 mod clipboard;
@@ -68,6 +70,8 @@ impl eframe::App for App {
         if let Some((pos, size)) = self.1.and_then(|g| g.fit_on_monitor(&window)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            let b = self.0.window_builder().clone().with_inner_size(size);
+            self.0.set_window_builder(b);
         }
         // The geometry saved for the next start is the active window's.
         let prev = self.0.ui.window;
@@ -130,6 +134,7 @@ impl eframe::App for App {
         if let Some(key_file) = &self.2 {
             key_file.remove();
         }
+        self.0.start_pending_update();
     }
 }
 
@@ -189,6 +194,8 @@ fn schedule_macos_terminate(app: &mut WordApp, key_file: Option<&control_server:
     if let Some(key_file) = key_file {
         key_file.remove();
     }
+    // `terminate:` ends the process without dropping the app, so a ready update's helper starts here.
+    app.start_pending_update();
     dispatch2::DispatchQueue::main().exec_async(|| {
         if let Some(mtm) = objc2::MainThreadMarker::new() {
             objc2_app_kit::NSApplication::sharedApplication(mtm).terminate(None);
@@ -301,7 +308,9 @@ fn agent_files(app: &WordApp) -> AgentFilesSetting {
 /// Save the preferences now if which files agents can use changed since they were saved; after a
 /// failed save, again every [`AGENT_FILES_RETRY`] until one is written.
 fn save_agent_files_now(app: &WordApp, ctx: &egui::Context) {
-    save_agent_files(&mut agent_files_on_disk(), agent_files(app), ctx, || write_app_prefs(app, false));
+    save_agent_files(&mut agent_files_on_disk(), agent_files(app), ctx, || {
+        write_app_prefs(app, false).inspect_err(|e| log::warn!("preferences: {e}")).is_ok()
+    });
 }
 
 /// [`save_agent_files_now`]: `write` saves the preferences and says whether they were written.
@@ -374,24 +383,29 @@ fn uses_x11(setting: wordcraft_ui_egui::DisplayServer, env: impl Fn(&str) -> Opt
 /// Save the preferences on exit: which files agents can use stay as `ui.json` has them
 /// ([`agent_files_on_disk`]), unless this window changed them and couldn't save that yet.
 fn save_prefs(app: &WordApp) {
+    if let Err(e) = try_save_prefs(app) {
+        log::warn!("preferences: {e}");
+    }
+}
+
+/// Saves the preferences and says why when it could not. `Ok(false)`: nothing was written
+/// because preferences are switched off or there is no settings folder. Which files agents can
+/// use stay as `ui.json` has them, unless this window changed them and couldn't save that yet.
+fn try_save_prefs(app: &WordApp) -> Result<bool, String> {
     let pending = agent_files_on_disk().pending(&agent_files(app));
-    write_app_prefs(app, !pending);
+    write_app_prefs(app, !pending)
 }
 
 /// Write `app`'s preferences to `ui.json`; with `disk_agent_files`, which files agents can use as
-/// the file has them, if it has them. Whether they were written (or are never saved).
-fn write_app_prefs(app: &WordApp, disk_agent_files: bool) -> bool {
+/// the file has them, if it has them. `Ok(false)`: nothing was written because preferences are
+/// switched off or there is no settings folder.
+fn write_app_prefs(app: &WordApp, disk_agent_files: bool) -> Result<bool, String> {
     if !prefs_enabled() {
-        return true;
+        return Ok(false);
     }
-    let Some(p) = prefs_path() else { return true };
-    match write_app_prefs_to(app, &p, disk_agent_files) {
-        Ok(()) => true,
-        Err(e) => {
-            log::warn!("preferences: cannot save {}: {e}", p.display());
-            false
-        }
-    }
+    let Some(p) = prefs_path() else { return Ok(false) };
+    write_app_prefs_to(app, &p, disk_agent_files).map_err(|e| format!("cannot save {}: {e}", p.display()))?;
+    Ok(true)
 }
 
 /// [`write_app_prefs`] to the file at `path`.
@@ -445,6 +459,7 @@ fn services(file_dialog: file_dialogs::Hook, ctx: &egui::Context) -> Services {
         set_clipboard_rich: Some(Box::new(clipboard::set_rich)),
         clipboard_rtf: Some(Box::new(clipboard::rtf)),
         clipboard_formats: Some(Box::new(clipboard::formats)),
+        save_prefs: Some(Box::new(try_save_prefs)),
         ..Default::default()
     }
 }
@@ -518,14 +533,15 @@ fn without_launch_args(args: Vec<String>) -> Vec<String> {
 
 /// Open a file whose name isn't valid Unicode (#1440). `file.open` takes its path as text, so it
 /// gets the file's bytes under the lossy name, and the document then keeps the real path to save to.
-/// The bytes are read as `file.open` reads a path: only a regular file, and at most 2 GB.
+/// The bytes are read as `file.open` reads a path: only a regular file, and at most 2 GB. A Word
+/// template starts a new document instead ([`WordApp::open_from_platform`]), which has no path.
 fn open_non_unicode(app: &mut WordApp, path: &std::path::Path) {
     let name = path.to_string_lossy();
     let opened = wordcraft_engine::io::read_document(path)
-        .and_then(|bytes| app.run("file.open", serde_json::json!({"path": name, "data": wordcraft_engine::cmd::insert::base64_encode(&bytes)})));
+        .and_then(|bytes| app.open_from_platform(&name, Some(&wordcraft_engine::cmd::insert::base64_encode(&bytes))));
     match opened {
         // Not when it waits for a password: that open names the document itself.
-        Ok(r) if r.get("pending").is_none() => app.session.path = Some(path.into()),
+        Ok(r) if r.get("pending").is_none() && !wordcraft_ui_egui::documents::is_word_template(&name) => app.session.path = Some(path.into()),
         Ok(_) => {}
         Err(e) => {
             app.report_open_failure(&name, &e);
@@ -546,14 +562,31 @@ fn main() -> eframe::Result {
     if let Some(result) = craft_update::self_update::finish(&wordcraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
         std::process::exit(i32::from(result.is_err()));
     }
+    // Linux: before anything reads another program's AppImage variables, or a thread starts (#5653).
+    #[cfg(target_os = "linux")]
+    let start_over_failed = appimage_env::drop_inherited();
+    // Still carrying them, this process must never update itself: the update would replace the
+    // other program's file.
+    #[cfg(target_os = "linux")]
+    let updates_unsafe = start_over_failed.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let updates_unsafe = false;
     // First, so the panic hook and every start-up warning are recorded (`logging`).
     let logger = logging::install();
     logging::install_panic_hook();
+    // ChatGPT's sign-in is sealed with a key kept in the system's keychain (or, with none, kept
+    // for the session only). Only this program asks for it: tests and tools never reach the
+    // person's keychain.
+    wordcraft_assist::chatgpt::use_system_keychain();
     // The settings folder holds the control channel's keys (with one, an agent would be the
     // window), recovery copies and preferences: no agent invited to a shared document reaches it,
     // whatever files File › Options › Agents lets agents use (#31).
     if let Some(dir) = wordcraft_control_key::settings_dir() {
         wordcraft_engine::file_access::protect(&dir);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(e) = start_over_failed {
+        log::error!("couldn't start again without another program's AppImage variables, so the self-update is off in this window: {e}");
     }
     let mut control_port: Option<u16> = std::env::var("WORDCRAFT_CONTROL_PORT").ok().and_then(|p| p.parse().ok());
     let mut files = Vec::new();
@@ -669,6 +702,10 @@ fn main() -> eframe::Result {
             let mut app = WordApp::new(session, services(file_dialog, &cc.egui_ctx));
             app.set_startup_update_check(true);
             load_prefs(&mut app);
+            // After the preferences, so the reason it gives is in the interface language.
+            if updates_unsafe {
+                app.disable_self_update();
+            }
             load_user_dictionary(&mut app);
             // Language packs from the suite's font store; an Install click is the person's own.
             wordcraft_engine::packs::use_font_store(true);
@@ -718,8 +755,9 @@ fn main() -> eframe::Result {
             if files.is_empty() && other_files.is_empty() && !sample && control_port.is_none() {
                 app.start_screen();
             }
+            // A Word template named here starts a new document based on it (#3433).
             for f in files {
-                if let Err(e) = app.run("file.open", serde_json::json!({"path": f})) {
+                if let Err(e) = app.open_from_platform(&f, None) {
                     app.report_open_failure(&f, &e);
                 }
             }

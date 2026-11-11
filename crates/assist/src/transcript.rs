@@ -8,9 +8,10 @@ use std::hash::{DefaultHasher, Hasher};
 use serde::Serialize;
 
 use crate::backend::{Answer, Event, PermissionRequest, PlanEntry, PlanStatus, Source, SourceKind, StopReason, ToolCall, ToolStatus, Usage, label};
+use crate::cases::log::{Record, ToolLine};
 use crate::cases::marker::{Card, CaseMarker, MAX_PER_TURN};
 use crate::cases::recall::RecallSent;
-use crate::cases::record::NoteId;
+use crate::cases::record::{NoteId, Quoted};
 use crate::context::Sent;
 use crate::markers::{Markers, Piece};
 use crate::output::{Action, OutputRow};
@@ -178,6 +179,14 @@ pub enum Written {
     Note,
     Plan,
     Balance,
+    /// A review corrected an unconfirmed note ([`crate::cases::ModelWrite::Correct`]).
+    Corrected,
+    /// A review retired an unconfirmed note ([`crate::cases::ModelWrite::Retire`]).
+    Retired,
+    /// A review found the record bears a note out: the text is its evidence. Nothing changed.
+    Supported,
+    /// A review's question for the person: the text is the question. Nothing changed.
+    Gap,
 }
 
 impl Entry {
@@ -423,6 +432,11 @@ pub struct Transcript {
     /// How many case markers the current turn has kept.
     #[serde(skip)]
     case_marked: u8,
+    /// The current turn is a review's ([`Transcript::review_turn`]): its answer's review verbs
+    /// are kept, up to [`crate::cases::marker::MAX_PER_REVIEW`]. In any other turn a review verb
+    /// is dropped and counted here and never reaches the window.
+    #[serde(skip)]
+    review: bool,
     /// The last card's number.
     #[serde(skip)]
     last_card: u64,
@@ -432,6 +446,13 @@ pub struct Transcript {
     /// What the conversation recalled, as windows, for [`Transcript::quotes_recalled`].
     #[serde(skip)]
     sent_windows: SentWindows,
+    /// How many turns were asked, trimmed or not.
+    #[serde(skip)]
+    turns: u32,
+    /// The turn that just ended, as one record for the case's log, until the window takes it
+    /// ([`Transcript::take_finished_turn`]).
+    #[serde(skip)]
+    finished: Option<Record>,
 }
 
 impl Transcript {
@@ -634,7 +655,68 @@ impl Transcript {
         self.turn_start = self.entries.len();
         self.proposed = 0;
         self.case_marked = 0;
+        self.review = false;
+        self.turns = self.turns.saturating_add(1);
         self.push(Entry::Asked { text: text.to_string() });
+    }
+
+    /// The turn just asked is a review's ([`crate::cases::marker::REVIEW_ASK`]): it may carry a
+    /// marker per note. Called right after [`Transcript::asked`], by the window that sent it.
+    pub fn review_turn(&mut self) {
+        self.review = true;
+    }
+
+    /// The window dropped a case marker of the turn (a review's verb outside a review, or a note
+    /// id this case doesn't have): Details counts it with the ones that didn't parse.
+    pub fn drop_case_marker(&mut self) {
+        self.dropped_marker();
+    }
+
+    /// The turn that just ended as one line for the case's record ([`crate::cases::log`]), once:
+    /// what was asked, the answer with its markers taken out (the pieces never held them), the
+    /// tool calls as they stand, the model, how it stopped, and the ids recalled and used.
+    pub fn take_finished_turn(&mut self) -> Option<Record> {
+        self.finished.take()
+    }
+
+    /// The conversation ended while a turn ran: the turn ends here as cancelled, with the answer
+    /// as far as it got, so the record keeps it. Its `Done` event will never be read.
+    pub(crate) fn cut_turn(&mut self) {
+        self.flush_markers();
+        self.push(Entry::Stopped { stop: StopReason::Cancelled });
+        self.finish_turn(StopReason::Cancelled);
+    }
+
+    fn finish_turn(&mut self, stop: StopReason) {
+        let mut asked = None;
+        let mut tools = Vec::new();
+        let mut model = None;
+        let mut recalled = Vec::new();
+        let mut used = Vec::new();
+        for entry in self.entries.iter().skip(self.turn_start) {
+            match entry {
+                Entry::Asked { text } => asked = Some(Quoted::parse(text)),
+                Entry::Tool(call) => {
+                    tools.push(ToolLine { title: Quoted::parse(&call.title), status: call.status, detail: Quoted::parse(&call.detail) });
+                }
+                Entry::Model { name, .. } => model = Some(name.clone()),
+                Entry::Recalled(sent) => recalled.extend(sent.items.iter().map(|i| i.id.to_string())),
+                Entry::Used { id } => used.push(id.clone()),
+                _ => {}
+            }
+        }
+        // A turn whose ask was trimmed away still ended: it is recorded as asked nothing.
+        self.finished = Some(Record::Turn {
+            at: wordcraft_engine::cmd::now_iso(),
+            n: self.turns,
+            asked: asked.unwrap_or_else(|| Quoted::parse("")),
+            answer: self.last_answer().map(|a| Quoted::parse(&a)),
+            tools,
+            model,
+            stop: Some(stop),
+            recalled,
+            used,
+        });
     }
 
     /// Add what `event` says.
@@ -706,6 +788,7 @@ impl Transcript {
                 if *stop != StopReason::EndTurn {
                     self.push(Entry::Stopped { stop: *stop });
                 }
+                self.finish_turn(*stop);
             }
             Event::Error { message } => self.push(Entry::Error { message: message.clone() }),
         }
@@ -780,7 +863,8 @@ impl Transcript {
             Piece::Remember(t) => self.propose(&t),
             Piece::Used(id) => self.mark_used(&id),
             Piece::Case(body) => match CaseMarker::parse(&body) {
-                Some(marker) if self.case_marked < MAX_PER_TURN => {
+                Some(marker) if marker.review_only() && !self.review => self.dropped_marker(),
+                Some(marker) if self.case_marked < if self.review { crate::cases::marker::MAX_PER_REVIEW } else { MAX_PER_TURN } => {
                     self.case_marked = self.case_marked.saturating_add(1);
                     self.unrouted.push(marker);
                 }

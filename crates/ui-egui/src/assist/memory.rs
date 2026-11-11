@@ -144,7 +144,7 @@ pub(crate) fn write(app: &mut WordApp, what: &str, req: &Value) -> Result<Value,
         return Err(YOURS.into());
     }
     let dir = app.services.settings_dir.clone().ok_or(NO_FOLDER)?;
-    if what.starts_with("memory.case.") || what.starts_with("memory.wall.") {
+    if what.starts_with("memory.case.") || what.starts_with("memory.wall.") || what.starts_with("memory.lesson.") {
         return super::cases::write(app, &dir, what, req);
     }
     let text = req.get("text").and_then(Value::as_str);

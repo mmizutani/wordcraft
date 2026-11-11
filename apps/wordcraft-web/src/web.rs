@@ -80,7 +80,8 @@ pub fn start() {
                     } else if cloud_enabled {
                         services.cloud = Some(crate::cloud::service(cc.egui_ctx.clone()));
                     }
-                    let mut app = WordApp::new(session, services);
+                    let control = crate::api::install(cc.egui_ctx.clone());
+                    let mut app = WordApp::new(session, services).with_control(control);
                     // Pasted pictures wait apart from dropped files: the app inserts one only when the page is the edit target (#1349).
                     app.services.pasted = Some(pasted);
                     app.autosave = false;

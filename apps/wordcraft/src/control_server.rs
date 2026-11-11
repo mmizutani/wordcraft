@@ -12,6 +12,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,38 @@ const MAX_LINE: usize = 1 << 20;
 
 /// A connection that sends no authorised request in this time is closed.
 const FIRST_REQUEST: Duration = Duration::from_secs(30);
+
+/// How long a caller waits for the UI to answer a request. A request still queued after this
+/// is cancelled and never runs.
+const REPLY_WAIT: Duration = Duration::from_secs(60);
+
+/// Connections that have not yet sent an authorised request are limited to this many; more are
+/// closed at once. Each one holds a thread until its first request or [`FIRST_REQUEST`].
+const MAX_UNAUTHENTICATED: usize = 64;
+
+/// Counts one unauthenticated connection until it authenticates or ends.
+struct Admission(Option<Arc<AtomicUsize>>);
+
+impl Admission {
+    fn enter(count: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        if count.fetch_add(1, Ordering::SeqCst) >= max {
+            count.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self(Some(count.clone())))
+    }
+    fn release(&mut self) {
+        if let Some(c) = self.0.take() {
+            c.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 
 /// The key file of a running control server; [`KeyFile::remove`] it when the window closes.
 pub struct KeyFile(PathBuf);
@@ -38,10 +71,19 @@ impl KeyFile {
 }
 
 /// Bind `127.0.0.1:port`, write the key file into `settings` and serve; participants with a
-/// key join the room `lobby` opens. `None` when the port cannot be bound or there is no random
-/// key (the control channel is off); the key file is `None` when it could not be written
-/// (requests with the window's key are then refused).
+/// key join the room `lobby` opens. `None` when the port cannot be bound, there is no random key
+/// or the accept thread cannot start (the control channel is off); the key file is `None` when it
+/// could not be written (requests with the window's key are then refused).
 pub fn start(port: u16, ctx: egui::Context, settings: Option<&Path>, lobby: Lobby) -> Option<(Receiver<ControlRequest>, Option<KeyFile>)> {
+    start_with(port, ctx, settings, move |listener, ctx, key| serve_on(listener, ctx, key, FIRST_REQUEST, lobby))
+}
+
+fn start_with(
+    port: u16,
+    ctx: egui::Context,
+    settings: Option<&Path>,
+    serve: impl FnOnce(TcpListener, egui::Context, String) -> std::io::Result<Receiver<ControlRequest>>,
+) -> Option<(Receiver<ControlRequest>, Option<KeyFile>)> {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
@@ -72,11 +114,21 @@ pub fn start(port: u16, ctx: egui::Context, settings: Option<&Path>, lobby: Lobb
             None
         }
     };
+    let rx = match serve(listener, ctx, key) {
+        Ok(rx) => rx,
+        Err(e) => {
+            if let Some(f) = &key_file {
+                f.remove();
+            }
+            log::error!("control server off: cannot start the accept thread ({e})");
+            return None;
+        }
+    };
     match &key_file {
         Some(f) => log::info!("control server listening on 127.0.0.1:{port}, key in {}", f.path().display()),
         None => log::info!("control server listening on 127.0.0.1:{port}"),
     }
-    Some((serve_on(listener, ctx, key, FIRST_REQUEST, lobby), key_file))
+    Some((rx, key_file))
 }
 
 /// A new key: 32 random bytes from the operating system, as hex.
@@ -108,18 +160,60 @@ fn keys_match(given: &str, key: &str) -> bool {
     !b.is_empty() && a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn serve_on(listener: TcpListener, ctx: egui::Context, key: String, first: Duration, lobby: Lobby) -> Receiver<ControlRequest> {
+fn serve_on(listener: TcpListener, ctx: egui::Context, key: String, first: Duration, lobby: Lobby) -> std::io::Result<Receiver<ControlRequest>> {
+    serve_with(listener, ctx, key, Limits { first, wait: REPLY_WAIT, max_unauthenticated: MAX_UNAUTHENTICATED }, lobby)
+}
+
+/// The time and count budgets of a server (small ones in tests).
+#[derive(Clone, Copy)]
+struct Limits {
+    first: Duration,
+    wait: Duration,
+    max_unauthenticated: usize,
+}
+
+/// Who else the port lets in: participants with an invite's key join the room `lobby` opens,
+/// and wrong keys slow down the replies to the next ones, on every connection.
+struct Guests {
+    lobby: Lobby,
+    refusals: hosted::Refusals,
+}
+
+fn serve_with(listener: TcpListener, ctx: egui::Context, key: String, limits: Limits, lobby: Lobby) -> std::io::Result<Receiver<ControlRequest>> {
+    serve_with_spawner(listener, ctx, key, limits, lobby, |accept| {
+        std::thread::Builder::new().name("control-accept".into()).spawn(accept).map(|_| ())
+    })
+}
+
+fn serve_with_spawner(
+    listener: TcpListener,
+    ctx: egui::Context,
+    key: String,
+    limits: Limits,
+    lobby: Lobby,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) -> std::io::Result<Receiver<ControlRequest>> {
     let (tx, rx) = channel::<ControlRequest>();
     let key: Arc<str> = key.into();
-    // Wrong keys slow down the replies to the next ones, on every connection.
-    let refusals = Arc::new(hosted::Refusals::default());
-    std::thread::spawn(move || {
+    let guests = Arc::new(Guests { lobby, refusals: hosted::Refusals::default() });
+    let unauthenticated = Arc::new(AtomicUsize::new(0));
+    let accept = move || {
         for stream in listener.incoming().flatten() {
-            let (tx, ctx, key, lobby, refusals) = (tx.clone(), ctx.clone(), key.clone(), lobby.clone(), refusals.clone());
-            std::thread::spawn(move || serve(stream, tx, ctx, &key, first, &lobby, &refusals));
+            let Some(admission) = Admission::enter(&unauthenticated, limits.max_unauthenticated) else {
+                log::warn!("control server: too many unauthenticated connections, one closed");
+                continue;
+            };
+            let (tx, ctx, key, guests) = (tx.clone(), ctx.clone(), key.clone(), guests.clone());
+            // A thread that cannot start closes this connection only (the guard releases its slot).
+            if let Err(e) =
+                std::thread::Builder::new().name("control-conn".into()).spawn(move || serve(stream, tx, ctx, &key, limits, admission, &guests))
+            {
+                log::warn!("control server: no thread for a connection: {e}");
+            }
         }
-    });
-    rx
+    };
+    spawn(Box::new(accept))?;
+    Ok(rx)
 }
 
 /// The read side of a connection with an optional overall deadline: each read waits only for
@@ -239,11 +333,11 @@ fn send(out: &mut TcpStream, id: &Value, mut v: Value) -> bool {
     writeln!(out, "{v}").is_ok()
 }
 
-fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key: &str, first: Duration, lobby: &Lobby, refusals: &hosted::Refusals) {
+fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key: &str, limits: Limits, mut admission: Admission, guests: &Guests) {
     let Ok(read) = stream.try_clone() else { return };
     let mut out = stream;
     // One overall deadline from accept to the first authorised request; after it, none.
-    let mut reader = BufReader::new(Timed { s: read, deadline: Some(Instant::now() + first) });
+    let mut reader = BufReader::new(Timed { s: read, deadline: Some(Instant::now() + limits.first) });
     let mut authorised = false;
     // The key an `auth` request gave this connection.
     let mut conn_key: Option<String> = None;
@@ -253,17 +347,19 @@ fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key:
         if !keys_match(&k, key) {
             // The key of an invite to the shared document, on the connection's first request:
             // its holder's own copy answers them from now on, on this thread.
-            if !authorised && let Ok(copy) = lobby.join_with(&k) {
+            if !authorised && let Ok(copy) = guests.lobby.join_with(&k) {
+                admission.release();
                 reader.get_mut().set_deadline(None);
-                serve_copy(&mut reader, &mut out, copy, &k, req, refusals);
+                serve_copy(&mut reader, &mut out, copy, &k, req, &guests.refusals);
                 return;
             }
-            std::thread::sleep(refusals.refused());
+            std::thread::sleep(guests.refusals.refused());
             let _ = send(&mut out, &req.id, json!({"ok": false, "error": "unauthorized"}));
             break;
         }
         if !authorised {
             authorised = true;
+            admission.release();
             reader.get_mut().set_deadline(None);
         }
         if req.method == "auth" {
@@ -274,12 +370,18 @@ fn serve(stream: TcpStream, tx: Sender<ControlRequest>, ctx: egui::Context, key:
             }
             continue;
         }
-        let (r, rrx) = ControlRequest::new(req.method, req.params);
+        let (r, rrx, waiter) = ControlRequest::with_waiter(req.method, req.params);
         if tx.send(r).is_err() {
             break;
         }
         ctx.request_repaint();
-        let reply = rrx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| json!({"ok": false, "error": "timeout"}));
+        let reply = rrx.recv_timeout(limits.wait).unwrap_or_else(|_| {
+            if waiter.cancel() {
+                json!({"ok": false, "error": "timeout before execution: the request was not run and never will be"})
+            } else {
+                json!({"ok": false, "error": "timeout: outcome unknown, the request had started when the wait ended; inspect the document to check"})
+            }
+        });
         if !send(&mut out, &req.id, reply) {
             break;
         }
@@ -332,7 +434,7 @@ mod tests {
     fn boot_in(first: Duration, lobby: Lobby) -> (u16, Receiver<ControlRequest>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        (port, serve_on(listener, egui::Context::default(), KEY.to_string(), first, lobby))
+        (port, serve_on(listener, egui::Context::default(), KEY.to_string(), first, lobby).unwrap())
     }
 
     fn boot() -> (u16, Receiver<ControlRequest>) {
@@ -709,6 +811,40 @@ mod tests {
     }
 
     #[test]
+    fn an_accept_thread_spawn_failure_aborts_start_and_removes_the_key() {
+        let dir = temp_dir("spawn-failure");
+        let path = wordcraft_control_key::key_path(&dir, 0);
+        let mut bound = None;
+        let result = start_with(0, egui::Context::default(), Some(&dir), |listener, ctx, key| {
+            bound = Some(listener.local_addr().unwrap());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), key, "startup wrote the key before spawning");
+            serve_with_spawner(listener, ctx, key, small(150, 8), Lobby::default(), |accept| {
+                drop(accept);
+                Err(std::io::Error::other("injected accept thread spawn failure"))
+            })
+        });
+        assert!(result.is_none(), "a server without its accept thread must not report success");
+        assert!(!path.exists(), "failed startup must remove its published key");
+        let _listener = TcpListener::bind(bound.unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_complete_json_request_at_eof_can_reach_the_ui() {
+        // This is why a bridge write failure before the newline is outcome-unknown.
+        let (port, rx) = boot();
+        let mut c = Conn::open(port);
+        let body = json!({"id": 1, "key": KEY, "method": "engine.execute", "params": {"command": "text.insert", "params": {"text": "once"}}});
+        c.1.write_all(body.to_string().as_bytes()).unwrap();
+        c.1.shutdown(std::net::Shutdown::Write).unwrap();
+        let req = answer(&rx);
+        assert_eq!(req.params["params"]["text"], "once");
+        assert_eq!(c.recv()["ok"], true);
+        assert!(c.closed());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn a_stale_key_file_is_replaced() {
         let dir = temp_dir("stale");
         std::fs::create_dir_all(&dir).unwrap();
@@ -727,5 +863,74 @@ mod tests {
             assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn boot_limits(limits: Limits) -> (u16, Receiver<ControlRequest>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (port, serve_with(listener, egui::Context::default(), KEY.to_string(), limits, Lobby::default()).unwrap())
+    }
+
+    fn small(wait_ms: u64, max_unauthenticated: usize) -> Limits {
+        Limits { first: FIRST_REQUEST, wait: Duration::from_millis(wait_ms), max_unauthenticated }
+    }
+
+    #[test]
+    fn a_request_that_timed_out_in_the_queue_never_runs() {
+        let (port, rx) = boot_limits(small(150, 8));
+        let mut c = Conn::open(port);
+        let r = c.call(&format!(r#"{{"id":1,"key":"{KEY}","method":"engine.execute","params":{{"command":"text.insert"}}}}"#));
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap_or("").starts_with("timeout before execution"), "{r}");
+        // The UI gets to it late: it must not run it.
+        let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!req.start(), "a cancelled request was started");
+    }
+
+    #[test]
+    fn a_request_that_started_before_the_timeout_reports_an_unknown_outcome() {
+        let (port, rx) = boot_limits(small(150, 8));
+        let mut c = Conn::open(port);
+        c.send(&format!(r#"{{"id":1,"key":"{KEY}","method":"engine.execute","params":{{"command":"text.insert"}}}}"#));
+        let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(req.start());
+        let r = c.recv();
+        assert!(r["error"].as_str().unwrap_or("").contains("outcome unknown"), "{r}");
+    }
+
+    #[test]
+    fn unauthenticated_connections_are_limited() {
+        let (port, rx) = boot_limits(small(5_000, 2));
+        let mut idle = [Conn::open(port), Conn::open(port)];
+        // Give the server time to count both.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(Conn::open(port).closed(), "the third idle connection was admitted");
+        // One authenticates: its slot is free again.
+        assert_eq!(idle[0].call(&format!(r#"{{"id":1,"method":"auth","key":"{KEY}"}}"#))["ok"], true);
+        std::thread::sleep(Duration::from_millis(200));
+        let mut again = Conn::open(port);
+        assert_eq!(again.call(&format!(r#"{{"id":1,"method":"auth","key":"{KEY}"}}"#))["ok"], true);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// An agent that joined with an invite's key is no longer waiting to authenticate: agents
+    /// connected to a shared document never use up the slots the window's key needs.
+    #[test]
+    fn an_invite_s_key_frees_its_unauthenticated_slot() {
+        let room = Room::new(Document::from_text("Hello world"));
+        let invite = room.invite("Agent", Role::Viewer).unwrap();
+        let lobby = Lobby::default();
+        lobby.open(room.clone());
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let rx = serve_with(listener, egui::Context::default(), KEY.to_string(), small(5_000, 2), lobby).unwrap();
+        let mut agents = [Conn::open(port), Conn::open(port)];
+        for agent in &mut agents {
+            assert_eq!(agent.call(&format!(r#"{{"id":1,"method":"auth","key":"{invite}"}}"#))["ok"], true);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let mut window = Conn::open(port);
+        assert_eq!(window.call(&format!(r#"{{"id":1,"method":"auth","key":"{KEY}"}}"#))["ok"], true, "the window's key got in");
+        assert!(rx.try_recv().is_err());
     }
 }

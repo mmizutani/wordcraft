@@ -377,7 +377,17 @@ fn recalled_with(t: &mut Transcript, text: &str, more: &[&str]) {
     use crate::cases::recall::{ItemId, Place, RecallSent, RecalledItem};
     use crate::cases::record::NoteId;
     let id = ItemId::Here { note: NoteId::parse("n1").unwrap() };
-    let item = RecalledItem { id, place: Place::ThisCase, title: None, kind: None, text: text.into(), balance: None, confirmed: true, again: false };
+    let item = RecalledItem {
+        id,
+        place: Place::ThisCase,
+        title: None,
+        kind: None,
+        text: text.into(),
+        balance: None,
+        confirmed: true,
+        again: false,
+        rungs: Vec::new(),
+    };
     let sent_text = std::iter::once(text).chain(more.iter().copied()).map(str::to_string).collect();
     t.record(&crate::Event::Recalled(RecallSent { items: vec![item], sent_text, ..RecallSent::default() }));
 }

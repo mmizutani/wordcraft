@@ -25,3 +25,6 @@ sys-locale = "0.3"
 [dev-dependencies]
 # The built-in assistant's ACP backend and its scripted agent, end to end through `mcp --connect`.
 wordcraft-assist = { workspace = true }
+wordcraft-fonts = { workspace = true }
+image = { workspace = true }
+zip = { workspace = true }

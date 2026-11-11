@@ -1,0 +1,653 @@
+//! A case's record (#107): the transcript layer of its memory, kept only when the person turned
+//! it on for that case. One conversation is one file, `log/<stamp>-<id>.jsonl` in the case's
+//! folder, with one [`Record`] a line: a whole turn when it ends, the person's Accept or Reject of
+//! anyone's change, the person's own edit of what the assistant wrote, and a snapshot of the other
+//! side's redlines. Nothing in a turn reads it; the review pass does.
+//!
+//! The file has one writer, the conversation's own thread, fed by [`CaseLog::write`] through a
+//! bounded queue with `try_send`, so a frame never waits for the disk and a full queue becomes a
+//! [`Record::Dropped`] line. No lock: no two writers share a file. It doesn't fsync, so a power cut
+//! can lose recent lines, and a crash truncates at most the last line, which the reader skips and
+//! counts. `Record` is its own type and never the pane's [`crate::Entry`]: an entry holds internal
+//! markers and is rewritten in place, and a record must read back the same in a later build.
+
+use std::fs;
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
+use std::ops::ControlFlow;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub use crate::feedback::Decision;
+
+use super::record::{CaseError, Quoted};
+use super::store::{CaseRef, Shelf};
+use crate::backend::{StopReason, ToolStatus};
+
+/// The folder inside a case's.
+pub const FOLDER: &str = "log";
+
+/// Most bytes one conversation's file takes; a record past it is counted, not written.
+pub const MAX_FILE_BYTES: u64 = 16 << 20;
+
+/// Most bytes a case's record takes in all. Opening a conversation past it removes the oldest
+/// conversations' files first until a whole new file has room.
+pub const MAX_CASE_BYTES: u64 = 64 << 20;
+
+/// Most bytes of one line: the writer never writes a longer one, and the reader skips and counts
+/// one it finds.
+pub const MAX_LINE_BYTES: usize = 1 << 20;
+
+/// Most bytes of one file a read goes through: what the writer can write, [`MAX_FILE_BYTES`] of
+/// records and then one `Dropped` line. A longer file wasn't written by WordCraft, and reading on
+/// would cost time in proportion to whatever was put there: it is read that far, as if a crash had
+/// cut it there, and the rest is one more skipped line.
+const MAX_READ_BYTES: u64 = MAX_FILE_BYTES + 1024;
+
+/// Most records waiting for the writer. A frame writes at most a handful; a writer stuck this far
+/// behind is stuck on the disk.
+const QUEUE: usize = 256;
+
+/// Most conversations' files a case's record keeps: opening one past it removes the files written
+/// least recently first, as [`MAX_CASE_BYTES`] does (which holds far fewer unless each is tiny).
+const MAX_FILES: usize = 1024;
+
+/// Most characters of an answer a turn's record keeps.
+const MAX_ANSWER: usize = 64 << 10;
+
+/// Most characters of any other text a record keeps.
+const MAX_TEXT: usize = 2 << 10;
+
+/// Most tool lines a turn's record keeps.
+const MAX_TOOLS: usize = 64;
+
+/// Most ids a turn's record keeps of what was recalled or used.
+const MAX_IDS: usize = 64;
+
+/// One line of the record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "camelCase")]
+pub enum Record {
+    /// A whole turn, written when it ends: the answer with internal markers taken out.
+    Turn {
+        at: String,
+        n: u32,
+        asked: Quoted,
+        answer: Option<Quoted>,
+        tools: Vec<ToolLine>,
+        model: Option<String>,
+        stop: Option<StopReason>,
+        /// The ids of what the turn recalled, and of what its answer marked as used.
+        recalled: Vec<String>,
+        used: Vec<String>,
+    },
+    /// The person's Accept or Reject of anyone's change: the only place this survives.
+    Decided { at: String, decision: Decision, kind: String, author: Quoted, text: Quoted },
+    /// The person changed what the assistant wrote.
+    Edited { at: String, was: Quoted, now: Quoted },
+    /// What the other side's draft held when the conversation first took it up. Scrubbed
+    /// metadata shows as it is: an author of "Author" and no dates is itself worth knowing.
+    Redlines { at: String, draft: Quoted, changes: Vec<RedlineLine>, comments: Vec<CommentLine>, more: u32 },
+    /// Records that didn't fit the queue or the file.
+    Dropped { n: u32 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolLine {
+    pub title: Quoted,
+    pub status: ToolStatus,
+    pub detail: Quoted,
+}
+
+/// One of the other side's tracked changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedlineLine {
+    /// `insert`, `delete`, `format`…, as the Reviewing Pane names it.
+    pub kind: String,
+    pub author: Quoted,
+    pub date: String,
+    pub text: Quoted,
+    /// Where it starts, as the engine writes a position.
+    pub at: Option<Value>,
+}
+
+/// One of the other side's comments.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentLine {
+    pub author: Quoted,
+    pub date: String,
+    pub text: Quoted,
+    pub at: Option<Value>,
+    pub resolved: bool,
+}
+
+impl Record {
+    /// Hold every text to its cap, so a record's line is bounded whatever a turn produced.
+    pub(crate) fn clamp(&mut self) {
+        match self {
+            Record::Turn { asked, answer, tools, recalled, used, .. } => {
+                asked.cut(MAX_TEXT);
+                if let Some(a) = answer {
+                    a.cut(MAX_ANSWER);
+                }
+                tools.truncate(MAX_TOOLS);
+                for t in tools {
+                    t.title.cut(MAX_TEXT);
+                    t.detail.cut(MAX_TEXT);
+                }
+                recalled.truncate(MAX_IDS);
+                used.truncate(MAX_IDS);
+            }
+            Record::Decided { author, text, .. } => {
+                author.cut(MAX_TEXT);
+                text.cut(MAX_TEXT);
+            }
+            Record::Edited { was, now, .. } => {
+                was.cut(MAX_TEXT);
+                now.cut(MAX_TEXT);
+            }
+            Record::Redlines { draft, changes, comments, .. } => {
+                draft.cut(MAX_TEXT);
+                for c in changes {
+                    c.author.cut(MAX_TEXT);
+                    c.text.cut(MAX_TEXT);
+                }
+                for c in comments {
+                    c.author.cut(MAX_TEXT);
+                    c.text.cut(MAX_TEXT);
+                }
+            }
+            Record::Dropped { .. } => {}
+        }
+    }
+
+    /// The texts a search looks through: what people wrote, not field names.
+    fn texts(&self) -> Vec<&str> {
+        match self {
+            Record::Turn { asked, answer, tools, .. } => {
+                let mut out = vec![asked.for_person()];
+                out.extend(answer.iter().map(Quoted::for_person));
+                out.extend(tools.iter().flat_map(|t| [t.title.for_person(), t.detail.for_person()]));
+                out
+            }
+            Record::Decided { author, text, .. } => vec![author.for_person(), text.for_person()],
+            Record::Edited { was, now, .. } => vec![was.for_person(), now.for_person()],
+            Record::Redlines { draft, changes, comments, .. } => {
+                let mut out = vec![draft.for_person()];
+                out.extend(changes.iter().flat_map(|c| [c.author.for_person(), c.text.for_person()]));
+                out.extend(comments.iter().flat_map(|c| [c.author.for_person(), c.text.for_person()]));
+                out
+            }
+            Record::Dropped { .. } => Vec::new(),
+        }
+    }
+
+    /// Whether `query`, folded, is in any of its texts. An empty query matches every record.
+    fn matches(&self, query: &str) -> bool {
+        query.is_empty() || self.texts().iter().any(|t| t.to_lowercase().contains(query))
+    }
+}
+
+/// The writer waits at this before each line: a test's stand-in for a slow disk.
+type Gate = Arc<(Mutex<bool>, Condvar)>;
+
+/// One conversation's record: its own file, its own writer thread. The window never waits.
+pub struct CaseLog {
+    tx: Option<SyncSender<Record>>,
+    thread: Option<JoinHandle<()>>,
+    /// Records the queue had no room for, not yet written as a [`Record::Dropped`].
+    dropped: u32,
+    /// What `dropped` still held when the log was dropped with the queue full: the writer adds
+    /// it to its last `Dropped` line, since no record can carry it then.
+    lost: Arc<AtomicU32>,
+}
+
+impl CaseLog {
+    /// Open a new file for a conversation in `at`'s record, named from `stamp` (a time string;
+    /// anything but letters, digits and hyphens is dropped). Removes the case's oldest files
+    /// first when the record is past [`MAX_CASE_BYTES`]. [`CaseError::Gone`] when the case isn't
+    /// there, and an error on the web, which has no thread.
+    pub fn open(shelf: &Shelf, at: &CaseRef, stamp: &str) -> Result<CaseLog, CaseError> {
+        CaseLog::open_with(shelf, at, stamp, QUEUE, None)
+    }
+
+    /// [`CaseLog::open`] with a queue of `queue` records and a writer that waits at `gate`
+    /// before each line, so a test can fill the queue.
+    #[doc(hidden)]
+    pub fn open_gated(shelf: &Shelf, at: &CaseRef, stamp: &str, queue: usize, gate: Gate) -> Result<CaseLog, CaseError> {
+        CaseLog::open_with(shelf, at, stamp, queue, Some(gate))
+    }
+
+    fn open_with(shelf: &Shelf, at: &CaseRef, stamp: &str, queue: usize, gate: Option<Gate>) -> Result<CaseLog, CaseError> {
+        let dir = shelf.real_case_dir(at)?.join(FOLDER);
+        super::store::make_dir(&dir, false)
+            .or_else(|e| if e.kind() == std::io::ErrorKind::AlreadyExists { Ok(()) } else { Err(e) })
+            .map_err(|e| CaseError::Io(format!("{} can't be made: {e}", dir.display())))?;
+        // A link where `log/` should be could point into another client's case: the folder is
+        // the wall, as `store` keeps it, so a link is refused and never written through.
+        if !super::store::real_dir(&dir) {
+            return Err(CaseError::Gone);
+        }
+        make_room(&dir);
+        let stamp: String = stamp.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(64).collect();
+        let stamp = if stamp.is_empty() { "conversation".to_string() } else { stamp };
+        let mut file = None;
+        for n in 0..8u32 {
+            let name = if n == 0 { format!("{stamp}.jsonl") } else { format!("{stamp}-{n}.jsonl") };
+            let path = dir.join(name);
+            // `create_new` fails on a link as on a file (O_EXCL doesn't follow), so no line is
+            // ever appended through one.
+            let mut open = fs::OpenOptions::new();
+            open.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+            match open.open(&path) {
+                Ok(f) => {
+                    file = Some(f);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(CaseError::Io(format!("{} can't be made: {e}", path.display()))),
+            }
+        }
+        let file = file.ok_or_else(|| CaseError::Io("the record's file can't be named".into()))?;
+        let (tx, rx) = sync_channel::<Record>(queue.max(1));
+        let lost = Arc::new(AtomicU32::new(0));
+        let counted = lost.clone();
+        let thread = std::thread::Builder::new()
+            .name("case record".into())
+            .spawn(move || writer(file, rx, gate, &counted))
+            .map_err(|e| CaseError::Io(format!("the record's writer can't start: {e}")))?;
+        Ok(CaseLog { tx: Some(tx), thread: Some(thread), dropped: 0, lost })
+    }
+
+    /// Queue `record` for the writer. Never waits: a full queue counts it, and the count goes in
+    /// front of the next record that fits.
+    pub fn write(&mut self, mut record: Record) {
+        record.clamp();
+        let Some(tx) = &self.tx else { return };
+        if self.dropped > 0 {
+            match tx.try_send(Record::Dropped { n: self.dropped }) {
+                Ok(()) => self.dropped = 0,
+                Err(_) => {
+                    self.dropped = self.dropped.saturating_add(1);
+                    return;
+                }
+            }
+        }
+        match tx.try_send(record) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => self.dropped = self.dropped.saturating_add(1),
+            // The writer is gone (its file failed): nothing more can be kept.
+            Err(TrySendError::Disconnected(_)) => self.tx = None,
+        }
+    }
+
+    /// Records the queue had no room for since the last `Dropped` line.
+    pub fn dropped(&self) -> u32 {
+        self.dropped
+    }
+
+    /// Wait for the writer to write what is queued and close the file. Off the frame: a delete
+    /// needs the file closed before the folder is renamed.
+    pub fn close(mut self) {
+        if let Some(tx) = self.tx.take() {
+            if self.dropped > 0 {
+                let _ = tx.send(Record::Dropped { n: self.dropped });
+                self.dropped = 0;
+            }
+            drop(tx);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for CaseLog {
+    /// Dropped on the frame, so it doesn't wait: the writer finishes what is queued on its own,
+    /// and a count the full queue can't take goes to it through `lost`.
+    fn drop(&mut self) {
+        if let (Some(tx), true) = (&self.tx, self.dropped > 0)
+            && tx.try_send(Record::Dropped { n: self.dropped }).is_err()
+        {
+            self.lost.fetch_add(self.dropped, Ordering::Release);
+        }
+    }
+}
+
+/// The writer thread: one line a record, each within [`MAX_LINE_BYTES`] so the reader takes it,
+/// up to [`MAX_FILE_BYTES`]; what didn't fit, and what `lost` counts, is one `Dropped` line at
+/// the end.
+fn writer(mut file: fs::File, rx: std::sync::mpsc::Receiver<Record>, gate: Option<Gate>, lost: &AtomicU32) {
+    let mut written = 0u64;
+    let mut over = 0u32;
+    for mut record in rx {
+        if let Some(gate) = &gate {
+            let (open, wake) = &**gate;
+            if let Ok(mut guard) = open.lock() {
+                while !*guard {
+                    guard = match wake.wait(guard) {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                }
+            }
+        }
+        let Some(mut line) = line_within_cap(&mut record) else {
+            over = over.saturating_add(1);
+            continue;
+        };
+        line.push(b'\n');
+        let len = u64::try_from(line.len()).unwrap_or(u64::MAX);
+        if written.saturating_add(len) > MAX_FILE_BYTES {
+            over = over.saturating_add(1);
+            continue;
+        }
+        if file.write_all(&line).is_err() {
+            return;
+        }
+        written = written.saturating_add(len);
+    }
+    // The sender is gone, so `lost` has its final count.
+    let over = over.saturating_add(lost.load(Ordering::Acquire));
+    if over > 0
+        && let Ok(mut line) = serde_json::to_vec(&Record::Dropped { n: over })
+    {
+        line.push(b'\n');
+        let _ = file.write_all(&line);
+    }
+}
+
+/// `record` as a line of at most [`MAX_LINE_BYTES`] (the end of line apart), or `None` when it
+/// can't be one. A `Redlines` snapshot is shrunk to fit, its last comments first and then its
+/// last changes going into `more`: every text is within its own cap, but 64 comments of 2 Ki
+/// four-byte characters each pass the line cap together.
+fn line_within_cap(record: &mut Record) -> Option<Vec<u8>> {
+    loop {
+        let line = serde_json::to_vec(record).ok()?;
+        if line.len() < MAX_LINE_BYTES {
+            return Some(line);
+        }
+        let Record::Redlines { changes, comments, more, .. } = record else { return None };
+        if comments.pop().is_none() && changes.pop().is_none() {
+            return None;
+        }
+        *more = more.saturating_add(1);
+    }
+}
+
+/// The record's plain `.jsonl` files in `dir`, the one written least recently first (its
+/// modification time; the name breaks a tie), each with its size. A name starts with the process
+/// id, so names would order files by process before time across restarts. `dir` must be a
+/// folder and not a link to one, and a link inside it is left out: one could point at another
+/// client's file, and everything here reads or removes what it lists. The listing stops at
+/// `16 * MAX_FILES` entries, far past what [`make_room`] lets grow, so a hostile folder can't
+/// exhaust memory.
+fn files_in(dir: &std::path::Path) -> Vec<(PathBuf, u64)> {
+    if !super::store::real_dir(dir) {
+        return Vec::new();
+    }
+    let mut out: Vec<(std::time::SystemTime, PathBuf, u64)> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .take(16 * MAX_FILES)
+        .filter_map(|e| {
+            if !e.file_type().is_ok_and(|t| t.is_file()) {
+                return None;
+            }
+            let path = e.path();
+            let meta = fs::symlink_metadata(&path).ok().filter(fs::Metadata::is_file)?;
+            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            (path.extension().is_some_and(|x| x == "jsonl")).then_some((modified, path, meta.len()))
+        })
+        .collect();
+    out.sort();
+    out.into_iter().map(|(_, path, len)| (path, len)).collect()
+}
+
+/// Remove the files written least recently until a whole new file fits under [`MAX_CASE_BYTES`]
+/// and, with it, the case has at most [`MAX_FILES`] files.
+fn make_room(dir: &std::path::Path) {
+    let files = files_in(dir);
+    let mut total: u64 = files.iter().map(|(_, len)| *len).sum();
+    let mut count = files.len();
+    for (path, len) in files {
+        if total.saturating_add(MAX_FILE_BYTES) <= MAX_CASE_BYTES && count < MAX_FILES {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+            count = count.saturating_sub(1);
+        }
+    }
+}
+
+/// Bytes the record of `at` takes on disk: a listing of its folder, a few stats.
+pub fn log_size(shelf: &Shelf, at: &CaseRef) -> u64 {
+    files_in(&shelf.log_dir(at)).iter().map(|(_, len)| *len).sum()
+}
+
+/// Remove the record of `at`, whole: the folder is renamed into the shelf's trash and removed, so
+/// a crash between the two is finished by the next listing. A missing record is nothing to do.
+pub fn delete_log(shelf: &Shelf, at: &CaseRef) -> Result<(), CaseError> {
+    let dir = shelf.real_case_dir(at)?.join(FOLDER);
+    if fs::symlink_metadata(&dir).is_err() {
+        return Ok(());
+    }
+    shelf.trash(&dir, &format!("{}-log", at.case.as_str()))
+}
+
+/// One record a search found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogHit {
+    /// The file's name: which conversation.
+    pub file: String,
+    pub line: u32,
+    pub record: Record,
+}
+
+/// What a search found, and how many lines it couldn't read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogSearch {
+    pub hits: Vec<LogHit>,
+    pub skipped: u32,
+}
+
+/// The records of `at` whose texts hold `query`, folded, at most `limit` of them, newest file
+/// first. A line that can't be read, is longer than [`MAX_LINE_BYTES`], or was cut by a crash is
+/// skipped and counted, and so is the rest of a file past [`MAX_READ_BYTES`]. Reads every file and
+/// holds only the hits: off the frame.
+pub fn search_log(shelf: &Shelf, at: &CaseRef, query: &str, limit: usize) -> Result<LogSearch, CaseError> {
+    let dir = shelf.real_case_dir(at)?.join(FOLDER);
+    let query = query.trim().to_lowercase();
+    let mut out = LogSearch::default();
+    for (path, _) in files_in(&dir).into_iter().rev() {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let skipped = each_record(&path, |line, record| {
+            if out.hits.len() < limit && record.matches(&query) {
+                out.hits.push(LogHit { file: name.clone(), line, record });
+            }
+        });
+        out.skipped = out.skipped.saturating_add(skipped);
+    }
+    Ok(out)
+}
+
+/// Most bytes of record lines a review carries, newest first.
+pub const REVIEW_RECORD_BYTES: usize = 96 << 10;
+
+/// The most recent records of `at`, oldest first, as many of the newest as fit `max_bytes` of
+/// their lines; how many of the lines it went through couldn't be read; and whether older records
+/// were left out. A case with no record gives none, which is not an error: a review works without
+/// one. Reads each file back from its newest line, the newest file first, and stops once the
+/// budget is spent, so what it reads and holds is about the budget whatever the files hold: off
+/// the frame.
+pub fn recent_records(shelf: &Shelf, at: &CaseRef, max_bytes: usize) -> Result<(Vec<Record>, u32, bool), CaseError> {
+    let dir = shelf.real_case_dir(at)?.join(FOLDER);
+    let mut newest_first: Vec<Record> = Vec::new();
+    let mut skipped = 0u32;
+    let mut left = max_bytes;
+    let mut more = false;
+    for (path, _) in files_in(&dir).into_iter().rev() {
+        // Listed as a plain file a moment ago; a link put there since is refused here too.
+        let Ok((mut file, len)) = open_plain(&path) else {
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        skipped = skipped.saturating_add(u32::from(len > MAX_READ_BYTES));
+        lines_back(&mut file, len.min(MAX_READ_BYTES), |line| {
+            match line.and_then(|l| Some((serde_json::from_slice::<Record>(l).ok()?, l.len()))) {
+                None => skipped = skipped.saturating_add(1),
+                Some((_, bytes)) if bytes > left => {
+                    more = true;
+                    return ControlFlow::Break(());
+                }
+                Some((record, bytes)) => {
+                    left = left.saturating_sub(bytes);
+                    newest_first.push(record);
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        if more {
+            break;
+        }
+    }
+    newest_first.reverse();
+    Ok((newest_first, skipped, more))
+}
+
+/// Each line of `file`'s first `len` bytes, the last first, to `f` until it breaks: `Some` with the
+/// line and its end of line, or `None` for one longer than [`MAX_LINE_BYTES`] or cut by a crash
+/// (what follows the last end of line). Holds one block and one line, so a review costs what it
+/// reads and not what the file holds. A read that fails, or a file shorter than `len`, ends it.
+fn lines_back(file: &mut fs::File, len: u64, mut f: impl FnMut(Option<&[u8]>) -> ControlFlow<()>) {
+    const BLOCK: u64 = 64 << 10;
+    let mut block = Vec::new();
+    // The line being read, from its last byte back; whether it has an end of line (all but what
+    // follows the last one do); and whether it passed the cap, its bytes then let go.
+    let mut line = Vec::new();
+    let mut ended = false;
+    let mut long = false;
+    let mut end = len;
+    while end > 0 {
+        let start = end.saturating_sub(BLOCK);
+        let want = end.saturating_sub(start);
+        block.clear();
+        let read = file.seek(SeekFrom::Start(start)).and_then(|_| (&mut *file).take(want).read_to_end(&mut block));
+        if read.ok().and_then(|n| u64::try_from(n).ok()) != Some(want) {
+            return;
+        }
+        for &byte in block.iter().rev() {
+            if byte == b'\n' {
+                if give_line(&mut f, &mut line, ended, long).is_break() {
+                    return;
+                }
+                line.clear();
+                line.push(b'\n');
+                (ended, long) = (true, false);
+            } else if !long {
+                line.push(byte);
+                if line.len() > MAX_LINE_BYTES.saturating_add(1) {
+                    (line, long) = (Vec::new(), true);
+                }
+            }
+        }
+        end = start;
+    }
+    let _ = give_line(&mut f, &mut line, ended, long);
+}
+
+/// [`lines_back`]'s line, read from its last byte back, to `f`; nothing when there is none.
+fn give_line(f: &mut impl FnMut(Option<&[u8]>) -> ControlFlow<()>, line: &mut [u8], ended: bool, long: bool) -> ControlFlow<()> {
+    if !ended && !long && line.is_empty() {
+        return ControlFlow::Continue(());
+    }
+    if !ended || long {
+        return f(None);
+    }
+    line.reverse();
+    f(Some(line))
+}
+
+/// Each record in the file at `path`, in order, to `f` with its line number; and how many lines
+/// were skipped: one that can't be read, is longer than [`MAX_LINE_BYTES`], or was cut by a crash,
+/// and the rest of a file past [`MAX_READ_BYTES`]. A file that can't be opened as a plain file is
+/// one skipped line. Holds one line at a time.
+fn each_record(path: &std::path::Path, mut f: impl FnMut(u32, Record)) -> u32 {
+    // Listed as a plain file a moment ago; a link put there since is refused here too.
+    let Ok((file, len)) = open_plain(path) else {
+        return 1;
+    };
+    let mut skipped = u32::from(len > MAX_READ_BYTES);
+    let mut reader = std::io::BufReader::new(file.take(MAX_READ_BYTES));
+    let mut line_no = 0u32;
+    let mut buf = Vec::new();
+    loop {
+        line_no = line_no.saturating_add(1);
+        buf.clear();
+        let n = match (&mut reader).take(MAX_LINE_BYTES as u64 + 1).read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let ended = buf.last() == Some(&b'\n');
+        if !ended {
+            // Cut by a crash at the end, or longer than a line may be: skip to the next line.
+            skipped = skipped.saturating_add(1);
+            if n > MAX_LINE_BYTES && !skip_line(&mut reader) {
+                break;
+            }
+            if n <= MAX_LINE_BYTES {
+                break;
+            }
+            continue;
+        }
+        match serde_json::from_slice::<Record>(&buf) {
+            Ok(record) => f(line_no, record),
+            Err(_) => skipped = skipped.saturating_add(1),
+        }
+    }
+    skipped
+}
+
+/// `path` open for reading, and its length, if it is a plain file and not a link: checked first,
+/// and on Unix the open itself refuses a link too (`O_NOFOLLOW`), so nothing swapped in between
+/// is followed. The length is the open file's.
+fn open_plain(path: &std::path::Path) -> std::io::Result<(fs::File, u64)> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(std::io::Error::other("not a plain file"));
+    }
+    let mut open = fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    let file = open.open(path)?;
+    let len = file.metadata()?.len();
+    Ok((file, len))
+}
+
+/// Read past the rest of an over-long line; whether a line end was found.
+fn skip_line(reader: &mut impl BufRead) -> bool {
+    let mut scratch = Vec::new();
+    loop {
+        scratch.clear();
+        match (&mut *reader).take(64 << 10).read_until(b'\n', &mut scratch) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) if scratch.last() == Some(&b'\n') => return true,
+            Ok(_) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

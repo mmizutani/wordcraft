@@ -19,7 +19,8 @@
 //! call's row links to the change it made in the shared document (`assist.showChange`).
 //!
 //! What the person accepts and rejects of the conversation's changes starts the next turn's
-//! context (#86, [`review_ended`]); nothing of it is stored.
+//! context (#86, [`review_ended`]); it stays with the conversation, and a case whose record the
+//! person turned on keeps each decision as a line ([`cases::record`]).
 //!
 //! What the person keeps for every later conversation is [`memory`]'s (#86). What a turn recalls
 //! from the case bound to the document is [`cases`]'s (#107).
@@ -177,6 +178,9 @@ pub(crate) struct Conversation {
     /// keeps what it read and ChatGPT's history holds answers that may quote it, so a document
     /// bound to another case gets a new conversation, never this one.
     pub(crate) case: Option<wordcraft_assist::cases::CaseRef>,
+    /// The case's record, while the case keeps one ([`cases::record`]): every line goes to
+    /// `case`, never to the document's current binding.
+    pub(crate) log: Option<wordcraft_assist::cases::CaseLog>,
 }
 
 impl WordApp {
@@ -266,11 +270,12 @@ fn status(app: &WordApp) -> AssistantStatus {
 /// again what is offered now and then, and tell the session what the assistant can do.
 pub(crate) fn tick(app: &mut WordApp) {
     sync_unattended(app);
-    if let Some(c) = app.assist.conversation.as_mut() {
+    let closed = app.assist.conversation.as_mut().is_some_and(|c| {
         c.assistant.poll();
-        if c.assistant.room().is_closed() {
-            c.assistant.end();
-        }
+        c.assistant.room().is_closed()
+    });
+    if closed {
+        cases::record::end(app);
     }
     edits::tick(app);
     memory::tick(app);
@@ -743,11 +748,11 @@ pub(crate) fn sync_unattended(app: &WordApp) {
     }
 }
 
-/// End the conversation there is, if any (its transcript stays for the pane).
+/// End the conversation there is, if any (its transcript stays for the pane, and a cut turn goes
+/// to its record).
 fn end(app: &mut WordApp) {
-    if let Some(c) = app.assist.conversation.as_mut() {
-        c.assistant.end();
-    }
+    cases::record::end(app);
+    app.assist.cases.lesson_cards.clear();
 }
 
 /// The role a prompt is for: the one it names, else the one chosen in the pane.
@@ -761,7 +766,7 @@ fn wanted(app: &WordApp, role: Option<Role>) -> Option<Role> {
 /// person's selection, or with the caret at its end (`at_end`). The pane opens, so the person
 /// sees the turn and can stop it; the keyboard stays where it is.
 pub(crate) fn ask(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) -> Result<Value, String> {
-    let r = ask_inner(app, prompt, role, at_end);
+    let r = ask_inner(app, prompt, role, at_end, false);
     app.assist.notice = r.as_ref().err().cloned();
     if r.is_ok() {
         app.session.view.assistant_pane = true;
@@ -772,7 +777,20 @@ pub(crate) fn ask(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: b
     r
 }
 
-fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) -> Result<Value, String> {
+/// **Review this case** (`memory.case.review`, the person's click): one ordinary turn in the bound
+/// case's conversation, asked with the fixed [`wordcraft_assist::cases::REVIEW_ASK`] and carrying
+/// the case's notes and its recent record as one data-grade source ([`cases::review`]). With
+/// anyone else in the room, or invited, it is withheld and says why, as recall is.
+pub(crate) fn review(app: &mut WordApp) -> Result<Value, String> {
+    let r = ask_inner(app, wordcraft_assist::cases::REVIEW_ASK, None, false, true);
+    app.assist.notice = r.as_ref().err().cloned();
+    if r.is_ok() {
+        app.session.view.assistant_pane = true;
+    }
+    r
+}
+
+fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool, review: bool) -> Result<Value, String> {
     if !app.has_document() {
         return Err("no document is open".into());
     }
@@ -830,7 +848,15 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     let kept = memory::for_turn(app, &mut sent);
     // Bound, the turn also says what the case's notes are for ([`cases::marker::CASE_ASK`]).
     let kept = if bound.is_some() { Some(wordcraft_assist::memory::Instructions::with_case_ask(kept)) } else { kept };
-    let recall = cases::for_turn(app, prompt, &ctx, &mut sent);
+    let recall = if review {
+        // A review with nothing to carry is no review: the turn isn't sent, and the person is told why.
+        Some(
+            cases::review::for_review(app, &mut sent)
+                .ok_or_else(|| format!("The review was withheld: {}.", sent.recall_withheld.as_deref().unwrap_or("the case can't be read")))?,
+        )
+    } else {
+        cases::for_turn(app, prompt, &ctx, &mut sent)
+    };
     let saved = app.conversation().and_then(|a| app.session.prefs.assistant.models.get(&a.info().id)).cloned().unwrap_or_default();
     let Some(a) = app.conversation_mut() else { return Err("the assistant couldn't start".into()) };
     a.set_memory(kept);
@@ -838,6 +864,9 @@ fn ask_inner(app: &mut WordApp, prompt: &str, role: Option<Role>, at_end: bool) 
     a.set_knowledge(carried);
     a.choose(saved.model, saved.effort);
     a.ask_with_policy(prompt, Some(context), selection, policy).map_err(|e| e.to_string())?;
+    if review {
+        a.review_turn();
+    }
     a.gave(sent);
     let (name, role, tracked) = (a.name().to_string(), a.role(), a.tracked());
     app.assist.feedback.clear();
@@ -891,7 +920,10 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
     };
     let assistant = Assistant::start(&room, backend, options).map_err(|e| e.to_string())?;
     let case = cases::bound_for(app);
-    app.assist.conversation = Some(Conversation { assistant, document: app.session.document_id(), case });
+    app.assist.conversation = Some(Conversation { assistant, document: app.session.document_id(), case, log: None });
+    cases::record::opened(app);
+    // The last conversation's lesson cards: their ids start again here.
+    app.assist.cases.lesson_cards.clear();
     // Its requests are numbered from 1: the pane opens for each of them.
     app.assist.opened_for = None;
     // It may be about another document, whose turn shouldn't quote this one's text.
@@ -904,9 +936,9 @@ fn start(app: &mut WordApp, role: Option<Role>) -> Result<(), String> {
 
 /// The conversation's changes as the person's Accept or Reject `id` starts: what
 /// [`review_ended`] compares.
-pub(crate) fn review_started(app: &WordApp, id: &str) -> Option<Vec<AuthoredChange>> {
+pub(crate) fn review_started(app: &WordApp, id: &str) -> Option<cases::record::Reviewing> {
     decision(id)?;
-    changes_of(&app.session, app.conversation()?.name())
+    cases::record::reviewing(app)
 }
 
 /// Accept or Reject `id` is about to run, whoever asked. What it does to the text isn't an edit of
@@ -922,14 +954,18 @@ pub(crate) fn before_command(app: &mut WordApp, id: &str) {
 /// now are what the next turn hears about (#86). Only [`WordApp::execute_user`] calls this, for
 /// the person's own commands: another participant's decisions arrive through the room, a script's
 /// through [`WordApp::execute`], and a macro's step has an id of its own.
-pub(crate) fn review_ended(app: &mut WordApp, id: &str, before: Vec<AuthoredChange>) {
+pub(crate) fn review_ended(app: &mut WordApp, id: &str, before: cases::record::Reviewing) {
     let (Some(decision), Some(name)) = (decision(id), app.conversation().map(|a| a.name().to_string())) else { return };
-    let Some(after) = changes_of(&app.session, &name) else { return };
-    let gone = resolved(before, after);
-    for change in &gone {
-        app.assist.feedback.record(decision, change.kind, &change.text);
+    // The conversation's own list unknown, before or after, is no feedback, not feedback on
+    // nothing; the record of anyone else's decision doesn't wait on it.
+    if let (Some(mine), Some(after)) = (before.mine, changes_of(&app.session, &name)) {
+        let gone = resolved(mine, after);
+        for change in &gone {
+            app.assist.feedback.record(decision, change.kind, &change.text);
+        }
+        memory::decided(app, decision, &gone);
     }
-    memory::decided(app, decision, &gone);
+    cases::record::decided(app, decision, before.anyone);
 }
 
 /// The changes of `before` that `after` doesn't have, unless one of `after`'s is new: a change with
@@ -1089,6 +1125,7 @@ pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
         Entry::CaseCard { card, .. } => {
             let texts: Vec<String> = match card {
                 wordcraft_assist::cases::Card::Facts(_) => vec![],
+                wordcraft_assist::cases::Card::Lesson(l) => vec![l.text.for_person().to_string()],
                 wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Note(d)) => {
                     d.body.texts().chain(d.how.iter()).map(|q| q.for_person().to_string()).collect()
                 }
@@ -1098,6 +1135,10 @@ pub(crate) fn entry_texts(e: &wordcraft_assist::Entry) -> Vec<String> {
                 wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Balance(b)) => {
                     b.factors.iter().filter_map(|f| f.why.as_ref()).map(|q| q.for_person().to_string()).collect()
                 }
+                wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Correct { text, why, .. }) => {
+                    vec![text.for_person().to_string(), why.for_person().to_string()]
+                }
+                wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Retire { why, .. }) => vec![why.for_person().to_string()],
                 wordcraft_assist::cases::Card::Write(wordcraft_assist::cases::ModelWrite::Used(_)) => vec![],
             };
             texts

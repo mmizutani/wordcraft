@@ -11,6 +11,9 @@ use crate::room::Role;
 pub struct Prefs {
     /// Word Count includes text boxes, footnotes and endnotes (Word's default).
     pub count_notes: bool,
+    /// On-screen paper for pages without a document background; excluded from saved documents.
+    #[serde(deserialize_with = "lenient_paper_color")]
+    pub paper_color: crate::cmd::view::PaperColor,
     /// Track Changes Options: what markup shows and how revisions are drawn (per user, as in
     /// Word).
     pub markup: wordcraft_layout::display::MarkupOptions,
@@ -188,6 +191,7 @@ fn lenient_assistant_role<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Role
 impl Default for Prefs {
     fn default() -> Self {
         Prefs {
+            paper_color: Default::default(),
             count_notes: true,
             markup: Default::default(),
             print_markup: false,
@@ -247,6 +251,11 @@ fn lenient_agent_folders<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<c
         _ => Vec::new(),
     };
     Ok(crate::agent_files::cleaned(folders))
+}
+
+fn lenient_paper_color<'de, D: serde::Deserializer<'de>>(d: D) -> Result<crate::cmd::view::PaperColor, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 /// Ignore an invalid saved Page Color without discarding other preferences.

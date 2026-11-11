@@ -17,8 +17,11 @@
 //! written it) and a request addressed to another document; and they take no key and go on no
 //! ribbon or Quick Access Toolbar ([`wordcraft_engine::cmd::assist::person_only`]). The address the browser opens may hold the
 //! last sign-in's id token as a hint, so it reaches neither a command's answer nor the log (the
-//! desktop app's logger keeps the browser opener's command lines out), and the tokens stay in the
-//! settings folder: nothing here holds one.
+//! desktop app's logger keeps the browser opener's command lines out), and the tokens stay with
+//! the assistant library (sealed in the settings folder with a key in the system's keychain, or
+//! in memory for the session): nothing here holds one. Who is signed in is read without waiting
+//! for the keychain; while the library asks it on a thread of its own, the window reads again
+//! every few frames.
 
 use serde_json::{Value, json};
 use wordcraft_engine::cmd::assist::ChatGptStatus;
@@ -85,6 +88,9 @@ pub(crate) struct ChatGptState {
     /// When it was read (`clock::now_ms`); `None` before the first time.
     #[cfg(not(target_arch = "wasm32"))]
     read_at: Option<f64>,
+    /// The keychain was still being asked at the last read: it is read again every few frames.
+    #[cfg(not(target_arch = "wasm32"))]
+    opening: bool,
     /// The last sign-in ended with the person not allowing plan usage: the next one asks again.
     #[cfg(not(target_arch = "wasm32"))]
     declined: bool,
@@ -112,6 +118,8 @@ impl Default for ChatGptState {
             account: None,
             #[cfg(not(target_arch = "wasm32"))]
             read_at: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            opening: false,
             #[cfg(not(target_arch = "wasm32"))]
             declined: false,
             notice: None,
@@ -320,8 +328,9 @@ pub(crate) fn tick(app: &mut WordApp) -> bool {
             // What the file says now: deleted, or kept when it couldn't be.
             s.read_at = None;
         }
-        let stale = s.read_at.is_none_or(|at| now - at > READ_EVERY * 1000.0);
+        let stale = s.opening || s.read_at.is_none_or(|at| now - at > READ_EVERY * 1000.0);
         if stale && s.sign_out.is_none() {
+            // Never waits for the keychain: while it is asked, nobody reads as signed in.
             let read = settings.as_deref().and_then(wordcraft_assist::chatgpt::account);
             if read != s.account {
                 changed |= s.read_at.is_some();
@@ -331,9 +340,11 @@ pub(crate) fn tick(app: &mut WordApp) -> bool {
             }
             s.account = read;
             s.read_at = Some(now);
+            s.opening = settings.as_deref().is_some_and(wordcraft_assist::chatgpt::opening);
         }
-        // Frames keep coming while the browser has the sign-in, so its end shows at once.
-        if (s.sign_in.is_some() || s.cancelled.is_some() || s.sign_out.is_some())
+        // Frames keep coming while the browser has the sign-in, or the keychain is asked, so its
+        // end shows at once.
+        if (s.sign_in.is_some() || s.cancelled.is_some() || s.sign_out.is_some() || s.opening)
             && let Some(ctx) = &app.ctx
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(LOOK_EVERY_MS));
@@ -416,6 +427,25 @@ pub(crate) fn controls(app: &mut WordApp, ui: &mut egui::Ui, compact: bool) {
     }
 }
 
+/// Where the sign-in is kept, once someone is signed in: the computer's keychain, or this
+/// session only (the person signs in again next time). The Account page shows it under who is
+/// signed in, and the Assistant pane under its picker while ChatGPT is chosen.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn kept(app: &WordApp, ui: &mut egui::Ui, t: &crate::theme::Tokens) {
+    use wordcraft_assist::chatgpt::Kept;
+    let Some(account) = account(app) else { return };
+    let (text, color) = match account.kept {
+        Kept::Keychain => (tl!("Your ChatGPT sign-in is kept in this computer's keychain."), t.text_dim),
+        Kept::Session => (
+            tl!(
+                "Your ChatGPT sign-in is kept for this session only: there's no keychain on this computer WordCraft can use, so you'll sign in again the next time you open WordCraft."
+            ),
+            t.orange,
+        ),
+    };
+    ui.add(egui::Label::new(egui::RichText::new(text).small().color(color)).wrap());
+}
+
 /// Who is signed in, whether they let WordCraft use their plan, and Sign Out.
 fn signed_in(app: &mut WordApp, ui: &mut egui::Ui, t: &crate::theme::Tokens, compact: bool) {
     use egui::RichText;
@@ -430,6 +460,7 @@ fn signed_in(app: &mut WordApp, ui: &mut egui::Ui, t: &crate::theme::Tokens, com
         };
         if !compact {
             ui.add(egui::Label::new(RichText::new(who).font(crate::theme::semibold(13.0))).wrap());
+            kept(app, ui, t);
         }
         if account.plan_usage {
             if !compact {
