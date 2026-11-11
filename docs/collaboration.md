@@ -413,9 +413,10 @@ Everyone sees where everyone else is. Presence sends no document text, only plac
 ## Known limits today
 
 - **One process.** The room lives in the app or a headless `wordcraft-cli`; there is no network
-  hub, durable log or offline editing yet (A3). Remote invites (#74) set the rules for agents on
-  other machines, but the way in for them, MCP over HTTP (#75) through an outbound relay (#76),
-  isn't built: until then only a developer's SSH tunnel reaches the room's port.
+  hub, durable log or offline editing yet (A3). Agents on other machines join with remote invites
+  (#74) over MCP over HTTP (#75), through an outbound relay the desktop dials out to (#76,
+  [relay.md](relay.md)), so no tunnel is needed. The relay is a way in, not a hub: the room still
+  lives in the person's app.
 - **Tracked edits at the same moment take turns.** Any two changes that both change the
   document's tracked-change list (`Document.revisions`) clash, so two participants' tracked
   edits made at the same moment go one after the other: the second is made again after the
@@ -441,7 +442,7 @@ agents. Issues: #28 (parent) and one sub-issue per milestone.
 | **A0 Foundations** (done) | Block ids (#2), changes that apply to any copy (#3), command scopes (#4), the hub spike (#5, kept open as a reference, never merged), this design doc (#40) | A second copy follows a person's edits exactly |
 | **A1 Shared instance** (#29, done) | In one process: in-app hub, agents' copies on their own threads, keys and roles, undo per participant (#7, #9, #12, #13, #14, #45, #64), File › Share (#33 in #70), presence (#32 in #71 and #72), and the gate test (#34 in #77) | Two agents and a person edit at once, with no stalls |
 | **A2 Agent API** (#35) | On one machine: content-addressed reads, guarded edits, rewrites as word-level tracked changes, room chat, leases (Review › Block Authors), people first (an agent's direct edit to a paragraph a person just typed in is refused as busy), MCP Events push and poll | Scenario steps 1 to 4 pass with scripted agents |
-| **A3 Network rooms** (#36) | Agents in remote sandboxes join the person's desktop room (design #73): remote-safe invites (done, #74), MCP over Streamable HTTP (#75), an outbound relay so no tunnel is needed (#76). Then the hub over TLS with keys, durable write-ahead log, snapshots that keep source XML, app and browser copies, offline editing in Merge and Suggest modes, version history, agent drafts (fork and merge), signed webhooks | With the hub killed or a laptop offline for an hour, nothing is lost |
+| **A3 Network rooms** (#36) | Agents in remote sandboxes join the person's desktop room (design #73): remote-safe invites (done, #74), MCP over Streamable HTTP (done, #75), an outbound relay so no tunnel is needed (done, #76). Then the hub over TLS with keys, durable write-ahead log, snapshots that keep source XML, app and browser copies, offline editing in Merge and Suggest modes, version history, agent drafts (fork and merge), signed webhooks | With the hub killed or a laptop offline for an hour, nothing is lost |
 | **A4 Hardening** (#37) | Seeded simulation over a lossy network, protocol fuzzing, text-level undo, 10 people on 188 pages | Simulation clean, latency targets met |
 | **A5 Interop** (#38) | Block ids saved as Word's paragraph ids (`w14:paraId`, done in #69); edits made in Word merged back through Compare as tracked changes, and names and dates through Word | The scenario's output round-trips through Word |
 | **A6 Peer-to-peer** (#39), only if needed | Copies merge each other's logs with no hub | Two laptops edit offline and converge |
