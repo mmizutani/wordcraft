@@ -72,6 +72,22 @@ fn execute(copy: &mut Replica, command: &str, params: Value) -> Result<Value, St
     call(copy, "engine.execute", json!({"command": command, "params": params}))
 }
 
+/// [`execute`] as a participant carries on while others' changes keep sending its edits back: a
+/// command that ran is done, and its edits go first with the next request; one held up by edits
+/// from before is asked for again. Every send the hub refuses clashes with a change it accepted
+/// since the last one, and the others make only so many, so far fewer tries than this are needed.
+fn execute_through_clashes(copy: &mut Replica, command: &str, params: Value) -> Result<(), String> {
+    let ran_but = format!("{command} ran, but the shared document hasn't taken");
+    for _ in 0..1000 {
+        match execute(copy, command, params.clone()) {
+            Err(why) if why.starts_with("the shared document still hasn't taken") => {}
+            Err(why) if !why.starts_with(&ran_but) => return Err(why),
+            _ => return Ok(()),
+        }
+    }
+    Err(format!("{command} never got past the edits held up before it"))
+}
+
 /// The bold characters of the first paragraph.
 fn bold(doc: &Document) -> String {
     let Some(p) = doc.body.first().and_then(|b| b.as_para()) else { return String::new() };
@@ -641,7 +657,7 @@ fn hosted_copies_on_threads_and_the_window_typing_at_once_end_up_the_same() {
     let keys: Vec<String> =
         (0..AGENTS).map(|i| room.invite(&format!("agent {i}"), if i == 0 { Role::Editor } else { Role::Suggester }).unwrap()).collect();
     let start = Arc::new(Barrier::new(AGENTS + 1));
-    let docs: Vec<Result<Document, String>> = std::thread::scope(|scope| {
+    let copies: Vec<Result<Replica, String>> = std::thread::scope(|scope| {
         let agents: Vec<_> = keys
             .iter()
             .enumerate()
@@ -653,13 +669,12 @@ fn hosted_copies_on_threads_and_the_window_typing_at_once_end_up_the_same() {
                     let place = if i == 0 { "caret.docStart" } else { "caret.docEnd" };
                     execute(&mut copy, place, json!({}))?;
                     for n in 0..25 {
-                        execute(&mut copy, "text.insert", json!({"text": format!("{i}{}", n % 10)}))?;
+                        execute_through_clashes(&mut copy, "text.insert", json!({"text": format!("{i}{}", n % 10)}))?;
                         if n % 8 == 5 {
-                            execute(&mut copy, "text.newParagraph", json!({}))?;
+                            execute_through_clashes(&mut copy, "text.newParagraph", json!({}))?;
                         }
                     }
-                    copy.receive();
-                    Ok(copy.session().doc.clone())
+                    Ok(copy)
                 })
             })
             .collect();
@@ -676,21 +691,19 @@ fn hosted_copies_on_threads_and_the_window_typing_at_once_end_up_the_same() {
         }
         agents.into_iter().map(|t| t.join().unwrap_or_else(|_| Err("an agent panicked".into()))).collect()
     });
-    settle_all(&mut own, &mut win, &mut []);
+    let mut copies: Vec<Replica> = copies.into_iter().map(Result::unwrap).collect();
+    settle_all(&mut own, &mut win, &mut copies);
     window_is_hub(&win, &room);
     assert_eq!((own.stats().lost, own.stats().read_again), (0, 0));
-    let typed: String = (0..40).map(|n| char::from(b'0' + (n % 10) as u8)).collect();
-    assert!(win.doc.plain_text(StoryRef::Body).contains(&format!("two{typed}")), "the person's keys stay in order");
-    for (i, doc) in docs.into_iter().enumerate() {
-        let doc = doc.unwrap();
-        assert!(doc.plain_text(StoryRef::Body).contains(&format!("{i}9")), "agent {i}'s copy has its own edits");
+    for (i, copy) in copies.iter().enumerate() {
+        assert_eq!(copy.stats().lost, 0, "agent {i} gave up edits");
+        assert!(copy.session().doc == win.doc, "agent {i}'s copy holds other content: {}", difference(&copy.session().doc, &win.doc));
     }
+    let typed: String = (0..40).map(|n| char::from(b'0' + (n % 10) as u8)).collect();
+    let agent = |i: usize| -> String { (0..25).map(|n| format!("{i}{}{}", n % 10, if n % 8 == 5 { "\n" } else { "" })).collect() };
     let mut accepted = Session::new(win.doc.clone());
     run_in(&mut accepted, "review.acceptAll");
-    let all = accepted.doc.plain_text(StoryRef::Body);
-    for i in 0..AGENTS {
-        assert_eq!(all.matches(&format!("{i}9")).count(), 2, "agent {i}'s edits all went in: {all}");
-    }
+    assert_eq!(accepted.doc.plain_text(StoryRef::Body), format!("{}one two{typed} three{}", agent(0), agent(1)));
 }
 
 #[test]
