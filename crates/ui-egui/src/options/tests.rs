@@ -609,3 +609,30 @@ fn agents_pane_chooses_the_files_agents_can_use() {
     assert!(h.state().session.prefs.agent_folders.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn screen_paper_color_options_round_trip_and_work_without_a_document() {
+    use wordcraft_engine::cmd::view::PaperColor;
+    let mut a = app();
+    a.start_screen();
+    a.run("view.paperColor", json!({"value":"green"})).unwrap();
+    let saved = serde_json::to_vec(&a.prefs()).unwrap();
+    let mut b = app();
+    b.apply_prefs(UiState::from_json(&saved).unwrap());
+    assert_eq!(b.session.prefs.paper_color, PaperColor::Green);
+    b.run("file.options", json!({"pane":"general"})).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        b,
+    );
+    h.run_steps(6);
+    h.get_by_label("Screen paper color:").click();
+    h.run_steps(2);
+    h.get_by_label("Warm cream").click();
+    h.run_steps(3);
+    assert_eq!(h.state().session.prefs.paper_color, PaperColor::Cream);
+}

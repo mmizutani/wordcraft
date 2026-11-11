@@ -603,6 +603,9 @@ impl ChangeSet {
             glossary,
             media_index: _,
             kept: _,
+            // What a reader dropped when the file was opened (strict export reports it): no
+            // command changes it, so no change carries it.
+            missing_pictures: _,
         } = after;
         let f = &mut self.fields;
         if *last_section != before.last_section {
