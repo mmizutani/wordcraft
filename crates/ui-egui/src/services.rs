@@ -4,6 +4,8 @@ use super::{FileDialogAnswer, FileDialogRequest, WordApp, async_saves, paste_pic
 /// Platform services injected by the host (file dialogs, file I/O).
 #[derive(Default)]
 pub struct Services {
+    /// Hosted editor: private DOCX library and explicit cloud saves.
+    pub cloud: Option<crate::cloud::CloudService>,
     /// Desktop: discover configured printers on a worker.
     pub printers: Option<printing::Discover>,
     /// Desktop: submit the PDF with the chosen settings on a worker.

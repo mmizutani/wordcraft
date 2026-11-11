@@ -1321,8 +1321,10 @@ fn password_dialog(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
         // `execute`, not `run`: Save Changes was asked when the open began. The command that
         // asked runs again, so a protected template still starts a new document (#3433).
         match app.execute(then, p) {
-            Ok(_) => {
-                app.ui.backstage = false;
+            Ok(result) => {
+                if result.get("pending").is_none() {
+                    app.ui.backstage = false;
+                }
                 return true;
             }
             Err(e) if wordcraft_engine::io::wrong_password(&e) => {

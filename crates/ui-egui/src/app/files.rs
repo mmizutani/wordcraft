@@ -15,7 +15,10 @@ impl WordApp {
         }
         // Don't Save is the user's say-so to discard the changes, which Close otherwise refuses.
         let mut params = params;
-        if choice == SaveChoice::DontSave && then == "file.close" {
+        if choice == SaveChoice::Cancel && matches!(then.as_str(), "ui.cloudOpen" | "ui.cloudApply") {
+            self.cancel_cloud_navigation();
+        }
+        if choice == SaveChoice::DontSave && matches!(then.as_str(), "file.close" | "ui.cloudOpen" | "ui.cloudApply") {
             match params.as_object_mut() {
                 Some(p) => {
                     p.insert("force".into(), json!(true));
@@ -26,6 +29,7 @@ impl WordApp {
         let go = match choice {
             SaveChoice::Cancel => false,
             SaveChoice::DontSave => true,
+            SaveChoice::Save if self.cloud_saves_current() => return self.cloud_wait_for_save(then, params, document),
             // A new document or an import-only Word file: ask where through Save As. The command
             // runs once that has saved, on a later frame with the non-blocking dialog (#94).
             SaveChoice::Save if (self.session.path.is_none() || self.legacy_word_path()) && self.services.download.is_none() => {
@@ -91,7 +95,7 @@ impl WordApp {
     }
 
     /// The document's name as the Save Changes prompt shows it: its file's name, else its title.
-    pub(super) fn prompt_name(&self) -> String {
+    pub(crate) fn prompt_name(&self) -> String {
         self.session.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.title_stem())
     }
 

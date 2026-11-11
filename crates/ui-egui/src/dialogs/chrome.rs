@@ -243,6 +243,13 @@ pub fn show(app: &mut WordApp, ctx: &egui::Context) {
         }
     }
     if close {
+        if app.dialog.is_none()
+            && !app.awaiting_save.as_ref().is_some_and(|wait| wait.then == "ui.cloudApply")
+            && (matches!(&d, Dialog::SaveChanges { then, .. } if then == "ui.cloudApply")
+                || matches!(&d, Dialog::Password { params, .. } if params.get("cloud").and_then(serde_json::Value::as_bool) == Some(true)))
+        {
+            app.cloud.discard_unattended_open();
+        }
         forget_nudge(ctx, id);
         // Not from a browser it opened as it closed (Save As): that one keeps the keyboard.
         if !app.file_browser_open() {

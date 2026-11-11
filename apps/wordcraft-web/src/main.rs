@@ -21,6 +21,8 @@ mod prefs;
 mod save_fallback;
 
 #[cfg(any(target_arch = "wasm32", test))]
+mod cloud;
+#[cfg(any(target_arch = "wasm32", test))]
 mod system_fonts;
 
 #[cfg(target_arch = "wasm32")]

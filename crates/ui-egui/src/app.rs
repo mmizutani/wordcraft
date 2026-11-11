@@ -103,6 +103,7 @@ impl WordApp {
                 ..UiState::default()
             },
             services,
+            cloud: Default::default(),
             printing: Default::default(),
             print_feedback_seen: None,
             integrated_titlebar: false,
@@ -264,6 +265,10 @@ impl WordApp {
         }
         options::sync(self);
         self.settle_async_saves();
+        self.settle_cloud();
+        if self.cloud.request_pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         // Chinese text wants the Chinese face before the Japanese one (one glyph style per line).
         // An installed CJK font is read only once CJK text is shown (#241): a CJK interface, the
         // language names in Options, or a file name the caption is drawing. A file opened later

@@ -34,6 +34,9 @@ mod tests {
     }
 }
 
+#[cfg(all(not(feature = "probe"), any(test, target_arch = "wasm32")))]
+mod cloud;
+
 #[cfg(all(feature = "probe", target_arch = "wasm32"))]
 mod probe;
 
@@ -46,6 +49,11 @@ async fn fetch(request: Request, env: Env, _context: Context) -> Result<Response
     #[cfg(feature = "probe")]
     if request.path() == "/__wordcraft_probe" {
         return probe::respond(&request, &env).await;
+    }
+
+    #[cfg(not(feature = "probe"))]
+    if cloud::handles(&request.path()) {
+        return cloud::respond(request, &env).await;
     }
 
     match env.service("ASSETS") {

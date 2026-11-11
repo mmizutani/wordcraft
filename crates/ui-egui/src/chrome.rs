@@ -401,12 +401,13 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
                 // No document open (#1129): the app's name alone.
                 "WordCraft".to_string()
             } else {
+                let cloud = app.cloud_saves_current();
                 format!(
                     "{} — {}",
                     crate::i18n::isolate(&app.title_stem()),
-                    if app.session.dirty {
+                    if app.session.dirty || (cloud && app.document_unsaved()) {
                         tl!("Edited")
-                    } else if app.session.path.is_some() {
+                    } else if app.session.path.is_some() || cloud {
                         tl!("Saved")
                     } else {
                         tl!("Not saved")

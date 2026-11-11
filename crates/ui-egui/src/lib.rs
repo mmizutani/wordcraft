@@ -31,6 +31,7 @@ pub mod backstage;
 pub mod canvas;
 pub mod caret_glide;
 pub mod chrome;
+pub mod cloud;
 pub mod colors;
 pub mod content_controls;
 pub mod control;
@@ -623,6 +624,7 @@ pub struct WordApp {
     pub session: Session,
     pub ui: UiState,
     pub services: Services,
+    pub(crate) cloud: cloud::State,
     pub printing: printing::State,
     print_feedback_seen: Option<printing::Feedback>,
     pub canvas: canvas::CanvasState,

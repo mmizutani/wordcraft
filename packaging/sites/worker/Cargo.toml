@@ -9,10 +9,12 @@ publish = false
 crate-type = ["cdylib"]
 
 [features]
-probe = ["worker/d1"]
+probe = []
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-worker = "0.8.7"
+worker = { version = "0.8.7", features = ["d1"] }
+serde = { version = "1", features = ["derive"] }
+futures-util = "0.3"
 
 [workspace]
 
