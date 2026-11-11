@@ -8,6 +8,7 @@
 //! the person kept on a card crosses clients, as text and coarse facts only ([`lessons`]).
 
 pub mod lessons;
+pub mod lineage;
 pub mod log;
 pub mod marker;
 pub mod recall;
@@ -16,8 +17,11 @@ pub mod store;
 pub mod text;
 
 pub use lessons::{KeptLesson, LessonDraft, LessonId, LessonOp, LessonProposal, Lessons, names_in};
-pub use log::{CaseLog, CommentLine, LogHit, LogSearch, Record, RedlineLine, ToolLine, delete_log, log_size, search_log};
-pub use marker::{CASE_ASK, Card, CaseMarker, MODEL_WRITES, ModelWrites, Route};
+pub use lineage::{DraftPrint, MAX_DRAFTS, MAX_HASHES};
+pub use log::{
+    CaseLog, CommentLine, LogHit, LogSearch, REVIEW_RECORD_BYTES, Record, RedlineLine, ToolLine, delete_log, log_size, recent_records, search_log,
+};
+pub use marker::{CASE_ASK, Card, CaseMarker, MODEL_WRITES, ModelWrites, REVIEW_ASK, Route};
 pub use recall::{Alone, BalanceGap, ItemId, MAX_RUNGS, Others, Place, RecallAsk, RecallSent, RecalledItem, Rung};
 pub use record::{
     Applied, Applies, Balance, BalanceDraft, Body, Case, CaseError, Click, ContractKind, CounterpartyKind, Day, Factor, FactorKind, Facts, Kind,

@@ -5,7 +5,9 @@
 //!
 //! The second half is how a turn gets what ranks highest ([`RecallAsk`]). It reads the bound case
 //! and the other cases of its wall ([`Pool`]), one client's folder and nothing else, ranks, and
-//! composes what fits as one JSON string the turn carries as data ([`Recalled::into_sources`]).
+//! composes what fits as one JSON string the turn carries as data ([`Recalled::into_sources`]),
+//! after the bound case itself as it stands: its closed facts, the balance now and the plan
+//! ([`case_item`]), which every turn of the conversation carries.
 //! It runs only with proof that no one but the person and this conversation's assistant reads the
 //! document ([`Alone`]), and never on the instruction channel: nothing here can make a
 //! [`crate::memory::Instructions`].
@@ -18,7 +20,8 @@ use serde_json::{Value, json};
 use wordcraft_engine::room::{ParticipantId, Room};
 
 use super::lessons::{KeptLesson, LessonId};
-use super::record::{Applies, Body, Case, CaseError, Day, Kind, Note, Quoted, Side, Stance, Standing, Topic, Topics};
+use super::log::REVIEW_RECORD_BYTES;
+use super::record::{Applies, Body, Case, CaseError, Day, Factor, Kind, Note, Quoted, Side, Stage, Stance, Standing, Topic, Topics};
 use super::store::{CaseId, CaseRef, Shelf};
 use super::text::{Bm25, Token, tokens, topics_in};
 use crate::backend::{cut, label, shown};
@@ -267,8 +270,14 @@ pub fn rank_by_text<'a>(q: &Query, pool: &[Candidate<'a>]) -> Vec<Ranked<'a>> {
     ranked_by(pool, |c, words| words.score(&q.tokens, &c.tokens()))
 }
 
-/// Most bytes of recalled items one turn carries, as the JSON the model reads.
+/// Most bytes of recalled items one turn carries, as the JSON the model reads, the bound case's
+/// own summary ([`case_item`]) included.
 pub const BUDGET: usize = 6 << 10;
+/// Most bytes of [`BUDGET`] the bound case's summary takes with its plan's steps. It reserves
+/// nothing: the steps take only what the ladders, lessons and notes left ([`compose`]), so this
+/// caps them on a turn that recalls little. Its goal, balance and facts go even past it. A guess,
+/// and the knob.
+pub const CASE_SHARE: usize = BUDGET / 2;
 /// Most items one turn carries.
 pub const MAX_ITEMS: usize = 12;
 /// Most notes one other case contributes to a turn.
@@ -348,6 +357,9 @@ pub struct RecallAsk {
     /// Windows of recalled text the conversation's transcript can still take
     /// ([`crate::Transcript::recall_room`]): a recall with more is withheld.
     room: usize,
+    /// A review's turn ([`super::marker::REVIEW_ASK`]): the whole case and its recent record go
+    /// as the one item, nothing is ranked, and nothing is held back as sent before.
+    review: bool,
 }
 
 impl std::fmt::Debug for RecallAsk {
@@ -366,7 +378,21 @@ impl RecallAsk {
             alone,
             after_reading: None,
             room: crate::transcript::MAX_WINDOWS,
+            review: false,
         }
+    }
+
+    /// What **Review this case** carries: the case's notes with their ids, standing, how and
+    /// dates, its facts, balance and plan, and the most recent [`REVIEW_RECORD_BYTES`] of its
+    /// record, as one data-grade source. The same proof as a recall, since the same text leaves
+    /// the case; nothing of the client's other cases or the lessons goes.
+    pub fn review(shelf: Shelf, at: CaseRef, today: Day, alone: Alone) -> RecallAsk {
+        RecallAsk { review: true, ..RecallAsk::new(shelf, at, "", today, alone) }
+    }
+
+    /// Whether this is a review's ask: one that is no use without its case.
+    pub(crate) fn is_review(&self) -> bool {
+        self.review
     }
 
     /// With `room` windows left in the conversation's transcript, set as the turn is sent.
@@ -392,20 +418,31 @@ impl RecallAsk {
         if let Err(o) = self.alone.recheck() {
             return others(o);
         }
-        let pool = match Pool::load(&self.shelf, &self.at) {
-            Ok(pool) => pool,
-            Err(e) => return Recalled::nothing(format!("the case couldn't be read: {e}")),
+        let mut recalled = if self.review {
+            match compose_review(&self.shelf, &self.at) {
+                Ok(recalled) => recalled,
+                Err(e) => return Recalled::nothing(format!("the case couldn't be read: {e}")),
+            }
+        } else {
+            let pool = match Pool::load(&self.shelf, &self.at) {
+                Ok(pool) => pool,
+                Err(e) => return Recalled::nothing(format!("the case couldn't be read: {e}")),
+            };
+            let query = Query::new(&self.about, pool.here.applies(self.today), self.today);
+            let mut recalled = compose(&pool, &query);
+            recalled.sent.problem = pool.problem();
+            recalled
         };
-        let query = Query::new(&self.about, pool.here.applies(self.today), self.today);
-        let mut recalled = compose(&pool, &query);
-        recalled.sent.problem = pool.problem();
         if let Some(f) = self.after_reading {
             f();
         }
         if let Err(o) = self.alone.recheck() {
             return others(o);
         }
-        told.filter(&mut recalled, retains);
+        // A review is asked for whole each time: what a session had of it before doesn't count.
+        if !self.review {
+            told.filter(&mut recalled, retains);
+        }
         // Fail closed: text that can't be checked for quotes afterwards isn't sent. Nothing in
         // the set leaves to make room, since a retaining session still holds what it was sent.
         if crate::transcript::recall_windows(recalled.sent().sent_text.iter().map(String::as_str)) > self.room {
@@ -485,20 +522,37 @@ impl Neighbor {
 
 /// What a recalled item is called in `[[used: …]]` and in Details: `n12` for this case's note,
 /// `<case>:n12` for another case's, `<case>:balance` for its balance, `l3` for a lesson,
-/// `ladder:liability` for a topic's ladder. Disjoint from a preference's `m1`.
+/// `ladder:liability` for a topic's ladder, and `case` for the bound case's own summary.
+/// Disjoint from a preference's `m1`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "where")]
 pub enum ItemId {
-    Here { note: super::record::NoteId },
-    Neighbor { case: CaseId, note: super::record::NoteId },
-    NeighborBalance { case: CaseId },
-    Lesson { lesson: LessonId },
-    Ladder { topic: Topic },
+    Here {
+        note: super::record::NoteId,
+    },
+    Neighbor {
+        case: CaseId,
+        note: super::record::NoteId,
+    },
+    NeighborBalance {
+        case: CaseId,
+    },
+    Lesson {
+        lesson: LessonId,
+    },
+    Ladder {
+        topic: Topic,
+    },
+    Case,
+    /// The whole case and its recent record, as a review's turn carries them.
+    Review,
 }
 
 impl std::fmt::Display for ItemId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ItemId::Case => write!(f, "case"),
+            ItemId::Review => write!(f, "review"),
             ItemId::Here { note } => write!(f, "{note}"),
             ItemId::Neighbor { case, note } => write!(f, "{}:{note}", case.as_str()),
             ItemId::NeighborBalance { case } => write!(f, "{}:balance", case.as_str()),
@@ -586,13 +640,16 @@ pub struct BalanceGap {
 
 impl BalanceGap {
     pub fn words(&self) -> String {
-        let word = |s: Option<Stance>| match s {
-            Some(Stance::Stronger) => "stronger",
-            Some(Stance::Even) => "even",
-            Some(Stance::Weaker) => "weaker",
-            None => "unknown",
-        };
-        format!("then {}, now {}", word(self.then), word(self.now))
+        format!("then {}, now {}", stance_word(self.then), stance_word(self.now))
+    }
+}
+
+fn stance_word(s: Option<Stance>) -> &'static str {
+    match s {
+        Some(Stance::Stronger) => "stronger",
+        Some(Stance::Even) => "even",
+        Some(Stance::Weaker) => "weaker",
+        None => "unknown",
     }
 }
 
@@ -687,10 +744,16 @@ impl Recalled {
         Recalled { sent: RecallSent { problem: Some(problem), ..RecallSent::default() }, json: Vec::new() }
     }
 
+    /// Why nothing was recalled, when nothing was. A review can't go without its case, so the
+    /// conversation's thread asks this before it sends one.
+    pub(crate) fn none_because(&self) -> Option<String> {
+        self.sent.items.is_empty().then(|| self.sent.problem.clone().unwrap_or_else(|| "nothing of the case could be read".into()))
+    }
+
     pub(crate) fn sent(&self) -> RecallSent {
         let mut sent_text = Vec::new();
         for json in self.fresh() {
-            strings(json, 0, &mut sent_text);
+            strings(json, &mut sent_text);
         }
         RecallSent { sent_text, ..self.sent.clone() }
     }
@@ -705,19 +768,64 @@ impl Recalled {
         self.sent.items.iter().filter(|i| !i.again).map(RecalledItem::told_key).collect()
     }
 
-    /// The items not sent to this session before, as one data-grade source; none when there are
-    /// none.
+    /// The bound case's summary as a source of its own, framed as the case it is, then the items
+    /// not sent to this session before as one more; each only when there is one. Both data-grade.
     pub(crate) fn into_sources(self) -> Vec<TurnSource> {
-        let fresh: Vec<&Value> = self.fresh().collect();
-        if fresh.is_empty() {
-            return Vec::new();
+        let mut case = None;
+        let mut items = Vec::new();
+        for (json, item) in self.json.into_iter().zip(&self.sent.items).filter(|(_, item)| !item.again) {
+            if item.id == ItemId::Case {
+                case = Some(json);
+            } else {
+                items.push(json);
+            }
         }
-        vec![TurnSource {
-            name: "recalled".into(),
-            text: Value::Array(fresh.into_iter().cloned().collect()).to_string(),
-            origin: SourceOrigin::Recalled,
-        }]
+        let mut out = Vec::new();
+        if let Some(case) = case {
+            out.push(TurnSource { name: "case".into(), text: case.to_string(), origin: SourceOrigin::Case });
+        }
+        if !items.is_empty() {
+            out.push(TurnSource { name: "recalled".into(), text: Value::Array(items).to_string(), origin: SourceOrigin::Recalled });
+        }
+        out
     }
+}
+
+/// What a review's turn carries ([`RecallAsk::review`]): the case as its file holds it, less its
+/// dismissed hashes, and the most recent record lines up to [`REVIEW_RECORD_BYTES`], as one item.
+/// A damaged case reviews nothing, since what it holds may be cut; a case with no record reviews
+/// its notes alone.
+pub(crate) fn compose_review(shelf: &Shelf, at: &CaseRef) -> Result<Recalled, CaseError> {
+    let case = shelf.open(at)?;
+    if case.damaged {
+        return Ok(Recalled::nothing("this case's file is damaged, so it can't be reviewed".into()));
+    }
+    let (record, skipped, cut) = super::log::recent_records(shelf, at, REVIEW_RECORD_BYTES)?;
+    let json = json!({
+        "title": case.title.for_person(),
+        "facts": case.facts,
+        "balance": case.balance,
+        "plan": case.plan,
+        "notes": case.notes,
+        "record": record,
+        "recordLinesUnreadable": skipped,
+        "recordOlderLinesLeftOut": cut,
+    });
+    let text = format!("{} notes, the balance and plan, and {} record lines", case.notes.len(), record.len());
+    let problem = (skipped > 0).then(|| format!("{skipped} lines of the record couldn't be read"));
+    let bytes = u32::try_from(json.to_string().len()).unwrap_or(u32::MAX);
+    let item = RecalledItem {
+        id: ItemId::Review,
+        place: Place::ThisCase,
+        title: None,
+        kind: None,
+        text,
+        balance: None,
+        confirmed: true,
+        again: false,
+        rungs: Vec::new(),
+    };
+    Ok(Recalled { sent: RecallSent { items: vec![item], left_out: 0, bytes, problem, sent_text: Vec::new() }, json: vec![json] })
 }
 
 /// For the evaluation harness (`examples/case_eval.rs`): what a turn bound to `at` would carry
@@ -731,14 +839,19 @@ pub fn compose_for_eval_without_room_check(shelf: &Shelf, at: &CaseRef, about: &
     Ok((recalled.sent(), recalled.into_sources()))
 }
 
-/// Every string in `json`, as [`note_item`], [`balance_item`] and [`ladder_item`] build it: a
-/// ladder's rungs are the deepest, three levels down.
-fn strings(json: &Value, depth: u8, out: &mut Vec<String>) {
-    match json {
-        Value::String(s) => out.push(s.clone()),
-        Value::Array(items) if depth < 4 => items.iter().for_each(|v| strings(v, depth.saturating_add(1), out)),
-        Value::Object(fields) if depth < 4 => fields.values().for_each(|v| strings(v, depth.saturating_add(1), out)),
-        _ => {}
+/// Every string in `json`, however deep, in order: a text the index misses is a quote the window
+/// can't flag. A stack and no depth limit, since a review item wraps a record line, which may nest
+/// as deep as `serde_json` reads, in more levels of its own; the work is bounded by the item's
+/// size, which is capped.
+fn strings(json: &Value, out: &mut Vec<String>) {
+    let mut stack = vec![json];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => stack.extend(items.iter().rev()),
+            Value::Object(fields) => stack.extend(fields.values().rev()),
+            _ => {}
+        }
     }
 }
 
@@ -761,7 +874,8 @@ impl Told {
         if self.generation != Some(generation) {
             return;
         }
-        for item in &mut recalled.sent.items {
+        // The case's summary goes every turn: it says how the case stands now, which changes.
+        for item in recalled.sent.items.iter_mut().filter(|item| item.id != ItemId::Case) {
             item.again = self.keys.contains(&item.told_key());
         }
     }
@@ -778,15 +892,23 @@ impl Told {
     }
 }
 
-/// Greedy by score inside [`BUDGET`], at most [`MAX_PER_NEIGHBOR`] notes from one other case and
-/// [`MAX_ITEMS`] in all, nothing below [`MIN_SCORE`]. An other case's newest confirmed balance
-/// rides with its first note that made the cut, so the model sees why that case stood where it did.
+/// The bound case's summary first ([`case_item`]), then greedy by score inside what is left of
+/// [`BUDGET`], at most [`MAX_PER_NEIGHBOR`] notes from one other case and [`MAX_ITEMS`] in all,
+/// nothing below [`MIN_SCORE`]. An other case's newest confirmed balance rides with its first note
+/// that made the cut, so the model sees why that case stood where it did.
 ///
 /// A topic of the query with at least [`LADDER_FROM`] `Position` notes in the pool goes as one
 /// [`ladder`] item in their place: it takes the rank of its best rung, counts as one item and its
 /// JSON against the budget, and its rungs count toward no neighbor's cap and bring no balance
 /// item, since each rung carries its own balance. The notes it replaces are neither sent nor
 /// counted as left out; rungs past [`MAX_RUNGS`] are.
+///
+/// The summary is budgeted in two parts, though it goes first and whole. Its facts, stage, balance
+/// and plan's goal are reserved before anything ranks: every item is weighed against them, and the
+/// record's limits keep them small. Its plan's steps come last, in the room the ladders, lessons and
+/// notes left, while the summary stays within [`CASE_SHARE`]: they aren't ranked for the question
+/// and a plan can hold far more than the budget, so a step never pushes out a ranked item, and the
+/// summary's own row says how many steps didn't fit. The summary counts toward no item cap.
 fn compose(pool: &Pool, query: &Query) -> Recalled {
     let positions = |topic: Topic| {
         let on = |n: &Note| n.body.topic() == Some(topic);
@@ -802,7 +924,17 @@ fn compose(pool: &Pool, query: &Query) -> Recalled {
     let candidates: Vec<Candidate<'_>> = here.into_iter().chain(theirs).chain(lessons).collect();
     let now = pool.here.stance_now().map(|(stance, _)| stance);
     let mut out = Recalled { sent: RecallSent::default(), json: Vec::new() };
-    let mut bytes = 0usize;
+    // The summary without its plan's steps, reserved first; it joins the items once they are in.
+    let core = case_item(&pool.here, query.today, 0).map(|(_, json)| json.to_string().len().saturating_add(1));
+    let core = match core {
+        Some(size) if size <= BUDGET => Some(size),
+        Some(_) => {
+            out.sent.left_out = out.sent.left_out.saturating_add(1);
+            None
+        }
+        None => None,
+    };
+    let mut bytes = core.unwrap_or(0);
     let mut per_neighbor: HashMap<&CaseId, usize> = HashMap::new();
     let mut push = |out: &mut Recalled, item: RecalledItem, json: Value| -> bool {
         let size = json.to_string().len().saturating_add(1);
@@ -873,6 +1005,15 @@ fn compose(pool: &Pool, query: &Query) -> Recalled {
             }
         }
     }
+    // The plan's steps take what the ranked items left, and the summary goes first.
+    if let Some(core) = core {
+        let room = CASE_SHARE.min(BUDGET.saturating_sub(bytes).saturating_add(core));
+        if let Some((item, json)) = case_item(&pool.here, query.today, room) {
+            bytes = bytes.saturating_sub(core).saturating_add(json.to_string().len().saturating_add(1));
+            out.sent.items.insert(0, item);
+            out.json.insert(0, json);
+        }
+    }
     out.sent.bytes = u32::try_from(bytes).unwrap_or(u32::MAX);
     out
 }
@@ -894,6 +1035,93 @@ fn place_line(title: Option<&String>) -> String {
         None => "this case".to_string(),
         Some(title) => format!("the same client's case {}", serde_json::to_string(title).unwrap_or_default()),
     }
+}
+
+/// The bound case as it stands `today`, which every turn of its conversation carries: its closed
+/// facts and stage, the balance now with its factors, and the plan. Never a name: the title and
+/// the parties stay out, as [`facts_json`] leaves them out of every item. The plan is the person's
+/// text, or a model's marked unconfirmed, sent as written: its goal whole, and its steps in order
+/// while the summary takes at most `room` bytes of the budget, its JSON and one more as an item
+/// counts. `None` when none of these is set and the case is still being negotiated.
+fn case_item(here: &Case, today: Day, room: usize) -> Option<(RecalledItem, Value)> {
+    let mut facts = serde_json::Map::new();
+    facts_json(&mut facts, &here.applies(today));
+    let balance = here.balance_now();
+    // The stage is set on its own, apart from the facts `applies` carries: a case closed with
+    // nothing else set still says so.
+    let closed = here.facts.stage != Stage::Negotiating;
+    if facts.is_empty() && balance.is_none() && here.plan.is_none() && !closed {
+        return None;
+    }
+    let confirmed = |s: Standing| matches!(s, Standing::Confirmed { .. });
+    let listed: Vec<&str> = facts.values().filter_map(Value::as_str).collect();
+    let mut words = vec![format!("facts: {}", if listed.is_empty() { "none set".to_string() } else { listed.join(", ") })];
+    let stage = serde_json::to_value(here.facts.stage).unwrap_or(Value::Null);
+    if closed {
+        words.push(format!("stage: {}", stage.as_str().unwrap_or_default()));
+    }
+    let mut json = serde_json::Map::new();
+    json.insert("id".into(), Value::String(ItemId::Case.to_string()));
+    json.insert("kind".into(), Value::String("case".into()));
+    json.append(&mut facts);
+    json.insert("stage".into(), stage);
+    let mut all_confirmed = true;
+    if let Some(b) = balance {
+        all_confirmed &= confirmed(b.standing);
+        words.push(format!("balance now {}", stance_word(Some(b.stance))));
+        let balance = json!({"stance": b.stance, "on": String::from(b.on), "factors": factors_json(&b.factors), "confirmed": confirmed(b.standing)});
+        json.insert("balance".into(), balance);
+    }
+    if let Some(plan) = &here.plan {
+        all_confirmed &= confirmed(plan.standing);
+        let plan_json = |next: &[&Quoted]| {
+            let next: Vec<&str> = next.iter().map(|q| q.for_person()).collect();
+            json!({"goal": plan.goal.for_person(), "next": next, "confirmed": confirmed(plan.standing)})
+        };
+        let fits = |next: &[&Quoted]| {
+            let mut whole = json.clone();
+            whole.insert("plan".into(), plan_json(next));
+            Value::Object(whole).to_string().len().saturating_add(1) <= room
+        };
+        let mut next: Vec<&Quoted> = Vec::new();
+        for step in &plan.next {
+            next.push(step);
+            if !fits(&next) {
+                next.pop();
+                break;
+            }
+        }
+        words.push(format!("plan: {}", plan.goal.for_person()));
+        let left_out = plan.next.len().saturating_sub(next.len());
+        if left_out > 0 {
+            words.push(format!("{left_out} of its next steps didn't fit"));
+        }
+        json.insert("plan".into(), plan_json(&next));
+    }
+    let item = RecalledItem {
+        id: ItemId::Case,
+        place: Place::ThisCase,
+        title: None,
+        kind: None,
+        text: words.join("; "),
+        balance: None,
+        confirmed: all_confirmed,
+        again: false,
+        rungs: Vec::new(),
+    };
+    Some((item, Value::Object(json)))
+}
+
+/// A balance's factors as the model reads them.
+fn factors_json(factors: &[Factor]) -> Value {
+    let factors = factors.iter().map(|f| {
+        let mut j = json!({"kind": f.kind, "favors": f.favors});
+        if let Some(why) = &f.why {
+            j["why"] = Value::String(why.for_person().to_string());
+        }
+        j
+    });
+    Value::Array(factors.collect())
 }
 
 /// The facts a model may see with an item: the closed fields of the case's facts, never a name.
@@ -1040,24 +1268,14 @@ fn balance_item(nb: &Neighbor, balance: &super::record::Balance, now: Option<Sta
     let id = ItemId::NeighborBalance { case: nb.id.clone() };
     let (place, title, place_words) = place_words(Some(nb));
     let gap = BalanceGap { then: Some(balance.stance), now };
-    let factors: Vec<Value> = balance
-        .factors
-        .iter()
-        .map(|f| {
-            let mut j = json!({"kind": f.kind, "favors": f.favors});
-            if let Some(why) = &f.why {
-                j["why"] = Value::String(why.for_person().to_string());
-            }
-            j
-        })
-        .collect();
+    let factors = factors_json(&balance.factors);
     let text = format!("that case's balance on {}: {}", String::from(balance.on), gap.words());
     let mut json = serde_json::Map::new();
     json.insert("id".into(), Value::String(id.to_string()));
     json.insert("place".into(), Value::String(place_words));
     json.insert("kind".into(), Value::String("balance".into()));
     json.insert("stance".into(), serde_json::to_value(balance.stance).unwrap_or(Value::Null));
-    json.insert("factors".into(), Value::Array(factors));
+    json.insert("factors".into(), factors);
     json.insert("on".into(), Value::String(String::from(balance.on)));
     facts_json(&mut json, &nb.case.applies(balance.on));
     json.insert("balance".into(), Value::String(gap.words()));
@@ -1093,8 +1311,133 @@ mod tests {
         case
     }
 
+    /// [`case`] with nothing set but its notes, so as the bound case it sends no summary.
+    fn bare(title: &str, notes: usize) -> Case {
+        let mut case = case(title, notes, Standing::Confirmed { on: day("2026-01-01") });
+        case.balance.clear();
+        case
+    }
+
     fn id(n: u8) -> CaseId {
         CaseId::parse(&format!("{n:016x}")).unwrap()
+    }
+
+    /// Every string in `json`, however deep.
+    fn all_strings(json: &Value, out: &mut Vec<String>) {
+        match json {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => items.iter().for_each(|v| all_strings(v, out)),
+            Value::Object(fields) => fields.values().for_each(|v| all_strings(v, out)),
+            _ => {}
+        }
+    }
+
+    /// A review's item carries the whole case and its record, so every text in it is what a
+    /// pasted quote is checked against: nothing nests too deep for the quote index, and a case with
+    /// no record reviews its notes alone. The record is read newest first up to its cap.
+    #[test]
+    fn a_review_item_puts_every_string_it_carries_in_the_quote_index_and_works_without_a_record() {
+        use crate::cases::log::{CaseLog, Record};
+        use crate::cases::record::{Click, NoteDraft, PersonOp};
+        let dir = std::env::temp_dir().join(format!("wordcraft-review-item-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Kestrel Freight KK", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Kestrel supply agreement", "2026-11-10", 2).unwrap();
+        let draft = NoteDraft {
+            body: Body::Position {
+                topic: Topic::Liability,
+                moved: Side::Them,
+                terms: Quoted::parse("Cap at twelve months of fees."),
+                traded_for: Some(Quoted::parse("notice cut to sixty days")),
+                landed: true,
+            },
+            how: Some(Quoted::parse("Reported from the Tuesday call.")),
+            topics: Topics::default(),
+        };
+        shelf.person(click, &at, PersonOp::AddNote(draft), day("2026-11-10")).unwrap();
+        let without = compose_review(&shelf, &at).unwrap();
+        assert_eq!(without.sent.items.len(), 1);
+        assert!(without.sent.items[0].text.contains("0 record lines"), "{}", without.sent.items[0].text);
+        let mut log = CaseLog::open(&shelf, &at, "2026-11-10T10-00-00").unwrap();
+        for n in 1..=3u32 {
+            log.write(Record::Turn {
+                at: format!("2026-11-10T10:0{n}:00"),
+                n,
+                asked: Quoted::parse(&format!("Turn {n}: is the audit clause in the Bluefin draft usual?")),
+                answer: Some(Quoted::parse(&format!("Turn {n} answer: the audit right is wider than the market's."))),
+                tools: vec![crate::cases::log::ToolLine {
+                    title: Quoted::parse("read"),
+                    status: crate::ToolStatus::Completed,
+                    detail: Quoted::parse(&format!("clause 14 (turn {n})")),
+                }],
+                model: Some("scripted".into()),
+                stop: None,
+                recalled: vec!["n1".into()],
+                used: Vec::new(),
+            });
+        }
+        log.close();
+        let recalled = compose_review(&shelf, &at).unwrap();
+        let sent = recalled.sent();
+        let mut every = Vec::new();
+        all_strings(&recalled.json[0], &mut every);
+        assert!(every.iter().any(|s| s == "clause 14 (turn 3)"), "the tool detail is three levels down a record line: {every:?}");
+        assert!(every.iter().any(|s| s == "Reported from the Tuesday call."));
+        for s in &every {
+            assert!(sent.sent_text.contains(s), "{s:?} isn't in the quote index: {:?}", sent.sent_text);
+        }
+        assert_eq!(sent.items[0].id, ItemId::Review);
+        assert!(sent.items[0].text.contains("1 notes") && sent.items[0].text.contains("3 record lines"), "{}", sent.items[0].text);
+        // The cap keeps the newest lines.
+        let (newest, skipped, cut) = crate::cases::log::recent_records(&shelf, &at, 400).unwrap();
+        assert_eq!((newest.len(), skipped, cut), (1, 0, true));
+        assert!(matches!(&newest[0], Record::Turn { n: 3, .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A redline's position is a JSON value a file can nest as deep as the parser reads a line,
+    /// and the review item wraps the line in more levels: its strings are in the quote index
+    /// however deep they land.
+    #[test]
+    fn a_string_nested_as_deep_as_a_record_line_parses_is_in_the_quote_index() {
+        use crate::cases::log::{CaseLog, Record, RedlineLine};
+        use crate::cases::record::Click;
+        let dir = std::env::temp_dir().join(format!("wordcraft-review-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Kestrel Freight KK", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Kestrel supply agreement", "2026-11-10", 2).unwrap();
+        // The line nests the record, its changes and a change, so 124 arrays more is the 127
+        // levels `serde_json` reads.
+        let mut position = json!(["Kestrel deep canary"]);
+        for _ in 1..124 {
+            position = json!([position]);
+        }
+        let mut log = CaseLog::open(&shelf, &at, "2026-11-10T10-00-00").unwrap();
+        log.write(Record::Redlines {
+            at: "2026-11-10T10:00:00".into(),
+            draft: Quoted::parse("Kestrel supply agreement"),
+            changes: vec![RedlineLine {
+                kind: "insert".into(),
+                author: Quoted::parse("Bluefin Systems Ltd"),
+                date: "2026-11-10".into(),
+                text: Quoted::parse("audit on ten days' notice"),
+                at: Some(position),
+            }],
+            comments: Vec::new(),
+            more: 0,
+        });
+        log.close();
+        let recalled = compose_review(&shelf, &at).unwrap();
+        assert!(recalled.json[0].to_string().contains("Kestrel deep canary"), "the line didn't parse, so the fixture proves nothing");
+        let sent = recalled.sent();
+        assert!(sent.sent_text.iter().any(|s| s == "Kestrel deep canary"), "sent to the model but not in the quote index: {:?}", sent.sent_text);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// What the loader reads from the lessons file on disk: the lessons that are on, and none at
@@ -1157,11 +1500,12 @@ mod tests {
         let pool = Pool { here, neighbors: Vec::new(), damaged: false, skipped: 0, lessons: kept.on().cloned().collect(), lessons_damaged: false };
         let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
         let out = compose(&pool, &query);
-        assert_eq!(out.sent.items.len(), 1, "{:?}", out.sent.items);
-        let item = &out.sent.items[0];
+        assert_eq!(out.sent.items.len(), 2, "{:?}", out.sent.items);
+        assert_eq!(out.sent.items[0].id, ItemId::Case, "the bound case's balance goes first as its summary");
+        let item = &out.sent.items[1];
         assert_eq!((item.id.to_string(), item.place), ("l1".to_string(), Place::Lesson));
         assert_eq!(item.balance, Some(BalanceGap { then: Some(Stance::Stronger), now: Some(Stance::Weaker) }));
-        let json = out.json[0].to_string();
+        let json = out.json[1].to_string();
         assert!(
             json.contains(r#""place":"a lesson the person kept""#) && json.contains(r#""contract":"saas""#) && json.contains(r#""year":2025"#),
             "{json}"
@@ -1169,7 +1513,7 @@ mod tests {
         assert!(!json.contains("from") && !json.contains(&id(7).as_str().to_string()) && !json.contains("size"), "{json}");
         assert!(pool.problem().is_none());
         let damaged = Pool { lessons: Vec::new(), lessons_damaged: true, ..pool };
-        assert!(compose(&damaged, &query).sent.items.is_empty());
+        assert!(compose(&damaged, &query).sent.items.iter().all(|i| i.id == ItemId::Case), "no lesson");
         assert_eq!(damaged.problem().as_deref(), Some("the lessons file is damaged, so no lesson was recalled"));
     }
 
@@ -1275,6 +1619,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A review without its case to check is no review: when the case can't be sent (someone
+    /// else can read the document by the time the turn runs, or the case file is damaged), no
+    /// request is made and the turn says why, rather than reviewing from what the model holds.
+    #[test]
+    fn a_review_whose_case_cant_be_sent_makes_no_request() {
+        use crate::cases::record::{Click, NoteDraft, PersonOp};
+        use crate::{Fake, Options};
+        use wordcraft_engine::room::{Role, Room};
+        let dir = std::env::temp_dir().join(format!("wordcraft-review-withheld-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shelf = Shelf::at(&dir);
+        let click = Click::by_person(true).unwrap();
+        let wall = shelf.new_wall(click, "Kestrel Freight", "2026-11-10", 1).unwrap();
+        let at = shelf.new_case(click, &wall, "Kestrel MSA", "2026-11-10", 2).unwrap();
+        let draft = NoteDraft {
+            body: Body::Pattern { rule: Quoted::parse("Cap liability at twelve months."), traps: None },
+            how: None,
+            topics: Topics::default(),
+        };
+        shelf.person(click, &at, PersonOp::AddNote(draft), day("2026-11-10")).unwrap();
+        let review = |shelf: Shelf, damage: bool| {
+            let mut session = wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("one"));
+            let (room, own) = Room::host(&mut session, "Minoru").unwrap();
+            let fake = Fake::new();
+            let seen = fake.seen();
+            let mut a = crate::Assistant::start(&room, Box::new(fake), Options::default()).unwrap();
+            let alone = Alone::check(&room, own.id(), a.name()).unwrap();
+            a.set_recall(Some(RecallAsk::review(shelf, at.clone(), day("2026-11-10"), alone)));
+            if !damage {
+                let _key = room.invite("Bob", Role::Viewer).unwrap();
+            }
+            a.ask("Review this case.", None).unwrap();
+            assert!(a.wait_idle(std::time::Duration::from_secs(30)));
+            let turns = seen.lock().unwrap().turns.len();
+            let error = a.transcript().entries().find_map(|e| if let crate::Entry::Error { message } = e { Some(message.clone()) } else { None });
+            (turns, error)
+        };
+        let (turns, error) = review(shelf.clone(), false);
+        assert_eq!(turns, 0, "no request is made for a review that can't see its case");
+        assert!(error.as_deref().is_some_and(|e| e.contains("Bob can read this document")), "{error:?}");
+        let file = dir.join("assistant-cases").join(at.wall.as_str()).join(at.case.as_str()).join("case.json");
+        std::fs::write(&file, "{ not a case").unwrap();
+        let (turns, error) = review(shelf, true);
+        assert_eq!(turns, 0);
+        assert!(error.as_deref().is_some_and(|e| e.contains("damaged")), "{error:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Someone joins while the recall reads its files: the proof is checked again after reading,
     /// so nothing of what was read reaches the turn.
     #[test]
@@ -1319,9 +1712,7 @@ mod tests {
     /// isn't a quote of this turn; what is sent is indexed.
     #[test]
     fn only_the_items_sent_are_indexed_for_the_quote_check() {
-        let confirmed = Standing::Confirmed { on: day("2026-01-01") };
-        let pool =
-            Pool { here: case("here", 1, confirmed), neighbors: Vec::new(), damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false };
+        let pool = Pool { here: bare("here", 1), neighbors: Vec::new(), damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false };
         let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
         let rule = "Liability cap pattern 0 for the renewal.";
         let mut told = Told::default();
@@ -1487,7 +1878,7 @@ mod tests {
         let out = compose(&pool, &liability_query(&pool));
         let mut ids: Vec<String> = out.sent.items.iter().map(|i| i.id.to_string()).collect();
         ids.sort();
-        assert_eq!(ids, ["ladder:liability", "n2"], "{:?}", out.sent.items);
+        assert_eq!(ids, ["case", "ladder:liability", "n2"], "{:?}", out.sent.items);
         let at = out.sent.items.iter().position(|i| i.id == ItemId::Ladder { topic: Topic::Liability }).unwrap();
         let item = &out.sent.items[at];
         assert_eq!(item.rungs.len(), 3);
@@ -1506,7 +1897,7 @@ mod tests {
         let out = compose(&fewer, &liability_query(&fewer));
         let mut ids: Vec<String> = out.sent.items.iter().map(|i| i.id.to_string()).collect();
         ids.sort();
-        assert_eq!(ids, ["n1", "n2"], "{:?}", out.sent.items);
+        assert_eq!(ids, ["case", "n1", "n2"], "{:?}", out.sent.items);
         assert_eq!(out.sent.left_out, 1, "the rung won while stronger scores under MIN_SCORE on its own; a ladder would have carried it");
     }
 
@@ -1655,11 +2046,189 @@ mod tests {
         assert!(!ladder.again, "a rung confirmed since is new to the model: {ladder:?}");
     }
 
+    /// A case with every part of its summary set, a party's name in its facts and its title, and
+    /// `notes` notes about the liability cap.
+    fn summarized(notes: usize, plan: crate::cases::Plan) -> Case {
+        use crate::cases::record::{ContractKind, Facts, OurSide, PersonOp};
+        let mut here = case("Acme MSA", notes, Standing::Confirmed { on: day("2026-01-01") });
+        here.balance.clear();
+        let facts = Facts {
+            kind: Some(ContractKind::Saas),
+            side: Some(OurSide::Customer),
+            law: Some(crate::cases::Law::try_from("JP".to_string()).unwrap()),
+            parties: vec![Quoted::parse("Acme KK")],
+            ..Facts::default()
+        };
+        here.apply_person(PersonOp::Facts(facts), day("2026-11-01")).unwrap();
+        let factors =
+            vec![crate::cases::Factor { kind: crate::cases::FactorKind::SoleSource, favors: Side::Them, why: Some(Quoted::parse("one vendor")) }];
+        here.apply_person(PersonOp::Balance(crate::cases::BalanceDraft { stance: Stance::Weaker, factors }), day("2026-11-01")).unwrap();
+        here.apply_person(PersonOp::Plan(Some(plan)), day("2026-11-01")).unwrap();
+        here
+    }
+
+    fn plan(goal: &str, next: &[&str]) -> crate::cases::Plan {
+        crate::cases::Plan { goal: Quoted::parse(goal), next: next.iter().map(|s| Quoted::parse(s)).collect(), standing: Standing::Unconfirmed }
+    }
+
+    fn summary_of(sources: &[TurnSource]) -> Value {
+        let case = sources.iter().find(|s| s.origin == SourceOrigin::Case).expect("a case source");
+        serde_json::from_str(&case.text).unwrap()
+    }
+
+    #[test]
+    fn the_bound_case_goes_first_as_its_own_source_with_its_facts_balance_and_plan_and_no_name() {
+        let here = summarized(3, plan("Cap liability at twelve months of fees", &["Send the redline", "Call on Friday"]));
+        let pool = Pool { here, neighbors: Vec::new(), damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false };
+        let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
+        let recalled = compose(&pool, &query);
+        assert_eq!(recalled.sent.items[0].id, ItemId::Case);
+        assert_eq!(recalled.sent.items.len(), 4, "the summary and the three notes");
+        assert!(recalled.sent.bytes as usize <= BUDGET, "the summary counts against the budget: {}", recalled.sent.bytes);
+        let row = &recalled.sent.items[0];
+        assert!(row.text.contains("saas") && row.text.contains("balance now weaker") && row.text.contains("plan: Cap liability"), "{}", row.text);
+        assert!(row.confirmed, "the person's own plan and balance");
+        let sources = recalled.into_sources();
+        assert_eq!(sources.iter().map(|s| s.origin).collect::<Vec<_>>(), [SourceOrigin::Case, SourceOrigin::Recalled]);
+        let summary = summary_of(&sources);
+        assert_eq!(summary["contract"], "saas");
+        assert_eq!(summary["side"], "customer");
+        assert_eq!(summary["law"], "JP");
+        assert_eq!(summary["stage"], "negotiating");
+        assert_eq!(summary["balance"]["stance"], "weaker");
+        assert_eq!(summary["balance"]["factors"][0]["why"], "one vendor");
+        assert_eq!(summary["balance"]["confirmed"], true);
+        assert_eq!(summary["plan"]["goal"], "Cap liability at twelve months of fees");
+        assert_eq!(summary["plan"]["next"], json!(["Send the redline", "Call on Friday"]));
+        assert_eq!(summary["plan"]["confirmed"], true);
+        let everything: String = sources.iter().map(TurnSource::as_text).collect();
+        assert!(!everything.contains("Acme"), "no party's name and no title: {everything}");
+
+        let mut pool = pool;
+        if let Some(p) = pool.here.plan.as_mut() {
+            p.standing = Standing::Unconfirmed;
+        }
+        let recalled = compose(&pool, &query);
+        assert!(!recalled.sent.items[0].confirmed, "a model's plan is unconfirmed, and the row says so");
+        assert_eq!(summary_of(&recalled.into_sources())["plan"]["confirmed"], false);
+    }
+
+    #[test]
+    fn a_case_with_nothing_set_sends_no_summary() {
+        let pool = Pool { here: bare("Acme MSA", 1), neighbors: Vec::new(), damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false };
+        let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
+        let sources = compose(&pool, &query).into_sources();
+        assert_eq!(sources.iter().map(|s| s.origin).collect::<Vec<_>>(), [SourceOrigin::Recalled]);
+    }
+
+    /// A case closed as Signed or Abandoned with nothing else set still says so: its stage is set
+    /// on the case page apart from the facts recall weighs.
+    #[test]
+    fn a_case_with_only_its_stage_set_sends_its_stage() {
+        for stage in [Stage::Signed, Stage::Abandoned] {
+            let mut here = bare("Acme MSA", 1);
+            here.facts.stage = stage;
+            let pool = Pool { here, neighbors: Vec::new(), damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false };
+            let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
+            let recalled = compose(&pool, &query);
+            let word = serde_json::to_value(stage).unwrap();
+            assert_eq!(recalled.sent.items[0].id, ItemId::Case, "{stage:?}");
+            assert!(recalled.sent.items[0].text.contains(&format!("stage: {}", word.as_str().unwrap())), "{}", recalled.sent.items[0].text);
+            assert_eq!(summary_of(&recalled.into_sources())["stage"], word);
+        }
+    }
+
+    /// The plan goes as the person wrote it: no step is cut short, and with room left over in the
+    /// budget the steps past the summary's share are left out whole and counted.
+    #[test]
+    fn a_long_plan_goes_as_written_step_by_step_within_its_share_of_the_budget() {
+        let long = |n: usize| format!("{n:02}{}", "責".repeat(crate::cases::record::MAX_TEXT - 2));
+        let steps: Vec<String> = (0..crate::cases::record::MAX_LIST).map(long).collect();
+        let next: Vec<&str> = steps.iter().map(String::as_str).collect();
+        let here = summarized(3, plan(&"目".repeat(crate::cases::record::MAX_TEXT), &next));
+        let pool = Pool { here, neighbors: Vec::new(), damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false };
+        let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
+        let recalled = compose(&pool, &query);
+        assert!(recalled.sent.bytes as usize <= BUDGET, "{}", recalled.sent.bytes);
+        assert!(recalled.sent.items.len() > 1, "notes still fit beside it");
+        let row = recalled.sent.items[0].clone();
+        let summary = summary_of(&recalled.into_sources());
+        assert!(summary.to_string().len() < CASE_SHARE, "{}", summary.to_string().len());
+        assert_eq!(summary["plan"]["goal"], "目".repeat(crate::cases::record::MAX_TEXT), "the goal goes whole");
+        let sent: Vec<&str> = summary["plan"]["next"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+        assert!(!sent.is_empty() && sent.len() < steps.len(), "{} steps", sent.len());
+        assert_eq!(sent, next[..sent.len()], "each step as written, in order");
+        assert!(row.text.contains(&format!("{} of its next steps didn't fit", steps.len() - sent.len())), "{}", row.text);
+    }
+
+    /// The plan's steps take only what the ranked items left: a ladder and a lesson the question
+    /// ranks go whole beside the summary, nothing ranked is left out, and the steps that didn't
+    /// fit are left out whole and counted on the summary's row. Reserving the steps first, up to
+    /// the summary's share, would cut the ladder's last rungs or the lesson here. With a ladder and
+    /// a lesson beside it, the summary still carries no party's name and no title.
+    #[test]
+    fn a_long_plan_yields_to_the_ladder_and_lesson_the_question_ranks() {
+        use crate::cases::lessons::{LessonDraft, LessonOp, Lessons};
+        use crate::cases::record::{MAX_LIST, MAX_TEXT};
+        let steps: Vec<String> = (0..MAX_LIST).map(|n| format!("{n:02}{}", "責".repeat(MAX_TEXT - 2))).collect();
+        let next: Vec<&str> = steps.iter().map(String::as_str).collect();
+        let mut here = summarized(0, plan("Cap liability at twelve months of fees", &next));
+        for n in 1..=u8::try_from(MAX_RUNGS).unwrap() {
+            let terms = format!(
+                "Rung {n}: liability capped at {n} months of fees paid in the year before the claim, excluding data breaches, \
+                 wilful misconduct, confidentiality and both indemnities, with a floor of the first year's fees whatever the claim."
+            );
+            here.notes.push(position(n, "2026-03-01", &terms, TRADES[usize::from(n) % TRADES.len()], true, confirmed()));
+        }
+        let mut kept = Lessons::default();
+        let lesson = "Ask for the SLA credit before the liability cap.";
+        let draft = LessonDraft { text: Quoted::parse(lesson), applies: Applies::default(), topics: Topics::default(), from: None };
+        kept.apply(LessonOp::Keep(draft)).unwrap();
+        let lessons = kept.on().cloned().collect();
+        let pool = Pool { here, neighbors: Vec::new(), damaged: false, skipped: 0, lessons, lessons_damaged: false };
+        let recalled = compose(&pool, &liability_query(&pool));
+        let ids: Vec<String> = recalled.sent.items.iter().map(|i| i.id.to_string()).collect();
+        assert_eq!(ids[0], "case", "the summary first");
+        let mut ranked = ids[1..].to_vec();
+        ranked.sort();
+        assert_eq!(ranked, ["l1", "ladder:liability"]);
+        let ladder = recalled.sent.items.iter().find(|i| matches!(i.id, ItemId::Ladder { .. })).map_or(0, |l| l.rungs.len());
+        assert_eq!(ladder, MAX_RUNGS, "every rung goes");
+        assert_eq!(recalled.sent.left_out, 0, "nothing ranked was pushed out");
+        assert!(recalled.sent.bytes as usize <= BUDGET, "{}", recalled.sent.bytes);
+        let row = recalled.sent.items[0].text.clone();
+        let sources = recalled.into_sources();
+        let sent = summary_of(&sources)["plan"]["next"].as_array().map_or(0, Vec::len);
+        assert!((1..MAX_LIST).contains(&sent), "the steps fill what was left: {sent}");
+        assert!(row.contains(&format!("{} of its next steps didn't fit", MAX_LIST - sent)), "{row}");
+        let case = sources.iter().find(|s| s.origin == SourceOrigin::Case).map(TurnSource::as_text).unwrap_or_default();
+        assert!(!case.contains("Acme"), "no party's name and no title: {case}");
+        assert!(sources.iter().any(|s| s.as_text().contains("SLA credit")), "the lesson is sent");
+    }
+
+    #[test]
+    fn a_retaining_session_gets_the_case_summary_every_turn_and_each_note_once() {
+        let pool = Pool {
+            here: summarized(2, plan("Cap liability", &[])),
+            neighbors: Vec::new(),
+            damaged: false,
+            skipped: 0,
+            lessons: Vec::new(),
+            lessons_damaged: false,
+        };
+        let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
+        let mut told = Told::default();
+        let first = compose(&pool, &query);
+        told.record(first.fresh_ids(), Some(0));
+        let mut second = compose(&pool, &query);
+        told.filter(&mut second, Some(0));
+        let sources = second.into_sources();
+        assert_eq!(sources.iter().map(|s| s.origin).collect::<Vec<_>>(), [SourceOrigin::Case], "the notes were told, the case goes again");
+    }
+
     #[test]
     fn a_session_that_retains_is_told_each_item_once_and_a_new_session_again() {
-        let confirmed = Standing::Confirmed { on: day("2026-01-01") };
-        let pool =
-            Pool { here: case("here", 2, confirmed), neighbors: Vec::new(), damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false };
+        let pool = Pool { here: bare("here", 2), neighbors: Vec::new(), damaged: false, skipped: 0, lessons: Vec::new(), lessons_damaged: false };
         let query = Query::new("the liability cap", pool.here.applies(day("2026-11-10")), day("2026-11-10"));
         let mut told = Told::default();
         let mut first = compose(&pool, &query);

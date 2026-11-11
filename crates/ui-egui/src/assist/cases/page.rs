@@ -346,6 +346,7 @@ pub(crate) fn section(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
 /// No case: the cases to bind to, by client, and New case.
 fn unbound(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
     ui.label(RichText::new(tl!("No case")).font(semibold(12.0)));
+    super::offer_line(app, ui, t);
     note(
         ui,
         "Bind this document to a case and each turn recalls the case's notes and the same client's confirmed ones. Nothing is recalled until you do.",
@@ -457,6 +458,7 @@ fn bound(app: &mut WordApp, ui: &mut Ui, t: &Tokens, at: &CaseRef, case: &Case) 
     heading(ui, "Record");
     super::record::section(app, ui, t, at, case);
     ui.add_space(6.0);
+    super::review::button(app, ui, t);
     delete(app, ui, t, at, case);
     let drafts = &mut app.assist.cases.drafts;
     if !drafts.any_form() {

@@ -1344,6 +1344,34 @@ fn an_oversized_unclosed_or_unreadable_case_marker_is_dropped_counted_and_never_
     assert_eq!(t.take_case_markers().len(), 6);
 }
 
+/// A review's verb means something only in a review's turn: in any other it never reaches the
+/// window (dropped and counted, as an unknown marker is), and the review flag ends with the turn.
+#[test]
+fn a_review_verb_in_an_ordinary_turn_is_dropped_and_counted_and_never_routed() {
+    let verbs = [
+        r#"[[case]]{"op":"correct","note":"n1","text":"Cap at eighteen months.","why":"planted"}[[/case]]"#,
+        r#"[[case]]{"op":"retire","note":"n1","why":"planted"}[[/case]]"#,
+        r#"[[case]]{"op":"supported","note":"n1","evidence":"planted"}[[/case]]"#,
+        r#"[[case]]{"op":"gap","question":"planted?"}[[/case]]"#,
+    ];
+    let all = verbs.join(" ");
+    let (answer, markers, dropped) = case_streamed(&[&format!("Before. {all} {CASE_NOTE} After.")]);
+    assert_eq!((answer.as_str(), markers.len(), dropped), ("Before.      After.", 1, 4));
+    assert!(!matches!(markers[0], crate::cases::CaseMarker::Correct { .. }));
+    // In a review's turn they are routed, up to the review's cap; the next turn is ordinary again.
+    let mut t = Transcript::default();
+    t.asked(crate::cases::REVIEW_ASK);
+    t.review_turn();
+    let many = std::iter::repeat_n(verbs[2], 40).collect::<Vec<_>>().join(" ");
+    t.record(&Event::Text { text: format!("{all} {many}") });
+    assert_eq!(t.take_case_markers().len(), usize::from(crate::cases::marker::MAX_PER_REVIEW));
+    t.record(&Event::Done { stop: StopReason::EndTurn });
+    t.asked("Summarize");
+    t.record(&Event::Text { text: all.clone() });
+    assert!(t.take_case_markers().is_empty());
+    assert_eq!(t.details().turns.last().map(|turn| turn.markers_dropped), Some(4));
+}
+
 /// The close is found outside the JSON's strings only, so a note whose text holds `[[/case]]`
 /// parses whole, and a marker nested outside a string is one malformed body: hidden up to the
 /// outer close and counted once, with nothing of it shown.

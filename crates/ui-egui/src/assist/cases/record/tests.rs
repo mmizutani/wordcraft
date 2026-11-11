@@ -268,6 +268,62 @@ fn delete_the_record_removes_it_and_deleting_the_case_runs_off_the_frame() {
     assert_eq!(Shelf::at(&folder.0).list().walls[0].cases.len(), 1, "the other case stays");
 }
 
+/// The records once the writer holds a `Turn`, with no frame run meanwhile: what ending the
+/// conversation queued on its own, before a next frame that may find the conversation or its
+/// log gone (a new conversation replaces it, a case delete takes its log to a worker).
+fn turn_written_without_a_frame(folder: &Folder, at: &CaseRef) -> Vec<Record> {
+    let started = std::time::Instant::now();
+    loop {
+        let all = records(folder, at);
+        if all.iter().any(|r| matches!(r, Record::Turn { .. })) {
+            return all;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "the cut turn's line never came without a frame: {all:?}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A turn cut off by the person ending the conversation (here, unbinding the case) is still a
+/// line of the record, stopped as cancelled, with its question and what was answered so far,
+/// queued as the conversation ends and not left to a later frame.
+#[test]
+fn ending_the_conversation_mid_turn_records_the_turn_as_cancelled() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    record_on(&folder, &c.a);
+    let mut a = window(&folder);
+    a.bind_case(Some(c.a.clone()));
+    ask(&mut a, Fake::new().then(vec![Step::Say("Cap it at twelve months.".into()), Step::Hold]), "What about the fees clause?");
+    frames_until(&mut a, "the answer streamed", |a| a.conversation().unwrap().transcript().last_answer().is_some_and(|t| t.contains("twelve")));
+    a.bind_case(None);
+    assert!(a.assist.conversation.as_ref().unwrap().assistant.has_ended());
+    let all = turn_written_without_a_frame(&folder, &c.a);
+    let turns: Vec<&Record> = all.iter().filter(|r| matches!(r, Record::Turn { .. })).collect();
+    assert_eq!(turns.len(), 1, "{turns:?}");
+    let Record::Turn { asked, answer, stop, .. } = turns[0] else { panic!("{turns:?}") };
+    assert_eq!(asked.for_person(), "What about the fees clause?");
+    assert_eq!(*stop, Some(wordcraft_assist::StopReason::Cancelled));
+    assert!(answer.as_ref().is_some_and(|t| t.for_person().contains("twelve")), "{answer:?}");
+}
+
+/// The same cut, by rebinding the document to case B while A's conversation answers: the turn
+/// goes into A's record alone, since it was A's conversation.
+#[test]
+fn rebinding_mid_turn_records_the_cut_turn_in_the_first_cases_record_only() {
+    let folder = Folder::new();
+    let c = cases(&folder);
+    record_on(&folder, &c.a);
+    record_on(&folder, &c.b);
+    let mut a = window(&folder);
+    a.bind_case(Some(c.a.clone()));
+    ask(&mut a, Fake::new().then(vec![Step::Say("Cap it at twelve months.".into()), Step::Hold]), "What about the fees clause?");
+    frames_until(&mut a, "the answer streamed", |a| a.conversation().unwrap().transcript().last_answer().is_some_and(|t| t.contains("twelve")));
+    a.bind_case(Some(c.b.clone()));
+    let in_a = turn_written_without_a_frame(&folder, &c.a);
+    assert!(in_a.iter().any(|r| matches!(r, Record::Turn { stop: Some(wordcraft_assist::StopReason::Cancelled), .. })), "{in_a:?}");
+    assert!(!log_dir(&folder, &c.b).exists(), "B got A's cut turn");
+}
+
 /// The second turn of a conversation: the same `Fake`'s next script, the same conversation.
 fn ask_again(a: &mut WordApp, prompt: &str) {
     a.execute("assist.ask", json!({"prompt": prompt})).unwrap();

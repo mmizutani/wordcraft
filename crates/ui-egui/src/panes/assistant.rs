@@ -42,6 +42,7 @@ pub(super) fn assistant(app: &mut WordApp, ui: &mut Ui) {
     if crate::assist::desktop(app) || !app.assist.offers.is_empty() {
         who(app, ui, &t);
     }
+    crate::assist::cases::suggest::card(app, ui, &t);
     if app.has_document() && app.shared_room().is_some() && !app.shows_shared_document() {
         ui.label(
             RichText::new(tl!("Another document is shared. Switching ends its conversation and disconnects its participants."))
@@ -121,6 +122,12 @@ fn picker(app: &mut WordApp, ui: &mut Ui, t: &Tokens) {
         combo.response.labelled_by(label.id);
     });
     if let Some(o) = &current {
+        // Where ChatGPT's sign-in is kept, while someone is signed in: the keychain, or this
+        // session only.
+        #[cfg(not(target_arch = "wasm32"))]
+        if o.id == wordcraft_assist::chatgpt::ID {
+            crate::assist::chatgpt::kept(app, ui, t);
+        }
         let text = match &o.readiness {
             Readiness::Ready => return,
             // A backend's sign-in hint already says what to do ("Sign in with …"), with the
@@ -201,6 +208,7 @@ fn transcript(app: &mut WordApp, ui: &mut Ui, t: &Tokens, height: f32) {
     let area = egui::ScrollArea::vertical().id_salt("assistant_transcript").max_height(height).auto_shrink([false, false]).stick_to_bottom(true);
     area.show(ui, |ui| {
         ui.set_width(ui.available_width());
+        crate::assist::cases::offer_line(app, ui, t);
         if entries.is_empty() {
             ui.label(RichText::new(tl!("Ask the assistant to draft, rewrite or check your writing. It works in the document like a collaborator: with the Suggester role, every edit is a tracked change for you to accept or reject.")).color(t.text_dim));
         }

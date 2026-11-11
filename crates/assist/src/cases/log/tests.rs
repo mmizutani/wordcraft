@@ -4,7 +4,10 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 
-use super::{CaseLog, Decision, LogSearch, MAX_CASE_BYTES, MAX_FILE_BYTES, Record, delete_log, log_size, search_log};
+use super::{
+    CaseLog, Decision, LogSearch, MAX_CASE_BYTES, MAX_FILE_BYTES, MAX_READ_BYTES, REVIEW_RECORD_BYTES, Record, delete_log, log_size, recent_records,
+    search_log,
+};
 use crate::cases::record::{Click, Quoted};
 use crate::cases::store::{CaseRef, Shelf};
 
@@ -81,6 +84,8 @@ fn a_truncated_last_line_is_skipped_and_counted() {
     let found = search(&shelf, &at, "second");
     assert!(found.hits.is_empty());
     assert_eq!(found.skipped, 1, "a line that can't be read is counted on every search");
+    let (records, skipped, more) = recent_records(&shelf, &at, REVIEW_RECORD_BYTES).unwrap();
+    assert_eq!((records, skipped, more), (vec![decided("first")], 1, false), "a review reading back counts it too");
 }
 
 /// The writer stuck on the disk, the queue fills: every write still returns at once, and what
@@ -96,8 +101,9 @@ fn a_full_queue_never_blocks_and_becomes_a_dropped_record() {
     }
     // A write that waited for the writer would wait for the gate, which stays shut: forever.
     assert!(started.elapsed() < std::time::Duration::from_secs(5), "a write waited for the writer");
-    // The writer took one record off the queue before the gate, so two of the eight waited there.
-    assert!(log.dropped() >= 4, "{}", log.dropped());
+    // The writer takes one record before the gate whenever its thread runs, and the slot that
+    // frees may go to a `Dropped` line mid-way, so only some count is certain here.
+    assert!(log.dropped() >= 1, "{}", log.dropped());
     {
         let (open, wake) = &*gate;
         *open.lock().unwrap() = true;
@@ -135,25 +141,32 @@ fn a_dropped_log_still_counts_what_the_queue_had_no_room_for() {
     for n in 0..8 {
         log.write(decided(&format!("change {n}")));
     }
-    assert!(log.dropped() >= 4, "{}", log.dropped());
+    // As in the full-queue test, only some count is certain whenever the writer's thread runs.
+    assert!(log.dropped() >= 1, "{}", log.dropped());
     drop(log);
     {
         let (open, wake) = &*gate;
         *open.lock().unwrap() = true;
         wake.notify_all();
     }
+    // A `Dropped` line queued mid-way can end the file before the last one: wait for the count.
+    let accounted = |records: &[Record]| {
+        records
+            .iter()
+            .map(|r| if let Record::Dropped { n } = r { *n as usize } else { usize::from(matches!(r, Record::Decided { .. })) })
+            .sum::<usize>()
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let records = loop {
         let records: Vec<Record> = lines(&shelf, &at).iter().filter_map(|l| serde_json::from_str(l).ok()).collect();
-        if matches!(records.last(), Some(Record::Dropped { .. })) {
+        if accounted(&records) >= 8 {
             break records;
         }
-        assert!(std::time::Instant::now() < deadline, "the writer never wrote the count: {records:?}");
+        assert!(std::time::Instant::now() < deadline, "the writer never counted every record: {records:?}");
         std::thread::sleep(std::time::Duration::from_millis(5));
     };
-    let dropped: u32 = records.iter().filter_map(|r| if let Record::Dropped { n } = r { Some(*n) } else { None }).sum();
-    let kept = records.iter().filter(|r| matches!(r, Record::Decided { .. })).count();
-    assert_eq!(dropped as usize + kept, 8, "every record is written or counted: {records:?}");
+    assert_eq!(accounted(&records), 8, "every record is written or counted: {records:?}");
+    assert!(matches!(records.last(), Some(Record::Dropped { .. })), "the count ends the file: {records:?}");
 }
 
 /// A `Redlines` snapshot whose texts are each within their cap can still pass the reader's line
@@ -217,13 +230,15 @@ fn the_caps_hold_and_the_oldest_conversation_goes_first() {
     assert_eq!(records.iter().filter(|r| matches!(r, Record::Decided { .. })).count(), fits);
     assert!(records.iter().any(|r| matches!(r, Record::Dropped { n: 3 })), "{:?}", records.last());
 
-    // Older files, named to sort first, bring the case past its cap: opening a new conversation
+    // Older files (by modification time) bring the case past its cap: opening a new conversation
     // removes them oldest first until the new file has room.
     let dir = shelf.log_dir(&at);
     let filler = vec![b'{'; (MAX_FILE_BYTES / 2) as usize];
     let older = (MAX_CASE_BYTES / (MAX_FILE_BYTES / 2)) as usize;
     for n in 0..older {
-        std::fs::write(dir.join(format!("20261101T0000{n:02}-9.jsonl")), &filler).unwrap();
+        let path = dir.join(format!("20261101T0000{n:02}-9.jsonl"));
+        std::fs::write(&path, &filler).unwrap();
+        set_mtime(&path, (10_000 - n) as u64);
     }
     assert!(log_size(&shelf, &at) > MAX_CASE_BYTES);
     let log = CaseLog::open(&shelf, &at, "20261111T090000-2").unwrap();
@@ -232,6 +247,72 @@ fn the_caps_hold_and_the_oldest_conversation_goes_first() {
     assert!(left + MAX_FILE_BYTES <= MAX_CASE_BYTES, "{left}");
     assert!(dir.join("20261110T090000-1.jsonl").exists(), "the newest full file stays");
     assert!(!dir.join("20261101T000000-9.jsonl").exists(), "the oldest went first");
+}
+
+/// Set `path`'s modification time to `ago` seconds before now.
+fn set_mtime(path: &std::path::Path, ago: u64) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(ago)).unwrap();
+}
+
+/// Which conversation is older is its file's modification time, not its name: a name starts
+/// with the process id, so names order files by process before time across restarts. Retention
+/// removes the file written least recently, and a search reads the newest first.
+#[test]
+fn files_are_ordered_by_modification_time_not_name() {
+    let (shelf, at) = shelf_with_case("mtime-order");
+    let dir = shelf.log_dir(&at);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Each file is one record and then a line too long to read, so two of them pass the case cap.
+    let filler = vec![b'{'; 25 << 20];
+    for (name, text, ago) in [("a-newer.jsonl", "alpha", 10), ("z-older.jsonl", "zulu", 1000)] {
+        let mut bytes = serde_json::to_vec(&decided(text)).unwrap();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&filler);
+        std::fs::write(dir.join(name), bytes).unwrap();
+        set_mtime(&dir.join(name), ago);
+    }
+    let found = search(&shelf, &at, "");
+    let texts: Vec<&str> = found.hits.iter().map(|h| h.file.as_str()).collect();
+    assert_eq!(texts, ["a-newer.jsonl", "z-older.jsonl"], "the newest file's hit comes first");
+    assert!(log_size(&shelf, &at) + MAX_FILE_BYTES > MAX_CASE_BYTES, "the fixture is past the cap");
+    CaseLog::open(&shelf, &at, "20261111T090000-2").unwrap().close();
+    assert!(dir.join("a-newer.jsonl").exists(), "the file written last went");
+    assert!(!dir.join("z-older.jsonl").exists(), "the file written least recently stayed");
+}
+
+/// Past `MAX_FILES` conversations, the oldest files go when the next opens, and every file left
+/// is seen by the size line and the search: none vanishes from a listing.
+#[test]
+fn more_files_than_the_cap_lose_the_oldest_and_none_is_hidden() {
+    let (shelf, at) = shelf_with_case("file-count");
+    let dir = shelf.log_dir(&at);
+    std::fs::create_dir_all(&dir).unwrap();
+    let extra = super::MAX_FILES + 3;
+    let mut bytes = 0u64;
+    for n in 0..extra {
+        let path = dir.join(format!("c-{n:04}.jsonl"));
+        let mut line = serde_json::to_vec(&decided(&format!("file {n}"))).unwrap();
+        line.push(b'\n');
+        bytes += line.len() as u64;
+        std::fs::write(&path, line).unwrap();
+        set_mtime(&path, (extra - n) as u64 * 10);
+    }
+    assert_eq!(log_size(&shelf, &at), bytes, "every file counts before the cap holds");
+    let log = CaseLog::open(&shelf, &at, "20261111T090000-2").unwrap();
+    log.close();
+    let left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert!(left.len() <= super::MAX_FILES, "{} files are left", left.len());
+    assert_eq!(left.len(), super::MAX_FILES);
+    for n in 0..4 {
+        assert!(!left.contains(&format!("c-{n:04}.jsonl")), "c-{n:04} is the oldest and stayed");
+    }
+    assert!(left.contains(&format!("c-{:04}.jsonl", extra - 1)));
+    let on_disk: u64 = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum();
+    assert_eq!(log_size(&shelf, &at), on_disk, "the size line sees every file left");
+    let found = search_log(&shelf, &at, "file", usize::MAX).unwrap();
+    assert_eq!(found.hits.len(), super::MAX_FILES - 1, "the search sees every record left: {}", found.hits.len());
+    assert_eq!(found.skipped, 0);
 }
 
 #[test]
@@ -283,6 +364,66 @@ fn hostile_lines_are_skipped_and_counted() {
     assert_eq!(found.hits.len(), 1);
     assert_eq!(found.skipped, 4);
     assert_eq!(search_log(&shelf, &at, "kept", 0).unwrap().hits.len(), 0, "a limit of none");
+    let (records, skipped, _) = recent_records(&shelf, &at, REVIEW_RECORD_BYTES).unwrap();
+    assert_eq!((records, skipped), (vec![decided("kept")], 4), "a review reading back skips and counts the same lines");
+}
+
+fn line_of(record: &Record) -> Vec<u8> {
+    let mut line = serde_json::to_vec(record).unwrap();
+    line.push(b'\n');
+    line
+}
+
+/// A review reads a file back from its newest line and stops once its budget is spent, so a file
+/// of short records far past the budget is never read whole: a junk first line, which would be
+/// counted if it were reached, isn't, and what comes back is the newest records within the budget.
+#[test]
+fn a_review_reads_the_newest_lines_and_stops_at_its_budget() {
+    let (shelf, at) = shelf_with_case("review-budget");
+    let dir = shelf.log_dir(&at);
+    std::fs::create_dir_all(&dir).unwrap();
+    let short = line_of(&Record::Dropped { n: 1 });
+    let mut bytes = b"not json\n".to_vec();
+    bytes.extend(short.repeat(8 * REVIEW_RECORD_BYTES / short.len()));
+    bytes.extend(line_of(&decided("newest")));
+    std::fs::write(dir.join("c-0001.jsonl"), &bytes).unwrap();
+    let (records, skipped, more) = recent_records(&shelf, &at, REVIEW_RECORD_BYTES).unwrap();
+    assert_eq!(skipped, 0, "the read went past the budget to the file's first line");
+    assert!(more, "older records were left out");
+    assert_eq!(records.last(), Some(&decided("newest")), "the newest record comes last");
+    let carried: usize = records.iter().map(|r| line_of(r).len()).sum();
+    assert!(carried <= REVIEW_RECORD_BYTES, "{carried}");
+    assert!(carried + short.len() > REVIEW_RECORD_BYTES, "the budget wasn't filled: {carried}");
+}
+
+/// A file longer than the writer can make wasn't written by WordCraft: a read goes only as far as
+/// the writer could have written, and the rest is one skipped line. A search keeps at most its
+/// limit of hits.
+#[test]
+fn a_file_past_what_the_writer_makes_is_read_only_that_far() {
+    let (shelf, at) = shelf_with_case("past-the-read-cap");
+    let dir = shelf.log_dir(&at);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cap = MAX_READ_BYTES as usize;
+    let filler = line_of(&decided(&"f".repeat(1000)));
+    let mut bytes = filler.repeat((cap - 4096) / filler.len());
+    // A line ends exactly where a read stops, and one more starts past it.
+    let pad = cap - bytes.len() - line_of(&decided("")).len();
+    bytes.extend(line_of(&decided(&"x".repeat(pad))));
+    assert_eq!(bytes.len(), cap, "the fixture's last line before the cap ends on it");
+    bytes.extend(line_of(&decided("beyond the cap")));
+    std::fs::write(dir.join("c-0001.jsonl"), &bytes).unwrap();
+
+    let found = search_log(&shelf, &at, "beyond", 10).unwrap();
+    assert!(found.hits.is_empty(), "the search read past the cap: {:?}", found.hits.len());
+    assert_eq!(found.skipped, 1, "the rest is one skipped line");
+    let found = search_log(&shelf, &at, "", 5).unwrap();
+    assert_eq!((found.hits.len(), found.skipped), (5, 1));
+
+    let (records, skipped, more) = recent_records(&shelf, &at, REVIEW_RECORD_BYTES).unwrap();
+    assert_eq!(skipped, 1, "the rest is one skipped line");
+    assert!(more);
+    assert_eq!(records.last(), Some(&decided(&"x".repeat(pad))), "the newest record a review reads is the last one before the cap");
 }
 
 /// A link where `log/` should be, or a `.jsonl` link inside it, points at another client's files:
