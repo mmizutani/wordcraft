@@ -483,6 +483,53 @@ fn cloud_open_rejects_non_docx_bytes_without_replacing_the_editor() {
     assert!(app.status_msg.is_some());
 }
 
+fn answer_open(requests: &Requests, password: &str) {
+    let (_, reply) = next(requests);
+    let bytes = io::save_bytes_with("encrypted.docx", &Document::from_text("encrypted cloud document"), Some(password), &Default::default()).unwrap();
+    reply.send(Ok(CloudResponse::Open { revision: 2, bytes })).unwrap();
+}
+
+#[test]
+fn a_scripts_open_of_an_encrypted_document_opens_no_dialog_and_takes_the_password_by_command() {
+    let (mut app, requests, _, _) = app();
+    list(&mut app, &requests, entry("encrypted", 1));
+    app.execute("ui.cloudOpen", json!({"id":"encrypted"})).unwrap();
+    let correct = test_passphrase("encrypted document");
+    answer_open(&requests, &correct);
+    app.settle_cloud();
+    assert!(app.dialog.is_none());
+    let error = app.execute("ui.cloudApply", json!({})).unwrap_err();
+    assert!(io::needs_password(&error), "{error}");
+    assert!(app.dialog.is_none());
+    app.execute("ui.cloudApply", json!({"password":correct})).unwrap();
+    assert_eq!(app.session.doc.plain_text(StoryRef::Body), "encrypted cloud document");
+}
+
+#[test]
+fn a_scripts_open_overtaken_by_an_edit_opens_no_dialog_and_keeps_the_edit() {
+    let (mut app, requests, _, _) = app();
+    list(&mut app, &requests, entry("other", 1));
+    app.execute("ui.cloudOpen", json!({"id":"other"})).unwrap();
+    let (_, reply) = next(&requests);
+    edit(&mut app, "typed while it loaded");
+    reply.send(Ok(CloudResponse::Open { revision: 1, bytes: docx("other") })).unwrap();
+    app.settle_cloud();
+    assert!(app.dialog.is_none());
+    assert!(app.session.doc.plain_text(StoryRef::Body).contains("typed while it loaded"));
+}
+
+#[test]
+fn a_persons_open_still_asks_for_the_password_after_answering_save_changes() {
+    let (mut app, requests, _, _) = app();
+    list(&mut app, &requests, entry("encrypted", 1));
+    edit(&mut app, "unsaved");
+    assert_eq!(app.run("ui.cloudOpen", json!({"id":"encrypted"})).unwrap()["pending"], "saveChanges");
+    app.run("ui.saveChanges", json!({"answer":"dontSave"})).unwrap();
+    answer_open(&requests, &test_passphrase("encrypted document"));
+    app.settle_cloud();
+    assert!(matches!(app.dialog, Some(Dialog::Password { .. })));
+}
+
 #[test]
 fn cloud_open_prompts_for_the_docx_password_and_the_next_save_keeps_it() {
     let (mut app, requests, _, _) = app();

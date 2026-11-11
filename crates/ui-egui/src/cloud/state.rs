@@ -62,6 +62,8 @@ struct Opening {
     result: OpenResult,
     save_pending: bool,
     confirmed: bool,
+    /// The window started it, so it may open dialogs. A script's open never does (`execute`).
+    asks: bool,
 }
 
 enum OpenResult {
@@ -358,6 +360,7 @@ impl WordApp {
             result: OpenResult::Fetching(reply),
             save_pending: self.cloud.unsaved(document),
             confirmed: true,
+            asks: params.get("asks").and_then(Value::as_bool) == Some(true),
         });
         Ok(json!({"pending": "cloudOpen"}))
     }
@@ -374,7 +377,7 @@ impl WordApp {
         let draft_refused = drafted && panes::flush_comment_drafts(self).is_err();
         let changed = !opening.snapshot.matches(&self.session) || (!opening.save_pending && self.cloud.unsaved(opening.document));
         if changed || (!force && (draft_refused || !opening.confirmed)) {
-            return Ok(self.confirm_cloud_replacement(opening));
+            return self.confirm_cloud_replacement(opening);
         }
         opening.confirmed = true;
         let OpenResult::Ready(bytes) = &opening.result else {
@@ -394,9 +397,10 @@ impl WordApp {
         let (document, encrypted) = match opened {
             Ok(opened) => opened,
             Err(error) if wordcraft_engine::io::needs_password(&error) || wordcraft_engine::io::wrong_password(&error) => {
-                let name = opening.entry.name.clone();
+                let (name, asks) = (opening.entry.name.clone(), opening.asks);
                 self.cloud.opening = Some(opening);
-                if password.is_some() {
+                // A script hears why, and can send the password with `ui.cloudApply`.
+                if password.is_some() || !asks {
                     return Err(error);
                 }
                 self.dialog = Some(Dialog::Password {
@@ -413,7 +417,7 @@ impl WordApp {
         if self.shows_shared_document() {
             self.stop_sharing();
             if !opening.snapshot.matches(&self.session) {
-                return Ok(self.confirm_cloud_replacement(opening));
+                return self.confirm_cloud_replacement(opening);
             }
         }
         let title = cloud_title(&opening.entry.name);
@@ -444,14 +448,18 @@ impl WordApp {
         Ok(json!({"opened": true}))
     }
 
-    fn confirm_cloud_replacement(&mut self, mut opening: Opening) -> Value {
+    fn confirm_cloud_replacement(&mut self, mut opening: Opening) -> Result<Value, String> {
+        let message = tl!("The document changed while opening the cloud copy.");
+        if !opening.asks {
+            return Err(message.into());
+        }
         opening.snapshot = DocumentSnapshot::capture(&self.session);
         opening.save_pending = self.cloud.unsaved(opening.document);
         opening.confirmed = false;
         let document = opening.document;
         self.cloud.opening = Some(opening);
-        self.cloud_save_prompt("ui.cloudApply".into(), json!({}), document, tl!("The document changed while opening the cloud copy.").into());
-        json!({"pending": "saveChanges"})
+        self.cloud_save_prompt("ui.cloudApply".into(), json!({}), document, message.into());
+        Ok(json!({"pending": "saveChanges"}))
     }
 }
 
