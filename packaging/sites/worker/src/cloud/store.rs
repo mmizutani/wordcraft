@@ -147,6 +147,7 @@ impl Store {
         let document = request.document_id.as_deref().map_or(JsValue::NULL, JsValue::from_str);
         let name = request.name.as_deref().map_or(JsValue::NULL, JsValue::from_str);
         // Only the request that inserts the row can upload. Retries only reconcile.
+        // A room Save has already reconstructed its exact bytes, so it may outlive a checkpoint advance.
         self.statement(
             "INSERT INTO cloud_saves (owner, operation_id, document_id, base_revision, name, byte_size, sha256, object_key, lease_until, room_revision)
              SELECT ?1, ?2, COALESCE(?3, lower(hex(randomblob(16)))), COALESCE(d.revision, ?4), COALESCE(?5, d.name), ?6, ?7,
@@ -154,7 +155,7 @@ impl Store {
              FROM (SELECT 1) LEFT JOIN cloud_documents d ON d.owner = ?1 AND d.id = ?3 AND d.deleted = 0
              LEFT JOIN cloud_rooms r ON r.owner = d.owner AND r.document_id = d.id
              WHERE ((?9 IS NULL AND (?3 IS NULL OR (d.revision = ?4 AND r.document_id IS NULL)))
-                 OR (?9 BETWEEN r.checkpoint_revision AND r.head AND ?9 >= r.published_room_revision AND d.revision < ?10))
+                 OR (?9 BETWEEN r.published_room_revision AND r.head AND d.revision < ?10))
                AND NOT EXISTS (SELECT 1 FROM cloud_documents WHERE owner = ?1 AND first_operation_id = ?2 AND deleted = 1)
              ON CONFLICT (owner, operation_id) DO NOTHING
              RETURNING *, 0 AS expired, 0 AS deleted, CAST(?9 IS NOT NULL AS INTEGER) AS room_active",

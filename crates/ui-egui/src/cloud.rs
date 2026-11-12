@@ -161,6 +161,7 @@ pub enum CloudFailureKind {
     RoomRequired,
     Conflict,
     Recovery,
+    RoomRevisionExpired,
     Capacity,
     AccessDenied,
 }

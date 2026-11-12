@@ -2,13 +2,13 @@ use super::{
     protocol::{Failure, INVALID, MAX_BYTES, MAX_REVISION, TOO_LARGE, digest, opaque_id, operation_id},
     room_access::{self, RoomAccess, RoomRole},
     room_presence,
-    room_store::{MAX_CHANGE_BYTES, MAX_TAIL_BYTES, MAX_TAIL_CHANGES, Room, RoomAppend, RoomChange, RoomReceipt},
+    room_store::{MAX_CHANGE_BYTES, MAX_ROOM_OPERATIONS, MAX_TAIL_BYTES, MAX_TAIL_CHANGES, PageKind, Room, RoomAppend, RoomChange, RoomReceipt},
     routes::{
         Api, ApiResult, DOCX, ErrorBody, INVALID_BODY, OPERATION_MISMATCH, STALE, STORAGE_ERROR, create_only, etag, save_response, valid_candidate,
     },
     store::{Save, SaveRequest, Store},
 };
-use crate::room_model::{RoomModelError, checkpoint, propose, replay, write_checkpoint};
+use crate::room_model::{RoomModelError, apply, checkpoint, propose, replay, write_checkpoint};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -23,6 +23,7 @@ const GONE: Failure = Failure(404, "room_not_found");
 const CHANGE_CONFLICT: Failure = Failure(409, "change_conflict");
 pub(super) const STALE_ROOM: Failure = Failure(409, "stale_room_revision");
 const ROOM_FULL: Failure = Failure(409, "room_storage_limit");
+const RECEIPT_EXPIRED: Failure = Failure(409, "receipt_expired");
 const ROOM_CHANGED: Failure = Failure(409, "room_changed");
 const INVALID_CHECKPOINT: Failure = Failure(422, "invalid_checkpoint");
 const UNSUPPORTED: Failure = Failure(422, "unsupported_room_document");
@@ -183,18 +184,10 @@ impl Api {
     }
 
     async fn put_checkpoint(&self, id: &str, revision: u64, key: &str, bytes: Vec<u8>) -> ApiResult<Response> {
-        let byte_size = bytes.len() as u64;
-        if !(1..=MAX_BYTES).contains(&byte_size) {
-            self.store.settle_checkpoint(key).await?;
-            return Err(TOO_LARGE);
-        }
-        let checksum = Sha256::digest(&bytes);
-        let put = self.bucket.put(key, bytes).only_if(create_only()).sha256(checksum.to_vec()).execute().await;
-        let result = match put {
-            Ok(Some(object)) if valid_candidate(&object, byte_size, &checksum) => {
-                self.store.publish_checkpoint(id, key, byte_size, &hex_checksum(&checksum)).await?
-            }
-            _ => {
+        let upload = self.upload_checkpoint(key, bytes).await;
+        let result = match &upload {
+            Ok((byte_size, checksum)) => self.store.publish_checkpoint(id, key, *byte_size, checksum).await?,
+            Err(_) => {
                 self.store.settle_checkpoint(key).await?;
                 None
             }
@@ -207,7 +200,58 @@ impl Api {
             }
             return same_activation(&room, revision);
         }
-        self.activation_race(id, revision, STORAGE_ERROR).await
+        self.activation_race(id, revision, upload.err().unwrap_or(STORAGE_ERROR)).await
+    }
+
+    async fn upload_checkpoint(&self, key: &str, bytes: Vec<u8>) -> ApiResult<(u64, String)> {
+        let byte_size = bytes.len() as u64;
+        if !(1..=MAX_BYTES).contains(&byte_size) {
+            return Err(TOO_LARGE);
+        }
+        let checksum = Sha256::digest(&bytes);
+        let put = self.bucket.put(key, bytes).only_if(create_only()).sha256(checksum.to_vec()).execute().await?;
+        if !put.is_some_and(|object| valid_candidate(&object, byte_size, &checksum)) {
+            return Err(STORAGE_ERROR);
+        }
+        Ok((byte_size, hex_checksum(&checksum)))
+    }
+
+    async fn compact(&self, room: &Room, target: u64, document: Option<&Document>) -> ApiResult<bool> {
+        let Some(key) = self.store.reserve_compaction(room, target).await? else {
+            return Ok(false);
+        };
+        let publish = self.compact_candidate(room, target, document, &key).await;
+        // Publication removes a winning reservation. Settling a losing one enables cleanup.
+        self.store.settle_checkpoint(&key).await?;
+        self.try_room_cleanup(Some(&room.document_id)).await;
+        publish.map(|()| true)
+    }
+
+    async fn compact_candidate(&self, room: &Room, target: u64, document: Option<&Document>, key: &str) -> ApiResult<()> {
+        let bytes = match document {
+            Some(document) => write_checkpoint(document),
+            None => {
+                let (document, _) = self.replay_through(room, target, target).await?;
+                write_checkpoint(&document)
+            }
+        }
+        .map_err(activation_error)?;
+        let (byte_size, checksum) = self.upload_checkpoint(key, bytes).await?;
+        self.store.publish_compaction(room, target, key, byte_size, &checksum).await?;
+        Ok(())
+    }
+
+    async fn recover_compaction(&self, room: &Room, document: Option<&Document>) -> bool {
+        if room.head >= MAX_ROOM_OPERATIONS || !room.should_compact(room.head, room.tail_bytes) {
+            return false;
+        }
+        match self.compact(room, room.head, document).await {
+            Ok(attempted) => attempted,
+            Err(_) => {
+                console_log!("cloud_rooms compaction_pending");
+                false
+            }
+        }
     }
 
     async fn activation_race(&self, id: &str, revision: u64, fallback: Failure) -> ApiResult<Response> {
@@ -246,7 +290,7 @@ impl Api {
         let object = self.bucket.get(&room.checkpoint_key).execute().await?;
         let Some(object) = object.filter(|object| room.checkpoint_size <= MAX_BYTES && valid_candidate(object, room.checkpoint_size, &checksum))
         else {
-            self.require_room(&room.document_id).await?;
+            self.check_replay_cursor(&room.document_id, room.checkpoint_revision).await?;
             return Err(STORAGE_ERROR);
         };
         let bytes = object.body().ok_or(STORAGE_ERROR)?.bytes().await?;
@@ -259,17 +303,24 @@ impl Api {
     async fn get_changes(&self, id: &str, query: Option<&str>, role: RoomRole) -> ApiResult<Response> {
         let room = self.require_room(id).await?;
         let (after, through) = page_window(query, &room)?;
-        let entries = self.room_entries(id, after, through).await?;
-        self.require_room(id).await?;
+        let entries = self.room_entries(id, after, through, PageKind::CatchUp).await?;
+        self.check_replay_cursor(id, after).await?;
         let next_after = entries.last().map(|entry| entry.revision).filter(|last| *last < through);
         let changes = entries.into_iter().map(parse_change).collect::<ApiResult<_>>()?;
         Ok(Response::from_json(&Page { role, head: through, changes, next_after })?)
     }
 
-    async fn room_entries(&self, id: &str, after: u64, through: u64) -> ApiResult<Vec<RoomChange>> {
-        let entries = self.store.room_page(id, after, through).await?;
+    async fn check_replay_cursor(&self, id: &str, after: u64) -> ApiResult<()> {
+        if after < self.require_room(id).await?.checkpoint_revision {
+            return Err(STALE_ROOM);
+        }
+        Ok(())
+    }
+
+    async fn room_entries(&self, id: &str, after: u64, through: u64, kind: PageKind) -> ApiResult<Vec<RoomChange>> {
+        let entries = self.store.room_page(id, after, through, kind).await?;
         if (entries.is_empty() && after < through) || entries.iter().zip(after + 1..).any(|(entry, expected)| entry.revision != expected) {
-            self.require_room(id).await?;
+            self.check_replay_cursor(id, after).await?;
             return Err(STORAGE_ERROR);
         }
         Ok(entries)
@@ -291,29 +342,50 @@ impl Api {
         }
         self.require_room(id).await?;
         let change = serde_json::from_value(submission.change).map_err(|_| INVALID_BODY)?;
-        for _ in 0..2 {
+        let base = submission.base_revision;
+        for attempt in 0..2 {
             let room = self.require_room(id).await?;
-            let canonical = self.propose_change(&room, submission.base_revision, &change).await;
+            let proposal = self.propose_change(&room, base, &change).await;
             // Another delivery may have committed this operation after the first receipt lookup.
             if let Some(receipt) = self.store.room_receipt(id, &operation).await? {
                 return receipt_response(&receipt, actor, &fingerprint);
             }
-            let json = serde_json::to_string(&canonical?).map_err(|_| STORAGE_ERROR)?;
+            let (canonical, prior) = match proposal {
+                Err(ROOM_FULL) if attempt == 0 && self.recover_compaction(&room, None).await => continue,
+                Err(STALE_ROOM) if attempt == 0 && (room.checkpoint_revision..=room.head).contains(&base) => continue,
+                other => other?,
+            };
+            let json = serde_json::to_string(&canonical).map_err(|_| STORAGE_ERROR)?;
             if json.len() > MAX_CHANGE_BYTES {
                 return Err(TOO_LARGE);
             }
-            if room.tail_bytes + json.len() as u64 > MAX_TAIL_BYTES {
+            let tail_bytes = room.tail_bytes + json.len() as u64;
+            if tail_bytes > MAX_TAIL_BYTES {
+                if attempt == 0 && self.recover_compaction(&room, prior.as_ref()).await {
+                    continue;
+                }
                 return Err(ROOM_FULL);
             }
             let append = RoomAppend {
                 actor,
                 grant_version: caller.access.grant_version,
+                base_revision: base,
                 operation_id: &operation,
                 fingerprint: &fingerprint,
                 change_json: &json,
             };
             if let Some(receipt) = self.store.append_room_change(&room, &append).await? {
-                return receipt_response(&receipt, actor, &fingerprint);
+                let response = receipt_response(&receipt, actor, &fingerprint)?;
+                // Keep the submitter's replay range, including any edits it rebased over.
+                if let Some(document) = prior.as_ref()
+                    && base == room.head
+                    && receipt.revision == room.head + 1
+                    && room.should_compact(receipt.revision, tail_bytes)
+                    && self.compact(&room, room.head, Some(document)).await.is_err()
+                {
+                    console_log!("cloud_rooms compaction_pending");
+                }
+                return Ok(response);
             }
         }
         self.require_room(id).await?;
@@ -370,34 +442,45 @@ impl Api {
 
     async fn prepare_room_save(&self, room: &Room, target: u64) -> ApiResult<Vec<u8>> {
         check_save_target(room, target)?;
-        let (document, _) = self.replay_through(room, target).await?;
+        let (document, _) = match self.replay_through(room, target, target).await {
+            Err(STALE_ROOM) => {
+                let current = self.require_room(&room.document_id).await?;
+                check_save_target(&current, target)?;
+                self.replay_through(&current, target, target).await?
+            }
+            replayed => replayed?,
+        };
         write_checkpoint(&document).map_err(activation_error)
     }
 
-    async fn propose_change(&self, room: &Room, base: u64, change: &ChangeSet) -> ApiResult<ChangeSet> {
+    async fn propose_change(&self, room: &Room, base: u64, change: &ChangeSet) -> ApiResult<(ChangeSet, Option<Document>)> {
         if base < room.checkpoint_revision || base > room.head {
             return Err(STALE_ROOM);
         }
-        if room.head == MAX_REVISION || room.head - room.checkpoint_revision >= MAX_TAIL_CHANGES {
+        if room.head >= MAX_ROOM_OPERATIONS || room.head - room.checkpoint_revision >= MAX_TAIL_CHANGES || room.tail_bytes >= MAX_TAIL_BYTES {
             return Err(ROOM_FULL);
         }
-        let (mut document, changes) = self.replay_through(room, room.head).await?;
-        let since_base = changes.get((base - room.checkpoint_revision) as usize..).ok_or(STORAGE_ERROR)?;
-        propose(&mut document, since_base, change.clone()).map_err(change_error)
+        let (mut document, changes) = self.replay_through(room, room.head, base).await?;
+        let prior = room.should_compact(room.head + 1, room.tail_bytes + MAX_CHANGE_BYTES as u64).then(|| document.clone());
+        let canonical = propose(&mut document, &changes, change.clone()).map_err(change_error)?;
+        Ok((canonical, prior))
     }
 
-    async fn replay_through(&self, room: &Room, through: u64) -> ApiResult<(Document, Vec<ChangeSet>)> {
-        let bytes = self.checkpoint_bytes(room).await?;
+    async fn replay_through(&self, room: &Room, through: u64, rebase_from: u64) -> ApiResult<(Document, Vec<ChangeSet>)> {
+        let mut document = replay(&self.checkpoint_bytes(room).await?, &[]).map_err(|_| STORAGE_ERROR)?;
         let mut after = room.checkpoint_revision;
         let mut changes = Vec::new();
         while after < through {
-            let entries = self.room_entries(&room.document_id, after, through).await?;
+            let entries = self.room_entries(&room.document_id, after, through, PageKind::Reconstruction).await?;
             after = entries.last().ok_or(STORAGE_ERROR)?.revision;
             for entry in entries {
-                changes.push(parse_change(entry)?.change);
+                let change = parse_change(entry)?;
+                document = apply(&document, &change.change).map_err(|_| STORAGE_ERROR)?;
+                if change.revision > rebase_from {
+                    changes.push(change.change);
+                }
             }
         }
-        let document = replay(&bytes, &changes).map_err(|_| STORAGE_ERROR)?;
         Ok((document, changes))
     }
 }
@@ -442,6 +525,9 @@ fn parse_change(change: RoomChange) -> ApiResult<Change> {
 fn receipt_response(receipt: &RoomReceipt, actor: &str, fingerprint: &str) -> ApiResult<Response> {
     if receipt.actor != actor || receipt.fingerprint != fingerprint {
         return Err(OPERATION_MISMATCH);
+    }
+    if receipt.expired == 1 {
+        return Err(RECEIPT_EXPIRED);
     }
     Ok(Response::from_json(&Accepted { revision: receipt.revision, head: receipt.revision })?)
 }

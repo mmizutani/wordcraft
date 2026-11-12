@@ -21,55 +21,85 @@ use super::{
 
 const POLL_MS: f64 = 350.0;
 
-pub(super) enum HostedOpen {
+pub(super) struct HostedOpen {
+    stage: OpenStage,
+    restarts_left: u8,
+    recovering_after: Option<u64>,
+}
+
+enum OpenStage {
     Metadata(CloudReply),
     Checkpoint(RoomMetadata, CloudReply),
     Replay(RoomMetadata, Box<RemoteReplica>, CloudReply),
 }
 
 impl HostedOpen {
+    pub(super) fn metadata(reply: CloudReply) -> Self {
+        Self { stage: OpenStage::Metadata(reply), restarts_left: 2, recovering_after: None }
+    }
+
     pub(super) fn reply(&self) -> &CloudReply {
-        match self {
-            Self::Metadata(reply) | Self::Checkpoint(_, reply) | Self::Replay(_, _, reply) => reply,
+        match &self.stage {
+            OpenStage::Metadata(reply) | OpenStage::Checkpoint(_, reply) | OpenStage::Replay(_, _, reply) => reply,
         }
     }
 
-    pub(super) fn advance(self, response: CloudResponse, service: &CloudService, id: &str) -> Result<OpenResult, String> {
-        match (self, response) {
-            (Self::Metadata(_), CloudResponse::RoomMetadata(meta))
+    fn retry(&mut self, service: &CloudService, id: &str) {
+        match &mut self.stage {
+            OpenStage::Metadata(reply) => *reply = (service.request)(CloudRequest::RoomMetadata { id: id.into() }),
+            OpenStage::Checkpoint(_, reply) => *reply = (service.request)(CloudRequest::RoomCheckpoint { id: id.into() }),
+            OpenStage::Replay(meta, replica, reply) => *reply = changes(service, id, replica.revision(), Some(meta.head)),
+        }
+    }
+
+    pub(super) fn advance(self, response: Result<CloudResponse, CloudFailure>, service: &CloudService, id: &str) -> Result<OpenResult, String> {
+        let Self { stage, restarts_left, recovering_after } = self;
+        let pending = |stage| OpenResult::Hosted(Self { stage, restarts_left, recovering_after });
+        let replay = |meta: RoomMetadata, replica: Box<RemoteReplica>| {
+            let reply = changes(service, &meta.id, replica.revision(), Some(meta.head));
+            pending(OpenStage::Replay(meta, replica, reply))
+        };
+        let restart = || {
+            let restarts_left = restarts_left
+                .checked_sub(1)
+                .ok_or_else(|| tl!("The room changed while opening. Open the latest version to try again.").to_owned())?;
+            let reply = (service.request)(CloudRequest::RoomMetadata { id: id.into() });
+            Ok(OpenResult::Hosted(Self { stage: OpenStage::Metadata(reply), restarts_left, recovering_after }))
+        };
+        match (stage, response) {
+            (OpenStage::Metadata(_), Ok(CloudResponse::RoomMetadata(meta)))
                 if meta.id == id && meta.file_revision > 0 && meta.checkpoint_revision <= meta.head =>
             {
                 let reply = (service.request)(CloudRequest::RoomCheckpoint { id: id.into() });
-                Ok(OpenResult::Hosted(Self::Checkpoint(meta, reply)))
+                Ok(pending(OpenStage::Checkpoint(meta, reply)))
             }
-            (Self::Checkpoint(meta, _), CloudResponse::RoomCheckpoint { revision, bytes })
-                if revision >= meta.checkpoint_revision && !bytes.is_empty() && bytes.len() <= MAX_BYTES =>
+            (OpenStage::Checkpoint(meta, _), Ok(CloudResponse::RoomCheckpoint { revision, bytes }))
+                if revision >= meta.checkpoint_revision
+                    && recovering_after.is_none_or(|after| revision > after)
+                    && !bytes.is_empty()
+                    && bytes.len() <= MAX_BYTES =>
             {
                 if revision > meta.head {
                     // Compaction won the race with the metadata read. Capture its new head.
-                    let reply = (service.request)(CloudRequest::RoomMetadata { id: id.into() });
-                    return Ok(OpenResult::Hosted(Self::Metadata(reply)));
+                    return restart();
                 }
                 let doc = wordcraft_engine::io::open_room_checkpoint(&bytes)?;
-                Ok(Self::replay(meta, Box::new(RemoteReplica::new(revision, doc)), service))
+                let replica = Box::new(RemoteReplica::new(revision, doc));
+                // A recovering editor must recheck access even when the new checkpoint has no tail.
+                Ok(if revision == meta.head && recovering_after.is_none() { OpenResult::HostedReady(meta, replica) } else { replay(meta, replica) })
             }
-            (Self::Replay(mut meta, mut replica, _), CloudResponse::RoomChanges(page)) if valid_page(&page, replica.revision(), Some(meta.head)) => {
+            (OpenStage::Replay(mut meta, mut replica, _), Ok(CloudResponse::RoomChanges(page)))
+                if valid_page(&page, replica.revision(), Some(meta.head)) =>
+            {
                 for entry in page.changes {
                     replica.integrate(entry.revision, &entry.operation_id, &entry.change).map_err(|error| error.to_string())?;
                 }
                 meta.role = page.role;
-                Ok(Self::replay(meta, replica, service))
+                Ok(if page.next_after.is_none() { OpenResult::HostedReady(meta, replica) } else { replay(meta, replica) })
             }
+            (OpenStage::Replay(..), Err(error)) if error.kind == CloudFailureKind::RoomRevisionExpired => restart(),
+            (_, Err(error)) => Err(error.message),
             _ => Err(unexpected().message),
-        }
-    }
-
-    fn replay(meta: RoomMetadata, replica: Box<RemoteReplica>, service: &CloudService) -> OpenResult {
-        if replica.revision() == meta.head {
-            OpenResult::HostedReady(meta, replica)
-        } else {
-            let reply = changes(service, &meta.id, replica.revision(), Some(meta.head));
-            OpenResult::Hosted(Self::Replay(meta, replica, reply))
         }
     }
 }
@@ -101,6 +131,11 @@ enum Exchange {
     Submit(CloudReply),
 }
 
+enum Reopening {
+    AfterComposition { may_reopen: bool },
+    Reading { opening: HostedOpen, retry_at: Option<f64> },
+}
+
 pub(super) struct HostedRoom {
     id: String,
     role: RoomRole,
@@ -111,6 +146,7 @@ pub(super) struct HostedRoom {
     publish: Option<Publish>,
     seen: u64,
     waiting: Option<Exchange>,
+    reopening: Option<Reopening>,
     /// The captured page head or the head a durable receipt asks us to read through.
     through: Option<u64>,
     receipt: Option<u64>,
@@ -131,6 +167,7 @@ impl HostedRoom {
             publish: None,
             seen: session.changes().version(),
             waiting: None,
+            reopening: None,
             through: None,
             receipt: None,
             next_poll: now + POLL_MS,
@@ -140,12 +177,13 @@ impl HostedRoom {
     }
 
     fn reading_only(&self) -> bool {
-        self.role == RoomRole::Viewer || self.check_role || self.replica.needs_recovery()
+        self.role == RoomRole::Viewer || self.check_role || matches!(self.reopening, Some(Reopening::Reading { .. })) || self.replica.needs_recovery()
     }
 
     fn recover(&mut self, message: &str) {
         self.replica.require_recovery();
         self.waiting = None;
+        self.reopening = None;
         self.message = Some(message.into());
     }
 
@@ -189,7 +227,91 @@ impl HostedRoom {
         Ok(())
     }
 
-    fn tick(&mut self, session: &mut Session, service: &CloudService, now: f64) {
+    fn can_reopen(&self, session: &Session, has_drafts: bool) -> bool {
+        !session.dirty
+            && !has_drafts
+            && self.seen == session.changes().version()
+            && self.replica.pending_len() == 0
+            && self.replica.in_flight().is_none()
+    }
+
+    fn start_reopen(&mut self, service: &CloudService) {
+        let reply = (service.request)(CloudRequest::RoomMetadata { id: self.id.clone() });
+        let opening = HostedOpen { recovering_after: Some(self.replica.revision()), ..HostedOpen::metadata(reply) };
+        self.reopening = Some(Reopening::Reading { opening, retry_at: None });
+        self.message = Some(tl!("Refreshing the shared document…").into());
+    }
+
+    fn tick_reopen(&mut self, session: &mut Session, service: &CloudService, now: f64, has_drafts: bool, composing: bool) -> Option<u64> {
+        if composing {
+            return None;
+        }
+        if !self.can_reopen(session, has_drafts) {
+            self.recover_unsynced(has_drafts);
+            return None;
+        }
+        let response = match self.reopening.as_mut()? {
+            Reopening::AfterComposition { may_reopen } => {
+                if *may_reopen {
+                    self.start_reopen(service);
+                } else {
+                    self.recover_unsynced(has_drafts);
+                }
+                return None;
+            }
+            Reopening::Reading { opening, retry_at } => {
+                if let Some(at) = *retry_at {
+                    if now >= at {
+                        opening.retry(service, &self.id);
+                        *retry_at = None;
+                    }
+                    return None;
+                }
+                let response = poll(opening.reply())?;
+                if let Err(error) = &response
+                    && matches!(error.kind, CloudFailureKind::Retryable | CloudFailureKind::Authentication)
+                {
+                    self.message = Some(error.message.clone());
+                    *retry_at = Some(now + POLL_MS);
+                    return None;
+                }
+                response
+            }
+        };
+        let Reopening::Reading { opening, .. } = self.reopening.take()? else { return None };
+        match opening.advance(response, service, &self.id) {
+            Ok(OpenResult::Hosted(opening)) => {
+                self.reopening = Some(Reopening::Reading { opening, retry_at: None });
+                self.message = Some(tl!("Refreshing the shared document…").into());
+            }
+            Ok(OpenResult::HostedReady(meta, replica)) => {
+                session.reset_shared(replica.document().clone());
+                session.dirty = false;
+                self.replica = replica;
+                self.seen = session.changes().version();
+                self.role = meta.role;
+                self.published_revision = self.published_revision.max(meta.published_room_revision);
+                self.check_role = false;
+                self.through = None;
+                self.receipt = None;
+                self.next_poll = now + POLL_MS;
+                self.message = None;
+                return Some(meta.file_revision);
+            }
+            _ => self.recover(tl!("The shared document could not refresh. Open the latest version to try again.")),
+        }
+        None
+    }
+
+    fn recover_unsynced(&mut self, has_drafts: bool) {
+        self.recover(if has_drafts {
+            tl!("The room history expired. Keep a copy of your comment drafts and download the document before opening the latest version.")
+        } else {
+            tl!("The room history expired. Download a copy to keep your edits before opening the latest version.")
+        });
+    }
+
+    fn tick(&mut self, session: &mut Session, service: &CloudService, now: f64, has_drafts: bool, composing: bool) {
         if self.replica.needs_recovery() {
             return;
         }
@@ -222,11 +344,22 @@ impl HostedRoom {
                     }
                     self.next_poll = if self.through.is_some() || self.replica.pending_len() > 0 { now } else { now + POLL_MS };
                 }
+                Err(error) if matches!(error.kind, CloudFailureKind::RoomRevisionExpired | CloudFailureKind::Recovery) => {
+                    let may_reopen = !is_submit && error.kind == CloudFailureKind::RoomRevisionExpired;
+                    if composing {
+                        self.reopening = Some(Reopening::AfterComposition { may_reopen });
+                        self.message = Some(tl!("Finish typing to recover the shared document.").into());
+                    } else if may_reopen && self.can_reopen(session, has_drafts) {
+                        self.start_reopen(service);
+                    } else {
+                        self.recover_unsynced(has_drafts);
+                    }
+                }
                 Err(error) => self.exchange_failed(error, now),
                 _ => self.exchange_failed(unexpected(), now),
             }
         }
-        if self.replica.needs_recovery() || now < self.next_poll {
+        if self.replica.needs_recovery() || self.reopening.is_some() || now < self.next_poll {
             return;
         }
         if self.through.is_none() && !self.reading_only() && self.replica.pending_len() > 0 {
@@ -293,7 +426,7 @@ impl WordApp {
         let reply = (self.cloud_service()?.request)(CloudRequest::RoomMetadata { id: id.into() });
         let entry = CloudEntry { id: id.into(), name: tl!("Shared document.docx").into(), revision: 0, byte_size: 0, saved_at: 0 };
         self.cloud.room_link = Some(RoomLink { id: id.into(), reply: None, access: None, message: None });
-        self.begin_cloud_open(entry, OpenResult::Hosted(HostedOpen::Metadata(reply)), params);
+        self.begin_cloud_open(entry, OpenResult::Hosted(HostedOpen::metadata(reply)), params);
         Ok(json!({"pending": "cloudOpen"}))
     }
 
@@ -323,8 +456,9 @@ impl WordApp {
     pub(crate) fn cloud_room_request_pending(&self) -> bool {
         self.cloud.rooms.get(&self.session.document_id()).is_some_and(|room| {
             room.waiting.is_some()
+                || matches!(room.reopening, Some(Reopening::Reading { retry_at: None, .. }))
                 || room.publish.as_ref().is_some_and(Publish::waiting)
-                || (!room.replica.needs_recovery() && room.presence.waiting())
+                || (!room.replica.needs_recovery() && room.reopening.is_none() && room.presence.waiting())
         }) || self.cloud.room_link.as_ref().is_some_and(|link| link.reply.is_some())
     }
 
@@ -371,7 +505,7 @@ impl WordApp {
             document,
             snapshot: DocumentSnapshot::capture(&self.session),
             entry,
-            result: OpenResult::Hosted(HostedOpen::Metadata(reply)),
+            result: OpenResult::Hosted(HostedOpen::metadata(reply)),
             save_pending: false,
             confirmed: true,
             asks: true,
@@ -382,12 +516,22 @@ impl WordApp {
     pub(super) fn settle_cloud_room(&mut self, now: f64) {
         let document = self.session.document_id();
         let Some(service) = &self.services.cloud else { return };
+        let has_drafts = crate::panes::has_comment_drafts(self);
+        let composing = !self.canvas.ime_preedit.is_empty();
         let Some(room) = self.cloud.rooms.get_mut(&document) else { return };
         let before = room.message.clone();
-        room.tick(&mut self.session, service, now);
+        if room.reopening.is_some() {
+            if let Some(file_revision) = room.tick_reopen(&mut self.session, service, now, has_drafts, composing)
+                && let Some(entry) = self.cloud.documents.get_mut(&document)
+            {
+                entry.revision = entry.revision.max(file_revision);
+            }
+        } else {
+            room.tick(&mut self.session, service, now, has_drafts, composing);
+        }
         let published = room.tick_publish(service, now);
         room.grants.poll();
-        if !room.replica.needs_recovery() && !room.check_role {
+        if !room.replica.needs_recovery() && room.reopening.is_none() && !room.check_role {
             room.presence.tick(&room.id, &room.replica, &self.session, service, now);
         }
         let status = room.message.as_ref().filter(|message| Some(*message) != before.as_ref()).cloned();
@@ -430,7 +574,7 @@ impl WordApp {
 
     pub(crate) fn hosted_others(&self) -> Option<&[(wordcraft_engine::room::Other, f64)]> {
         let room = self.cloud.rooms.get(&self.session.document_id())?;
-        Some(if room.replica.needs_recovery() || room.check_role { &[] } else { &room.presence.others })
+        Some(if room.replica.needs_recovery() || room.reopening.is_some() || room.check_role { &[] } else { &room.presence.others })
     }
 
     pub(crate) fn show_hosted_share(&mut self, ui: &mut egui::Ui) {
@@ -496,7 +640,7 @@ impl WordApp {
     pub(super) fn show_hosted_room_status(&mut self, ui: &mut egui::Ui) -> bool {
         let Some(room) = self.cloud.rooms.get(&self.session.document_id()) else { return false };
         let recovering = room.replica.needs_recovery();
-        let can_publish = room.role == RoomRole::Owner && !recovering;
+        let can_publish = room.role == RoomRole::Owner && !recovering && room.reopening.is_none();
         let reload = recovering.then(|| room.id.clone());
         if let Some(message) = &room.message {
             ui.label(message);

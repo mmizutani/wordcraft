@@ -186,7 +186,8 @@ pub(super) fn room_status_failure(status: u16, code: Option<&str>) -> CloudFailu
         }
         (404, _) => failure(Missing, "The shared room is unavailable."),
         (409, Some("change_conflict")) => failure(Conflict, "This edit conflicts with a change already in the room."),
-        (409, Some("stale_room_revision" | "receipt_expired")) => failure(Recovery, "The room changed. Reopen it to recover the latest version."),
+        (409, Some("stale_room_revision")) => failure(RoomRevisionExpired, "This room revision is no longer available."),
+        (409, Some("receipt_expired")) => failure(Recovery, "The room changed. Reopen it to recover the latest version."),
         (409, Some("room_storage_limit")) => failure(Capacity, "The shared room has reached its storage limit."),
         (409, Some("room_access_limit")) => failure(Capacity, "The shared room has reached its access request limit."),
         (413, _) => failure(Invalid, "The shared room rejected data that exceeded its size limit."),
@@ -297,7 +298,8 @@ mod tests {
         use CloudFailureKind::*;
         assert_eq!(room_status_failure(403, Some("room_read_only")).kind, AccessDenied);
         assert_eq!(room_status_failure(409, Some("change_conflict")).kind, Conflict);
-        assert_eq!(room_status_failure(409, Some("stale_room_revision")).kind, Recovery);
+        assert_eq!(room_status_failure(409, Some("stale_room_revision")).kind, RoomRevisionExpired);
+        assert_eq!(room_status_failure(409, Some("receipt_expired")).kind, Recovery);
         assert_eq!(room_status_failure(409, Some("room_access_limit")).kind, Capacity);
         assert_eq!(status_failure(409, Some("room_required")).kind, RoomRequired);
         assert_eq!(room_status_failure(409, Some("some internal error")).kind, Retryable);

@@ -48,6 +48,10 @@ impl HostedRoom {
                 let _ = state;
                 return Some(Err(tl!("The shared document cannot be published while access or edits need recovery.").into()));
             }
+            state if self.reopening.is_some() => {
+                self.publish = Some(state);
+                return None;
+            }
             Publish::Queued if self.replica.pending_len() > 0 || self.check_role => {
                 self.publish = Some(Publish::Queued);
                 return None;

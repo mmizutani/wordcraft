@@ -576,9 +576,8 @@ impl WordApp {
             }
             (OpenResult::Fetching(_), Err(error)) if error.kind == CloudFailureKind::RoomRequired => {
                 let reply = (service.request)(CloudRequest::RoomMetadata { id: opening.entry.id.clone() });
-                OpenResult::Hosted(HostedOpen::Metadata(reply))
+                OpenResult::Hosted(HostedOpen::metadata(reply))
             }
-            (OpenResult::Hosted(hosted), Ok(response)) => hosted.advance(response, service, &opening.entry.id)?,
             (OpenResult::Hosted(_), Err(error))
                 if self.cloud.room_link.is_some() && matches!(error.kind, CloudFailureKind::Missing | CloudFailureKind::AccessDenied) =>
             {
@@ -587,10 +586,7 @@ impl WordApp {
                 self.ui.backstage_page = "share".into();
                 return Ok(());
             }
-            (OpenResult::Hosted(_), Err(error)) if error.kind == CloudFailureKind::Recovery => {
-                let reply = (service.request)(CloudRequest::RoomMetadata { id: opening.entry.id.clone() });
-                OpenResult::Hosted(HostedOpen::Metadata(reply))
-            }
+            (OpenResult::Hosted(hosted), response) => hosted.advance(response, service, &opening.entry.id)?,
             (_, Err(error)) => return Err(error.message),
             _ => return Err(unexpected().message),
         };

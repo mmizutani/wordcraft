@@ -43,6 +43,13 @@
       "when": 1794441603000,
       "tag": "0005_cloud_room_save",
       "breakpoints": false
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1794441604000,
+      "tag": "0006_cloud_room_compaction",
+      "breakpoints": false
     }
   ]
 }

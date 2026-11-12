@@ -346,3 +346,239 @@ fn a_viewers_parked_document_stays_read_only_to_an_addressed_command() {
     app.show_document(shared).unwrap();
     assert_eq!(app.session.doc.plain_text(StoryRef::Body), "shared text");
 }
+
+fn room_revision_expired() -> CloudFailure {
+    CloudFailure { kind: CloudFailureKind::RoomRevisionExpired, message: "room revision expired".into() }
+}
+
+fn open_at_zero(app: &mut WordApp, requests: &Requests, role: RoomRole) {
+    app.run("ui.cloudOpenRoom", json!({"id": ID})).unwrap();
+    let (request, reply) = next(requests);
+    assert_eq!(request, CloudRequest::RoomMetadata { id: ID.into() });
+    reply.send(Ok(metadata(0, 0, role))).unwrap();
+    app.settle_cloud();
+    let (bytes, _) = checkpoint("original");
+    checkpoint_reply(app, requests, 0, bytes);
+}
+
+#[test]
+fn a_clean_room_recovers_in_place_after_compaction() {
+    let (mut app, requests, _, _) = app();
+    open_at_zero(&mut app, &requests, RoomRole::Editor);
+    let document = app.session.document_id();
+    app.settle_cloud_room(1000.0);
+    let (request, expired) = next(&requests);
+    assert_eq!(request, CloudRequest::RoomChanges { id: ID.into(), after: 0, through: None });
+    expired.send(Err(room_revision_expired())).unwrap();
+    app.settle_cloud_room(1050.0);
+
+    let (request, reply) = requests.try_recv().expect("a clean replica should request current room metadata");
+    assert_eq!(request, CloudRequest::RoomMetadata { id: ID.into() });
+    assert!(app.run("text.insert", json!({"text": "blocked during reopen"})).is_err());
+    reply.send(Ok(metadata(4, 5, RoomRole::Editor))).unwrap();
+    app.settle_cloud_room(1100.0);
+    let (request, reply) = next(&requests);
+    assert_eq!(request, CloudRequest::RoomCheckpoint { id: ID.into() });
+    let (bytes, mut doc) = checkpoint("compacted");
+    reply.send(Ok(CloudResponse::RoomCheckpoint { revision: 4, bytes })).unwrap();
+    app.settle_cloud_room(1150.0);
+
+    let (request, reply) = next(&requests);
+    assert_eq!(request, CloudRequest::RoomChanges { id: ID.into(), after: 4, through: Some(5) });
+    let change = insert(&mut doc, 9, "!");
+    reply.send(Ok(page(5, None, RoomRole::Viewer, vec![entry_at(5, "peer", change)]))).unwrap();
+    app.settle_cloud_room(1200.0);
+
+    assert_eq!(app.session.document_id(), document);
+    assert_eq!(app.session.doc.plain_text(StoryRef::Body), "compacted!");
+    assert!(app.cloud_room_polling());
+    assert!(!app.session.dirty);
+    assert!(app.run("text.insert", json!({"text": "viewer cannot edit"})).is_err());
+
+    app.settle_cloud_room(1550.0);
+    let (request, _) = next(&requests);
+    assert_eq!(request, CloudRequest::RoomChanges { id: ID.into(), after: 5, through: None });
+}
+
+#[test]
+fn a_compacted_cursor_preserves_edits_entered_while_the_poll_was_pending() {
+    let (mut app, requests, downloads, _) = app();
+    open_at_zero(&mut app, &requests, RoomRole::Editor);
+    app.settle_cloud_room(1000.0);
+    let (_, expired) = next(&requests);
+    edit(&mut app, "my edits ");
+    expired.send(Err(room_revision_expired())).unwrap();
+    app.settle_cloud_room(1050.0);
+
+    assert!(!app.cloud_room_polling());
+    assert!(app.session.dirty);
+    assert!(requests.try_recv().is_err());
+    app.run("ui.cloudDownload", json!({})).unwrap();
+    {
+        let downloaded = downloads.borrow();
+        let doc = wordcraft_engine::io::open_docx_bytes(&downloaded[0].1, None).unwrap().0;
+        assert_eq!(doc.plain_text(StoryRef::Body), "my edits original");
+    }
+
+    assert_eq!(app.run("ui.cloudOpenRoom", json!({"id": ID})).unwrap()["pending"], "saveChanges");
+    app.run("ui.saveChanges", json!({"answer": "dontSave"})).unwrap();
+    let (request, _) = requests.try_recv().expect("explicit discard should reopen the room");
+    assert_eq!(request, CloudRequest::RoomMetadata { id: ID.into() });
+}
+
+#[test]
+fn recovery_restarts_when_a_new_checkpoint_overtakes_metadata_or_replay() {
+    let (mut app, requests, _, _) = app();
+    open_at_zero(&mut app, &requests, RoomRole::Editor);
+    app.settle_cloud_room(1000.0);
+    let (_, expired) = next(&requests);
+    expired.send(Err(room_revision_expired())).unwrap();
+    app.settle_cloud_room(1050.0);
+
+    for (metadata_revision, checkpoint_revision) in [(4, 5), (5, 5), (6, 6)] {
+        let (request, reply) = next(&requests);
+        assert_eq!(request, CloudRequest::RoomMetadata { id: ID.into() });
+        reply.send(Ok(metadata(metadata_revision, metadata_revision, RoomRole::Editor))).unwrap();
+        app.settle_cloud_room(1100.0);
+        let (request, reply) = next(&requests);
+        assert_eq!(request, CloudRequest::RoomCheckpoint { id: ID.into() });
+        let (bytes, _) = checkpoint("new checkpoint");
+        reply.send(Ok(CloudResponse::RoomCheckpoint { revision: checkpoint_revision, bytes })).unwrap();
+        app.settle_cloud_room(1150.0);
+        if metadata_revision == checkpoint_revision {
+            let (request, reply) = next(&requests);
+            assert_eq!(request, CloudRequest::RoomChanges { id: ID.into(), after: checkpoint_revision, through: Some(metadata_revision) });
+            reply.send(Err(room_revision_expired())).unwrap();
+            app.settle_cloud_room(1200.0);
+        }
+        assert_eq!(app.session.doc.plain_text(StoryRef::Body), "original");
+    }
+    assert!(!app.cloud_room_polling());
+    assert!(requests.try_recv().is_err());
+}
+
+#[test]
+fn an_expired_operation_receipt_keeps_the_pending_submission_for_explicit_recovery() {
+    let (mut app, requests, downloads, _) = app();
+    open_at_zero(&mut app, &requests, RoomRole::Editor);
+    edit(&mut app, "uncertain ");
+    app.settle_cloud_room(1000.0);
+    let (request, reply) = next(&requests);
+    let CloudRequest::RoomSubmit { proposal, .. } = request else { panic!("expected a submitted edit") };
+    reply.send(Err(CloudFailure { kind: CloudFailureKind::Recovery, message: "receipt expired".into() })).unwrap();
+    app.settle_cloud_room(1050.0);
+
+    let room = &app.cloud.rooms[&app.session.document_id()];
+    assert_eq!(room.replica.in_flight(), Some(&proposal));
+    assert!(!app.cloud_room_polling());
+    assert!(requests.try_recv().is_err());
+    app.run("ui.cloudDownload", json!({})).unwrap();
+    let downloaded = downloads.borrow();
+    let doc = wordcraft_engine::io::open_docx_bytes(&downloaded[0].1, None).unwrap().0;
+    assert_eq!(doc.plain_text(StoryRef::Body), "uncertain original");
+}
+
+#[test]
+fn a_publish_waiting_for_checkpoint_recovery_uses_its_confirmed_head() {
+    let (mut app, requests, _, _) = app();
+    open_at_zero(&mut app, &requests, RoomRole::Owner);
+    app.settle_cloud_room(1000.0);
+    let (_, expired) = next(&requests);
+    app.run("file.save", json!({})).unwrap();
+    expired.send(Err(room_revision_expired())).unwrap();
+    app.settle_cloud_room(1050.0);
+
+    let (request, reply) = next(&requests);
+    assert_eq!(request, CloudRequest::RoomMetadata { id: ID.into() });
+    assert!(requests.try_recv().is_err());
+    reply.send(Ok(metadata(4, 4, RoomRole::Owner))).unwrap();
+    app.settle_cloud_room(1100.0);
+    let (request, reply) = next(&requests);
+    assert_eq!(request, CloudRequest::RoomCheckpoint { id: ID.into() });
+    let (bytes, _) = checkpoint("new checkpoint");
+    reply.send(Ok(CloudResponse::RoomCheckpoint { revision: 4, bytes })).unwrap();
+    app.settle_cloud_room(1150.0);
+    let (request, reply) = next(&requests);
+    assert_eq!(request, CloudRequest::RoomChanges { id: ID.into(), after: 4, through: Some(4) });
+    assert!(requests.try_recv().is_err());
+    reply.send(Ok(page(4, None, RoomRole::Owner, vec![]))).unwrap();
+    app.settle_cloud_room(1200.0);
+
+    let (request, reply) = next(&requests);
+    assert!(matches!(request, CloudRequest::RoomSave { id, room_revision: 4, .. } if id == ID));
+    reply.send(Ok(CloudResponse::RoomSaved { file_revision: 2, room_revision: 4 })).unwrap();
+    app.settle_cloud_room(1250.0);
+    assert_eq!(app.cloud.documents[&app.session.document_id()].revision, 2);
+}
+
+#[test]
+fn checkpoint_recovery_retries_transport_and_authentication_failures() {
+    let (mut app, requests, _, _) = app();
+    open_at_zero(&mut app, &requests, RoomRole::Editor);
+    app.settle_cloud_room(1000.0);
+    let (_, expired) = next(&requests);
+    expired.send(Err(room_revision_expired())).unwrap();
+    app.settle_cloud_room(1050.0);
+
+    let (metadata_request, reply) = next(&requests);
+    reply.send(Err(CloudFailure { kind: CloudFailureKind::Retryable, message: "network".into() })).unwrap();
+    app.settle_cloud_room(1100.0);
+    assert!(app.cloud_room_polling(), "a network interruption must leave recovery active");
+    assert!(app.run("text.insert", json!({"text": "during retry"})).is_err());
+    app.settle_cloud_room(1449.0);
+    assert!(requests.try_recv().is_err());
+    app.settle_cloud_room(1450.0);
+    let (request, reply) = next(&requests);
+    assert_eq!(request, metadata_request);
+    reply.send(Ok(metadata(4, 4, RoomRole::Editor))).unwrap();
+    app.settle_cloud_room(1500.0);
+    let (request, reply) = next(&requests);
+    assert_eq!(request, CloudRequest::RoomCheckpoint { id: ID.into() });
+    let (bytes, _) = checkpoint("recovered");
+    reply.send(Ok(CloudResponse::RoomCheckpoint { revision: 4, bytes })).unwrap();
+    app.settle_cloud_room(1550.0);
+
+    let (replay, reply) = next(&requests);
+    reply.send(Err(CloudFailure { kind: CloudFailureKind::Authentication, message: "sign in".into() })).unwrap();
+    app.settle_cloud_room(1600.0);
+    assert!(app.cloud_room_polling());
+    app.settle_cloud_room(1949.0);
+    assert!(requests.try_recv().is_err());
+    app.settle_cloud_room(1950.0);
+    let (request, reply) = next(&requests);
+    assert_eq!(request, replay);
+    reply.send(Ok(page(4, None, RoomRole::Editor, vec![]))).unwrap();
+    app.settle_cloud_room(2000.0);
+    assert_eq!(app.session.doc.plain_text(StoryRef::Body), "recovered");
+    assert!(app.run("text.insert", json!({"text": "after recovery"})).is_ok());
+}
+
+#[test]
+fn an_expired_cursor_waits_for_the_input_method_before_reopening() {
+    for commit in [true, false] {
+        let (mut app, requests, _, _) = app();
+        open_at_zero(&mut app, &requests, RoomRole::Editor);
+        app.settle_cloud_room(1000.0);
+        let (_, expired) = next(&requests);
+        app.canvas.ime_preedit = "にほん".into();
+        expired.send(Err(room_revision_expired())).unwrap();
+        app.settle_cloud_room(1050.0);
+        assert_eq!(app.hosted_room_read_only(app.session.document_id()), Some(false), "the IME must still be able to commit");
+        assert!(requests.try_recv().is_err());
+
+        app.canvas.ime_preedit.clear();
+        if commit {
+            edit(&mut app, "日本 ");
+        }
+        app.settle_cloud_room(1100.0);
+        if commit {
+            assert!(!app.cloud_room_polling());
+            assert_eq!(app.session.doc.plain_text(StoryRef::Body), "日本 original");
+            assert!(requests.try_recv().is_err(), "the edit must remain local");
+        } else {
+            let (request, _) = next(&requests);
+            assert_eq!(request, CloudRequest::RoomMetadata { id: ID.into() });
+            assert_eq!(app.session.doc.plain_text(StoryRef::Body), "original");
+        }
+    }
+}

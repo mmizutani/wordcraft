@@ -103,7 +103,7 @@ fn supported(doc: &Document) -> Result<(), RoomModelError> {
     Ok(())
 }
 
-fn apply(doc: &Document, change: &ChangeSet) -> Result<Document, RoomModelError> {
+pub(crate) fn apply(doc: &Document, change: &ChangeSet) -> Result<Document, RoomModelError> {
     if change.is_empty() || change.puts_in_unnamed_blocks() {
         return Err(RoomModelError::Invalid);
     }
