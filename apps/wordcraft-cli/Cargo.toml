@@ -14,6 +14,10 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+getrandom = { workspace = true }
+wordcraft-assist = { workspace = true }
+wordcraft-control-key = { workspace = true }
+wordcraft-http = { workspace = true }
 wordcraft-doc = { workspace = true }
 wordcraft-engine = { workspace = true }
 wordcraft-render = { workspace = true }
@@ -23,8 +27,6 @@ serde_json = { workspace = true }
 sys-locale = "0.3"
 
 [dev-dependencies]
-# The built-in assistant's ACP backend and its scripted agent, end to end through `mcp --connect`.
-wordcraft-assist = { workspace = true }
 wordcraft-fonts = { workspace = true }
 image = { workspace = true }
 zip = { workspace = true }

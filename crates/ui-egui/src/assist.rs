@@ -62,6 +62,8 @@ pub(crate) const FOCUS_FRAMES: u8 = 3;
 /// The window's assistant.
 #[derive(Default)]
 pub(crate) struct AssistState {
+    /// The selected-text action supplied by the local web server.
+    pub(crate) local: crate::local_assistant::State,
     /// The conversation, once one started: kept when it ends, so the pane still shows it.
     pub(crate) conversation: Option<Conversation>,
     /// The assistants offered, as last asked ([`wordcraft_assist::offers::offers`]).
@@ -1028,6 +1030,10 @@ fn action_item(ui: &mut egui::Ui, app: &mut WordApp, label: &str, id: &str, para
 /// The writing actions (#18) as menu items: the mini toolbar's Assistant menu and the
 /// right-click menu's. Draft asks what to write in the pane's prompt box.
 pub(crate) fn action_items(ui: &mut egui::Ui, app: &mut WordApp) {
+    if app.services.local_assistant.is_some() {
+        action_item(ui, app, "Open Assistant for Rewrite…", "assist.pane", json!({"value": true}));
+        return;
+    }
     let on = crate::widgets::enabled(app, "assist.draft");
     let mut r = ui.add_enabled(on, crate::rtl::menu_item(ui, tl!("Draft…"), "", 0.0));
     if let Some(why) = app.session.why_disabled("assist.draft") {

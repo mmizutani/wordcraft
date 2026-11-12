@@ -7044,13 +7044,16 @@ dependencies = [
 name = "wordcraft-cli"
 version = "0.15.1"
 dependencies = [
+ "getrandom 0.3.4",
  "image",
  "serde_json",
  "sys-locale",
  "wordcraft-assist",
+ "wordcraft-control-key",
  "wordcraft-doc",
  "wordcraft-engine",
  "wordcraft-fonts",
+ "wordcraft-http",
  "wordcraft-mcp",
  "wordcraft-render",
  "wordcraft-zotero",

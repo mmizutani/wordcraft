@@ -55,6 +55,7 @@ pub mod ink;
 pub mod keys;
 pub mod keytips;
 pub(crate) mod language_packs;
+pub mod local_assistant;
 mod local_time;
 pub mod mini_toolbar;
 pub mod objects;

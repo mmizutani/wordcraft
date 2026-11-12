@@ -76,6 +76,11 @@ pub(super) fn claims(client_id: &str, nonce: Option<&str>) -> Value {
 /// What the fake sign-in server does.
 #[derive(Default)]
 pub(super) struct Script {
+    /// The local web profile requires a real signature.
+    signed_identity: Mutex<bool>,
+    invalid_signature: Mutex<bool>,
+    /// The subject of the selected provider account.
+    subject: Mutex<Option<String>>,
     /// The nonce the token endpoint puts in the id token (the sign-in's).
     pub(super) nonce: Mutex<String>,
     /// The scopes the token endpoint grants, when not all of them.
@@ -101,8 +106,13 @@ pub(super) fn server(script: Arc<Script>, api: impl Fn(&Request, usize) -> Reply
         ("POST", "/oauth/token") => token(&script, r, n),
         ("GET", "/.well-known/openid-configuration") => Reply::json(
             200,
-            &json!({"issuer": ISSUER, "revocation_endpoint": format!("http://{}/oauth/revoke", r.header("host").unwrap_or_default())}),
+            &json!({
+                "issuer": ISSUER,
+                "revocation_endpoint": format!("http://{}/oauth/revoke", r.header("host").unwrap_or_default()),
+                "jwks_uri": format!("http://{}/jwks", r.header("host").unwrap_or_default()),
+            }),
         ),
+        ("GET", "/jwks") => Reply::json(200, &super::local_web_tests::jwks()),
         ("POST", "/oauth/revoke") => Reply::empty(match *script.revoke.lock().unwrap() {
             0 => 200,
             s => s,
@@ -139,10 +149,19 @@ fn token(script: &Script, r: &Request, n: usize) -> Reply {
     let first = r.field("grant_type").as_deref() == Some("authorization_code");
     let nonce = script.nonce.lock().unwrap().clone();
     let scope = script.scope.lock().unwrap().clone().unwrap_or_else(|| SCOPES.to_string());
+    let mut identity = claims(&client, first.then_some(nonce.as_str()));
+    if let Some(subject) = script.subject.lock().unwrap().as_ref() {
+        identity["sub"] = json!(subject);
+    }
+    let mut identity = if *script.signed_identity.lock().unwrap() { super::local_web_tests::signed(&identity) } else { id_token(&identity) };
+    if *script.invalid_signature.lock().unwrap() {
+        let offset = identity.rfind('.').unwrap() + 1;
+        identity.replace_range(offset.., &b64url(b"wrong signature"));
+    }
     let mut body = json!({
         "access_token": format!("access-{n}"),
         "refresh_token": format!("refresh-{n}"),
-        "id_token": id_token(&claims(&client, first.then_some(nonce.as_str()))),
+        "id_token": identity,
         "token_type": "Bearer",
         "expires_in": 3600,
         "scope": scope,
@@ -1296,4 +1315,109 @@ fn the_pane_offers_chatgpt_with_what_it_needs_first() {
     assert!(e.starts_with("ChatGPT: Sign in"), "{e}");
     let nowhere = crate::offers::offers(&Host::default());
     assert!(matches!(&nowhere.iter().find(|o| o.id == ID).unwrap().readiness, Readiness::Unavailable { .. }));
+}
+
+fn local_web_sign_in(folder: &Path, script: &Script, endpoints: &Endpoints, new: bool) -> (u16, Result<Account, AuthError>) {
+    let mut attempt = SignIn::start_for_local_web(folder, options(endpoints)).unwrap();
+    let url = attempt.url().to_string();
+    assert!(!url.contains("id_token_hint"));
+    *script.nonce.lock().unwrap() = param(&url, "nonce").unwrap();
+    let state = param(&url, "state").unwrap();
+    let client = if new { "&client_id=oaiapp_test" } else { "" };
+    let host = attempt.redirect_uri().strip_prefix("http://").unwrap().split_once('/').unwrap().0;
+    let (wrong_host, _) = raw(host, format!("GET /auth/callback?code=c&state={state}{client} HTTP/1.1\r\nHost: rebound.example\r\n\r\n").as_bytes());
+    assert_eq!(wrong_host, 400);
+    let (status, _) = callback(attempt.redirect_uri(), &format!("code=c&state={state}{client}"));
+    (status, attempt.wait(WAIT).cloned().unwrap())
+}
+
+#[test]
+fn local_web_sign_in_requires_a_signed_identity_and_an_explicit_plan_grant() {
+    let folder = Folder::new();
+    fake_keychain(folder.path(), false);
+    let script = Arc::new(Script::default());
+    let server = server(script.clone(), no_api);
+    let endpoints = Endpoints::local(server.base());
+
+    let (status, result) = local_web_sign_in(folder.path(), &script, &endpoints, true);
+    assert_eq!(status, 400);
+    assert!(result.is_err());
+    assert!(account(folder.path()).is_none());
+
+    *script.signed_identity.lock().unwrap() = true;
+    *script.invalid_signature.lock().unwrap() = true;
+    assert!(local_web_sign_in(folder.path(), &script, &endpoints, false).1.is_err());
+    assert!(account(folder.path()).is_none());
+    *script.invalid_signature.lock().unwrap() = false;
+
+    *script.omit_scope.lock().unwrap() = true;
+    assert_eq!(local_web_sign_in(folder.path(), &script, &endpoints, false).1, Err(AuthError::Denied));
+    assert!(account(folder.path()).is_none());
+
+    *script.omit_scope.lock().unwrap() = false;
+    let connected = local_web_sign_in(folder.path(), &script, &endpoints, false).1.unwrap();
+    assert!(connected.plan_usage);
+    assert_eq!(connected.kept, Kept::Session);
+    assert!(!folder.path().join(CREDENTIALS_FILE).exists());
+    assert_eq!(server.to("/jwks").len(), 3);
+
+    *script.subject.lock().unwrap() = Some("another-user".into());
+    assert!(local_web_sign_in(folder.path(), &script, &endpoints, false).1.is_err());
+    assert_eq!(store::read_credentials(folder.path()).unwrap().subject, "user-123");
+}
+
+#[test]
+fn local_web_rewrite_uses_the_selected_plan_and_requires_completed_output() {
+    use super::local_web::{LocalRewriteError, rewrite_with};
+    let folder = Folder::new();
+    let script = Arc::new(Script::default());
+    *script.signed_identity.lock().unwrap() = true;
+    let provider = server(script.clone(), |r, n| {
+        assert_eq!(r.path, "/v1/responses");
+        assert_eq!(r.header("authorization"), Some("Bearer access-0"));
+        let body = r.json();
+        assert_eq!(body["model"], "gpt-test");
+        assert_eq!(body["input"][0]["content"], "初めの文章です。");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert!(body.get("tools").is_none());
+        match n {
+            0 => Reply::sse(&[json!({"type":"response.completed","response":{"status":"completed","output":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"改めた文章です。"}]}
+            ]}})]),
+            1 => Reply::sse(&[json!({"type":"response.output_text.delta","delta":"partial"})]),
+            _ => Reply::sse(&[json!({"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded"}}})]),
+        }
+    });
+    let endpoints = Endpoints::local(provider.base());
+    assert!(local_web_sign_in(folder.path(), &script, &endpoints, true).1.unwrap().plan_usage);
+
+    assert_eq!(rewrite_with(folder.path(), &endpoints, "初めの文章です。"), Ok("改めた文章です。".into()));
+    assert_eq!(rewrite_with(folder.path(), &endpoints, "初めの文章です。"), Err(LocalRewriteError::Failed));
+    assert_eq!(rewrite_with(folder.path(), &endpoints, "初めの文章です。"), Err(LocalRewriteError::Usage));
+    assert_eq!(rewrite_with(folder.path(), &endpoints, "first\nsecond"), Err(LocalRewriteError::Failed));
+    assert_eq!(provider.to("/v1/responses").len(), 3);
+}
+
+#[test]
+#[ignore = "exercises a provider stream past the 30-second authentication deadline"]
+fn local_web_rewrite_accepts_completion_after_auth_deadline() {
+    use super::fake_server::Part;
+    use super::local_web::rewrite_with;
+
+    let folder = Folder::new();
+    let script = Arc::new(Script::default());
+    *script.signed_identity.lock().unwrap() = true;
+    let provider = server(script.clone(), |r, _| {
+        assert_eq!(r.path, "/v1/responses");
+        let mut reply = Reply::sse(&[json!({"type":"response.completed","response":{"status":"completed","output":[
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Rewritten."}]}
+        ]}})]);
+        reply.parts.insert(0, Part::Wait(http::AUTH_CALL + Duration::from_secs(1)));
+        reply
+    });
+    let endpoints = Endpoints::local(provider.base());
+    assert!(local_web_sign_in(folder.path(), &script, &endpoints, true).1.unwrap().plan_usage);
+
+    assert_eq!(rewrite_with(folder.path(), &endpoints, "Original."), Ok("Rewritten.".into()));
 }

@@ -30,6 +30,10 @@ pub fn enabled(app: &WordApp, id: &str) -> bool {
         None if id.starts_with("ui.zotero.") => app.zotero.busy.is_none() && !cfg!(target_arch = "wasm32"),
         None if id == "ui.linkTextBox" => enabled(app, "shape.link"),
         None if id == "ui.crop" => crate::crop::can_toggle(app),
+        None if id == crate::local_assistant::REWRITE_COMMAND => crate::local_assistant::rewrite_enabled(app),
+        None if matches!(id, crate::local_assistant::CONNECT_COMMAND | crate::local_assistant::DISCONNECT_COMMAND) => {
+            crate::local_assistant::connection_enabled(app, id)
+        }
         None => id.starts_with("ui."),
     }
 }

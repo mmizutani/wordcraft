@@ -3,6 +3,7 @@
 
 mod automation_args;
 mod call;
+mod local_assistant;
 mod script;
 
 use std::ffi::{OsStr, OsString};
@@ -78,6 +79,7 @@ USAGE:
                                               running): addEditCitation, addEditBibliography,
                                               addNote, refresh, removeCodes, setDocPrefs
                                               (--cmd runs first, e.g. --cmd caret.docEnd)
+  wordcraft-cli local-assistant <trunk-dist>   serve the local browser editor with ChatGPT sign-in
   wordcraft-cli [<command>] -h | --help       this help
   wordcraft-cli --version
 
@@ -93,7 +95,8 @@ same output on every machine.
 ";
 
 /// The subcommands, in `USAGE` order; `--help` or `-h` after any of them prints `USAGE` (#968).
-const SUBCOMMANDS: &[&str] = &["convert", "info", "text", "inspect", "render", "run", "commands", "parity", "mcp", "call", "zotero"];
+const SUBCOMMANDS: &[&str] =
+    &["convert", "info", "text", "inspect", "render", "run", "commands", "parity", "mcp", "call", "zotero", "local-assistant"];
 
 fn wants_help(cmd: &str, rest: &[String]) -> bool {
     SUBCOMMANDS.contains(&cmd) && rest.iter().any(|a| a == "--help" || a == "-h")
@@ -569,6 +572,10 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
     }
     match cmd {
         "convert" => run_convert(&rest, open),
+        "local-assistant" => {
+            let [dist] = rest.as_slice() else { return Err("usage: wordcraft-cli local-assistant <trunk-dist>".into()) };
+            local_assistant::serve(Path::new(dist)).map_err(Into::into)
+        }
         "info" => {
             validate_options("info", &rest, PASSWORD_OPTIONS)?;
             let paths = positionals(&rest, PASSWORD_OPTIONS);

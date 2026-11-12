@@ -35,6 +35,10 @@ const BOTTOM: f32 = 110.0;
 const MIN_TRANSCRIPT: f32 = 60.0;
 
 pub(super) fn assistant(app: &mut WordApp, ui: &mut Ui) {
+    if app.services.local_assistant.is_some() {
+        crate::local_assistant::show(app, ui);
+        return;
+    }
     let t = Tokens::get(ui.ctx());
     picker(app, ui, &t);
     ui.add_space(4.0);
