@@ -15,6 +15,34 @@
       "when": 1794355200000,
       "tag": "0001_cloud_documents",
       "breakpoints": false
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1794441600000,
+      "tag": "0002_cloud_rooms",
+      "breakpoints": false
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1794441601000,
+      "tag": "0003_cloud_room_grants",
+      "breakpoints": false
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1794441602000,
+      "tag": "0004_cloud_room_presence",
+      "breakpoints": false
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1794441603000,
+      "tag": "0005_cloud_room_save",
+      "breakpoints": false
     }
   ]
 }

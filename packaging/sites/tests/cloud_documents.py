@@ -8,6 +8,7 @@ Use --wrangler /path/to/wrangler if your PATH does not have Wrangler 4.
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from hashlib import sha256
 from http.client import HTTPConnection
 import json
@@ -338,7 +339,8 @@ def start_api(server):
     raise RuntimeError(f"Wrangler did not start on port {server.port}")
 
 
-def run_local(args, root):
+@contextmanager
+def local_storage(args, root):
     with TemporaryDirectory(prefix="wordcraft-cloud-check-") as directory:
         sandbox = Path(directory)
         for name in ("index.js", "index_bg.wasm"):
@@ -384,33 +386,48 @@ def run_local(args, root):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             api = Api(sock.getsockname()[1])
-        with (sandbox / "wrangler.log").open("w+") as log:
-            process = subprocess.Popen(
-                [*cli, "dev", *local, "--ip", "127.0.0.1", "--port", str(api.port), "--inspector-port", "0"],
-                cwd=sandbox, stdout=log, stderr=subprocess.STDOUT,
-            )
+        yield api, cli, local, state, sandbox, read_object
+
+
+@contextmanager
+def running_worker(api, cli, local, sandbox):
+    with (sandbox / "wrangler.log").open("w+") as log:
+        process = subprocess.Popen(
+            [*cli, "dev", *local, "--ip", "127.0.0.1", "--port", str(api.port), "--inspector-port", "0"],
+            cwd=sandbox, stdout=log, stderr=subprocess.STDOUT,
+        )
+        try:
+            start_api(api)
+            yield
+        except Exception:
+            log.seek(0)
+            print(log.read(), flush=True)
+            raise
+        finally:
+            process.terminate()
+            process.wait(timeout=15)
+
+
+def local_db(state):
+    db_path, = (file for file in (state / "v3" / "d1").glob(
+        "miniflare-D1DatabaseObject/*.sqlite"
+    ) if file.name != "metadata.sqlite")
+    return sqlite3.connect(db_path)
+
+
+def run_local(args, root):
+    with local_storage(args, root) as (api, cli, local, state, sandbox, read_object):
+        with running_worker(api, cli, local, sandbox):
+            path, create, latest = ordinary_requests(api)
+            db = local_db(state)
             try:
-                start_api(api)
-                path, create, latest = ordinary_requests(api)
-                db_path, = (file for file in (state / "v3" / "d1").glob(
-                    "miniflare-D1DatabaseObject/*.sqlite"
-                ) if file.name != "metadata.sqlite")
-                db = sqlite3.connect(db_path)
-                try:
-                    latest = concurrent_updates(api, db, path, latest)
-                    interrupted_uploads(api, db)
-                    library_pages(api, db)
-                    exact_limit(api)
-                    delete_during_upload(api, db, path, create, latest, read_object)
-                finally:
-                    db.close()
-            except Exception:
-                log.seek(0)
-                print(log.read(), flush=True)
-                raise
+                latest = concurrent_updates(api, db, path, latest)
+                interrupted_uploads(api, db)
+                library_pages(api, db)
+                exact_limit(api)
+                delete_during_upload(api, db, path, create, latest, read_object)
             finally:
-                process.terminate()
-                process.wait(timeout=15)
+                db.close()
 
 
 if __name__ == "__main__":

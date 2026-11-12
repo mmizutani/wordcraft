@@ -9,11 +9,11 @@ use std::{
 use wordcraft_doc::{Document, StoryRef};
 use wordcraft_engine::{Session, io};
 
-type Respond = mpsc::Sender<Result<CloudResponse, CloudFailure>>;
-type Requests = mpsc::Receiver<(CloudRequest, Respond)>;
+pub(super) type Respond = mpsc::Sender<Result<CloudResponse, CloudFailure>>;
+pub(super) type Requests = mpsc::Receiver<(CloudRequest, Respond)>;
 type Downloads = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
 
-fn app() -> (WordApp, Requests, Downloads, Rc<Cell<bool>>) {
+pub(super) fn app() -> (WordApp, Requests, Downloads, Rc<Cell<bool>>) {
     let (requests, received) = mpsc::channel();
     let operation = Cell::new(0);
     let cloud = CloudService {
@@ -50,11 +50,11 @@ fn app() -> (WordApp, Requests, Downloads, Rc<Cell<bool>>) {
     (app, received, downloads, dirty)
 }
 
-fn next(requests: &Requests) -> (CloudRequest, Respond) {
+pub(super) fn next(requests: &Requests) -> (CloudRequest, Respond) {
     requests.try_recv().unwrap()
 }
 
-fn docx(text: &str) -> Vec<u8> {
+pub(super) fn docx(text: &str) -> Vec<u8> {
     io::save_bytes("test.docx", &Document::from_text(text)).unwrap()
 }
 
@@ -62,15 +62,15 @@ fn test_passphrase(scenario: &str) -> String {
     format!("WordCraft test fixture {scenario}")
 }
 
-fn edit(app: &mut WordApp, text: &str) {
+pub(super) fn edit(app: &mut WordApp, text: &str) {
     app.run("text.insert", json!({"text": text})).unwrap();
 }
 
-fn entry(id: &str, revision: u64) -> CloudEntry {
+pub(super) fn entry(id: &str, revision: u64) -> CloudEntry {
     CloudEntry { id: id.into(), name: "Cloud document.docx".into(), revision, byte_size: 10, saved_at: 1 }
 }
 
-fn saved(request: CloudRequest, respond: Respond) {
+pub(super) fn saved(request: CloudRequest, respond: Respond) {
     let CloudRequest::Save { id, base_revision, name, bytes, .. } = request else {
         panic!("expected a save");
     };
@@ -92,7 +92,7 @@ fn start_save(app: &mut WordApp, requests: &Requests) -> (CloudRequest, Respond)
     next(requests)
 }
 
-fn list(app: &mut WordApp, requests: &Requests, entry: CloudEntry) {
+pub(super) fn list(app: &mut WordApp, requests: &Requests, entry: CloudEntry) {
     app.run("ui.cloudRefresh", json!({})).unwrap();
     let (request, reply) = next(requests);
     assert_eq!(request, CloudRequest::List { cursor: None });
@@ -207,7 +207,7 @@ fn cloud_open_from_the_start_screen_uses_the_read_revision() {
     list(&mut app, &requests, entry("from-library", 2));
     app.run("ui.cloudOpen", json!({"id":"from-library"})).unwrap();
     let (request, reply) = next(&requests);
-    assert_eq!(request, CloudRequest::Open { id: "from-library".into() });
+    assert_eq!(request, CloudRequest::OpenEditor { id: "from-library".into() });
     reply.send(Ok(CloudResponse::Open { revision: 5, bytes: docx("read revision") })).unwrap();
     app.settle_cloud();
     assert!(app.has_document());
@@ -596,7 +596,7 @@ fn an_old_picker_failure_keeps_the_newer_cloud_open_and_the_unsaved_buffer() {
         app.run("ui.cloudOpen", json!({"id":"new"})).unwrap();
         app.run("ui.saveChanges", json!({"answer":"dontSave"})).unwrap();
         let (request, reply) = next(&requests);
-        assert_eq!(request, CloudRequest::Open { id: "new".into() });
+        assert_eq!(request, CloudRequest::OpenEditor { id: "new".into() });
 
         saves.finish(ticket.get().unwrap(), SaveOutcome::Failed("test write error".into()));
         app.settle_async_saves();

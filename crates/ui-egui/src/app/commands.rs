@@ -30,7 +30,7 @@ impl WordApp {
     pub fn run(&mut self, id: &str, mut params: Value) -> Result<Value, String> {
         // A cloud open finishes frames later, so whether it may ask travels with its params,
         // through Save Changes too, whose answer runs it with `execute`.
-        if id == "ui.cloudOpen"
+        if matches!(id, "ui.cloudOpen" | "ui.cloudOpenRoom")
             && let Some(p) = params.as_object_mut()
         {
             p.insert("asks".into(), json!(true));
@@ -44,11 +44,14 @@ impl WordApp {
         }
         let waits_for_cloud =
             self.cloud.unsaved(self.session.document_id()) && matches!(id, "file.new" | "file.newFromTemplate" | "file.open" | "ui.openFileDialog");
-        let guards = discards_document(id, &params) || id == "ui.cloudOpen" || waits_for_cloud;
+        let guards = discards_document(id, &params) || matches!(id, "ui.cloudOpen" | "ui.cloudOpenRoom") || waits_for_cloud;
         let refused = if guards || flushes_comment_drafts(id, &params) { panes::flush_comment_drafts(self).err() } else { None };
         if id == "file.recover" && params.as_object().is_none_or(|p| p.is_empty()) {
             self.ui.backstage = true;
             self.ui.backstage_page = "recover".into();
+        }
+        if self.hosted_room_open() && matches!(id, "file.encrypt" | "file.protect" | "review.restrict") {
+            return self.execute(id, params);
         }
         // A button whose command needs input the user hasn't given yet opens its dialog (#240).
         if let Some(name) = input_dialog(id, &params)
@@ -1204,6 +1207,9 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "file.listTemplates"
             | "file.open"
             | "ui.cloudOpen"
+            | "ui.cloudOpenRoom"
+            | "ui.cloudRoomRequestAccess"
+            | "ui.cloudRoomCheckAccess"
             | "ui.cloudApply"
             | "ui.cloudRefresh"
             | "ui.cloudMore"
@@ -1297,6 +1303,7 @@ fn supersedes_cloud_navigation(id: &str) -> bool {
             | "file.closeDocument"
             | "ui.openFileDialog"
             | "ui.cloudOpen"
+            | "ui.cloudOpenRoom"
             | "view.switchWindows"
     )
 }

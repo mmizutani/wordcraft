@@ -75,7 +75,8 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     // No document open (#1129): only the pages that open or create one, and Options.
     let has_document = app.has_document();
-    if !has_document && !works_without_document(&app.ui.backstage_page) {
+    let room_link = app.cloud_room_link_open();
+    if !(has_document || works_without_document(&app.ui.backstage_page) || room_link && app.ui.backstage_page == "share") {
         app.ui.backstage_page = "home".into();
     }
     let mac = app.integrated_titlebar;
@@ -137,7 +138,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                     continue;
                 }
                 // No document open (#1129): Info, Save, Save As, Print, Share and Export are greyed out.
-                let on = has_document || works_without_document(id);
+                let on = has_document || works_without_document(id) || room_link && id == "share";
                 let (r, resp) = ui.add_enabled_ui(on, |ui| ui.allocate_exact_size(vec2(200.0, 38.0), Sense::click())).inner;
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, on, tl!(label)));
                 let active = app.ui.backstage_page == id;

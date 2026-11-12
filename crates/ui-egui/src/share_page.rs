@@ -182,6 +182,12 @@ fn note(ui: &mut Ui, s: &str) {
 /// Draws File › Share.
 pub(crate) fn page(app: &mut WordApp, ui: &mut Ui) {
     heading(ui, "Share");
+    if app.services.cloud.is_some() {
+        app.show_hosted_share(ui);
+        ui.add_space(8.0);
+        export_button(app, ui);
+        return;
+    }
     if !crate::assist::desktop(app) {
         // Nobody reaches the web app's room: people and agents join through the desktop app.
         ui.label(tl!("People and agents join a shared document through the desktop app. Here, export a copy to send."));

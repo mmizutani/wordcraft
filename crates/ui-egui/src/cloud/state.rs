@@ -1,8 +1,12 @@
 use super::{CloudEntry, CloudFailure, CloudFailureKind, CloudReply, CloudRequest, CloudResponse, CloudService};
+mod room;
 mod view;
+use super::RoomMetadata;
+use room::{HostedOpen, HostedRoom, RoomLink};
 use std::collections::HashMap;
 use std::sync::mpsc::TryRecvError;
 pub(crate) use view::{show_library, show_save, show_status, show_waiting_navigation};
+use wordcraft_engine::room::remote::RemoteReplica;
 
 use serde_json::{Value, json};
 use wordcraft_engine::{Password, Session};
@@ -15,6 +19,8 @@ const CLOUD_CREATE_FORMAT: &str = "Save to Cloud supports new documents and loca
 #[derive(Default)]
 pub(crate) struct State {
     documents: HashMap<u64, CloudEntry>,
+    rooms: HashMap<u64, HostedRoom>,
+    room_link: Option<RoomLink>,
     saves: HashMap<u64, Save>,
     held: Option<Held>,
     opening: Option<Opening>,
@@ -69,6 +75,22 @@ struct Opening {
 enum OpenResult {
     Fetching(CloudReply),
     Ready(Vec<u8>),
+    Hosted(HostedOpen),
+    HostedReady(RoomMetadata, Box<RemoteReplica>),
+}
+
+impl OpenResult {
+    fn ready(&self) -> bool {
+        matches!(self, Self::Ready(_) | Self::HostedReady(_, _))
+    }
+
+    fn reply(&self) -> Option<&CloudReply> {
+        match self {
+            Self::Fetching(reply) => Some(reply),
+            Self::Hosted(hosted) => Some(hosted.reply()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -108,7 +130,7 @@ impl State {
     }
 
     pub(crate) fn unsaved(&self, document: u64) -> bool {
-        self.saves.contains_key(&document)
+        self.saves.contains_key(&document) || self.rooms.get(&document).is_some_and(HostedRoom::publishing)
     }
 
     fn sending(&self, document: u64) -> bool {
@@ -116,7 +138,7 @@ impl State {
     }
 
     pub(crate) fn discard_unattended_open(&mut self) {
-        if !self.held() && self.opening.as_ref().is_some_and(|opening| matches!(opening.result, OpenResult::Ready(_))) {
+        if !self.held() && self.opening.as_ref().is_some_and(|opening| opening.result.ready()) {
             self.opening = None;
         }
     }
@@ -126,7 +148,7 @@ impl State {
     }
 
     fn fetching(&self) -> bool {
-        self.opening.as_ref().is_some_and(|opening| matches!(opening.result, OpenResult::Fetching(_)))
+        self.opening.as_ref().is_some_and(|opening| !opening.result.ready())
     }
 }
 
@@ -134,6 +156,7 @@ impl WordApp {
     pub(crate) fn cancel_cloud_navigation(&mut self) {
         self.cloud.opening = None;
         self.cloud.held = None;
+        self.cloud.room_link = None;
         // The picker still reports its write; only its obsolete cloud navigation is canceled.
         let _ = self.awaiting_save.take_if(|wait| matches!(wait.then.as_str(), "ui.cloudOpen" | "ui.cloudApply"));
     }
@@ -145,6 +168,15 @@ impl WordApp {
             "ui.cloudRefresh" => self.cloud_list(false).map(|()| json!({})),
             "ui.cloudMore" => self.cloud_list(true).map(|()| json!({})),
             "ui.cloudOpen" => self.cloud_open(params),
+            "ui.cloudOpenRoom" => self.cloud_open_room(params),
+            "ui.cloudActivateRoom" => self.cloud_activate_room(),
+            "ui.cloudRoomRequestAccess" => self.cloud_room_access(true),
+            "ui.cloudRoomCheckAccess" => self.cloud_room_access(false),
+            "ui.cloudRoomGrants" => self.cloud_manage_room_grants(None),
+            "ui.cloudSetRoomRole" => self.cloud_manage_room_grants(Some(params)),
+            "file.encrypt" | "file.protect" | "review.restrict" if self.hosted_room_open() => {
+                Err(tl!("Document protection is unavailable while sharing a cloud document.").into())
+            }
             "ui.cloudApply" => {
                 self.cloud_apply(params.get("password").and_then(Value::as_str), params.get("force").and_then(Value::as_bool) == Some(true))
             }
@@ -203,6 +235,9 @@ impl WordApp {
 
     pub(crate) fn cloud_save(&mut self, name: Option<&str>, params: &Value) -> Result<Value, String> {
         let document = self.session.document_id();
+        if self.hosted_room_open() {
+            return self.cloud_publish_room(params);
+        }
         if let Some(save) = self.cloud.saves.get(&document) {
             if params.get("password").is_some_and(|password| !password.is_null()) {
                 return Err(tl!("A cloud save is pending. Finish that save before setting a password through Save.").into());
@@ -351,18 +386,23 @@ impl WordApp {
         } else {
             self.library_entry(params)?
         };
-        let reply = (self.cloud_service()?.request)(CloudRequest::Open { id: entry.id.clone() });
+        let reply = (self.cloud_service()?.request)(CloudRequest::OpenEditor { id: entry.id.clone() });
+        self.begin_cloud_open(entry, OpenResult::Fetching(reply), params);
+        Ok(json!({"pending": "cloudOpen"}))
+    }
+
+    fn begin_cloud_open(&mut self, entry: CloudEntry, result: OpenResult, params: &Value) {
+        let document = self.session.document_id();
         self.cloud.library.message.clear();
         self.cloud.opening = Some(Opening {
             document,
             snapshot: DocumentSnapshot::capture(&self.session),
             entry,
-            result: OpenResult::Fetching(reply),
+            result,
             save_pending: self.cloud.unsaved(document),
             confirmed: true,
             asks: params.get("asks").and_then(Value::as_bool) == Some(true),
         });
-        Ok(json!({"pending": "cloudOpen"}))
     }
 
     fn cloud_apply(&mut self, password: Option<&str>, force: bool) -> Result<Value, String> {
@@ -380,7 +420,7 @@ impl WordApp {
             return self.confirm_cloud_replacement(opening);
         }
         opening.confirmed = true;
-        let OpenResult::Ready(bytes) = &opening.result else {
+        if !opening.result.ready() {
             self.cloud.opening = Some(opening);
             return Err(tl!("The cloud document is still loading.").into());
         };
@@ -392,8 +432,11 @@ impl WordApp {
         {
             return Err(tl!("This tab already has a newer saved cloud revision.").into());
         }
-        // The same bounded import and password handling used by the local file command.
-        let opened = wordcraft_engine::io::open_docx_bytes(bytes, password);
+        let opened = match &opening.result {
+            OpenResult::HostedReady(_, replica) => Ok((replica.document().clone(), false)),
+            OpenResult::Ready(bytes) => wordcraft_engine::io::open_docx_bytes(bytes, password),
+            _ => return Err(tl!("The cloud document is still loading.").into()),
+        };
         let (document, encrypted) = match opened {
             Ok(opened) => opened,
             Err(error) if wordcraft_engine::io::needs_password(&error) || wordcraft_engine::io::wrong_password(&error) => {
@@ -441,6 +484,9 @@ impl WordApp {
         }
         let local = self.session.document_id();
         self.cloud.documents.insert(local, opening.entry);
+        if let OpenResult::HostedReady(meta, replica) = opening.result {
+            self.cloud.rooms.insert(local, HostedRoom::new(meta, replica, &self.session, crate::now_ms()));
+        }
         self.sync_document();
         self.recovery_seen = true;
         self.ui.backstage = false;
@@ -487,6 +533,7 @@ impl WordApp {
         let session = &self.session;
         self.cloud.documents.retain(|document, _| session.is_open(*document));
         self.cloud.saves.retain(|document, _| session.is_open(*document));
+        self.cloud.rooms.retain(|document, _| session.is_open(*document));
         let completed: Vec<_> = self
             .cloud
             .saves
@@ -506,26 +553,56 @@ impl WordApp {
         {
             self.finish_library_request(action, result);
         }
-        if let Some(result) = self.cloud.opening.as_ref().and_then(|opening| match &opening.result {
-            OpenResult::Fetching(reply) => poll(reply),
-            OpenResult::Ready(_) => None,
-        }) && let Some(mut opening) = self.cloud.opening.take()
+        if let Some(result) = self.cloud.opening.as_ref().and_then(|opening| opening.result.reply().and_then(poll))
+            && let Some(opening) = self.cloud.opening.take()
             && opening.document == self.session.document_id()
+            && let Err(error) = self.finish_cloud_open(opening, result)
         {
-            match result {
-                Ok(CloudResponse::Open { revision, bytes }) if revision > 0 && !bytes.is_empty() && bytes.len() <= MAX_BYTES => {
-                    opening.entry.revision = revision;
-                    opening.entry.byte_size = bytes.len() as u64;
-                    opening.result = OpenResult::Ready(bytes);
-                    self.cloud.opening = Some(opening);
-                    if let Err(error) = self.cloud_apply(None, false) {
-                        self.cloud_open_error(error);
-                    }
-                }
-                Err(error) => self.cloud_open_error(error.message),
-                _ => self.cloud_open_error(unexpected().message),
-            }
+            self.cloud_open_error(error);
         }
+        self.settle_room_access();
+        self.settle_cloud_room(crate::now_ms());
+    }
+
+    fn finish_cloud_open(&mut self, mut opening: Opening, response: Result<CloudResponse, CloudFailure>) -> Result<(), String> {
+        let service = self.cloud_service()?;
+        opening.result = match (opening.result, response) {
+            (OpenResult::Fetching(_), Ok(CloudResponse::Open { revision, bytes }))
+                if revision > 0 && !bytes.is_empty() && bytes.len() <= MAX_BYTES =>
+            {
+                opening.entry.revision = revision;
+                opening.entry.byte_size = bytes.len() as u64;
+                OpenResult::Ready(bytes)
+            }
+            (OpenResult::Fetching(_), Err(error)) if error.kind == CloudFailureKind::RoomRequired => {
+                let reply = (service.request)(CloudRequest::RoomMetadata { id: opening.entry.id.clone() });
+                OpenResult::Hosted(HostedOpen::Metadata(reply))
+            }
+            (OpenResult::Hosted(hosted), Ok(response)) => hosted.advance(response, service, &opening.entry.id)?,
+            (OpenResult::Hosted(_), Err(error))
+                if self.cloud.room_link.is_some() && matches!(error.kind, CloudFailureKind::Missing | CloudFailureKind::AccessDenied) =>
+            {
+                self.cloud_room_access(false)?;
+                self.ui.backstage = true;
+                self.ui.backstage_page = "share".into();
+                return Ok(());
+            }
+            (OpenResult::Hosted(_), Err(error)) if error.kind == CloudFailureKind::Recovery => {
+                let reply = (service.request)(CloudRequest::RoomMetadata { id: opening.entry.id.clone() });
+                OpenResult::Hosted(HostedOpen::Metadata(reply))
+            }
+            (_, Err(error)) => return Err(error.message),
+            _ => return Err(unexpected().message),
+        };
+        if let OpenResult::HostedReady(meta, _) = &opening.result {
+            opening.entry.revision = meta.file_revision;
+        }
+        let ready = opening.result.ready();
+        self.cloud.opening = Some(opening);
+        if ready {
+            self.cloud_apply(None, false)?;
+        }
+        Ok(())
     }
 
     fn cloud_open_error(&mut self, error: String) {

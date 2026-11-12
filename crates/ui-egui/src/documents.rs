@@ -43,6 +43,7 @@ impl WordApp {
     /// With native windows ([`crate::windows`]) the window that shows the document comes to the
     /// front instead, or a new one opens for it.
     pub(crate) fn sync_document(&mut self) {
+        self.sync_cloud_room_role();
         let id = self.session.document_id();
         if self.windows.native() {
             self.prune_windows();

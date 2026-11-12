@@ -266,11 +266,13 @@ impl Session {
         }
     }
 
-    /// Why command `id` can't run now, for greying it out: its own `enabled` check, then what
-    /// Restrict Editing refuses outright. `None` when it can run (or doesn't exist).
+    /// Why command `id` can't run now, for greying it out. Checks command availability,
+    /// the participant's role, and restrictions on editing.
     pub fn why_disabled(&self, id: &str) -> Option<&'static str> {
         let spec = self.registry.get(id)?;
-        (spec.enabled)(self).or_else(|| if spec.mutates { crate::cmd::protect::greyed_out(self, id, || self.protect_facts()) } else { None })
+        (spec.enabled)(self)
+            .or_else(|| self.refused_by_role(spec.mutates))
+            .or_else(|| if spec.mutates { crate::cmd::protect::greyed_out(self, id, || self.protect_facts()) } else { None })
     }
 
     /// Put the revision back to `rev` after a command that changed nothing or failed. What the

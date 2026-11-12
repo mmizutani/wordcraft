@@ -40,6 +40,9 @@ mod cloud;
 #[cfg(all(feature = "probe", target_arch = "wasm32"))]
 mod probe;
 
+#[cfg(all(not(feature = "probe"), any(test, target_arch = "wasm32")))]
+mod room_model;
+
 #[cfg(target_arch = "wasm32")]
 use worker::{Context, EncodeBody, Env, Fetcher, Request, Response, Result, event};
 

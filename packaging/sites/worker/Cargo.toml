@@ -11,10 +11,19 @@ crate-type = ["cdylib"]
 [features]
 probe = []
 
+[dependencies]
+wordcraft-doc = { path = "../../../crates/doc" }
+wordcraft-docx = { path = "../../../crates/docx" }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[dev-dependencies]
+zip = { version = "3", default-features = false, features = ["deflate"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 worker = { version = "0.8.7", features = ["d1"] }
 serde = { version = "1", features = ["derive"] }
 futures-util = "0.3"
+sha2 = "0.11"
 
 [workspace]
 

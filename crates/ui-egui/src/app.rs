@@ -265,9 +265,14 @@ impl WordApp {
         }
         options::sync(self);
         self.settle_async_saves();
+        if ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::WindowFocused(true)))) {
+            self.nudge_cloud_room();
+        }
         self.settle_cloud();
-        if self.cloud.request_pending() {
+        if self.cloud.request_pending() || self.cloud_room_request_pending() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        } else if self.cloud_room_polling() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(350));
         }
         // Chinese text wants the Chinese face before the Japanese one (one glyph style per line).
         // An installed CJK font is read only once CJK text is shown (#241): a CJK interface, the

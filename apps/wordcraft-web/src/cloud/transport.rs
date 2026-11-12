@@ -1,6 +1,10 @@
 //! Fetch adapter for the private Sites editor. The browser supplies the Site session cookie.
 
-use super::{Entry, MAX_BYTES, Page, etag, failure, revision, status_failure, valid_cursor, valid_id, valid_name};
+use super::room::{
+    Grants, MAX_REPLAY_RESPONSE_BYTES, Presence, RoomSaveReceipt, SubmissionReceipt, checkpoint_revision, grant_url, replay_page, replay_url,
+    room_status_failure, room_url, submission_bytes, valid_access, valid_grant_receipt, valid_heartbeat, valid_metadata, valid_operation_id,
+};
+use super::{Entry, MAX_BYTES, MAX_REVISION, Page, etag, failure, revision, status_failure, valid_cursor, valid_id, valid_name};
 use js_sys::{Promise, Reflect, Uint8Array};
 use serde::Deserialize;
 use std::{fmt::Write as _, sync::mpsc};
@@ -10,7 +14,7 @@ use web_sys::{
     AbortSignal, Headers, ReadableStreamDefaultReader, Request, RequestCache, RequestCredentials, RequestInit, RequestMode, RequestRedirect,
     Response, ResponseType, Window,
 };
-use wordcraft_ui_egui::cloud::{CloudFailure, CloudFailureKind, CloudRequest, CloudResponse, CloudService};
+use wordcraft_ui_egui::cloud::{CloudFailure, CloudFailureKind, CloudRequest, CloudResponse, CloudService, RoomAccess, RoomGrant, RoomMetadata};
 
 const ROOT: &str = "/api/cloud/documents";
 const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
@@ -54,19 +58,17 @@ async fn execute(request: CloudRequest) -> CloudResult<CloudResponse> {
             let (documents, next_cursor) = json::<Page>(&response).await?.validated().ok_or_else(invalid_response)?;
             Ok(CloudResponse::List { documents, next_cursor })
         }
-        CloudRequest::Open { id } => {
-            let response = fetch(&window, "GET", &document_url(&id)?, &headers, None).await?;
+        CloudRequest::Open { ref id } | CloudRequest::OpenEditor { ref id } => {
+            let mut url = document_url(id)?;
+            if matches!(request, CloudRequest::OpenEditor { .. }) {
+                url.push_str("?open=1");
+            }
+            let response = fetch(&window, "GET", &url, &headers, None).await?;
             if response.status() != 200 {
                 return Err(response_failure(response).await);
             }
             let revision = response_revision(&response)?;
-            if response.headers().get("Content-Type").map_err(browser_error)?.as_deref() != Some(DOCX) {
-                return Err(invalid_response());
-            }
-            let bytes = bounded_body(&response, MAX_BYTES).await?;
-            if bytes.is_empty() {
-                return Err(invalid_response());
-            }
+            let bytes = docx_body(&response).await?;
             Ok(CloudResponse::Open { revision, bytes })
         }
         CloudRequest::Delete { id, revision } => {
@@ -117,7 +119,138 @@ async fn execute(request: CloudRequest) -> CloudResult<CloudResponse> {
                 wait(&window, delay).await?;
             }
         }
+        CloudRequest::RoomMetadata { ref id } | CloudRequest::RoomActivate { ref id, .. } => {
+            let url = room_url(id).ok_or_else(invalid_response)?;
+            let (method, body, activating) = match request {
+                CloudRequest::RoomActivate { file_revision, .. } if (1..=MAX_REVISION).contains(&file_revision) => {
+                    ("POST", Some(serde_json::json!({ "file_revision": file_revision }).to_string()), Some(file_revision))
+                }
+                CloudRequest::RoomMetadata { .. } => ("GET", None, None),
+                _ => return Err(invalid_response()),
+            };
+            let response =
+                fetch_room(&window, method, &url, body.as_ref().map(String::as_bytes), if activating.is_some() { &[200, 201] } else { &[200] })
+                    .await?;
+            let metadata = json::<RoomMetadata>(&response).await?;
+            if !valid_metadata(&metadata, id, activating) {
+                return Err(invalid_response());
+            }
+            Ok(CloudResponse::RoomMetadata(metadata))
+        }
+        CloudRequest::RoomCheckpoint { id } => {
+            let url = format!("{}/checkpoint", room_url(&id).ok_or_else(invalid_response)?);
+            let response = fetch_room(&window, "GET", &url, None, &[200]).await?;
+            let tag = response.headers().get("ETag").map_err(browser_error)?;
+            let revision = tag.as_deref().and_then(checkpoint_revision).ok_or_else(invalid_response)?;
+            Ok(CloudResponse::RoomCheckpoint { revision, bytes: docx_body(&response).await? })
+        }
+        CloudRequest::RoomChanges { id, after, through } => {
+            let url = replay_url(&id, after, through).ok_or_else(invalid_response)?;
+            let response = fetch_room(&window, "GET", &url, None, &[200]).await?;
+            let bytes = bounded_body(&response, MAX_REPLAY_RESPONSE_BYTES).await?;
+            let page = replay_page(&bytes, after, through).ok_or_else(invalid_response)?;
+            Ok(CloudResponse::RoomChanges(page))
+        }
+        CloudRequest::RoomSubmit { id, proposal } => {
+            let url = format!("{}/changes", room_url(&id).ok_or_else(invalid_response)?);
+            let bytes = submission_bytes(&proposal).ok_or_else(invalid_response)?;
+            let response = fetch_room(&window, "POST", &url, Some(&bytes), &[200]).await?;
+            let receipt: SubmissionReceipt = json(&response).await.map_err(|_| invalid_receipt())?;
+            if !receipt.valid_for(proposal.base_revision) {
+                return Err(invalid_receipt());
+            }
+            Ok(CloudResponse::RoomSubmitted { revision: receipt.revision, head: receipt.head })
+        }
+        CloudRequest::RoomAccess { ref id } | CloudRequest::RoomRequestAccess { ref id } => {
+            let url = format!("{}/access", room_url(id).ok_or_else(invalid_response)?);
+            let method = if matches!(request, CloudRequest::RoomRequestAccess { .. }) { "POST" } else { "GET" };
+            let response = fetch_room(&window, method, &url, None, &[200]).await?;
+            let access: RoomAccess = json(&response).await?;
+            if !valid_access(&access) {
+                return Err(invalid_response());
+            }
+            Ok(CloudResponse::RoomAccess(access))
+        }
+        CloudRequest::RoomGrants { id } => {
+            let url = format!("{}/grants", room_url(&id).ok_or_else(invalid_response)?);
+            let response = fetch_room(&window, "GET", &url, None, &[200]).await?;
+            let grants: Grants = json(&response).await?;
+            if !grants.valid() {
+                return Err(invalid_response());
+            }
+            Ok(CloudResponse::RoomGrants(grants.grants))
+        }
+        CloudRequest::RoomSetRole { id, grant_id, role } => {
+            let url = grant_url(&id, &grant_id).ok_or_else(invalid_response)?;
+            let body = serde_json::json!({ "role": role }).to_string();
+            let response = fetch_room(&window, "PUT", &url, Some(body.as_bytes()), &[200]).await?;
+            let grant: RoomGrant = json(&response).await?;
+            if !valid_grant_receipt(&grant, &grant_id, role) {
+                return Err(invalid_response());
+            }
+            Ok(CloudResponse::RoomGrant(grant))
+        }
+        CloudRequest::RoomPresence { id } => {
+            let url = format!("{}/presence", room_url(&id).ok_or_else(invalid_response)?);
+            let response = fetch_room(&window, "GET", &url, None, &[200]).await?;
+            let presence: Presence = json(&response).await?;
+            if !presence.valid() {
+                return Err(invalid_response());
+            }
+            Ok(CloudResponse::RoomPresence(presence.participants))
+        }
+        CloudRequest::RoomHeartbeat { id, session_id, revision, position } => {
+            if !valid_heartbeat(&session_id, revision, position) {
+                return Err(invalid_response());
+            }
+            let url = format!("{}/presence", room_url(&id).ok_or_else(invalid_response)?);
+            let body = serde_json::json!({ "session_id": session_id, "revision": revision, "position": position }).to_string();
+            fetch_room(&window, "POST", &url, Some(body.as_bytes()), &[204]).await?;
+            Ok(CloudResponse::RoomHeartbeat)
+        }
+        CloudRequest::RoomSave { id, operation_id, room_revision } => {
+            if room_revision > MAX_REVISION || !valid_operation_id(&operation_id) {
+                return Err(invalid_response());
+            }
+            let url = format!("{}/save", room_url(&id).ok_or_else(invalid_response)?);
+            let body = serde_json::json!({ "operation_id": operation_id, "room_revision": room_revision }).to_string();
+            let response = fetch_room(&window, "POST", &url, Some(body.as_bytes()), &[200]).await?;
+            let receipt: RoomSaveReceipt = json(&response).await.map_err(|_| invalid_receipt())?;
+            if !receipt.valid_for(room_revision) {
+                return Err(invalid_receipt());
+            }
+            Ok(CloudResponse::RoomSaved { file_revision: receipt.file_revision, room_revision: receipt.room_revision })
+        }
     }
+}
+
+async fn fetch_room(window: &Window, method: &str, url: &str, body: Option<&[u8]>, statuses: &[u16]) -> CloudResult<Response> {
+    let headers = Headers::new().map_err(browser_error)?;
+    let body = body.map(Uint8Array::from);
+    if body.is_some() {
+        set_header(&headers, "Content-Type", "application/json")?;
+    }
+    let response = fetch(window, method, url, &headers, body.as_ref()).await?;
+    let status = response.status();
+    if statuses.contains(&status) {
+        return Ok(response);
+    }
+    let code = error_code(&response, &[403, 409, 422]).await;
+    if (200..300).contains(&status) {
+        return Err(invalid_receipt());
+    }
+    Err(room_status_failure(status, code.as_deref()))
+}
+
+async fn docx_body(response: &Response) -> CloudResult<Vec<u8>> {
+    if response.headers().get("Content-Type").map_err(browser_error)?.as_deref() != Some(DOCX) {
+        return Err(invalid_response());
+    }
+    let bytes = bounded_body(response, MAX_BYTES).await?;
+    if bytes.is_empty() {
+        return Err(invalid_response());
+    }
+    Ok(bytes)
 }
 
 async fn save_receipt(response: &Response, id: Option<&str>, base: Option<u64>, name: &str, bytes: usize) -> CloudResult<CloudResponse> {
@@ -233,16 +366,19 @@ struct ErrorBody {
     code: String,
 }
 
+async fn error_code(response: &Response, statuses: &[u16]) -> Option<String> {
+    if statuses.contains(&response.status()) {
+        return json::<ErrorBody>(response).await.ok().map(|body| body.code);
+    }
+    if let Some(body) = response.body() {
+        let _ = JsFuture::from(body.cancel()).await;
+    }
+    None
+}
+
 async fn response_failure(response: Response) -> CloudFailure {
     let status = response.status();
-    let code = if matches!(status, 403 | 409) {
-        json::<ErrorBody>(&response).await.ok().map(|body| body.code)
-    } else {
-        if let Some(body) = response.body() {
-            let _ = JsFuture::from(body.cancel()).await;
-        }
-        None
-    };
+    let code = error_code(&response, &[403, 409]).await;
     if (200..300).contains(&status) {
         return invalid_receipt();
     }

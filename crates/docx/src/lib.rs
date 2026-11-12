@@ -107,6 +107,17 @@ pub fn read_with(bytes: &[u8], opts: &ReadOptions) -> Result<wordcraft_doc::Docu
     read::read_package(bytes, opts.chunks)
 }
 
+/// Read an unencrypted DOCX with a caller-supplied limit on the total decompressed bytes.
+/// The reader also applies its usual per-part, entry count, and XML limits.
+pub fn read_bounded(bytes: &[u8], max_expanded_bytes: u64) -> Result<wordcraft_doc::Document, DocxError> {
+    if is_encrypted(bytes) {
+        return Err(DocxError::PasswordRequired);
+    }
+    let max_part = max_expanded_bytes.min(package::MAX_PART);
+    let max_total = max_expanded_bytes.min(package::MAX_TOTAL);
+    read::read_opened(&package::Package::open_limited(bytes, max_part, max_total)?, None)
+}
+
 /// Which kind of WordprocessingML package to write. The main part's content type differs per
 /// kind, and Word refuses a file whose content type doesn't match its extension.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

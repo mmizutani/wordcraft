@@ -234,6 +234,17 @@ pub fn open_docx_bytes(bytes: &[u8], password: Option<&str>) -> Result<(Document
     Ok((doc, wordcraft_docx::is_encrypted(bytes)))
 }
 
+/// Read the exact model at a hosted room checkpoint without updating its date and time fields.
+pub fn open_room_checkpoint(bytes: &[u8]) -> Result<Document, String> {
+    let doc = wordcraft_docx::read_bounded(bytes, 16 * 1024 * 1024).map_err(|error| error.to_string())?;
+    let ids = doc.block_ids();
+    if ids.iter().any(|id| !id.is_set()) || doc.repeated_id(&ids).is_some() {
+        return Err("The shared document's checkpoint has invalid block IDs.".into());
+    }
+    load_embedded_fonts(&doc);
+    Ok(doc)
+}
+
 /// A DOCX save would omit the document's preserved VBA project.
 pub fn docx_has_vba(doc: &Document) -> bool {
     doc.passthrough.get(wordcraft_docx::VBA_PROJECT_PART).is_some_and(|bytes| !bytes.is_empty())
