@@ -619,6 +619,9 @@ impl WordApp {
                 Value::Null
             }
             crate::local_assistant::REWRITE_COMMAND => return Some(crate::local_assistant::rewrite(self)),
+            crate::local_assistant::CONNECT_COMMAND | crate::local_assistant::DISCONNECT_COMMAND => {
+                return Some(crate::local_assistant::change_connection(self, id));
+            }
             "ui.tab" => {
                 let tab = s("tab").unwrap_or("Home").to_string();
                 if tab == "File" {
@@ -1262,6 +1265,8 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "assist.chatgpt.signIn"
             | "assist.chatgpt.cancelSignIn"
             | "assist.chatgpt.signOut"
+            | crate::local_assistant::CONNECT_COMMAND
+            | crate::local_assistant::DISCONNECT_COMMAND
     ) || id.starts_with("help.")
         || id == "assist.memory"
         || id.starts_with("assist.memory.")

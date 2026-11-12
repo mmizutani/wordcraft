@@ -87,6 +87,94 @@ fn open_pane(mut app: WordApp) -> Harness<'static, WordApp> {
 }
 
 #[test]
+fn local_account_buttons_require_a_person() {
+    use std::cell::Cell;
+
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::clone(&sent);
+    let account = Rc::new(Cell::new(super::Account::Disconnected));
+    let status = Rc::clone(&account);
+    let response = Rc::new(RefCell::new(None));
+    let pending_response = Rc::clone(&response);
+    let service = Box::new(move |request| {
+        let is_status = matches!(request, Request::Status);
+        let reply = match request {
+            Request::Status => Reply::Status {
+                connected: matches!(status.get(), super::Account::Connected),
+                connecting: matches!(status.get(), super::Account::Connecting),
+            },
+            Request::Connect => {
+                seen.borrow_mut().push("connect");
+                status.set(super::Account::Connecting);
+                Reply::AuthorizationUrl("https://example.com/sign-in".into())
+            }
+            Request::Disconnect => {
+                seen.borrow_mut().push("disconnect");
+                status.set(super::Account::Disconnected);
+                Reply::Disconnected
+            }
+            Request::Rewrite(_) => panic!("unexpected request"),
+        };
+        let (send, recv) = mpsc::channel();
+        if is_status {
+            send.send(Ok(reply)).unwrap();
+        } else {
+            *pending_response.borrow_mut() = Some((send, reply));
+        }
+        recv
+    });
+    let mut app = WordApp::new(selected(), Services { local_assistant: Some(service), ..Services::default() });
+    app.assist_as_web();
+    app.run("assist.pane", json!({"value": true})).unwrap();
+    let synthetic = Rc::new(Cell::new(false));
+    let frame_origin = Rc::clone(&synthetic);
+    let mut harness = Harness::builder().with_size(egui::vec2(1500.0, 900.0)).build_ui_state(
+        move |ui, app: &mut WordApp| {
+            app.synthetic_pending = frame_origin.get();
+            app.logic(ui.ctx());
+            app.ui(ui);
+        },
+        app,
+    );
+    harness.run_steps(4);
+
+    for (label, command, request, expected) in [
+        ("Continue with ChatGPT", "ui.localAssistantConnect", "connect", "Cancel sign-in"),
+        ("Cancel sign-in", "ui.localAssistantDisconnect", "disconnect", "Continue with ChatGPT"),
+        ("Disconnect", "ui.localAssistantDisconnect", "disconnect", "Continue with ChatGPT"),
+    ] {
+        if label == "Disconnect" {
+            account.set(super::Account::Connected);
+            harness.state_mut().assist.local.poll_at = 0.0;
+            harness.run_steps(3);
+        }
+        assert!(harness.state_mut().execute(command, json!({})).is_err());
+        synthetic.set(true);
+        harness.get_by_label(label).click();
+        harness.run_steps(3);
+        assert!(sent.borrow().is_empty(), "{label} sent a request for synthetic input");
+
+        synthetic.set(false);
+        harness.get_by_label(label).click();
+        harness.run_steps(3);
+        assert!(harness.get_by_label(label).accesskit_node().is_disabled(), "{label}");
+        assert!(harness.state_mut().run(command, json!({})).is_err());
+        assert_eq!(*sent.borrow(), [request], "{label}");
+        sent.borrow_mut().clear();
+        let (send, reply) = response.borrow_mut().take().unwrap();
+        send.send(Ok(reply)).unwrap();
+        harness.run_steps(3);
+        assert!(harness.query_by_label(expected).is_some());
+    }
+
+    let mut app_without_service = WordApp::new(selected(), Services::default());
+    for command in ["ui.localAssistantConnect", "ui.localAssistantDisconnect"] {
+        assert!(!crate::widgets::enabled(&app_without_service, command));
+        assert!(app_without_service.run(command, json!({})).is_err());
+    }
+}
+
+#[test]
 fn local_rewrite_command_requires_a_person_and_an_eligible_selection() {
     let id = "ui.localAssistantRewrite";
     let (app, sent) = local_app(selected());
@@ -269,4 +357,21 @@ fn local_rewrite_rejects_hidden_text_inherited_from_document_styles() {
     harness.get_by_label("Rewrite selected text").click();
     harness.run_steps(3);
     assert_eq!(*sent.borrow(), ["public"]);
+}
+
+#[test]
+fn local_rewrite_replaces_the_selection_when_typing_leaves_it_intact() {
+    let mut session = selected();
+    session.prefs.typing_replaces_selection = false;
+    let (app, sent) = local_app(session);
+    let mut harness = open_pane(app);
+
+    harness.get_by_label("Rewrite selected text").click();
+    harness.run_steps(3);
+    assert_eq!(*sent.borrow(), ["two"]);
+    let app = harness.state_mut();
+    app.run("review.acceptAll", json!({"author": "ChatGPT"})).unwrap();
+
+    assert_eq!(app.session.doc.plain_text(StoryRef::Body), "one second three");
+    assert!(!app.session.prefs.typing_replaces_selection);
 }

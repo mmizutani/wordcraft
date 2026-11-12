@@ -14,6 +14,8 @@ use wordcraft_engine::{Selection, Session};
 use crate::WordApp;
 
 pub(crate) const REWRITE_COMMAND: &str = "ui.localAssistantRewrite";
+pub(crate) const CONNECT_COMMAND: &str = "ui.localAssistantConnect";
+pub(crate) const DISCONNECT_COMMAND: &str = "ui.localAssistantDisconnect";
 
 const AUTHOR: &str = "ChatGPT";
 const MAX_TEXT_BYTES: usize = 8 * 1024;
@@ -173,18 +175,45 @@ pub(crate) fn rewrite(app: &mut WordApp) -> Result<serde_json::Value, String> {
     Ok(json!({"pending": "rewrite"}))
 }
 
-pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
-    let Some(service) = &app.services.local_assistant else { return };
-    let rewrite_enabled = crate::widgets::enabled(app, REWRITE_COMMAND);
+fn connection_service<'a>(app: &'a WordApp, id: &str) -> Option<&'a Service> {
+    let state = &app.assist.local;
+    let available = matches!(
+        (id, state.account),
+        (CONNECT_COMMAND, Some(Account::Disconnected)) | (DISCONNECT_COMMAND, Some(Account::Connecting | Account::Connected))
+    );
+    app.services.local_assistant.as_ref().filter(|_| available && state.pending.is_none())
+}
+
+pub(crate) fn connection_enabled(app: &WordApp, id: &str) -> bool {
+    connection_service(app, id).is_some()
+}
+
+pub(crate) fn change_connection(app: &mut WordApp, id: &str) -> Result<serde_json::Value, String> {
+    if !app.assist.by_person {
+        return Err(tl!("Choose the ChatGPT connection button in the Assistant pane.").into());
+    }
+    let service = connection_service(app, id).ok_or(tl!("This ChatGPT connection action is unavailable."))?;
+    let (job, request) = if id == CONNECT_COMMAND { (Job::Connect, Request::Connect) } else { (Job::Disconnect, Request::Disconnect) };
+    let reply = service(request);
     let state = &mut app.assist.local;
+    state.notice = None;
+    state.pending = Some((job, reply));
+    Ok(json!({"pending": true}))
+}
+
+pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
+    if app.services.local_assistant.is_none() {
+        return;
+    }
+    let rewrite_enabled = crate::widgets::enabled(app, REWRITE_COMMAND);
+    let state = &app.assist.local;
     let waiting = state.pending.is_some();
     let mut paragraph_to_select = None;
     match state.account {
         Some(Account::Connected) => {
             ui.label(tl!("Connected to ChatGPT."));
-            if ui.add_enabled(!waiting, egui::Button::new(tl!("Disconnect"))).clicked() {
-                state.notice = None;
-                state.pending = Some((Job::Disconnect, service(Request::Disconnect)));
+            if ui.add_enabled(crate::widgets::enabled(app, DISCONNECT_COMMAND), egui::Button::new(tl!("Disconnect"))).clicked() {
+                let _ = app.run(DISCONNECT_COMMAND, json!({}));
             }
             ui.label(tl!("Rewrite sends the selected text to ChatGPT using your plan."));
             if ui.add_enabled(rewrite_enabled, egui::Button::new(tl!("Rewrite selected text"))).clicked() {
@@ -209,15 +238,13 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
             if let Some(url) = &state.authorization_url {
                 ui.add(egui::Hyperlink::from_label_and_url(tl!("Open ChatGPT sign-in"), url).open_in_new_tab(true));
             }
-            if ui.add_enabled(!waiting, egui::Button::new(tl!("Cancel sign-in"))).clicked() {
-                state.notice = None;
-                state.pending = Some((Job::Disconnect, service(Request::Disconnect)));
+            if ui.add_enabled(crate::widgets::enabled(app, DISCONNECT_COMMAND), egui::Button::new(tl!("Cancel sign-in"))).clicked() {
+                let _ = app.run(DISCONNECT_COMMAND, json!({}));
             }
         }
         Some(Account::Disconnected) => {
-            if ui.add_enabled(!waiting, egui::Button::new(tl!("Continue with ChatGPT"))).clicked() {
-                state.notice = None;
-                state.pending = Some((Job::Connect, service(Request::Connect)));
+            if ui.add_enabled(crate::widgets::enabled(app, CONNECT_COMMAND), egui::Button::new(tl!("Continue with ChatGPT"))).clicked() {
+                let _ = app.run(CONNECT_COMMAND, json!({}));
             }
         }
         None if waiting || state.poll_at == 0.0 => {
@@ -292,7 +319,7 @@ impl Blocked {
 }
 
 fn selected_text<'a>(session: &'a Session, selection: &Selection) -> Result<&'a str, Blocked> {
-    if selection.is_collapsed() || !text_stream(session) || session.role.is_some() || session.why_disabled("text.insert").is_some() {
+    if selection.is_collapsed() || !text_stream(session) || session.role.is_some() || session.why_disabled("edit.pasteText").is_some() {
         return Err(Blocked::Other);
     }
     let (start, end) = selection.ordered();
@@ -371,7 +398,8 @@ impl Rewrite {
         // A suggester's command forces tracking, and the engine rolls back any untracked edit.
         let author = std::mem::replace(&mut session.author, AUTHOR.into());
         session.role = Some(Role::Suggester);
-        let result = session.run("text.insert", &json!({"text": replacement, "raw": true}));
+        // Plain-text paste replaces the range regardless of keyboard typing preferences.
+        let result = session.run("edit.pasteText", &json!({"text": replacement}));
         session.role = None;
         session.author = author;
         result.map_err(|_| tl!("WordCraft could not stage the rewrite at this selection.").to_string())?;
