@@ -31,6 +31,7 @@ pub(super) struct SaveRequest {
     pub operation_id: String,
     pub document_id: Option<String>,
     pub base_revision: u64,
+    pub room_revision: Option<u64>,
     pub name: Option<String>,
     pub byte_size: u64,
     pub sha256: String,
@@ -53,6 +54,7 @@ pub(super) struct Save {
     pub operation_id: String,
     pub document_id: String,
     pub base_revision: u64,
+    pub room_revision: Option<u64>,
     pub name: String,
     pub byte_size: u64,
     pub sha256: String,
@@ -61,6 +63,7 @@ pub(super) struct Save {
     pub saved_at: Option<u64>,
     pub expired: u32,
     pub deleted: u32,
+    pub room_active: u32,
 }
 
 impl Save {
@@ -70,6 +73,7 @@ impl Save {
             None => self.base_revision == 0,
         };
         target_matches
+            && self.room_revision == request.room_revision
             && self.base_revision == request.base_revision
             && request.name.as_ref().is_none_or(|name| self.name == *name)
             && self.byte_size == request.byte_size
@@ -95,11 +99,12 @@ pub(super) struct Cleanup {
     pub settled: u32,
 }
 
-const READ_SAVE: &str = "SELECT s.*, CAST(s.lease_until <= unixepoch() AS INTEGER) AS expired, COALESCE(d.deleted, 0) AS deleted
+const READ_SAVE: &str = "SELECT s.*, CAST(s.lease_until <= unixepoch() AS INTEGER) AS expired, COALESCE(d.deleted, 0) AS deleted,
+                                CAST(EXISTS (SELECT 1 FROM cloud_rooms r WHERE r.owner = s.owner AND r.document_id = s.document_id) AS INTEGER) AS room_active
                          FROM cloud_saves s LEFT JOIN cloud_documents d ON d.owner = s.owner AND d.id = s.document_id";
 
 impl Store {
-    fn statement(&self, sql: &str, args: &[JsValue]) -> Result<D1PreparedStatement> {
+    pub(super) fn statement(&self, sql: &str, args: &[JsValue]) -> Result<D1PreparedStatement> {
         let bindings = [vec![JsValue::from_str(&self.owner)], args.to_vec()].concat();
         self.db.prepare(sql).bind(&bindings)
     }
@@ -142,15 +147,18 @@ impl Store {
         let document = request.document_id.as_deref().map_or(JsValue::NULL, JsValue::from_str);
         let name = request.name.as_deref().map_or(JsValue::NULL, JsValue::from_str);
         // Only the request that inserts the row can upload. Retries only reconcile.
+        // A room Save has already reconstructed its exact bytes, so it may outlive a checkpoint advance.
         self.statement(
-            "INSERT INTO cloud_saves (owner, operation_id, document_id, base_revision, name, byte_size, sha256, object_key, lease_until)
-             SELECT ?1, ?2, COALESCE(?3, lower(hex(randomblob(16)))), ?4, COALESCE(?5, d.name), ?6, ?7,
-                    'wordcraft-cloud/' || lower(hex(randomblob(16))), unixepoch() + ?8
-             FROM (SELECT 1) LEFT JOIN cloud_documents d ON d.owner = ?1 AND d.id = ?3 AND d.deleted = 0 AND d.revision = ?4
-             WHERE (?3 IS NULL OR d.id IS NOT NULL)
+            "INSERT INTO cloud_saves (owner, operation_id, document_id, base_revision, name, byte_size, sha256, object_key, lease_until, room_revision)
+             SELECT ?1, ?2, COALESCE(?3, lower(hex(randomblob(16)))), COALESCE(d.revision, ?4), COALESCE(?5, d.name), ?6, ?7,
+                    'wordcraft-cloud/' || lower(hex(randomblob(16))), unixepoch() + ?8, ?9
+             FROM (SELECT 1) LEFT JOIN cloud_documents d ON d.owner = ?1 AND d.id = ?3 AND d.deleted = 0
+             LEFT JOIN cloud_rooms r ON r.owner = d.owner AND r.document_id = d.id
+             WHERE ((?9 IS NULL AND (?3 IS NULL OR (d.revision = ?4 AND r.document_id IS NULL)))
+                 OR (?9 BETWEEN r.published_room_revision AND r.head AND d.revision < ?10))
                AND NOT EXISTS (SELECT 1 FROM cloud_documents WHERE owner = ?1 AND first_operation_id = ?2 AND deleted = 1)
              ON CONFLICT (owner, operation_id) DO NOTHING
-             RETURNING *, 0 AS expired, 0 AS deleted",
+             RETURNING *, 0 AS expired, 0 AS deleted, CAST(?9 IS NOT NULL AS INTEGER) AS room_active",
             &[
                 request.operation_id.as_str().into(),
                 document,
@@ -159,6 +167,8 @@ impl Store {
                 number(request.byte_size),
                 request.sha256.as_str().into(),
                 UPLOAD_LEASE_SECONDS.into(),
+                request.room_revision.map_or(JsValue::NULL, number),
+                number(MAX_REVISION),
             ],
         )?
         .first(None)
@@ -168,17 +178,37 @@ impl Store {
     pub async fn publish(&self, save: &Save) -> Result<Save> {
         let args = &[save.operation_id.as_str().into(), save.object_key.as_str().into()];
         let statements = vec![
+            // An earlier room Save may have published while these immutable bytes were uploading.
+            // Give this candidate the current file base only if its room target can still publish.
+            self.statement(
+                "UPDATE cloud_saves AS s SET base_revision = d.revision
+                 FROM cloud_documents d JOIN cloud_rooms r ON r.owner = d.owner AND r.document_id = d.id
+                 WHERE s.owner = ?1 AND s.operation_id = ?2 AND s.object_key = ?3 AND s.outcome = 'pending'
+                   AND d.owner = s.owner AND d.id = s.document_id AND d.deleted = 0 AND d.revision < ?4
+                   AND s.room_revision BETWEEN r.published_room_revision AND r.head",
+                &[save.operation_id.as_str().into(), save.object_key.as_str().into(), number(MAX_REVISION)],
+            )?,
             self.statement(
                 "INSERT INTO cloud_documents (owner, id, first_operation_id, name, revision, object_key, byte_size, saved_at)
                  SELECT owner, document_id, operation_id, name, base_revision + 1, object_key, byte_size, unixepoch()
                  FROM cloud_saves s WHERE s.owner = ?1 AND s.operation_id = ?2 AND s.object_key = ?3 AND s.outcome = 'pending'
-                   AND (s.base_revision = 0 OR EXISTS (
-                     SELECT 1 FROM cloud_documents d
+                   AND ((s.base_revision = 0 AND s.room_revision IS NULL) OR EXISTS (
+                     SELECT 1 FROM cloud_documents d LEFT JOIN cloud_rooms r ON r.owner = d.owner AND r.document_id = d.id
                      WHERE d.owner = ?1 AND d.id = s.document_id AND d.deleted = 0 AND d.revision = s.base_revision
+                       AND ((s.room_revision IS NULL AND r.document_id IS NULL)
+                         OR s.room_revision BETWEEN r.published_room_revision AND r.head)
                    ))
                  ON CONFLICT (owner, id) DO UPDATE SET revision = excluded.revision, object_key = excluded.object_key,
                      byte_size = excluded.byte_size, saved_at = excluded.saved_at
                  WHERE cloud_documents.deleted = 0 AND cloud_documents.revision = excluded.revision - 1",
+                args,
+            )?,
+            self.statement(
+                "UPDATE cloud_rooms AS r SET file_revision = d.revision, published_room_revision = s.room_revision
+                 FROM cloud_saves s JOIN cloud_documents d ON d.owner = s.owner AND d.id = s.document_id
+                 WHERE s.owner = ?1 AND s.operation_id = ?2 AND s.object_key = ?3 AND s.outcome = 'pending'
+                   AND s.room_revision IS NOT NULL AND d.deleted = 0 AND d.object_key = s.object_key
+                   AND r.owner = s.owner AND r.document_id = s.document_id",
                 args,
             )?,
             // The receipt is conditional on the pointer, so a lost CAS cannot commit the ledger.
@@ -308,6 +338,6 @@ impl Store {
     }
 }
 
-fn number(value: u64) -> JsValue {
+pub(super) fn number(value: u64) -> JsValue {
     JsValue::from_f64(value as f64)
 }

@@ -29,6 +29,9 @@ pub(crate) fn show_save(app: &mut WordApp, ui: &mut egui::Ui) {
 }
 
 pub(crate) fn show_status(app: &mut WordApp, ui: &mut egui::Ui) {
+    if app.show_hosted_room_status(ui) {
+        return;
+    }
     let document = app.session.document_id();
     let sending = app.cloud.sending(document);
     let failure = app.cloud.saves.get(&document).and_then(|save| match &save.phase {

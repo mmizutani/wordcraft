@@ -15,10 +15,10 @@ impl WordApp {
         }
         // Don't Save is the user's say-so to discard the changes, which Close otherwise refuses.
         let mut params = params;
-        if choice == SaveChoice::Cancel && matches!(then.as_str(), "ui.cloudOpen" | "ui.cloudApply") {
+        if choice == SaveChoice::Cancel && matches!(then.as_str(), "ui.cloudOpen" | "ui.cloudOpenRoom" | "ui.cloudApply") {
             self.cancel_cloud_navigation();
         }
-        if choice == SaveChoice::DontSave && matches!(then.as_str(), "file.close" | "ui.cloudOpen" | "ui.cloudApply") {
+        if choice == SaveChoice::DontSave && matches!(then.as_str(), "file.close" | "ui.cloudOpen" | "ui.cloudOpenRoom" | "ui.cloudApply") {
             match params.as_object_mut() {
                 Some(p) => {
                     p.insert("force".into(), json!(true));

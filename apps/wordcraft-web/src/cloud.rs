@@ -1,3 +1,4 @@
+mod room;
 #[cfg(target_arch = "wasm32")]
 mod transport;
 #[cfg(target_arch = "wasm32")]
@@ -91,6 +92,7 @@ fn status_failure(status: u16, code: Option<&str>) -> CloudFailure {
         (401 | 403, _) => failure(Authentication, "Sign in to the Site, then try again."),
         (404, _) => failure(Missing, "The cloud document is no longer available."),
         (412, _) => failure(Stale, "A newer cloud revision is available."),
+        (409, Some("room_required")) => failure(RoomRequired, "Open the shared room to edit this document."),
         (409, Some("operation_abandoned")) => failure(Abandoned, "The cloud save expired before it could commit."),
         (409, Some("operation_mismatch")) => failure(Invalid, "The Site rejected this cloud operation ID."),
         (202 | 408 | 429 | 500..=599 | 409, _) => failure(Retryable, "The Site could not confirm the cloud operation. Try again."),

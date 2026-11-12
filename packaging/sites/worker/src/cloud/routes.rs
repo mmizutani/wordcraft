@@ -1,5 +1,6 @@
 use super::{
     protocol::{Failure, INVALID, MAX_BYTES, MAX_REVISION, TOO_LARGE, attachment, digest, filename, opaque_id, operation_id, revision, size},
+    rooms,
     store::{Document, Entry, Outcome, PAGE_SIZE, Save, SaveRequest, Store},
 };
 use futures_util::{StreamExt, stream};
@@ -8,14 +9,15 @@ use std::{cell::Cell, rc::Rc};
 use worker::{Bucket, Conditional, Date, Env, Error, FixedLengthStream, Headers, Object, Request, Response, Result, console_log};
 
 const ROOT: &str = "/api/cloud/documents";
-const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+pub(super) const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const GONE: Failure = Failure(404, "document_not_found");
-const STALE: Failure = Failure(412, "stale_revision");
-const INVALID_BODY: Failure = Failure(400, "invalid_body");
-const OPERATION_MISMATCH: Failure = Failure(409, "operation_mismatch");
-const STORAGE_ERROR: Failure = Failure(503, "storage_unavailable");
+const ROOM_REQUIRED: Failure = Failure(409, "room_required");
+pub(super) const STALE: Failure = Failure(412, "stale_revision");
+pub(super) const INVALID_BODY: Failure = Failure(400, "invalid_body");
+pub(super) const OPERATION_MISMATCH: Failure = Failure(409, "operation_mismatch");
+pub(super) const STORAGE_ERROR: Failure = Failure(503, "storage_unavailable");
 
-type ApiResult<T> = std::result::Result<T, Failure>;
+pub(super) type ApiResult<T> = std::result::Result<T, Failure>;
 
 impl From<Error> for Failure {
     fn from(_: Error) -> Self {
@@ -24,8 +26,8 @@ impl From<Error> for Failure {
 }
 
 #[derive(Serialize)]
-struct ErrorBody {
-    code: &'static str,
+pub(super) struct ErrorBody {
+    pub code: &'static str,
 }
 
 #[derive(Serialize)]
@@ -35,7 +37,7 @@ struct Page {
 }
 
 pub(crate) fn handles(path: &str) -> bool {
-    path == ROOT || path.strip_prefix(ROOT).is_some_and(|rest| rest.starts_with('/'))
+    path == ROOT || path.strip_prefix(ROOT).is_some_and(|rest| rest.starts_with('/')) || rooms::handles(path)
 }
 
 pub(crate) async fn respond(mut request: Request, env: &Env) -> Result<Response> {
@@ -59,6 +61,15 @@ async fn dispatch(request: &mut Request, env: &Env) -> ApiResult<Response> {
         .filter(|owner| !owner.trim().is_empty())
         .ok_or(Failure(401, "authentication_required"))?;
     let path = request.path();
+    if rooms::handles(&path) {
+        let url = request.url()?;
+        let origin = request.headers().get("Origin")?;
+        if (request.inner().method() != "GET" || origin.is_some()) && origin.as_deref() != Some(url.origin().ascii_serialization().as_str()) {
+            return Err(Failure(403, "invalid_origin"));
+        }
+        let api = Api { store: Store { db: env.d1("DB")?, owner }, bucket: env.bucket("BUCKET")? };
+        return rooms::dispatch(&api, request, &path, env).await;
+    }
     let id = if path == ROOT {
         None
     } else {
@@ -81,6 +92,7 @@ async fn dispatch(request: &mut Request, env: &Env) -> ApiResult<Response> {
     let api = Api { store: Store { db: env.d1("DB")?, owner }, bucket: env.bucket("BUCKET")? };
     match (method.as_str(), id) {
         ("GET", None) => api.list(url.query()).await,
+        ("GET", Some(id)) if url.query() == Some("open=1") => api.read_for_edit(id).await,
         ("GET", Some(id)) => api.read(id).await,
         ("POST", None) | ("PUT", Some(_)) => api.save(request, id).await,
         ("DELETE", Some(id)) => api.delete(id, revision(request.headers().get("If-Match")?.as_deref())?).await,
@@ -94,9 +106,9 @@ enum Reconcile {
     ConditionalRejection,
 }
 
-struct Api {
-    store: Store,
-    bucket: Bucket,
+pub(super) struct Api {
+    pub store: Store,
+    pub bucket: Bucket,
 }
 
 impl Api {
@@ -111,6 +123,17 @@ impl Api {
             None
         };
         Ok(Response::from_json(&Page { documents, next_cursor })?)
+    }
+
+    async fn read_for_edit(&self, id: &str) -> ApiResult<Response> {
+        if self.store.room(id).await?.is_some() {
+            return Err(ROOM_REQUIRED);
+        }
+        let body = self.read(id).await?;
+        if self.store.room(id).await?.is_some() {
+            return Err(ROOM_REQUIRED);
+        }
+        Ok(body)
     }
 
     async fn read(&self, id: &str) -> ApiResult<Response> {
@@ -141,6 +164,11 @@ impl Api {
     }
 
     async fn save(&self, request: &mut Request, id: Option<&str>) -> ApiResult<Response> {
+        if let Some(id) = id
+            && self.store.room(id).await?.is_some()
+        {
+            return Err(ROOM_REQUIRED);
+        }
         let input = save_request(request.headers(), id)?;
         if let Some(row) = self.store.save(&input.operation_id).await? {
             return self.replay(row, &input).await;
@@ -160,6 +188,7 @@ impl Api {
             return Err(if id.is_none() { GONE } else { OPERATION_MISMATCH });
         }
         match id {
+            Some(id) if self.store.room(id).await?.is_some() => Err(ROOM_REQUIRED),
             Some(id) if self.store.document(id).await?.is_some() => Err(STALE),
             Some(_) => Err(GONE),
             None => Err(STORAGE_ERROR),
@@ -170,12 +199,16 @@ impl Api {
         if !row.matches(input) {
             return Err(OPERATION_MISMATCH);
         }
-        if row.deleted == 0 && matches!(row.outcome, Outcome::Pending) && row.expired == 1 {
+        save_response(&self.recover_expired_save(row).await?)
+    }
+
+    pub(super) async fn recover_expired_save(&self, row: Save) -> ApiResult<Save> {
+        if row.deleted == 0 && (row.room_active == 0 || row.room_revision.is_some()) && matches!(row.outcome, Outcome::Pending) && row.expired == 1 {
             let row = self.reconcile(&row, Reconcile::Expired).await?;
             self.try_cleanup(Some(&row.document_id)).await;
-            return save_response(&row);
+            return Ok(row);
         }
-        save_response(&row)
+        Ok(row)
     }
 
     async fn upload(&self, request: &mut Request, row: Save) -> ApiResult<Save> {
@@ -214,6 +247,15 @@ impl Api {
         }
     }
 
+    pub(super) async fn upload_save_bytes(&self, row: &Save, body: Vec<u8>, sha256: &[u8]) -> ApiResult<Save> {
+        let put = self.bucket.put(&row.object_key, body).only_if(create_only()).sha256(sha256.to_vec()).execute().await?;
+        match put {
+            Some(object) if valid_candidate(&object, row.byte_size, sha256) => Ok(self.store.publish(row).await?),
+            Some(_) => self.reconcile(row, Reconcile::Completed).await,
+            None => self.reconcile(row, Reconcile::ConditionalRejection).await,
+        }
+    }
+
     async fn reconcile(&self, row: &Save, reason: Reconcile) -> ApiResult<Save> {
         let object = self.bucket.head(&row.object_key).await?;
         let sha256 = digest(Some(&row.sha256))?;
@@ -235,9 +277,13 @@ impl Api {
             Some(_) => {}
         }
         self.try_cleanup(Some(id)).await;
-        let status = match self.store.has_cleanup(id).await {
-            Ok(false) => 204,
-            _ => 202,
+        self.try_room_cleanup(Some(id)).await;
+        let status = if matches!(self.store.has_cleanup(id).await, Ok(false))
+            && matches!(self.store.room_cleanup(Some(id)).await, Ok(items) if items.is_empty())
+        {
+            204
+        } else {
+            202
         };
         Ok(Response::empty()?.with_status(status))
     }
@@ -251,9 +297,10 @@ impl Api {
             }
         }
         self.try_cleanup(None).await;
+        self.try_room_cleanup(None).await;
     }
 
-    async fn try_cleanup(&self, document_id: Option<&str>) {
+    pub(super) async fn try_cleanup(&self, document_id: Option<&str>) {
         let Ok(items) = self.store.cleanup(document_id).await else {
             console_log!("cloud_documents cleanup_pending");
             return;
@@ -266,7 +313,7 @@ impl Api {
         }
     }
 
-    async fn purge(&self, key: &str) -> ApiResult<()> {
+    pub(super) async fn purge(&self, key: &str) -> ApiResult<()> {
         self.bucket.delete(key).await?;
         match self.bucket.head(key).await? {
             None => Ok(()),
@@ -274,7 +321,7 @@ impl Api {
         }
     }
 
-    async fn fence(&self, key: &str) -> ApiResult<()> {
+    pub(super) async fn fence(&self, key: &str) -> ApiResult<()> {
         // The upload may still finish. Keep the marker for a sealed, unsettled candidate.
         // If the upload wins the conditional put race, retry on a later cleanup pass.
         let condition = match self.bucket.head(key).await? {
@@ -323,7 +370,15 @@ fn save_request(headers: &Headers, id: Option<&str>) -> ApiResult<SaveRequest> {
         (Some(_), None) => None,
         (Some(_), Some(_)) => return Err(INVALID),
     };
-    Ok(SaveRequest { operation_id, document_id: id.map(str::to_owned), base_revision, name, byte_size, sha256: sha256.to_ascii_lowercase() })
+    Ok(SaveRequest {
+        operation_id,
+        document_id: id.map(str::to_owned),
+        base_revision,
+        room_revision: None,
+        name,
+        byte_size,
+        sha256: sha256.to_ascii_lowercase(),
+    })
 }
 
 fn bounded_body(body: worker::ByteStream, expected: u64, failure: Rc<Cell<Option<Failure>>>) -> impl futures_util::Stream<Item = Result<Vec<u8>>> {
@@ -359,11 +414,11 @@ fn bounded_body(body: worker::ByteStream, expected: u64, failure: Rc<Cell<Option
     })
 }
 
-fn create_only() -> Conditional {
+pub(super) fn create_only() -> Conditional {
     Conditional { etag_does_not_match: Some("*".into()), ..Conditional::default() }
 }
 
-fn valid_candidate(object: &Object, byte_size: u64, sha256: &[u8]) -> bool {
+pub(super) fn valid_candidate(object: &Object, byte_size: u64, sha256: &[u8]) -> bool {
     object.size() == byte_size && object.checksum().sha256.as_deref() == Some(sha256)
 }
 
@@ -373,13 +428,22 @@ fn invalid_r2_body(error: &Error) -> bool {
         if message.ends_with("(10013)") || message.ends_with("(10037)"))
 }
 
-fn etag(revision: u64) -> String {
+pub(super) fn etag(revision: u64) -> String {
     format!("\"{revision}\"")
 }
 
-fn save_response(row: &Save) -> ApiResult<Response> {
+#[derive(Serialize)]
+struct RoomSaveReceipt {
+    file_revision: u64,
+    room_revision: u64,
+}
+
+pub(super) fn save_response(row: &Save) -> ApiResult<Response> {
     if row.deleted == 1 {
         return Err(GONE);
+    }
+    if row.room_revision.is_none() && row.base_revision > 0 && row.room_active == 1 {
+        return Err(ROOM_REQUIRED);
     }
     match row.outcome {
         Outcome::Pending => {
@@ -389,10 +453,14 @@ fn save_response(row: &Save) -> ApiResult<Response> {
         }
         Outcome::Committed => {
             let receipt = row.receipt()?;
-            let mut response = Response::from_json(&receipt)?.with_status(if row.base_revision == 0 { 201 } else { 200 });
+            let mut response = match row.room_revision {
+                Some(room_revision) => Response::from_json(&RoomSaveReceipt { file_revision: receipt.revision, room_revision })?,
+                None => Response::from_json(&receipt)?.with_status(if row.base_revision == 0 { 201 } else { 200 }),
+            };
             response.headers_mut().set("ETag", &etag(receipt.revision))?;
             Ok(response)
         }
+        Outcome::Stale if row.room_revision.is_some() => Err(rooms::STALE_ROOM),
         Outcome::Stale => Err(STALE),
         Outcome::Abandoned => Err(Failure(409, "operation_abandoned")),
         Outcome::Invalid => Err(INVALID_BODY),

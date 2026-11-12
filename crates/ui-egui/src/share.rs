@@ -284,6 +284,9 @@ impl WordApp {
     /// Everyone else in the document the window shares, and where they are in it, when the window
     /// shows it; with when each one's place last changed ([`crate::now_ms`]).
     pub(crate) fn others_here(&self) -> Vec<(&Other, f64)> {
+        if let Some(others) = self.hosted_others() {
+            return others.iter().map(|(other, moved)| (other, *moved)).collect();
+        }
         let Some(share) = self.share.as_ref().filter(|s| s.copy.document() == self.session.document_id()) else { return Vec::new() };
         share.others.iter().map(|o| (o, share.moved.iter().find(|(id, _)| *id == o.who.id).map_or(f64::NEG_INFINITY, |(_, t)| *t))).collect()
     }

@@ -226,10 +226,24 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
             }
             // In the shared document, through its copy, as the window's own commands go: its
             // edits reach the room at once, and a save has what others changed.
+            let hosted = app.hosted_room_read_only(doc);
+            if hosted.is_some() && matches!(id, "file.save" | "file.encrypt" | "file.protect" | "review.restrict") {
+                return err("switch to the shared document to use its cloud commands");
+            }
+            let role = if app.services.cloud.is_some() {
+                hosted.filter(|read_only| *read_only).map(|_| wordcraft_engine::room::Role::Viewer)
+            } else {
+                app.session.role
+            };
             let share = app.share.as_mut();
-            let r = app.session.with_document(doc, |s| match share.and_then(|share| share.run(s, id, &params, false)) {
-                Some(r) => r,
-                None => s.run(id, &params),
+            let r = app.session.with_document(doc, |s| {
+                let previous = std::mem::replace(&mut s.role, role);
+                let result = match share.and_then(|share| share.run(s, id, &params, false)) {
+                    Some(r) => r,
+                    None => s.run(id, &params),
+                };
+                s.role = previous;
+                result
             });
             // UI requests the command made carry `document`, so the window can tell they aren't
             // about the document it shows.

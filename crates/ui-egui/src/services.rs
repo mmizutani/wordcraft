@@ -6,6 +6,8 @@ use super::{FileDialogAnswer, FileDialogRequest, WordApp, async_saves, paste_pic
 pub struct Services {
     /// Hosted editor: private DOCX library and explicit cloud saves.
     pub cloud: Option<crate::cloud::CloudService>,
+    /// Hosted editor URL without a query, used to copy links to shared documents.
+    pub cloud_room_base_url: Option<String>,
     /// Desktop: discover configured printers on a worker.
     pub printers: Option<printing::Discover>,
     /// Desktop: submit the PDF with the chosen settings on a worker.

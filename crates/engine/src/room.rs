@@ -61,6 +61,7 @@ use crate::{Registry, Selection, Session};
 
 pub mod hosted;
 mod hub;
+pub mod remote;
 mod replica;
 pub(crate) mod rules;
 

@@ -37,6 +37,10 @@ pub fn start() {
         let app_bridge = bridge.clone();
         let cloud_enabled =
             bridge.is_none() && document.query_selector("meta[name=wordcraft-cloud-documents][content=enabled]").ok().flatten().is_some();
+        let room = cloud_enabled
+            .then(|| query_param("room"))
+            .flatten()
+            .filter(|id| id.len() == 32 && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
         let dirty = Rc::new(Cell::new(false));
         let saves = AsyncSaves::default();
         if bridge.is_none()
@@ -69,7 +73,7 @@ pub fn start() {
                     // decimal separator (#838).
                     let region = wordcraft_ui_egui::i18n::system_region();
                     // In host mode the parent sends the document to edit; no sample meanwhile.
-                    let sample = app_bridge.is_none() && query().contains("sample");
+                    let sample = room.is_none() && app_bridge.is_none() && query().contains("sample");
                     let doc = if sample { wordcraft_engine::sample::sample_document() } else { wordcraft_engine::blank_document(&region) };
                     let mut session = Session::new(doc);
                     session.system_region = region;
@@ -79,6 +83,7 @@ pub fn start() {
                         bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone());
                     } else if cloud_enabled {
                         services.cloud = Some(crate::cloud::service(cc.egui_ctx.clone()));
+                        services.cloud_room_base_url = room_base_url();
                     }
                     let control = crate::api::install(cc.egui_ctx.clone());
                     let mut app = WordApp::new(session, services).with_control(control);
@@ -98,6 +103,11 @@ pub fn start() {
                     // No document to show: start on File › Home, as the desktop app does (#766).
                     if !sample {
                         app.start_screen();
+                    }
+                    if let Some(id) = room
+                        && let Err(error) = app.run("ui.cloudOpenRoom", serde_json::json!({"id": id}))
+                    {
+                        app.status(error);
                     }
                     // The host's name for the user signs this visit's work, but isn't stored as the
                     // browser's own preference, which a visit outside the host would restore.
@@ -138,6 +148,11 @@ fn query_param(key: &str) -> Option<String> {
 
 /// Wraps the app to read dropped files asynchronously (browsers can't read them synchronously)
 /// and feed them through the inbox.
+fn room_base_url() -> Option<String> {
+    let location = web_sys::window()?.location();
+    Some(format!("{}{}", location.origin().ok()?, location.pathname().ok()?))
+}
+
 struct WebShell {
     app: WordApp,
     inbox: Inbox,
