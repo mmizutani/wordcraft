@@ -13,6 +13,8 @@ use wordcraft_engine::{Selection, Session};
 
 use crate::WordApp;
 
+pub(crate) const REWRITE_COMMAND: &str = "ui.localAssistantRewrite";
+
 const AUTHOR: &str = "ChatGPT";
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 
@@ -137,8 +139,43 @@ fn finish(app: &mut WordApp, job: Job, result: Result<Reply, String>) {
     }
 }
 
+fn rewrite_service(app: &WordApp) -> Result<&Service, &str> {
+    let service = app.services.local_assistant.as_ref().ok_or(tl!("Rewrite is available in the local web Assistant."))?;
+    if !app.has_document() || app.ui.backstage || app.modal_open() {
+        return Err(tl!("Return to the document to rewrite selected text."));
+    }
+    let state = &app.assist.local;
+    if state.pending.is_some() {
+        return Err(tl!("Wait for the local Assistant to finish."));
+    }
+    if !matches!(state.account, Some(Account::Connected)) {
+        return Err(tl!("Connect to ChatGPT to rewrite selected text."));
+    }
+    Ok(service)
+}
+
+pub(crate) fn rewrite_enabled(app: &WordApp) -> bool {
+    rewrite_service(app).is_ok() && selected_text(&app.session, &app.session.sel).is_ok()
+}
+
+pub(crate) fn rewrite(app: &mut WordApp) -> Result<serde_json::Value, String> {
+    // Only the person's own action can send document text to ChatGPT.
+    if !app.assist.by_person {
+        return Err(tl!("Choose Rewrite selected text in the Assistant pane.").into());
+    }
+    let service = rewrite_service(app)?;
+    let selection = Rewrite::capture(&app.session).map_err(Blocked::message)?;
+    let reply = service(Request::Rewrite(selection.text.clone()));
+    let state = &mut app.assist.local;
+    state.staged = None;
+    state.notice = None;
+    state.pending = Some((Job::Rewrite(selection), reply));
+    Ok(json!({"pending": "rewrite"}))
+}
+
 pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
     let Some(service) = &app.services.local_assistant else { return };
+    let rewrite_enabled = crate::widgets::enabled(app, REWRITE_COMMAND);
     let state = &mut app.assist.local;
     let waiting = state.pending.is_some();
     let mut paragraph_to_select = None;
@@ -149,16 +186,10 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
                 state.notice = None;
                 state.pending = Some((Job::Disconnect, service(Request::Disconnect)));
             }
-            let selection = Rewrite::capture(&app.session);
             ui.label(tl!("Rewrite sends the selected text to ChatGPT using your plan."));
-            if ui.add_enabled(!waiting && selection.is_ok(), egui::Button::new(tl!("Rewrite selected text"))).clicked()
-                && let Ok(selection) = selection
-            {
-                state.staged = None;
-                state.notice = None;
-                let reply = service(Request::Rewrite(selection.text.clone()));
-                state.pending = Some((Job::Rewrite(selection), reply));
-            } else if let Err(blocked) = selection {
+            if ui.add_enabled(rewrite_enabled, egui::Button::new(tl!("Rewrite selected text"))).clicked() {
+                let _ = app.run(REWRITE_COMMAND, json!({}));
+            } else if !rewrite_enabled && let Err(blocked) = selected_text(&app.session, &app.session.sel) {
                 let caret = app.session.sel.is_collapsed();
                 match if caret { current_paragraph(&app.session) } else { Err(blocked) } {
                     Ok(paragraph) => {
@@ -166,14 +197,9 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
                             paragraph_to_select = Some(paragraph);
                         }
                     }
-                    Err(Blocked::TrackedChanges) if !caret => {
-                        ui.label(tl!("This selection contains tracked changes. Accept or reject them in Review, or select other text."));
-                    }
-                    Err(Blocked::HiddenText) => {
-                        ui.label(tl!("Hidden text cannot be rewritten. Select visible text to rewrite."));
-                    }
-                    Err(_) => {
-                        ui.label(tl!("Select up to 8 KiB of editable text within one paragraph."));
+                    Err(blocked) => {
+                        let reason = if caret && matches!(blocked, Blocked::TrackedChanges) { Blocked::Other } else { blocked };
+                        ui.label(reason.message());
                     }
                 }
             }
@@ -201,6 +227,7 @@ pub(crate) fn show(app: &mut WordApp, ui: &mut Ui) {
             ui.label(tl!("The local Assistant could not check the connection."));
         }
     }
+    let state = &app.assist.local;
     match &state.pending {
         Some((Job::Rewrite(_), _)) => {
             ui.label(tl!("Rewriting selected text…"));
@@ -252,6 +279,16 @@ enum Blocked {
     TrackedChanges,
     HiddenText,
     Other,
+}
+
+impl Blocked {
+    fn message(self) -> &'static str {
+        match self {
+            Self::TrackedChanges => tl!("This selection contains tracked changes. Accept or reject them in Review, or select other text."),
+            Self::HiddenText => tl!("Hidden text cannot be rewritten. Select visible text to rewrite."),
+            Self::Other => tl!("Select up to 8 KiB of editable text within one paragraph."),
+        }
+    }
 }
 
 fn selected_text<'a>(session: &'a Session, selection: &Selection) -> Result<&'a str, Blocked> {

@@ -1086,9 +1086,11 @@ pub(crate) fn search_results(app: &mut WordApp, ui: &mut Ui, query: &str, enter:
     };
     hits.truncate(14);
     let mut run: Option<&str> = enter.then(|| hits.first().map(|c| c.id)).flatten();
+    let local_assistant = app.services.local_assistant.is_some();
     for c in &hits {
         let sc = crate::widgets::shortcut_text(app, c.id);
-        let label = format!("{}   —   {}", tl!(c.label), crate::i18n::location(c.location));
+        let name = if local_assistant && c.id == "assist.rewrite" { tl!("Open Assistant for Rewrite…") } else { tl!(c.label) };
+        let label = format!("{name}   —   {}", crate::i18n::location(c.location));
         if ui.add(egui::Button::new(label).shortcut_text(sc).min_size(vec2(width, 0.0))).clicked() {
             run = Some(c.id);
         }
@@ -1107,6 +1109,8 @@ pub(crate) fn search_results(app: &mut WordApp, ui: &mut Ui, query: &str, enter:
             // sending the engine command an empty value. Programmatic callers still get the
             // command's normal parameter validation.
             let _ = app.run("file.options", json!({"pane": "general"}));
+        } else if local_assistant && id == "assist.rewrite" {
+            let _ = app.run("assist.pane", json!({"value": true}));
         } else {
             let _ = app.run(id, json!({}));
         }

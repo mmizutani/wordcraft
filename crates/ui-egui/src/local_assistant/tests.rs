@@ -68,18 +68,61 @@ fn local_app(session: Session) -> (WordApp, Rc<RefCell<Vec<String>>>) {
     (app, sent)
 }
 
-fn open_pane(mut app: WordApp) -> Harness<'static, WordApp> {
-    app.run("assist.pane", json!({"value": true})).unwrap();
-    let mut harness = Harness::builder().with_size(egui::vec2(1500.0, 900.0)).build_ui_state(
+fn app_harness(app: WordApp) -> Harness<'static, WordApp> {
+    Harness::builder().with_size(egui::vec2(1500.0, 900.0)).build_ui_state(
         |ui, app: &mut WordApp| {
             app.logic(ui.ctx());
             app.ui(ui);
         },
         app,
-    );
+    )
+}
+
+fn open_pane(mut app: WordApp) -> Harness<'static, WordApp> {
+    app.run("assist.pane", json!({"value": true})).unwrap();
+    let mut harness = app_harness(app);
     harness.run_steps(4);
     assert!(harness.query_by_label("Connected to ChatGPT.").is_some());
     harness
+}
+
+#[test]
+fn local_rewrite_command_requires_a_person_and_an_eligible_selection() {
+    let id = "ui.localAssistantRewrite";
+    let (app, sent) = local_app(selected());
+    let mut harness = open_pane(app);
+    assert!(harness.state_mut().execute(id, json!({})).is_err());
+    harness.state_mut().synthetic_pending = true;
+    assert!(harness.state_mut().run(id, json!({})).is_err());
+    harness.state_mut().synthetic_pending = false;
+    harness.state_mut().run("ui.backstage", json!({"value": true})).unwrap();
+    assert!(!crate::widgets::enabled(harness.state(), id));
+    assert!(harness.state_mut().run(id, json!({})).is_err());
+    harness.state_mut().run("ui.backstage", json!({"value": false})).unwrap();
+    harness.state_mut().run("ui.dialog", json!({"name": "paragraph"})).unwrap();
+    assert!(harness.state().modal_open());
+    assert!(!crate::widgets::enabled(harness.state(), id));
+    assert!(harness.state_mut().run(id, json!({})).is_err());
+    harness.state_mut().run("ui.closeDialog", json!({})).unwrap();
+    assert!(sent.borrow().is_empty());
+
+    harness.state_mut().run("select.text", json!({"text": "three"})).unwrap();
+    assert!(crate::widgets::enabled(harness.state(), id));
+    harness.state_mut().run(id, json!({})).unwrap();
+    assert_eq!(*sent.borrow(), ["three"]);
+    assert!(!crate::widgets::enabled(harness.state(), id));
+    assert!(harness.state_mut().run(id, json!({})).is_err());
+    assert_eq!(*sent.borrow(), ["three"]);
+
+    let (app, sent) = local_app(Session::new(Document::from_text("No selection.")));
+    let mut harness = open_pane(app);
+    assert!(!crate::widgets::enabled(harness.state(), id));
+    assert!(harness.state_mut().run(id, json!({})).is_err());
+    assert!(sent.borrow().is_empty());
+
+    let mut desktop = WordApp::new(selected(), Services::default());
+    assert!(!crate::widgets::enabled(&desktop, id));
+    assert!(desktop.run(id, json!({})).is_err());
 }
 
 #[test]
@@ -130,6 +173,24 @@ fn local_assistant_menu_opens_the_pane_without_sending_text() {
     assert!(harness.state().session.view.assistant_pane);
     assert_eq!(harness.state().session.sel, selected);
     assert!(sent.borrow().is_empty());
+}
+
+#[test]
+fn local_rewrite_command_search_opens_the_pane_without_sending_text() {
+    let (mut app, sent) = local_app(selected());
+    let selection = app.session.sel.clone();
+    app.dialog = Some(crate::dialogs::Dialog::Commands { query: "rewrite".into(), swallow: false });
+    let mut harness = app_harness(app);
+    harness.run_steps(4);
+    harness.get_by_label_contains("Open Assistant for Rewrite…").click();
+    harness.run_steps(4);
+
+    assert!(harness.state().session.view.assistant_pane);
+    assert_eq!(harness.state().session.sel, selection);
+    assert!(sent.borrow().is_empty());
+    harness.get_by_label("Rewrite selected text").click();
+    harness.run_steps(3);
+    assert_eq!(*sent.borrow(), ["two"]);
 }
 
 #[test]

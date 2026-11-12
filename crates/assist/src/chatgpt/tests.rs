@@ -1398,3 +1398,26 @@ fn local_web_rewrite_uses_the_selected_plan_and_requires_completed_output() {
     assert_eq!(rewrite_with(folder.path(), &endpoints, "first\nsecond"), Err(LocalRewriteError::Failed));
     assert_eq!(provider.to("/v1/responses").len(), 3);
 }
+
+#[test]
+#[ignore = "exercises a provider stream past the 30-second authentication deadline"]
+fn local_web_rewrite_accepts_completion_after_auth_deadline() {
+    use super::fake_server::Part;
+    use super::local_web::rewrite_with;
+
+    let folder = Folder::new();
+    let script = Arc::new(Script::default());
+    *script.signed_identity.lock().unwrap() = true;
+    let provider = server(script.clone(), |r, _| {
+        assert_eq!(r.path, "/v1/responses");
+        let mut reply = Reply::sse(&[json!({"type":"response.completed","response":{"status":"completed","output":[
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Rewritten."}]}
+        ]}})]);
+        reply.parts.insert(0, Part::Wait(http::AUTH_CALL + Duration::from_secs(1)));
+        reply
+    });
+    let endpoints = Endpoints::local(provider.base());
+    assert!(local_web_sign_in(folder.path(), &script, &endpoints, true).1.unwrap().plan_usage);
+
+    assert_eq!(rewrite_with(folder.path(), &endpoints, "Original."), Ok("Rewritten.".into()));
+}

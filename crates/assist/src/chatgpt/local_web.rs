@@ -1,6 +1,7 @@
 //! One bounded Rewrite on a tester's locally authorized ChatGPT plan.
 
 use std::path::Path;
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -32,12 +33,18 @@ pub(super) fn rewrite_with(settings: &Path, endpoints: &Endpoints, text: &str) -
         return Err(Failed);
     }
     endpoints.check().map_err(|_| Failed)?;
-    let agent = http::auth_agent(endpoints.is_local());
+    let local = endpoints.is_local();
+    let catalog_agent = http::auth_agent(local);
+    let rewrite_agent = http::agent(local, true);
+    let deadline = Instant::now() + http::CALL;
     let base = endpoints.api.trim_end_matches('/');
     let mut refused = None;
     for _ in 0..2 {
+        if Instant::now() >= deadline {
+            break;
+        }
         let token = local_web_access_token(settings, endpoints, refused.as_deref()).map_err(|_| Failed)?.access_token;
-        let catalog = http::get_json(&agent, &format!("{base}/models"), Some(&token)).map_err(|_| Failed)?;
+        let catalog = http::get_json(&catalog_agent, &format!("{base}/models"), Some(&token)).map_err(|_| Failed)?;
         if catalog.status == 401 && refused.is_none() {
             refused = Some(token);
             continue;
@@ -58,8 +65,13 @@ pub(super) fn rewrite_with(settings: &Path, endpoints: &Endpoints, text: &str) -
             "stream": true,
             "max_output_tokens": 2048,
         });
-        let response = agent
+        // One deadline across attempts keeps the relay's rewrite slot bounded even with SSE keepalives.
+        let remaining = deadline.checked_duration_since(Instant::now()).filter(|duration| !duration.is_zero()).ok_or(Failed)?;
+        let response = rewrite_agent
             .post(&format!("{base}/responses"))
+            .config()
+            .timeout_global(Some(remaining))
+            .build()
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")

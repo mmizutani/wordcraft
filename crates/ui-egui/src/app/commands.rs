@@ -618,6 +618,7 @@ impl WordApp {
                 crate::updates_ui::check(self);
                 Value::Null
             }
+            crate::local_assistant::REWRITE_COMMAND => return Some(crate::local_assistant::rewrite(self)),
             "ui.tab" => {
                 let tab = s("tab").unwrap_or("Home").to_string();
                 if tab == "File" {
