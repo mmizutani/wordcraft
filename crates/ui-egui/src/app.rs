@@ -434,6 +434,8 @@ impl WordApp {
         } else {
             self.window_ui(ui);
         }
+        // Apply a rewrite after this frame has handled the editor's selection and document input.
+        crate::local_assistant::tick(self, ui.ctx());
     }
 
     /// Lay out the drawn window. A command that brings another window's state in (New, Open,

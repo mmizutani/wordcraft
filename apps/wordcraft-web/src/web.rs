@@ -14,6 +14,7 @@ const DOC_EXTS: &[&str] =
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "wmf", "emf"];
 const RECIPIENT_EXTS: &[&str] = wordcraft_engine::cmd::mailings::RECIPIENT_EXTENSIONS;
 mod font_store;
+mod local_assistant;
 const CANVAS_ID: &str = "wordcraft_canvas";
 const LOADING_ID: &str = "wordcraft_loading";
 
@@ -37,6 +38,7 @@ pub fn start() {
         let app_bridge = bridge.clone();
         let cloud_enabled =
             bridge.is_none() && document.query_selector("meta[name=wordcraft-cloud-documents][content=enabled]").ok().flatten().is_some();
+        let assistant_key = bridge.is_none().then(|| local_assistant::launch_key(&document)).flatten();
         let dirty = Rc::new(Cell::new(false));
         let saves = AsyncSaves::default();
         if bridge.is_none()
@@ -79,6 +81,9 @@ pub fn start() {
                         bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone());
                     } else if cloud_enabled {
                         services.cloud = Some(crate::cloud::service(cc.egui_ctx.clone()));
+                    }
+                    if let Some(key) = assistant_key {
+                        services.local_assistant = Some(local_assistant::service(cc.egui_ctx.clone(), key));
                     }
                     let control = crate::api::install(cc.egui_ctx.clone());
                     let mut app = WordApp::new(session, services).with_control(control);

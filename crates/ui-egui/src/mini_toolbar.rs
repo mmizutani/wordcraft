@@ -316,9 +316,8 @@ fn content(app: &mut WordApp, ui: &mut egui::Ui, t: &Tokens, preview_on_hover: b
         hover_small(ui, app, "grow", "Increase Font Size", "format.growFont", false, preview_on_hover);
         hover_small(ui, app, "shrink", "Decrease Font Size", "format.shrinkFont", false, preview_on_hover);
         // The assistant's writing actions on the selection (#18), greyed out with no assistant.
-        widgets::menu_button(ui, app, widgets::MenuButtonOptions::new("assistant", None, "Assistant", false, "assist.draft"), |ui, app| {
-            crate::assist::action_items(ui, app)
-        });
+        let assistant = if app.services.local_assistant.is_some() { "assist.pane" } else { "assist.draft" };
+        widgets::menu_button(ui, app, widgets::MenuButtonOptions::new("assistant", None, "Assistant", false, assistant), crate::assist::action_items);
     });
 
     row(ui, app, &|ui, app| {

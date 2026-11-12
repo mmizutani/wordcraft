@@ -56,6 +56,9 @@ pub(crate) struct Client {
     pub(crate) host_id: String,
     /// The `oaiapp_…` client id the first sign-in was issued, once it was.
     pub(crate) client_id: Option<String>,
+    /// The verified local web account bound to this registration, stored as an opaque digest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) subject_digest: Option<String>,
 }
 
 /// The signed-in account and its tokens.
@@ -165,7 +168,7 @@ pub(crate) fn client(settings: &Path) -> Result<Client, String> {
     if let Some(c) = read_json::<Client>(&settings.join(CLIENT_FILE)).filter(|c| valid_host_id(&c.host_id)) {
         return Ok(c);
     }
-    let c = Client { host_id: new_host_id()?, client_id: None };
+    let c = Client { host_id: new_host_id()?, ..Client::default() };
     save_client(settings, &c)?;
     Ok(c)
 }

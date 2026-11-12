@@ -12,7 +12,7 @@
 //! (`invalid_client`): then it is forgotten, and the next sign-in registers again. The id
 //! token's claims are checked (issuer, audience, expiry, nonce); its signature is not, as
 //! OpenID Connect Core §3.1.3.7 allows for an id token taken straight from the token endpoint
-//! over TLS.
+//! over TLS. The local web profile also verifies the signature with the provider JWKS.
 //!
 //! Plan usage is granted only with the [`PLAN_SCOPE`] scope: a sign-in without it is kept, and
 //! the account says so ([`Account::plan_usage`]); signing in again with `consent` asks again.
@@ -152,6 +152,16 @@ impl SignIn {
     /// Start signing in with the settings folder `settings`: listen for the browser, and make
     /// the address the browser opens. The installation's host id is made and kept first.
     pub fn start(settings: &Path, options: SignInOptions) -> Result<SignIn, AuthError> {
+        Self::start_with_profile(settings, options, false)
+    }
+
+    /// Start the development editor's dedicated sign-in and verify its OpenID signature.
+    /// The authorization URL returned to the editor contains no retained identity token.
+    pub fn start_for_local_web(settings: &Path, options: SignInOptions) -> Result<SignIn, AuthError> {
+        Self::start_with_profile(settings, options, true)
+    }
+
+    fn start_with_profile(settings: &Path, options: SignInOptions, local_web: bool) -> Result<SignIn, AuthError> {
         options.endpoints.check().map_err(AuthError::Failed)?;
         let client = store::client(settings).map_err(AuthError::Storage)?;
         let listener = listen(options.port)?;
@@ -161,7 +171,7 @@ impl SignIn {
         let (state, nonce, verifier) = (secret(32)?, secret(32)?, secret(48)?);
         let challenge = b64url(Sha256::digest(verifier.as_bytes()).as_slice());
         // The window's thread starts it: the hints come from what is known without the keychain.
-        let saved = store::peek(settings).map(|(c, _)| c);
+        let saved = (!local_web).then(|| store::peek(settings)).flatten().map(|(c, _)| c);
         let url =
             authorize_url(&options, &client, saved.as_ref(), &Params { redirect: &redirect, state: &state, nonce: &nonce, challenge: &challenge });
         let pending = Pending {
@@ -172,6 +182,7 @@ impl SignIn {
             nonce,
             verifier,
             client,
+            local_web,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, done) = channel();
@@ -306,6 +317,7 @@ struct Pending {
     nonce: String,
     verifier: String,
     client: Client,
+    local_web: bool,
 }
 
 /// Answer requests on the port, each read on a thread of its own (at most
@@ -404,6 +416,18 @@ fn read_callback(mut stream: TcpStream, state: &str) -> Option<Callback> {
         respond(&mut stream, 400, "This sign-in answer isn't for the sign-in WordCraft is waiting for. Start signing in again from WordCraft.");
         return None;
     }
+    let host = stream.local_addr().ok()?.to_string();
+    let mut hosts = head
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.trim());
+    if hosts.next() != Some(host.as_str()) || hosts.next().is_some() {
+        respond(&mut stream, 400, "This sign-in answer didn't arrive at WordCraft's loopback address.");
+        return None;
+    }
     Some(Callback { stream, params })
 }
 
@@ -414,6 +438,7 @@ fn finish_callback(p: &Pending, mut callback: Callback) -> Result<Account, AuthE
     let result = finish(p, param("error"), param("error_description"), param("code"), param("client_id"));
     match &result {
         Ok(_) => respond(&mut callback.stream, 200, "You're signed in. You can close this tab and go back to WordCraft."),
+        Err(_) if p.local_web => respond(&mut callback.stream, 400, "ChatGPT plan sign-in didn't finish. Close this tab and go back to WordCraft."),
         Err(e) => respond(&mut callback.stream, 400, &format!("The sign-in didn't work: {e}. You can close this tab and go back to WordCraft.")),
     }
     result
@@ -459,7 +484,7 @@ fn respond(stream: &mut TcpStream, status: u16, message: &str) {
         escape_html(message)
     );
     let reply = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: frame-ancestors 'none'\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(reply.as_bytes());
@@ -523,7 +548,7 @@ fn forget_client(settings: &Path, dead: &str) -> Result<(), String> {
         return Ok(());
     }
     log::warn!("ChatGPT sign-in: ChatGPT no longer knows WordCraft's registration; the next sign-in registers again");
-    store::save_client(settings, &Client { client_id: None, ..client })
+    store::save_client(settings, &Client { client_id: None, subject_digest: None, ..client })
 }
 
 /// Exchange the code for tokens, check the id token, and keep them.
@@ -554,6 +579,9 @@ fn exchange(p: &Pending, client_id: &str, code: &str) -> Result<Account, AuthErr
     }
     let tokens = Tokens::from(&reply.json(), true)?;
     let claims = check_id_token(&tokens.id_token, &p.endpoints.issuer, client_id, Some(&p.nonce))?;
+    if p.local_web {
+        super::identity::verify(&tokens.id_token, &p.endpoints)?;
+    }
     let credentials = Credentials {
         version: 0,
         client_id: client_id.to_string(),
@@ -567,11 +595,32 @@ fn exchange(p: &Pending, client_id: &str, code: &str) -> Result<Account, AuthErr
         refresh_token: tokens.refresh_token,
         token_type: tokens.token_type,
         expires_at: now().saturating_add(tokens.expires_in),
-        scopes: tokens.scopes.unwrap_or_else(|| SCOPES.split_whitespace().map(str::to_string).collect()),
+        scopes: tokens.scopes.unwrap_or_else(|| if p.local_web { Vec::new() } else { SCOPES.split_whitespace().map(str::to_string).collect() }),
         saved_at: 0,
     };
     let lock = Lock::take(&p.settings);
+    if p.local_web {
+        let profile = lock.and_then(|lock| {
+            let mut client = store::client(&p.settings)?;
+            let digest = b64url(&Sha256::digest(credentials.subject.as_bytes()));
+            if client.client_id.as_deref() != Some(client_id) || client.subject_digest.as_deref().is_some_and(|subject| subject != digest) {
+                return Err("ChatGPT returned a different account for this registration.".into());
+            }
+            client.subject_digest = Some(digest);
+            store::save_client(&p.settings, &client)?;
+            Ok(lock)
+        });
+        if !has_local_plan(&credentials) {
+            revoke_unkept(&p.endpoints, credentials);
+            return Err(AuthError::Denied);
+        }
+        return keep_sign_in(&p.settings, &p.endpoints, credentials, profile);
+    }
     keep_sign_in(&p.settings, &p.endpoints, credentials, lock)
+}
+
+fn has_local_plan(credentials: &Credentials) -> bool {
+    credentials.plan_usage() && credentials.scopes.iter().any(|scope| scope == "resource.invoke")
 }
 
 /// Keep one issued sign-in after the credentials lock has been acquired.
@@ -695,7 +744,8 @@ pub(super) fn check_id_token(token: &str, issuer: &str, client_id: &str, nonce: 
     if claims.get("iat").and_then(Value::as_u64).is_none() {
         return Err(bad("it has no issue time"));
     }
-    let subject = text("sub").filter(|s| !s.is_empty()).ok_or_else(|| bad("it names no account"))?;
+    let subject =
+        text("sub").filter(|s| !s.is_empty() && s.len() <= 320 && !s.chars().any(char::is_control)).ok_or_else(|| bad("it names no account"))?;
     if let Some(nonce) = nonce
         && !text("nonce").is_some_and(|n| same_secret(n, nonce))
     {
@@ -705,7 +755,7 @@ pub(super) fn check_id_token(token: &str, issuer: &str, client_id: &str, nonce: 
         return Err(bad("its session is empty"));
     }
     let short = |s: &str| s.chars().filter(|c| !c.is_control()).take(320).collect::<String>();
-    Ok(Claims { subject: short(subject), email: text("email").map(short).unwrap_or_default(), name: text("name").map(short) })
+    Ok(Claims { subject: subject.to_string(), email: text("email").map(short).unwrap_or_default(), name: text("name").map(short) })
 }
 
 /// The signed-in account's credentials with an access token that has more than five minutes
@@ -713,6 +763,18 @@ pub(super) fn check_id_token(token: &str, issuer: &str, client_id: &str, nonce: 
 /// different saved one (another refresh made it) is used as it is; that one is refreshed even
 /// before it expires. One refresh runs at a time: one that waited finds the new token saved.
 pub(crate) fn access_token(settings: &Path, endpoints: &Endpoints, refused: Option<&str>) -> Result<Credentials, AuthError> {
+    access_token_for_profile(settings, endpoints, refused, false)
+}
+
+pub(super) fn local_web_access_token(settings: &Path, endpoints: &Endpoints, refused: Option<&str>) -> Result<Credentials, AuthError> {
+    let credentials = access_token_for_profile(settings, endpoints, refused, true)?;
+    if !has_local_plan(&credentials) {
+        return Err(AuthError::Denied);
+    }
+    Ok(credentials)
+}
+
+fn access_token_for_profile(settings: &Path, endpoints: &Endpoints, refused: Option<&str>, local_web: bool) -> Result<Credentials, AuthError> {
     let usable = |c: &Credentials| {
         !c.access_token.is_empty() && c.expires_at > now().saturating_add(REFRESH_MARGIN) && refused.is_none_or(|r| r != c.access_token)
     };
@@ -725,11 +787,11 @@ pub(crate) fn access_token(settings: &Path, endpoints: &Endpoints, refused: Opti
     if usable(&saved) {
         return Ok(saved);
     }
-    refresh(settings, endpoints, saved)
+    refresh(settings, endpoints, saved, local_web)
 }
 
 /// Refresh `saved`'s tokens (the caller holds the lock) and keep them.
-fn refresh(settings: &Path, endpoints: &Endpoints, saved: Credentials) -> Result<Credentials, AuthError> {
+fn refresh(settings: &Path, endpoints: &Endpoints, saved: Credentials, local_web: bool) -> Result<Credentials, AuthError> {
     endpoints.check().map_err(AuthError::Failed)?;
     let agent = http::auth_agent(endpoints.is_local());
     let fields = [
@@ -756,7 +818,13 @@ fn refresh(settings: &Path, endpoints: &Endpoints, saved: Credentials) -> Result
         fresh.scopes = scopes;
     }
     if !tokens.id_token.is_empty() {
-        match check_id_token(&tokens.id_token, &fresh.issuer, &fresh.client_id, None) {
+        let verified = check_id_token(&tokens.id_token, &fresh.issuer, &fresh.client_id, None).and_then(|claims| {
+            if local_web {
+                super::identity::verify(&tokens.id_token, endpoints)?;
+            }
+            Ok(claims)
+        });
+        match verified {
             Ok(claims) if claims.subject != fresh.subject => {
                 // Another account's tokens: neither used nor kept (they're revoked), and the
                 // sign-in ends.
@@ -771,8 +839,18 @@ fn refresh(settings: &Path, endpoints: &Endpoints, saved: Credentials) -> Result
             }
             // The tokens are kept with the last id token and its claims (a clock running ahead
             // makes a new id token look expired).
+            Err(e) if local_web => {
+                revoke_unkept(endpoints, fresh);
+                save_over(settings, endpoints, &saved, &ended(&saved))?;
+                return Err(e);
+            }
             Err(e) => log::warn!("ChatGPT sign-in: the refreshed id token isn't kept ({e})"),
         }
+    }
+    if local_web && !has_local_plan(&fresh) {
+        revoke_unkept(endpoints, fresh);
+        save_over(settings, endpoints, &saved, &ended(&saved))?;
+        return Err(AuthError::Denied);
     }
     save_over(settings, endpoints, &saved, &fresh)?;
     log::info!("ChatGPT sign-in: refreshed");

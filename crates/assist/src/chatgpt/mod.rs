@@ -25,6 +25,8 @@
 mod auth;
 mod backend;
 mod http;
+mod identity;
+mod local_web;
 mod models;
 mod sse;
 mod store;
@@ -34,6 +36,7 @@ pub use auth::{
     AuthError, CALLBACK_PATH, DEFAULT_PORT, PLAN_SCOPE, SCOPES, SIGN_IN_WAIT, SignIn, SignInOptions, SignOut, SignedOut, sign_out, sign_out_with,
 };
 pub use backend::{ChatGpt, MAX_ROUNDS, request_for_eval};
+pub use local_web::{LocalRewriteError, local_rewrite, valid_local_rewrite};
 pub use models::{Resolved, models, models_with, resolve};
 pub use store::{Account, CLIENT_FILE, CREDENTIALS_FILE, Kept, PLAINTEXT_FILE, account};
 pub use vault::{fake_keychain, opening, use_system_keychain};
@@ -149,3 +152,6 @@ mod fake_server;
 mod models_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod local_web_tests;
